@@ -19,15 +19,16 @@ const ALLOWED_CAPABILITIES: Record<LeasePreset, ReadonlySet<LeaseCapability>> = 
 
 /**
  * Require an unexpired lease for `projectId` that permits `capability`.
- * Throws LEASE_REQUIRED (no/expired/mismatched lease) or PERMISSION_DENIED
- * (lease exists but its preset does not grant the requested capability).
+ * Throws LEASE_REQUIRED (no/mismatched lease), LEASE_EXPIRED (matching lease
+ * expired before the operation started), or PERMISSION_DENIED (lease exists
+ * but its preset does not grant the requested capability).
  */
 export async function requireProjectLease(
   ctx: ToolContext,
   projectId: string,
   capability: LeaseCapability = "read",
 ): Promise<Lease> {
-  const session = await ctx.store.getSession();
+  const session = await ctx.store.getSession(ctx.sessionScope);
   const lease = requireLease(session, projectId);
   if (!ALLOWED_CAPABILITIES[lease.preset].has(capability)) {
     throw new DomainError(ErrorCode.PERMISSION_DENIED, `Lease preset ${lease.preset} does not allow ${capability}`, {

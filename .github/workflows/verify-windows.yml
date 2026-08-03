@@ -1,0 +1,168 @@
+name: Verify Windows Source
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/verify-windows.yml"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+      - "src/**"
+      - "windows/ChatGPTToCodexLauncher.cs"
+      - "windows/ChatGPTToCodexTray.ps1"
+      - "windows/Install-Prerequisites.ps1"
+      - "windows/Start-ChatGPTToCodexTray.cmd"
+      - "start-chatgpt.ps1"
+      - "start-chatgpt.cmd"
+      - "assets/chatgpt2codex-icon.ico"
+  pull_request:
+    paths:
+      - ".github/workflows/verify-windows.yml"
+      - "package.json"
+      - "package-lock.json"
+      - "tsconfig.json"
+      - "src/**"
+      - "windows/ChatGPTToCodexLauncher.cs"
+      - "windows/ChatGPTToCodexTray.ps1"
+      - "windows/Install-Prerequisites.ps1"
+      - "windows/Start-ChatGPTToCodexTray.cmd"
+      - "start-chatgpt.ps1"
+      - "start-chatgpt.cmd"
+      - "assets/chatgpt2codex-icon.ico"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-source-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-windows-source:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24.18.1"
+          cache: npm
+
+      - name: Install dependencies
+        shell: pwsh
+        run: npm ci --ignore-scripts
+
+      - name: Audit production dependencies
+        shell: pwsh
+        run: npm audit --omit=dev --audit-level=moderate
+
+      - name: Verify shared runtime
+        shell: pwsh
+        run: |
+          npm run typecheck
+          npm run build
+
+      - name: Parse public PowerShell sources
+        shell: pwsh
+        run: |
+          $files = @(
+            "start-chatgpt.ps1",
+            "windows/ChatGPTToCodexTray.ps1",
+            "windows/Install-Prerequisites.ps1"
+          )
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            $path = (Resolve-Path -LiteralPath $file).Path
+            [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $details = ($errors | ForEach-Object { "${file}:$($_.Extent.StartLineNumber): $($_.Message)" }) -join "`n"
+              throw "PowerShell parse errors:`n$details"
+            }
+          }
+
+      - name: Compile Windows launcher
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path "build/windows" | Out-Null
+          $cscCandidates = @(
+            (Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"),
+            (Join-Path $env:WINDIR "Microsoft.NET\Framework\v4.0.30319\csc.exe")
+          )
+          $csc = $cscCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $csc) { throw "Microsoft .NET Framework csc.exe was not found." }
+          $source = (Resolve-Path -LiteralPath "windows\ChatGPTToCodexLauncher.cs").Path
+          $icon = (Resolve-Path -LiteralPath "assets\chatgpt2codex-icon.ico").Path
+          $output = (Join-Path (Resolve-Path -LiteralPath "build/windows").Path "ChatGPT To Codex.exe")
+          & $csc `
+            /nologo `
+            /target:winexe `
+            "/win32icon:$icon" `
+            /reference:System.dll `
+            /reference:System.Core.dll `
+            /reference:System.Web.Extensions.dll `
+            /reference:System.Windows.Forms.dll `
+            /reference:System.Drawing.dll `
+            "/out:$output" `
+            $source
+          if ($LASTEXITCODE -ne 0) { throw "Windows launcher compilation failed with exit code $LASTEXITCODE." }
+          $artifact = Get-Item -LiteralPath $output -ErrorAction Stop
+          if ($artifact.Length -le 0) { throw "Launcher artifact is empty." }
+          Get-FileHash -LiteralPath $artifact.FullName -Algorithm SHA256
+
+      - name: Smoke-test Windows HTTP runtime
+        shell: pwsh
+        run: |
+          $workspace = Join-Path $env:RUNNER_TEMP "chatgpt2codex-ci-workspace"
+          $ciHome = Join-Path $env:RUNNER_TEMP "chatgpt2codex-ci-home"
+          $stdout = Join-Path $env:RUNNER_TEMP "chatgpt2codex-runtime.stdout.log"
+          $stderr = Join-Path $env:RUNNER_TEMP "chatgpt2codex-runtime.stderr.log"
+          New-Item -ItemType Directory -Force -Path $workspace, $ciHome | Out-Null
+          $env:USERPROFILE = $ciHome
+          $env:HOMEDRIVE = $ciHome.Substring(0, 2)
+          $env:HOMEPATH = $ciHome.Substring(2)
+          $ownerToken = [guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N")
+          $ownerToken | node dist/cli.js owner-token --set-stdin | Out-Null
+          $server = $null
+          try {
+            $server = Start-Process `
+              -FilePath "node" `
+              -ArgumentList @("dist/cli.js", "serve", "--http", "--host", "127.0.0.1", "--port", "7979", "--workspace", $workspace) `
+              -WorkingDirectory $env:GITHUB_WORKSPACE `
+              -PassThru `
+              -NoNewWindow `
+              -RedirectStandardOutput $stdout `
+              -RedirectStandardError $stderr
+
+            $health = $null
+            for ($attempt = 0; $attempt -lt 20; $attempt++) {
+              if ($server.HasExited) { throw "HTTP runtime exited before health check." }
+              try {
+                $health = Invoke-RestMethod -UseBasicParsing -TimeoutSec 2 -Uri "http://127.0.0.1:7979/healthz"
+                break
+              } catch {
+                Start-Sleep -Seconds 1
+              }
+            }
+            if ($null -eq $health) { throw "HTTP runtime health check timed out." }
+            if (-not $health.ok) { throw "HTTP runtime health returned ok=false." }
+            if ($health.platform -ne "win32") { throw "Unexpected platform: $($health.platform)" }
+            if ($health.transport -ne "http") { throw "Unexpected transport: $($health.transport)" }
+          } finally {
+            if ($server -and -not $server.HasExited) {
+              Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+            }
+          }

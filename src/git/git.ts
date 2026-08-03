@@ -4,6 +4,7 @@ import { promisify } from "node:util";
 import { DomainError, ErrorCode } from "../types.js";
 import { isSecretPath, redact } from "../policy/secrets.js";
 
+// execution-capability: git-readonly-argv
 const execFileAsync = promisify(execFile);
 
 /** Options threaded to execFile for every git invocation in this module. */
@@ -20,8 +21,9 @@ const EXEC_OPTS = {
 async function runGit(
   cwd: string,
   args: string[],
+  gitExecutable = "git",
 ): Promise<{ stdout: string; stderr: string }> {
-  return execFileAsync("git", args, { ...EXEC_OPTS, cwd });
+  return execFileAsync(gitExecutable, args, { ...EXEC_OPTS, cwd });
 }
 
 /** True if `err` looks like "not a git repository" / git missing, vs a real failure. */
@@ -37,28 +39,103 @@ function isNonGitError(err: unknown): boolean {
   );
 }
 
+function isGitUnavailableError(err: unknown): boolean {
+  return (err as { code?: unknown } | undefined)?.code === "ENOENT";
+}
+
+function isNotRepositoryError(err: unknown): boolean {
+  const e = err as { stderr?: string; message?: string } | undefined;
+  const text = `${e?.stderr ?? ""} ${e?.message ?? ""}`.toLowerCase();
+  return text.includes("not a git repository") || text.includes("not a git repo");
+}
+
+function statusErrorMessage(err: unknown): string {
+  const e = err as { stderr?: string; message?: string } | undefined;
+  const message = (e?.stderr?.trim() || e?.message || String(err)).replace(/\s+/g, " ");
+  return redact(message).slice(0, 1_000);
+}
+
+export type GitHeadState = "branch" | "detached" | "unborn" | "unavailable";
+
+export interface GitStatus {
+  /** Compatibility field. Empty for detached/unavailable, branch name otherwise. */
+  branch: string;
+  isGitRepository: boolean;
+  headState: GitHeadState;
+  branchName: string | null;
+  headCommit: string | null;
+  statusError: string | null;
+  dirtyFiles: string[];
+  staged: string[];
+}
+
+export interface GitReadOptions {
+  /** Test/embedded override. Public tools always use the default verified PATH lookup. */
+  gitExecutable?: string;
+}
+
+function unavailableStatus(statusError: string, isGitRepository = false): GitStatus {
+  return {
+    branch: "",
+    isGitRepository,
+    headState: "unavailable",
+    branchName: null,
+    headCommit: null,
+    statusError,
+    dirtyFiles: [],
+    staged: [],
+  };
+}
+
 /** Git status summary for a project (PRD §8.6 git_status). */
 export async function gitStatus(
   root: string,
-): Promise<{ branch: string; dirtyFiles: string[]; staged: string[] }> {
+  options: GitReadOptions = {},
+): Promise<GitStatus> {
+  const gitExecutable = options.gitExecutable ?? "git";
   try {
-    let branch = "";
-    let hasHead = true;
-    try {
-      const branchResult = await runGit(root, ["rev-parse", "--abbrev-ref", "HEAD"]);
-      branch = branchResult.stdout.trim();
-    } catch (branchErr) {
-      const e = branchErr as { stderr?: string; message?: string };
-      const text = `${e.stderr ?? ""} ${e.message ?? ""}`.toLowerCase();
-      if (text.includes("ambiguous argument") || text.includes("unknown revision") || text.includes("bad revision") || text.includes("needed a single revision")) {
-        hasHead = false;
-        branch = (await runGit(root, ["branch", "--show-current"]).catch(() => ({ stdout: "", stderr: "" }))).stdout.trim();
-      } else {
-        throw branchErr;
-      }
+    const repository = await runGit(root, ["rev-parse", "--is-inside-work-tree"], gitExecutable);
+    if (repository.stdout.trim() !== "true") {
+      return unavailableStatus("not a Git work tree");
     }
 
-    const statusResult = await runGit(root, ["status", "--porcelain=v1"]);
+    let branchName: string | null = null;
+    try {
+      const symbolic = await runGit(root, ["symbolic-ref", "--quiet", "--short", "HEAD"], gitExecutable);
+      branchName = symbolic.stdout.trim() || null;
+    } catch {
+      // Detached HEAD intentionally has no symbolic branch. Unborn branches
+      // still return their symbolic name, so no error inference is required.
+    }
+
+    let headCommit: string | null = null;
+    try {
+      const commit = await runGit(root, ["rev-parse", "--verify", "HEAD"], gitExecutable);
+      headCommit = commit.stdout.trim() || null;
+    } catch {
+      // A valid symbolic branch with no commit is an unborn repository.
+    }
+
+    const headState: GitHeadState = headCommit
+      ? (branchName ? "branch" : "detached")
+      : (branchName ? "unborn" : "unavailable");
+    const branch = branchName ?? "";
+
+    let statusResult: { stdout: string; stderr: string };
+    try {
+      statusResult = await runGit(root, ["status", "--porcelain=v1"], gitExecutable);
+    } catch (err) {
+      return {
+        branch,
+        isGitRepository: true,
+        headState,
+        branchName,
+        headCommit,
+        statusError: statusErrorMessage(err),
+        dirtyFiles: [],
+        staged: [],
+      };
+    }
     const dirtyFiles: string[] = [];
     const staged: string[] = [];
 
@@ -87,20 +164,30 @@ export async function gitStatus(
       }
     }
 
-    return { branch, dirtyFiles, staged };
+    return {
+      branch,
+      isGitRepository: true,
+      headState,
+      branchName,
+      headCommit,
+      statusError: headState === "unavailable" ? "Git HEAD state could not be resolved" : null,
+      dirtyFiles,
+      staged,
+    };
   } catch (err) {
-    if (isNonGitError(err)) {
-      return { branch: "", dirtyFiles: [], staged: [] };
-    }
-    throw new DomainError(
-      ErrorCode.NOT_IMPLEMENTED,
-      `gitStatus failed: ${(err as Error).message ?? String(err)}`,
-    );
+    if (isGitUnavailableError(err)) return unavailableStatus("git executable unavailable");
+    if (isNotRepositoryError(err)) return unavailableStatus("not a git repository");
+    return unavailableStatus(`git status unavailable: ${statusErrorMessage(err)}`);
   }
 }
 
 export interface GitRepositoryStatus {
   branch: string;
+  isGitRepository: boolean;
+  headState: GitHeadState;
+  branchName: string | null;
+  headCommit: string | null;
+  statusError: string | null;
   dirtyFiles: string[];
   staged: string[];
   remotes: Array<{ name: string; url: string }>;
@@ -111,12 +198,26 @@ export interface GitRepositoryStatus {
 }
 
 /** Read-only repository state plus already-known upstream relation; never fetches. */
-export async function gitRepositoryStatus(root: string): Promise<GitRepositoryStatus> {
-  const status = await gitStatus(root);
+export async function gitRepositoryStatus(
+  root: string,
+  options: GitReadOptions = {},
+): Promise<GitRepositoryStatus> {
+  const status = await gitStatus(root, options);
+  if (!status.isGitRepository) {
+    return {
+      ...status,
+      remotes: [],
+      upstream: null,
+      ahead: 0,
+      behind: 0,
+      syncState: "unknown",
+    };
+  }
+  const gitExecutable = options.gitExecutable ?? "git";
   const [remotes, upstream, counts] = await Promise.all([
-    listGitRemotes(root),
-    readGitUpstream(root),
-    readGitAheadBehind(root),
+    listGitRemotes(root, gitExecutable),
+    readGitUpstream(root, gitExecutable),
+    readGitAheadBehind(root, gitExecutable),
   ]);
   return {
     ...status,
@@ -128,9 +229,9 @@ export async function gitRepositoryStatus(root: string): Promise<GitRepositorySt
   };
 }
 
-async function listGitRemotes(root: string): Promise<Array<{ name: string; url: string }>> {
+async function listGitRemotes(root: string, gitExecutable = "git"): Promise<Array<{ name: string; url: string }>> {
   try {
-    const result = await runGit(root, ["remote", "-v"]);
+    const result = await runGit(root, ["remote", "-v"], gitExecutable);
     const remotes = new Map<string, string>();
     for (const line of result.stdout.split("\n")) {
       const match = line.match(/^(\S+)\s+(\S+)\s+\((fetch|push)\)$/);
@@ -144,18 +245,18 @@ async function listGitRemotes(root: string): Promise<Array<{ name: string; url: 
   }
 }
 
-async function readGitUpstream(root: string): Promise<string | null> {
+async function readGitUpstream(root: string, gitExecutable = "git"): Promise<string | null> {
   try {
-    const result = await runGit(root, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]);
+    const result = await runGit(root, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], gitExecutable);
     return result.stdout.trim() || null;
   } catch {
     return null;
   }
 }
 
-async function readGitAheadBehind(root: string): Promise<{ ahead: number; behind: number }> {
+async function readGitAheadBehind(root: string, gitExecutable = "git"): Promise<{ ahead: number; behind: number }> {
   try {
-    const result = await runGit(root, ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"]);
+    const result = await runGit(root, ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"], gitExecutable);
     const [aheadRaw, behindRaw] = result.stdout.trim().split(/\s+/);
     return {
       ahead: Number.parseInt(aheadRaw ?? "0", 10) || 0,

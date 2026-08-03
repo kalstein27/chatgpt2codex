@@ -1,81 +1,106 @@
 # ChatGPT To Codex for Windows
 
-Beginner install:
+Windows has a WinForms tray launcher, portable-bundle builder, installer builder,
+and installer E2E script. The shared TypeScript/Node runtime provides project,
+file, patch, command, Git, image intake, OAuth, connector, and session-status
+features.
 
-1. Download `chatgpt2codex-0.2.0-windows-setup.exe` from the official GitHub release:
-   <https://github.com/ezBuilder/chatgpt2codex/releases/tag/v0.2.0>
-2. Double-click the installer.
-3. If Windows SmartScreen appears, choose **More info** -> **Run anyway** only
-   when the file came from the official release page.
-4. Open **ChatGPT To Codex**.
-5. Confirm the tray icon appears near the clock.
-6. Open **Settings...**, choose a project folder, enable the ChatGPT web
-   connector if needed, then click **Start MCP**.
-7. Copy the `/mcp` Connector URL and approve it in ChatGPT with the Owner Token.
+A Windows installer is publishable only after the current commit is built and
+tested on a real Windows runner. A successful TypeScript build or macOS test is
+not Windows release evidence. Native Windows screenshot, click, type, and UI
+Automation control are not implemented yet, so `Agent Arm` remains unavailable.
+
+## Install from an official release
+
+Use this path only when a Windows setup asset is attached to an official GitHub
+Release and its Windows acceptance checks are recorded.
+
+1. Download `chatgpt2codex-<version>-windows-setup.exe` from the official release.
+2. Verify the source and published checksum before running an unsigned build.
+3. Launch **ChatGPT To Codex** and confirm the tray icon appears.
+4. Open **Settings...**, choose a project, and start MCP.
+5. Enable the web connector only when needed.
+6. Copy the `/mcp` connector URL and approve the connection with the Owner Token.
 
 Keep the Owner Token private. Treat it like a password.
 
-Portable/source install:
+The Windows release publishes three related assets:
 
-- From a packaged folder, double-click `ChatGPT To Codex.exe`.
-- If the exe has not been built yet, run `windows\Build-ChatGPTToCodexExe.ps1`
-  once on Windows.
-- Fallback launcher: `windows\Start-ChatGPTToCodexTray.cmd`.
+- `chatgpt2codex-<version>-windows-setup.exe` — unsigned installer
+- `chatgpt2codex-<version>-windows-portable.zip` — unsigned portable bundle
+- `SHA256SUMS.txt` — SHA-256 manifest for both files
 
-The app uses `winget` to install Node.js LTS and `cloudflared` only when they
-are missing, then opens a tray controller. Starting MCP is loopback-only by
-default. For ChatGPT web, prefer your own stable hostname; use temporary Quick
-Tunnel URLs only for short tests because they change after restart.
+Authenticode signing remains TBD. A release containing these assets must not be
+described as signed until a Windows signing and verification gate is added. The
+current GitHub Actions release workflow therefore creates only a draft
+prerelease for verification; it does not publish an unsigned stable release.
 
-The tray menu stays deliberately small:
+## Build from source
 
-- Start/Stop/Restart MCP.
-- Open Settings.
-- Quit.
+Prerequisites:
 
-Settings contains the busy stuff: project folder, ChatGPT web connector, owned
-fixed domain, port, launch-at-login, start-on-open, update checks, language
-override, connector URL, health links, logs, releases, and the copyright footer.
-GitHub is a direct button, not a text setting.
-
-First prompt to try in ChatGPT:
-
-```text
-Use ChatGPT To Codex. Select my project, read the README and package scripts,
-run the safest available check, then summarize the result with exact evidence.
-```
-
-E2E screenshot prompt:
-
-```text
-Use ChatGPT To Codex to run E2E, open the app, capture screenshots, and show them inline.
-```
-
-Troubleshooting:
-
-- If SmartScreen appears, verify the installer came from the official GitHub
-  release before running it.
-- If the connector URL is empty, open Settings, enable ChatGPT web connector,
-  click **Start MCP**, then copy the URL again.
-- If port 7676 is busy, use **Restart MCP** from the tray menu. The launcher
-  cleans up stale runtime processes before restart.
-- If a screenshot is blank, keep the browser or app window visible on screen and
-  retry the E2E action.
-- If ChatGPT asks for approval, paste the Owner Token from the Windows app.
-
-The tray UI follows the Windows display language by default and can be changed
-in Settings. Supported UI languages: English, Korean, Japanese, Simplified
-Chinese, Traditional Chinese, Spanish, French, German, Brazilian Portuguese,
-Italian, Dutch, Polish, Russian, Turkish, Vietnamese, Indonesian, Thai, Arabic,
-Hindi, and Ukrainian.
-
-For first-time machine setup from a source checkout:
+- Windows 10 or Windows 11
+- PowerShell
+- Node.js 22 or newer
+- .NET Framework C# compiler available to the launcher build script
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1 -RepoUrl https://github.com/ezBuilder/chatgpt2codex.git -Launch
+npm ci
+npm run typecheck
+npm run build
 ```
 
-For source-free users, ship the Windows zip from `npm run windows:package`.
-They only need to unzip it and double-click `ChatGPT To Codex.exe`.
+Installer, portable-bundle, and installer-E2E automation are kept outside the
+minimal public source tree. They must run on a real Windows runner before any
+artifact is treated as a release candidate. Release binaries belong in GitHub
+Releases, not in the Git tree.
+
+## Runtime behavior
+
+- Default loopback port: `7979`
+- Starting MCP is loopback-only unless the web connector is enabled.
+- Temporary Quick Tunnel URLs may change after restart.
+- The tray shows MCP state, selected project, local port, active sessions,
+  pending approvals, Settings, diagnostics, and start/stop/restart actions.
+- The launcher cleans stale runtime processes before restart.
+
+The tray and terminal should run at the same privilege level. Do not recommend
+Administrator mode unless a diagnosed operation specifically requires it.
+
+## Platform boundary
+
+Supported through the shared runtime:
+
+- project discovery and scoped leases
+- guarded file read/write and hash-checked patches
+- allowlisted commands and bounded shell execution
+- Git inspection
+- image intake
+- OAuth and connector sessions
+- approval/status reporting
+
+Not implemented on Windows yet:
+
+- native desktop screenshot capture
+- Windows UI Automation element targeting
+- SendInput click/type/key control
+- control leases backed by a Windows-native executor
+
+The disabled `Agent Arm` item is intentional. Do not work around it with macOS
+commands or claim native-control parity.
+
+## Troubleshooting
+
+- If port `7979` is busy, use **Restart MCP** from the tray and inspect logs.
+- If the connector URL is empty, enable the web connector and restart MCP.
+- If a temporary connector URL changes, replace the old ChatGPT connection.
+- If tools are visible but calls fail, open **Connection Diagnostics...**. No
+  event at the failure time means the request did not reach the local runtime.
+- If SmartScreen appears, run the file only after verifying it came from the
+  official release or from your own source build.
+
+See [the Korean Windows quick start](../docs/WINDOWS-QUICKSTART.ko.md),
+[the installation guide](../docs/INSTALL.md), and the
+[build guide](../docs/BUILDING.md).
 
 Copyright 2026 ezBuilder. All rights reserved.

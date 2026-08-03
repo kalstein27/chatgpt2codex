@@ -4,6 +4,12 @@ import { requireProjectLease } from "../workspace/lease-guard.js";
 import { resolveActiveProject } from "../workspace/active.js";
 import { captureE2eAppScreenshot, captureE2eScreenshot } from "../e2e/local-e2e.js";
 import { redact } from "../policy/secrets.js";
+import {
+  summarizeAuditInput,
+  summarizeControlTarget,
+  summarizePrivateText,
+  summarizeResolvedTarget,
+} from "../policy/audit-input.js";
 import { assertAllowedTarget, controlAllowlist, isAppAllowed, isControlChatGptExposed } from "./policy.js";
 import { assertScreenshotTargetAllowed, maskSensitiveRegions } from "./screenshot-mask.js";
 import { executeApprovedAction } from "./executor.js";
@@ -37,27 +43,17 @@ interface CallToolResultLike {
   [key: string]: unknown;
 }
 
-function redactControlInput(input: unknown): unknown {
-  try {
-    return JSON.parse(redact(JSON.stringify(input)));
-  } catch {
-    return undefined;
-  }
-}
-
 // Success-path structuredContent already goes through toSummary()/redact()
 // (e.g. computer_action_status text summary). The error path must too: a
 // raw thrown error message (or its `details`) can otherwise reach both the
 // permanent ledger `error` field and the untrusted-model-facing tool result
 // unredacted — mirrors src/server/tools.ts mapError, which has the
-// identical DomainError/non-DomainError branches redact()ed. redactControlInput
-// already JSON-round-trips through redact(), so it doubles as the `details`
-// redactor here.
+// identical DomainError/non-DomainError branches redact()ed.
 function mapControlError(err: unknown): ToolResult<{ error: string; code: string; details?: unknown }> {
   if (err instanceof DomainError) {
     const safeMessage = redact(err.message);
     return makeResult(
-      { error: safeMessage, code: err.code, details: redactControlInput(err.details) },
+      { error: safeMessage, code: err.code, details: summarizeAuditInput(err.details) },
       `Error [${err.code}]: ${safeMessage}`,
       true,
     );
@@ -73,24 +69,47 @@ async function withControlErrorMapping<T extends Record<string, unknown>>(
   input: unknown,
   fn: () => Promise<ToolResult<T> | CallToolResultLike>,
 ): Promise<CallToolResultLike> {
+  const operationId = ctx.activity?.tracker.startOperation(ctx.activity.session, toolName);
   try {
     const result = await fn();
     await ctx.ledger.append({
       type: "tool.call.completed",
       tool: toolName,
-      input: redactControlInput(input),
+      input: summarizeAuditInput(input),
       isError: result.isError === true,
     });
+    ctx.activity?.tracker.finishOperation(ctx.activity.session, operationId, {
+      errorCode: result.isError ? "TOOL_RESULT_ERROR" : undefined,
+    });
+    await ctx.diagnostics
+      ?.record({
+        event: "tool.call",
+        outcome: result.isError ? "failure" : "success",
+        tool: toolName,
+        ...(result.isError ? { errorCode: "TOOL_RESULT_ERROR" } : {}),
+      })
+      .catch(() => undefined);
     return { content: result.content, structuredContent: result.structuredContent, ...(result.isError ? { isError: true } : {}) };
   } catch (err) {
     const mapped = mapControlError(err);
     await ctx.ledger.append({
       type: "tool.call.failed",
       tool: toolName,
-      input: redactControlInput(input),
+      input: summarizeAuditInput(input),
       code: mapped.structuredContent.code,
       error: mapped.structuredContent.error,
     });
+    ctx.activity?.tracker.finishOperation(ctx.activity.session, operationId, {
+      errorCode: String(mapped.structuredContent.code),
+    });
+    await ctx.diagnostics
+      ?.record({
+        event: "tool.call",
+        outcome: "failure",
+        tool: toolName,
+        errorCode: String(mapped.structuredContent.code),
+      })
+      .catch(() => undefined);
     return { content: mapped.content, structuredContent: mapped.structuredContent, isError: true };
   }
 }
@@ -269,9 +288,9 @@ export async function handleComputerRequestAction(ctx: ToolContext, input: Compu
       actionId: record.actionId,
       appName: record.appName,
       kind: record.kind,
-      target: record.target,
-      reason: record.reason,
-      resolved: record.resolved,
+      target: summarizeControlTarget(record.target),
+      reason: summarizePrivateText(record.reason),
+      resolved: summarizeResolvedTarget(record.resolved),
     });
 
     if (isControlChatGptExposed() && !(await isChatGptExposedRateLimited(ctx.stateDir))) {
@@ -357,7 +376,7 @@ export async function handleComputerKillSwitch(ctx: ToolContext, input: Computer
   return withControlErrorMapping(ctx, "computer_kill_switch", input, async () => {
     const { projectId } = await requireControlLease(ctx);
     await setKill(ctx.stateDir);
-    await ctx.ledger.append({ type: "control.kill", projectId, reason: input.reason });
+    await ctx.ledger.append({ type: "control.kill", projectId, reason: input.reason ? summarizePrivateText(input.reason) : undefined });
     return {
       structuredContent: { killed: true },
       content: [{ type: "text", text: "Control session killed. All pending actions were rejected." }],

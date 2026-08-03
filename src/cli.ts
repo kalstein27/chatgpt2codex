@@ -25,6 +25,7 @@ import { createServer } from "./server/mcp-server.js";
 import { createHttpServer, defaultHttpServerConfig } from "./server/http.js";
 import { generateOwnerToken, hasOwnerToken, storeOwnerToken } from "./auth/owner-token.js";
 import { JsonOAuthStore } from "./auth/oauth-store.js";
+import { ensureLocalControlToken } from "./auth/local-control-token.js";
 import { checkIntakeAvailability } from "./assets/image-intake.js";
 import { controlAllowlist, isAppAllowed, isControlEnabled, isSensitiveApp } from "./control/policy.js";
 import { startExecutor } from "./control/executor.js";
@@ -32,6 +33,7 @@ import { approveAction, isKilled, listActions, rejectAction, setKill, toSummary 
 import { preflightPermissions } from "./control/mac-input.js";
 import { clampMinutes, clearAuto, readAuto, setAuto, type AutoActionKind } from "./control/auto.js";
 
+// execution-capability: cli-runtime-doctor
 const execFileAsync = promisify(execFile);
 
 interface ParsedArgs {
@@ -99,8 +101,8 @@ async function buildToolContext(workspace: string): Promise<ToolContext> {
     store: {
       loadProjects: () => store.loadProjects(),
       saveProjects: (p) => store.saveProjects(p),
-      getSession: () => store.getSession(),
-      setSession: (s) => store.setSession(s),
+      getSession: (scope) => store.getSession(scope),
+      setSession: (s, scope) => store.setSession(s, scope),
     },
     config,
   };
@@ -195,14 +197,13 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
   if (isControlEnabled()) startExecutor(ctx);
 
   let httpServer: ReturnType<ReturnType<typeof createHttpServer>["app"]["listen"]> | undefined;
-  let closeHttpServer: () => void = () => undefined;
+  let closeHttpServer: () => Promise<void> = async () => undefined;
   let shuttingDown = false;
   const shutdown = (exitCode = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
     const finish = () => {
-      closeHttpServer();
-      process.exit(exitCode);
+      void closeHttpServer().finally(() => process.exit(exitCode));
     };
     if (httpServer) httpServer.close(finish);
     else finish();
@@ -217,6 +218,7 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
       console.error("chatgpt2codex serve --http: idle timeout reached; stopping.");
       shutdown(0);
     },
+    localControlToken: await ensureLocalControlToken(ctx.stateDir),
   });
   const running = createHttpServer(ctx, httpConfig);
   const { app } = running;

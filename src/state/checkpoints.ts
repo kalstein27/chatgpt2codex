@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { DomainError, ErrorCode } from "../types.js";
 import { redact } from "../policy/secrets.js";
 
+// execution-capability: checkpoint-git-operations
 const execFileAsync = promisify(execFile);
 const MAX_DIFF_BYTES = 2 * 1024 * 1024;
 

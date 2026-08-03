@@ -28,6 +28,11 @@ import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/share
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 const OAUTH_FILE = "oauth.json";
+const MAX_REDIRECT_URIS = 8;
+const MAX_REDIRECT_URI_LENGTH = 2048;
+const MAX_CLIENT_METADATA_BYTES = 16 * 1024;
+const MAX_REGISTERED_CLIENTS = 64;
+const CLIENT_FLOW_GRACE_SECONDS = 15 * 60;
 
 export interface PersistedAccessTokenRecord {
   clientId: string;
@@ -97,8 +102,20 @@ function redirectHostAllowed(redirectUri: string, allowedHosts: string[]): boole
   } catch {
     return false;
   }
-  if (["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)) return true;
-  return allowedHosts.includes(parsed.hostname);
+  if (parsed.username || parsed.password || parsed.hash || parsed.protocol === "") return false;
+
+  const loopbackHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
+  if (loopbackHosts.has(parsed.hostname)) {
+    // Native OAuth clients use a dynamically allocated loopback HTTP port.
+    return parsed.protocol === "http:" && parsed.port.length > 0;
+  }
+
+  // ChatGPT's redirect endpoint is an HTTPS web endpoint. Do not let a
+  // hostname allowlist accidentally turn into a javascript:/data:/ftp: or
+  // non-TLS redirect sink.
+  return parsed.protocol === "https:" &&
+    (parsed.port.length === 0 || parsed.port === "443") &&
+    allowedHosts.includes(parsed.hostname);
 }
 
 /**
@@ -166,6 +183,29 @@ export class JsonOAuthStore {
     doc.refreshTokens = doc.refreshTokens.filter((t) => t.expiresAt >= nowSeconds);
   }
 
+  private pruneClients(doc: OAuthFile, nowSeconds: number): void {
+    if (doc.clients.length < MAX_REGISTERED_CLIENTS) return;
+
+    const protectedClientIds = new Set<string>();
+    for (const token of doc.accessTokens) {
+      if (token.expiresAt >= nowSeconds) protectedClientIds.add(token.clientId);
+    }
+    for (const token of doc.refreshTokens) {
+      if (token.expiresAt >= nowSeconds) protectedClientIds.add(token.clientId);
+    }
+
+    const cutoff = nowSeconds - CLIENT_FLOW_GRACE_SECONDS;
+    const candidates = doc.clients
+      .filter((client) => !protectedClientIds.has(client.clientId) && client.issuedAt < cutoff)
+      .sort((left, right) => left.issuedAt - right.issuedAt);
+    const needed = doc.clients.length - MAX_REGISTERED_CLIENTS + 1;
+    if (candidates.length < needed) {
+      throw new InvalidRequestError("OAuth client registration limit reached; retry later");
+    }
+    const remove = new Set(candidates.slice(0, needed).map((client) => client.clientId));
+    doc.clients = doc.clients.filter((client) => !remove.has(client.clientId));
+  }
+
   async getClient(clientId: string): Promise<OAuthClientInformationFull | undefined> {
     return this.locked(async () => {
       const doc = await this.load();
@@ -179,11 +219,31 @@ export class JsonOAuthStore {
     allowedRedirectHosts: string[],
   ): Promise<OAuthClientInformationFull> {
     return this.locked(async () => {
+      if (!Array.isArray(client.redirect_uris) || client.redirect_uris.length === 0 || client.redirect_uris.length > MAX_REDIRECT_URIS) {
+        throw new InvalidRequestError(`OAuth clients must provide 1-${MAX_REDIRECT_URIS} redirect URIs`);
+      }
+      if (client.redirect_uris.some((uri) => String(uri).length > MAX_REDIRECT_URI_LENGTH)) {
+        throw new InvalidRequestError("OAuth redirect URI is too long");
+      }
+      if (typeof client.client_name === "string" && client.client_name.length > 128) {
+        throw new InvalidRequestError("OAuth client name is too long");
+      }
+      let metadataBytes: number;
+      try {
+        metadataBytes = Buffer.byteLength(JSON.stringify(client), "utf8");
+      } catch {
+        throw new InvalidRequestError("OAuth client metadata is invalid");
+      }
+      if (metadataBytes > MAX_CLIENT_METADATA_BYTES) {
+        throw new InvalidRequestError("OAuth client metadata is too large");
+      }
       if (!client.redirect_uris.every((uri) => redirectHostAllowed(String(uri), allowedRedirectHosts))) {
         throw new InvalidRequestError("Client redirect_uri is not allowed for this chatgpt2codex server");
       }
       const doc = await this.load();
       const now = Math.floor(Date.now() / 1000);
+      this.sweepExpired(doc, now);
+      this.pruneClients(doc, now);
       const registered: OAuthClientInformationFull = {
         ...client,
         client_id: `chatgpt2codex-${randomUUID()}`,

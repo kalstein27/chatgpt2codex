@@ -15,11 +15,48 @@ const DENY_BASENAME_PATTERNS: RegExp[] = [
   /\.p12$/i,
   /\.pfx$/i,
   /^\.npmrc$/i,
-  /token/i,
-  /secret/i,
-  /credential/i,
   /\.keystore$/i,
 ];
+
+const SECRET_BASENAME_TERM_RE = /(token|secret|credential)/i;
+
+/**
+ * Source and documentation files remain inspectable even when their basename
+ * describes security functionality (for example `secrets.ts` or
+ * `local-control-token.test.ts`). Their contents still pass through redact().
+ */
+const INSPECTABLE_SOURCE_OR_DOC_EXTENSIONS = [
+  ".ts",
+  ".tsx",
+  ".mts",
+  ".cts",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+  ".py",
+  ".go",
+  ".rs",
+  ".java",
+  ".kt",
+  ".kts",
+  ".swift",
+  ".cs",
+  ".c",
+  ".cc",
+  ".cpp",
+  ".h",
+  ".hpp",
+  ".md",
+  ".mdx",
+  ".rst",
+  ".adoc",
+] as const;
+
+function isInspectableSourceOrDoc(basename: string): boolean {
+  const lower = basename.toLowerCase();
+  return INSPECTABLE_SOURCE_OR_DOC_EXTENSIONS.some((extension) => lower.endsWith(extension));
+}
 
 /** Directory-scoped patterns: any file inside one of these dirs is denied. */
 const DENY_DIR_SEGMENTS: string[] = [".aws", ".ssh", "gcloud"];
@@ -35,6 +72,10 @@ export function isSecretPath(abs: string): boolean {
   const basename = segments[segments.length - 1] ?? "";
 
   if (DENY_BASENAME_PATTERNS.some((re) => re.test(basename))) {
+    return true;
+  }
+
+  if (SECRET_BASENAME_TERM_RE.test(basename)) {
     return true;
   }
 
@@ -60,13 +101,33 @@ export function isSecretPath(abs: string): boolean {
   return false;
 }
 
+/**
+ * Read-only path policy. Security implementation source and documentation may
+ * be inspected even when their basename contains token/secret/credential;
+ * their contents still pass through redact(). Strict write/commit/import
+ * guards continue to use isSecretPath().
+ */
+export function isSecretReadPath(abs: string): boolean {
+  const normalized = abs.split(path.sep).join("/");
+  const segments = normalized.split("/").filter((s) => s.length > 0);
+  const basename = segments[segments.length - 1] ?? "";
+
+  if (DENY_BASENAME_PATTERNS.some((re) => re.test(basename))) return true;
+
+  for (const segment of segments) {
+    if (DENY_DIR_SEGMENTS.includes(segment)) return true;
+  }
+
+  return SECRET_BASENAME_TERM_RE.test(basename) && !isInspectableSourceOrDoc(basename);
+}
+
 // ---------------------------------------------------------------------------
 // redact()
 // ---------------------------------------------------------------------------
 
 const MASK = "[REDACTED]";
 
-/** AWS access key id, e.g. AKIAABCDEFGHIJKLMNOP */
+/** AWS access key id, e.g. the AKIA prefix followed by 16 uppercase characters. */
 const AWS_ACCESS_KEY_RE = /\b(AKIA|ASIA)[0-9A-Z]{16}\b/g;
 
 /** AWS secret access key assignment (heuristic: 40-char base64-ish value). */
@@ -87,7 +148,7 @@ const DATABASE_URL_RE =
 /** Generic connection-string form: scheme://user:pass@host */
 const CONN_STRING_CREDS_RE = /\b([a-zA-Z][\w+.-]*:\/\/)([^:\/\s]+):([^@\/\s]+)@/g;
 
-/** PEM private key block, e.g. -----BEGIN RSA PRIVATE KEY----- ... -----END ... -----. */
+/** PEM private key block, identified by its private-key header/footer markers. */
 const PEM_BLOCK_RE =
   /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g;
 
@@ -105,7 +166,12 @@ const BEARER_RE = /\b(Bearer\s+)([A-Za-z0-9\-_.~+/]{10,}=*)/gi;
  * mass false positives on ordinary code/prose.
  */
 function maskHighEntropyTokens(text: string): string {
-  return text.replace(/\b[A-Za-z0-9+/_-]{32,}={0,2}\b/g, (match) => {
+  return text.replace(/\b[A-Za-z0-9+/_-]{32,}={0,2}\b/g, (match, offset: number, source: string) => {
+    const before = source.slice(Math.max(0, offset - 96), offset);
+    const after = source.slice(offset + match.length, offset + match.length + 24);
+
+    if (isExplicitProjectEvidence(match, before, after)) return match;
+
     // Skip if it looks like a normal word run (all-lowercase, no digits) —
     // reduces false positives on long identifiers/URLs made of words only.
     const hasDigit = /\d/.test(match);
@@ -121,6 +187,39 @@ function maskHighEntropyTokens(text: string): string {
 
     return MASK;
   });
+}
+
+const DIGEST_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64}|[0-9a-f]{128})$/i;
+const DIGEST_LABEL_CONTEXT_RE =
+  /(?:sha(?:-?256)?|(?:file|range|line)?hash|digest|checksum)[\s"'=:]{0,12}$/i;
+const PROJECT_EVIDENCE_EXTENSION_RE =
+  /^\.(?:mdx?|rst|adoc|txt|json|ya?ml|toml|tsx?|[cm]?jsx?|py|go|rs|java|kts?|swift|cs|c|cc|cpp|h|hpp|sh|zsh|fish|ps1|png|svg|jpe?g|webp|pdf|log)\b/i;
+const SECRET_IDENTIFIER_TERM_RE =
+  /(?:^|[_-])(?:api[_-]?key|token|secret|password|passwd|pwd|credential)(?:[_-]|$)/i;
+const KNOWN_SECRET_PREFIX_RE = /^(?:sk|gh[opusr]|github_pat|xox[baprs]|AIza|AKIA|ASIA)(?:[_-]|$)/i;
+
+function isExplicitProjectEvidence(match: string, before: string, after: string): boolean {
+  if (DIGEST_RE.test(match) && DIGEST_LABEL_CONTEXT_RE.test(before)) return true;
+
+  if (
+    PROJECT_EVIDENCE_EXTENSION_RE.test(after) &&
+    (match.includes("/") || match.includes("_") || match.includes("-"))
+  ) {
+    return true;
+  }
+
+  if (!match.includes("_") && !match.includes("-")) return false;
+  if (KNOWN_SECRET_PREFIX_RE.test(match) || SECRET_IDENTIFIER_TERM_RE.test(match)) return false;
+
+  const segments = match.split(/[_-]+/u).filter(Boolean);
+  if (segments.length < 3 || segments.some((segment) => segment.length > 20)) return false;
+
+  const readableWordSegments = segments.filter(
+    (segment) =>
+      /^[A-Za-z]{3,20}$/u.test(segment) &&
+      (segment === segment.toLowerCase() || segment === segment.toUpperCase()),
+  );
+  return readableWordSegments.length >= 2;
 }
 
 /**

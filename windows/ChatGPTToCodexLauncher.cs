@@ -6,6 +6,7 @@ using System.Linq;
 using System.Net;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -18,6 +19,48 @@ internal static class ChatGPTToCodexLauncher
         Application.SetCompatibleTextRenderingDefault(false);
         Application.Run(new LauncherForm(args));
     }
+}
+
+internal sealed class LocalControlSnapshot
+{
+    public LocalControlInfo control { get; set; }
+    public LocalControlSession[] sessions { get; set; }
+}
+
+internal sealed class LocalControlInfo
+{
+    public bool enabled { get; set; }
+    public bool platformSupported { get; set; }
+    public bool armed { get; set; }
+    public bool killed { get; set; }
+    public int pendingCount { get; set; }
+    public LocalPendingControlAction[] pendingActions { get; set; }
+    public bool autoEnabled { get; set; }
+    public long autoRemainingMs { get; set; }
+    public int allowlistedAppCount { get; set; }
+}
+
+internal sealed class LocalPendingControlAction
+{
+    public string actionId { get; set; }
+    public string appName { get; set; }
+    public string kind { get; set; }
+    public string status { get; set; }
+}
+
+internal sealed class LocalControlSession
+{
+    public string sessionLabel { get; set; }
+    public string clientName { get; set; }
+    public string state { get; set; }
+    public LocalControlOperation operation { get; set; }
+}
+
+internal sealed class LocalControlOperation
+{
+    public string tool { get; set; }
+    public string state { get; set; }
+    public long elapsedMs { get; set; }
 }
 
 internal sealed class LauncherForm : Form
@@ -54,6 +97,7 @@ internal sealed class LauncherForm : Form
         {"stopMCP", new[] {"Stop MCP", "MCP 중지", "MCP を停止", "停止 MCP", "停止 MCP", "Detener MCP", "Arrêter MCP", "MCP stoppen", "Parar MCP", "Ferma MCP", "MCP stoppen", "Zatrzymaj MCP", "Остановить MCP", "MCP durdur", "Dừng MCP", "Hentikan MCP", "หยุด MCP", "إيقاف MCP", "MCP रोकें", "Зупинити MCP"}},
         {"restartMCP", new[] {"Restart MCP", "MCP 재시작", "MCP を再起動", "重启 MCP", "重新啟動 MCP", "Reiniciar MCP", "Redémarrer MCP", "MCP neu starten", "Reiniciar MCP", "Riavvia MCP", "MCP herstarten", "Uruchom ponownie MCP", "Перезапустить MCP", "MCP yeniden başlat", "Khởi động lại MCP", "Mulai ulang MCP", "รีสตาร์ท MCP", "إعادة تشغيل MCP", "MCP फिर शुरू करें", "Перезапустити MCP"}},
         {"settingsMenu", new[] {"Settings...", "설정...", "設定...", "设置...", "設定...", "Ajustes...", "Réglages...", "Einstellungen...", "Configurações...", "Impostazioni...", "Instellingen...", "Ustawienia...", "Настройки...", "Ayarlar...", "Cài đặt...", "Pengaturan...", "การตั้งค่า...", "الإعدادات...", "सेटिंग्स...", "Налаштування..."}},
+        {"connectionDiagnosticsMenu", new[] {"Connection Diagnostics...", "연결 진단 로그..."}},
         {"quit", new[] {"Quit", "종료", "終了", "退出", "結束", "Salir", "Quitter", "Beenden", "Sair", "Esci", "Afsluiten", "Zakończ", "Выход", "Çık", "Thoát", "Keluar", "ออก", "إنهاء", "बंद करें", "Вийти"}},
         {"settingsTitle", new[] {"ChatGPT To Codex Settings", "ChatGPT To Codex 설정", "ChatGPT To Codex 設定", "ChatGPT To Codex 设置", "ChatGPT To Codex 設定", "Ajustes de ChatGPT To Codex", "Réglages de ChatGPT To Codex", "ChatGPT To Codex Einstellungen", "Configurações do ChatGPT To Codex", "Impostazioni ChatGPT To Codex", "ChatGPT To Codex instellingen", "Ustawienia ChatGPT To Codex", "Настройки ChatGPT To Codex", "ChatGPT To Codex ayarları", "Cài đặt ChatGPT To Codex", "Pengaturan ChatGPT To Codex", "การตั้งค่า ChatGPT To Codex", "إعدادات ChatGPT To Codex", "ChatGPT To Codex सेटिंग्स", "Налаштування ChatGPT To Codex"}},
         {"language", new[] {"Language", "언어", "言語", "语言", "語言", "Idioma", "Langue", "Sprache", "Idioma", "Lingua", "Taal", "Język", "Язык", "Dil", "Ngôn ngữ", "Bahasa", "ภาษา", "اللغة", "भाषा", "Мова"}},
@@ -90,13 +134,34 @@ internal sealed class LauncherForm : Form
         {"temporaryTunnelReady", new[] {"Temporary tunnel URL ready. It changes when the tunnel restarts.", "임시 터널 URL 준비 완료. 터널을 재시작하면 주소가 바뀝니다."}},
         {"temporaryTunnelChanged", new[] {"Temporary tunnel URL changed. Reconnect or update the ChatGPT app registration.", "임시 터널 URL이 변경되었습니다. ChatGPT 앱 등록을 다시 연결하거나 업데이트하세요."}},
         {"temporaryTunnelCopied", new[] {"Temporary connector URL copied. For permanent use, configure a stable domain before registering in ChatGPT.", "임시 커넥터 URL 복사 완료. 상시 사용하려면 ChatGPT 등록 전에 고정 도메인을 설정하세요."}},
-        {"stableConnectorReady", new[] {"Ready: {0}", "준비됨: {0}"}}
+        {"stableConnectorReady", new[] {"Ready: {0}", "준비됨: {0}"}},
+        {"projectPrefix", new[] {"Project", "프로젝트"}},
+        {"portPrefix", new[] {"Port", "포트"}},
+        {"activeSessionsMenu", new[] {"Active session status", "활성 세션 상태"}},
+        {"sessionNoActive", new[] {"No active sessions", "활성 세션 없음"}},
+        {"agentArmOnMenu", new[] {"Agent Arm: on", "Agent Arm: 켜짐"}},
+        {"agentArmOffMenu", new[] {"Agent Arm: off", "Agent Arm: 꺼짐"}},
+        {"agentArmUnavailableWindows", new[] {"Agent Arm: unavailable on Windows", "Agent Arm: Windows에서 아직 지원 안 됨"}},
+        {"pendingControlActionsMenu", new[] {"Pending control actions", "대기 중인 제어 작업"}},
+        {"controlNoPendingActions", new[] {"No pending actions", "대기 중인 작업 없음"}},
+        {"controlApprove", new[] {"Approve", "승인"}},
+        {"controlReject", new[] {"Reject", "거부"}},
+        {"approveAllControlMenu", new[] {"Approve all pending", "대기 중인 작업 모두 승인"}},
+        {"autoApproveOnMenu", new[] {"Turn on auto-approve (10 min)", "자동 승인 켜기 (10분)"}},
+        {"autoApproveOffMenu", new[] {"Turn off auto-approve", "자동 승인 끄기"}},
+        {"autoApproveStatusMenu", new[] {"Auto-approve: on ({0}m)", "자동 승인: 켜짐 ({0}분)"}},
+        {"autoApproveUnavailableMenu", new[] {"Auto-approve needs an allowlisted app", "자동 승인에는 허용 목록 앱이 필요합니다"}},
+        {"killControlMenu", new[] {"Kill Control", "제어 강제 종료"}},
+        {"killControlConfirmTitle", new[] {"Stop all desktop control?", "모든 데스크톱 제어를 중지할까요?"}},
+        {"killControlConfirmInfo", new[] {"This rejects every pending control action and blocks new ones until control is armed again.", "대기 중인 모든 제어 작업을 거부하고 제어를 다시 켤 때까지 새 작업을 차단합니다."}},
+        {"localStatusUnavailable", new[] {"Local status is not available", "로컬 상태를 확인할 수 없음"}}
     };
     private readonly string[] args;
     private readonly string root;
     private readonly string appDataDir;
     private readonly string logDir;
     private readonly string logFile;
+    private readonly string connectionDiagnosticsFile;
     private readonly string selectedProjectFile;
     private readonly string settingsFile;
     private readonly string defaultWorkspace;
@@ -121,10 +186,18 @@ internal sealed class LauncherForm : Form
     private readonly NotifyIcon trayIcon;
     private readonly ContextMenuStrip trayMenu;
     private readonly ToolStripMenuItem statusTrayItem;
+    private readonly ToolStripMenuItem projectTrayItem;
+    private readonly ToolStripMenuItem portTrayItem;
+    private readonly ToolStripMenuItem sessionsTrayItem;
+    private readonly ToolStripMenuItem armTrayItem;
+    private readonly ToolStripMenuItem killTrayItem;
+    private readonly ToolStripMenuItem pendingTrayItem;
     private readonly ToolStripMenuItem toggleTrayItem;
     private readonly ToolStripMenuItem restartTrayItem;
+    private readonly ToolStripMenuItem connectionDiagnosticsTrayItem;
     private readonly ToolStripMenuItem settingsTrayItem;
     private readonly ToolStripMenuItem quitTrayItem;
+    private readonly System.Windows.Forms.Timer controlStatusTimer;
     private Process process;
     private string mcpUrl;
     private string ownerToken;
@@ -134,6 +207,8 @@ internal sealed class LauncherForm : Form
     private bool exitRequested;
     private bool trayNoticeShown;
     private bool autoGenerateOwnerTokenOnNextStart;
+    private bool controlStatusRefreshInFlight;
+    private LocalControlSnapshot latestControlSnapshot;
 
     internal LauncherForm(string[] args)
     {
@@ -154,6 +229,12 @@ internal sealed class LauncherForm : Form
         Directory.CreateDirectory(logDir);
         PruneLauncherLogs(logDir);
         logFile = Path.Combine(logDir, "launcher-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".log");
+        connectionDiagnosticsFile = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".local",
+            "share",
+            "chatgpt2codex",
+            "connection-events.jsonl");
 
         Text = "ChatGPT To Codex";
         Width = 920;
@@ -251,17 +332,42 @@ internal sealed class LauncherForm : Form
         trayMenu = new ContextMenuStrip();
         statusTrayItem = new ToolStripMenuItem("ChatGPT To Codex: " + L("statusChecking"));
         statusTrayItem.Enabled = false;
+        projectTrayItem = new ToolStripMenuItem(L("projectPrefix") + ": -");
+        projectTrayItem.Enabled = false;
+        portTrayItem = new ToolStripMenuItem(L("portPrefix") + ": " + port);
+        portTrayItem.Enabled = false;
+        sessionsTrayItem = new ToolStripMenuItem(L("activeSessionsMenu"));
+        sessionsTrayItem.DropDownItems.Add(new ToolStripMenuItem(L("sessionNoActive")) { Enabled = false });
+        armTrayItem = new ToolStripMenuItem(L("agentArmOffMenu"), null, delegate { ToggleAgentArm(); });
+        armTrayItem.Enabled = false;
+        killTrayItem = new ToolStripMenuItem(L("killControlMenu"), null, delegate { KillControl(); });
+        killTrayItem.Enabled = false;
+        pendingTrayItem = new ToolStripMenuItem(L("pendingControlActionsMenu"));
+        pendingTrayItem.DropDownItems.Add(new ToolStripMenuItem(L("controlNoPendingActions")) { Enabled = false });
         toggleTrayItem = new ToolStripMenuItem(L("startMCP"), null, delegate { ToggleServer(); });
         restartTrayItem = new ToolStripMenuItem(L("restartMCP"), null, delegate { RestartServer(); });
+        connectionDiagnosticsTrayItem = new ToolStripMenuItem(
+            L("connectionDiagnosticsMenu"),
+            null,
+            delegate { ShowConnectionDiagnostics(); });
         settingsTrayItem = new ToolStripMenuItem(L("settingsMenu"), null, delegate { ShowSettings(); });
         quitTrayItem = new ToolStripMenuItem(L("quit"), null, delegate { ExitApplication(); });
         trayMenu.Items.Add(statusTrayItem);
+        trayMenu.Items.Add(projectTrayItem);
+        trayMenu.Items.Add(portTrayItem);
+        trayMenu.Items.Add(sessionsTrayItem);
+        trayMenu.Items.Add(new ToolStripSeparator());
+        trayMenu.Items.Add(armTrayItem);
+        trayMenu.Items.Add(killTrayItem);
+        trayMenu.Items.Add(pendingTrayItem);
         trayMenu.Items.Add(new ToolStripSeparator());
         trayMenu.Items.Add(toggleTrayItem);
         trayMenu.Items.Add(restartTrayItem);
+        trayMenu.Items.Add(connectionDiagnosticsTrayItem);
         trayMenu.Items.Add(settingsTrayItem);
         trayMenu.Items.Add(new ToolStripSeparator());
         trayMenu.Items.Add(quitTrayItem);
+        trayMenu.Opening += delegate { RequestLocalControlRefresh(); };
 
         trayIcon = new NotifyIcon();
         trayIcon.Text = "ChatGPT To Codex";
@@ -269,6 +375,11 @@ internal sealed class LauncherForm : Form
         trayIcon.ContextMenuStrip = trayMenu;
         trayIcon.Visible = true;
         trayIcon.DoubleClick += delegate { ShowFromTray(); };
+
+        controlStatusTimer = new System.Windows.Forms.Timer();
+        controlStatusTimer.Interval = 2000;
+        controlStatusTimer.Tick += delegate { RequestLocalControlRefresh(); };
+        controlStatusTimer.Start();
         RefreshTrayState();
 
         Shown += delegate
@@ -291,6 +402,8 @@ internal sealed class LauncherForm : Form
         FormClosing += OnFormClosing;
         FormClosed += delegate
         {
+            controlStatusTimer.Stop();
+            controlStatusTimer.Dispose();
             trayIcon.Visible = false;
             trayIcon.Dispose();
             trayMenu.Dispose();
@@ -629,6 +742,26 @@ internal sealed class LauncherForm : Form
         Process.Start("explorer.exe", "/select,\"" + logFile + "\"");
     }
 
+    private void ShowConnectionDiagnostics()
+    {
+        if (!File.Exists(connectionDiagnosticsFile))
+        {
+            MessageBox.Show(
+                this,
+                "No connection events have been recorded yet.\r\n\r\n" + connectionDiagnosticsFile,
+                L("connectionDiagnosticsMenu").TrimEnd('.'),
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+            return;
+        }
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = "notepad.exe",
+            Arguments = "\"" + connectionDiagnosticsFile + "\"",
+            UseShellExecute = true
+        });
+    }
+
     private void OpenGithub()
     {
         OpenUrl(githubRepoUrl);
@@ -922,10 +1055,268 @@ internal sealed class LauncherForm : Form
         }
     }
 
+    private string LocalControlTokenPath()
+    {
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".local",
+            "share",
+            "chatgpt2codex",
+            "local-control-token");
+    }
+
+    private string ReadLocalControlToken()
+    {
+        try
+        {
+            var path = LocalControlTokenPath();
+            return File.Exists(path) ? File.ReadAllText(path, Encoding.UTF8).Trim() : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private string SendLocalControlRequest(string path, string method)
+    {
+        var token = ReadLocalControlToken();
+        if (string.IsNullOrWhiteSpace(token)) return null;
+        var request = (HttpWebRequest)WebRequest.Create(
+            "http://127.0.0.1:" + port + "/local-control/v1" + path);
+        request.Method = method;
+        request.Timeout = 1500;
+        request.ReadWriteTimeout = 1500;
+        request.Proxy = null;
+        request.Headers[HttpRequestHeader.Authorization] = "Bearer " + token;
+        if (string.Equals(method, "POST", StringComparison.OrdinalIgnoreCase))
+        {
+            request.ContentLength = 0;
+        }
+        using (var response = (HttpWebResponse)request.GetResponse())
+        using (var stream = response.GetResponseStream())
+        using (var reader = new StreamReader(stream, Encoding.UTF8))
+        {
+            return reader.ReadToEnd();
+        }
+    }
+
+    private void RequestLocalControlRefresh()
+    {
+        if (exitRequested || controlStatusRefreshInFlight) return;
+        if (!IsManagedProcessRunning())
+        {
+            latestControlSnapshot = null;
+            ApplyLocalControlSnapshot();
+            return;
+        }
+
+        controlStatusRefreshInFlight = true;
+        System.Threading.ThreadPool.QueueUserWorkItem(delegate
+        {
+            LocalControlSnapshot snapshot = null;
+            try
+            {
+                var json = SendLocalControlRequest("/status", "GET");
+                if (!string.IsNullOrWhiteSpace(json))
+                {
+                    snapshot = new JavaScriptSerializer().Deserialize<LocalControlSnapshot>(json);
+                }
+            }
+            catch
+            {
+                snapshot = null;
+            }
+
+            if (IsDisposed || !IsHandleCreated) return;
+            try
+            {
+                BeginInvoke((Action)delegate
+                {
+                    controlStatusRefreshInFlight = false;
+                    latestControlSnapshot = snapshot;
+                    ApplyLocalControlSnapshot();
+                });
+            }
+            catch (InvalidOperationException)
+            {
+                controlStatusRefreshInFlight = false;
+            }
+        });
+    }
+
+    private void PerformLocalControl(string path)
+    {
+        if (exitRequested) return;
+        System.Threading.ThreadPool.QueueUserWorkItem(delegate
+        {
+            var ok = false;
+            try
+            {
+                ok = SendLocalControlRequest(path, "POST") != null;
+            }
+            catch
+            {
+                ok = false;
+            }
+            if (IsDisposed || !IsHandleCreated) return;
+            try
+            {
+                BeginInvoke((Action)delegate
+                {
+                    if (!ok) statusLabel.Text = L("localStatusUnavailable");
+                    RequestLocalControlRefresh();
+                });
+            }
+            catch (InvalidOperationException)
+            {
+                // The form is already closing.
+            }
+        });
+    }
+
+    private void ToggleAgentArm()
+    {
+        var control = latestControlSnapshot == null ? null : latestControlSnapshot.control;
+        if (control == null || !control.platformSupported) return;
+        PerformLocalControl(control.armed ? "/control/disarm" : "/control/arm");
+    }
+
+    private void ToggleAutoApprove()
+    {
+        var control = latestControlSnapshot == null ? null : latestControlSnapshot.control;
+        if (control == null || !control.platformSupported) return;
+        PerformLocalControl(control.autoEnabled ? "/control/auto/off" : "/control/auto/on");
+    }
+
+    private void KillControl()
+    {
+        var control = latestControlSnapshot == null ? null : latestControlSnapshot.control;
+        if (control == null || !control.platformSupported) return;
+        var answer = MessageBox.Show(
+            this,
+            L("killControlConfirmInfo"),
+            L("killControlConfirmTitle"),
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Warning);
+        if (answer == DialogResult.OK) PerformLocalControl("/control/kill");
+    }
+
+    private void ApplyLocalControlSnapshot()
+    {
+        var snapshot = latestControlSnapshot;
+        var sessions = snapshot != null && snapshot.sessions != null
+            ? snapshot.sessions
+            : new LocalControlSession[0];
+        sessionsTrayItem.Text = L("activeSessionsMenu") + " (" + sessions.Length + ")";
+        sessionsTrayItem.DropDownItems.Clear();
+        if (sessions.Length == 0)
+        {
+            sessionsTrayItem.DropDownItems.Add(new ToolStripMenuItem(L("sessionNoActive")) { Enabled = false });
+        }
+        else
+        {
+            foreach (var session in sessions)
+            {
+                var identity = string.IsNullOrWhiteSpace(session.clientName)
+                    ? session.sessionLabel
+                    : session.clientName + " · " + session.sessionLabel;
+                var sessionItem = new ToolStripMenuItem(identity) { Enabled = false };
+                sessionsTrayItem.DropDownItems.Add(sessionItem);
+                var operation = session.operation;
+                var detail = operation == null
+                    ? session.state
+                    : operation.tool + " · " + operation.state +
+                        (operation.elapsedMs > 0 ? " · " + Math.Max(1, operation.elapsedMs / 1000) + "s" : "");
+                sessionsTrayItem.DropDownItems.Add(new ToolStripMenuItem("  " + detail) { Enabled = false });
+                sessionsTrayItem.DropDownItems.Add(new ToolStripSeparator());
+            }
+        }
+
+        var control = snapshot == null ? null : snapshot.control;
+        if (control == null)
+        {
+            armTrayItem.Text = IsManagedProcessRunning() ? L("localStatusUnavailable") : L("agentArmOffMenu");
+            armTrayItem.Checked = false;
+            armTrayItem.Enabled = false;
+            killTrayItem.Enabled = false;
+            pendingTrayItem.Text = L("pendingControlActionsMenu");
+            pendingTrayItem.DropDownItems.Clear();
+            pendingTrayItem.DropDownItems.Add(new ToolStripMenuItem(L("controlNoPendingActions")) { Enabled = false });
+            return;
+        }
+
+        armTrayItem.Text = control.platformSupported
+            ? L(control.armed ? "agentArmOnMenu" : "agentArmOffMenu")
+            : L("agentArmUnavailableWindows");
+        armTrayItem.Checked = control.platformSupported && control.armed;
+        armTrayItem.Enabled = control.platformSupported && IsManagedProcessRunning();
+        killTrayItem.Enabled = control.platformSupported && IsManagedProcessRunning();
+
+        var pending = control.pendingActions ?? new LocalPendingControlAction[0];
+        pendingTrayItem.Text = L("pendingControlActionsMenu") + " (" + pending.Length + ")";
+        pendingTrayItem.DropDownItems.Clear();
+        if (control.platformSupported)
+        {
+            var minutesLeft = Math.Max(1, control.autoRemainingMs / 60000);
+            var autoItem = new ToolStripMenuItem(
+                control.autoEnabled
+                    ? LFormat("autoApproveStatusMenu", minutesLeft) + " — " + L("autoApproveOffMenu")
+                    : L("autoApproveOnMenu"),
+                null,
+                delegate { ToggleAutoApprove(); });
+            autoItem.Enabled = control.autoEnabled || control.allowlistedAppCount > 0;
+            if (!autoItem.Enabled) autoItem.ToolTipText = L("autoApproveUnavailableMenu");
+            pendingTrayItem.DropDownItems.Add(autoItem);
+            pendingTrayItem.DropDownItems.Add(new ToolStripSeparator());
+        }
+        if (pending.Length == 0)
+        {
+            pendingTrayItem.DropDownItems.Add(new ToolStripMenuItem(L("controlNoPendingActions")) { Enabled = false });
+            return;
+        }
+        if (control.platformSupported)
+        {
+            pendingTrayItem.DropDownItems.Add(new ToolStripMenuItem(
+                L("approveAllControlMenu"),
+                null,
+                delegate { PerformLocalControl("/control/actions/approve-all"); }));
+            pendingTrayItem.DropDownItems.Add(new ToolStripSeparator());
+        }
+        foreach (var action in pending)
+        {
+            var summary = string.Join(
+                " · ",
+                new[] { action.appName, action.kind }.Where(value => !string.IsNullOrWhiteSpace(value)).ToArray());
+            var actionItem = new ToolStripMenuItem(summary);
+            if (control.platformSupported)
+            {
+                var actionId = action.actionId;
+                actionItem.DropDownItems.Add(new ToolStripMenuItem(
+                    L("controlApprove"),
+                    null,
+                    delegate { PerformLocalControl("/control/actions/" + Uri.EscapeDataString(actionId) + "/approve"); }));
+                actionItem.DropDownItems.Add(new ToolStripMenuItem(
+                    L("controlReject"),
+                    null,
+                    delegate { PerformLocalControl("/control/actions/" + Uri.EscapeDataString(actionId) + "/reject"); }));
+            }
+            else
+            {
+                actionItem.Enabled = false;
+            }
+            pendingTrayItem.DropDownItems.Add(actionItem);
+        }
+    }
+
     private void RefreshTrayState()
     {
         var running = IsManagedProcessRunning();
         statusTrayItem.Text = "ChatGPT To Codex: " + (running ? L("statusOn") : L("statusOff"));
+        var projectPath = string.IsNullOrWhiteSpace(selectedProjectPath) ? defaultWorkspace : selectedProjectPath;
+        projectTrayItem.Text = L("projectPrefix") + ": " +
+            (string.IsNullOrWhiteSpace(projectPath) ? "-" : new DirectoryInfo(projectPath).Name);
+        portTrayItem.Text = L("portPrefix") + ": " + port;
         toggleTrayItem.Text = running ? L("stopMCP") : L("startMCP");
         stopButton.Text = running ? L("stopMCP") : L("startMCP");
         stopButton.Enabled = true;
@@ -947,8 +1338,14 @@ internal sealed class LauncherForm : Form
         autoGenerateOwnerTokenButton.Text = L("autoGenerateToken");
         autoGenerateOwnerTokenButton.Enabled = !exitRequested && !autoGenerateOwnerTokenOnNextStart;
         openLogButton.Text = L("showLogs");
+        connectionDiagnosticsTrayItem.Text = L("connectionDiagnosticsMenu");
         settingsTrayItem.Text = L("settingsMenu");
         quitTrayItem.Text = L("quit");
+        if (!running)
+        {
+            latestControlSnapshot = null;
+            ApplyLocalControlSnapshot();
+        }
     }
 
     private void ToggleServer()

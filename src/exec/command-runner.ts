@@ -1,12 +1,20 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { DomainError, ErrorCode } from "../types.js";
+import { BoundedOutputCollector } from "./bounded-output.js";
+import { OUTPUT_ARTIFACT_STREAM_BYTES } from "./output-artifacts.js";
+import { resolveNpmInvocation } from "./runtime-environment.js";
+import {
+  commandStatusFromExit,
+  type CleanupStatus,
+  type ProcessExecutionResult,
+} from "./process-result.js";
 
 /**
  * Command metadata as discovered from project manifests. `argv` is the
- * literal argv array used by `execFile` — never a shell string — so
+ * literal argv array used by `spawn` — never a shell string — so
  * discovered commands can be executed without ever invoking a shell.
  */
 interface DiscoveredCommand {
@@ -45,6 +53,12 @@ export function buildSafeChildEnv(): NodeJS.ProcessEnv {
   for (const key of ENV_ALLOWLIST) {
     const value = process.env[key];
     if (value !== undefined) env[key] = value;
+  }
+  const runtimeBin = dirname(process.execPath);
+  const inheritedPath = env.PATH ?? "";
+  const pathEntries = inheritedPath.split(delimiter).filter(Boolean);
+  if (!pathEntries.includes(runtimeBin)) {
+    env.PATH = [runtimeBin, ...pathEntries].join(delimiter);
   }
   return env;
 }
@@ -99,11 +113,8 @@ async function discoverPackageJsonCommands(root: string): Promise<DiscoveredComm
 }
 
 function npmRunArgv(name: string): string[] {
-  const npmExecPath = process.env.npm_execpath;
-  if (npmExecPath && existsSync(npmExecPath)) {
-    return [process.execPath, npmExecPath, "run", name];
-  }
-  return [process.platform === "win32" ? "npm.cmd" : "npm", "run", name];
+  const npm = resolveNpmInvocation();
+  return npm ? [...npm.argvPrefix, "run", name] : [];
 }
 
 async function discoverMakefileCommands(root: string): Promise<DiscoveredCommand[]> {
@@ -211,7 +222,7 @@ function quoteCmdArg(value: string): string {
   return '"' + value.replace(/(["&|<>^])/g, "^$1").replace(/%/g, "%%") + '"';
 }
 
-function buildExecFileInvocation(cmd: string, args: string[]): { file: string; args: string[] } {
+function buildSpawnInvocation(cmd: string, args: string[]): { file: string; args: string[] } {
   if (process.platform === "win32" && /\.cmd$/i.test(cmd)) {
     const comspec = process.env.ComSpec || process.env.COMSPEC || "cmd.exe";
     return {
@@ -222,35 +233,40 @@ function buildExecFileInvocation(cmd: string, args: string[]): { file: string; a
   return { file: cmd, args };
 }
 
-function killProcessTree(pid: number | undefined, done: () => void): void {
+export function killProcessTree(
+  pid: number | undefined,
+  done: (cleanupStatus: CleanupStatus) => void,
+): void {
   if (!pid) {
-    done();
+    done("FAILED");
     return;
   }
   if (process.platform === "win32") {
-    execFile("taskkill.exe", ["/pid", String(pid), "/t", "/f"], { windowsHide: true }, () => done());
+    // execution-capability: windows-process-tree-cleanup
+    execFile(
+      "taskkill.exe",
+      ["/pid", String(pid), "/t", "/f"],
+      { windowsHide: true },
+      (error) => done(error ? "FAILED" : "COMPLETED"),
+    );
     return;
   }
   try {
-    process.kill(pid, "SIGKILL");
+    // Children are spawned in a dedicated Unix process group (`detached`
+    // below), so a timeout also terminates descendants created by npm/make.
+    process.kill(-pid, "SIGKILL");
+    done("COMPLETED");
+    return;
   } catch {
-    // The process may already have exited.
+    try {
+      process.kill(pid, "SIGKILL");
+      done("COMPLETED");
+      return;
+    } catch {
+      // The process may already have exited.
+    }
   }
-  done();
-}
-
-/** Truncate a buffer to head+tail, returning text and whether it was cut. */
-function truncateOutput(buf: Buffer): { text: string; truncated: boolean } {
-  const limit = OUTPUT_HEAD_BYTES + OUTPUT_TAIL_BYTES;
-  if (buf.length <= limit) {
-    return { text: buf.toString("utf8"), truncated: false };
-  }
-  const head = buf.subarray(0, OUTPUT_HEAD_BYTES).toString("utf8");
-  const tail = buf.subarray(buf.length - OUTPUT_TAIL_BYTES).toString("utf8");
-  return {
-    text: `${head}\n...[truncated ${buf.length - limit} bytes]...\n${tail}`,
-    truncated: true,
-  };
+  done("FAILED");
 }
 
 /**
@@ -265,13 +281,8 @@ export async function runCommand(
   commandId: string,
   args?: string[],
   timeoutSec?: number,
-): Promise<{
-  exitCode: number;
-  stdoutSummary: string;
-  stderrSummary: string;
-  durationMs: number;
-  outputTruncated: boolean;
-}> {
+  approval?: { granted: boolean },
+): Promise<ProcessExecutionResult> {
   const discovered = await discoverAllCommands(root);
   const found = discovered.find((c) => c.commandId === commandId);
   if (!found) {
@@ -284,7 +295,7 @@ export async function runCommand(
     );
   }
 
-  if (found.riskTier === "destructive" || found.riskTier === "network") {
+  if ((found.riskTier === "destructive" || found.riskTier === "network") && !approval?.granted) {
     throw new DomainError(
       ErrorCode.APPROVAL_REQUIRED,
       `command "${commandId}" requires explicit human approval (riskTier=${found.riskTier})`,
@@ -297,20 +308,32 @@ export async function runCommand(
 
   const [cmd, ...baseArgs] = found.argv;
   if (!cmd) {
-    throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, `commandId "${commandId}" has no argv`, {
-      commandId,
-    });
+    const missingBinary = commandId.startsWith("npm:") ? "npm" : "command runtime";
+    throw new DomainError(
+      ErrorCode.COMMAND_NOT_ALLOWED,
+      `commandId "${commandId}" cannot run because ${missingBinary} is unavailable in the verified runtime`,
+      {
+        commandId,
+        missingBinary,
+        alternatives: ["command_list", "local_shell_run"],
+      },
+    );
   }
   const extraArgs = args ?? [];
   const fullArgs = [...baseArgs, ...extraArgs];
-  const invocation = buildExecFileInvocation(cmd, fullArgs);
+  const invocation = buildSpawnInvocation(cmd, fullArgs);
 
   const start = Date.now();
 
-  return await new Promise((resolve, reject) => {
+  return await new Promise((resolve) => {
     let settled = false;
     let timedOut = false;
+    let spawnFailed = false;
     let timeoutHandle: NodeJS.Timeout | undefined;
+    const stdout = new BoundedOutputCollector(OUTPUT_HEAD_BYTES, OUTPUT_TAIL_BYTES);
+    const stderr = new BoundedOutputCollector(OUTPUT_HEAD_BYTES, OUTPUT_TAIL_BYTES);
+    const stdoutArtifact = new BoundedOutputCollector(OUTPUT_ARTIFACT_STREAM_BYTES, 0);
+    const stderrArtifact = new BoundedOutputCollector(OUTPUT_ARTIFACT_STREAM_BYTES, 0);
     const finish = (fn: () => void) => {
       if (settled) return;
       settled = true;
@@ -318,48 +341,94 @@ export async function runCommand(
       fn();
     };
 
-    const child = execFile(
+    // execution-capability: allowlisted-project-command
+    const child = spawn(
       invocation.file,
       invocation.args,
       {
         cwd: root,
         env: buildChildEnv(),
-        maxBuffer: 64 * 1024 * 1024,
+        detached: process.platform !== "win32",
         windowsHide: true,
-      },
-      (error, stdout, stderr) => {
-        if (timedOut) return;
-        const durationMs = Date.now() - start;
-        const stdoutBuf = Buffer.isBuffer(stdout) ? stdout : Buffer.from(stdout ?? "", "utf8");
-        const stderrBuf = Buffer.isBuffer(stderr) ? stderr : Buffer.from(stderr ?? "", "utf8");
-
-        const outStd = truncateOutput(stdoutBuf);
-        const outErr = truncateOutput(stderrBuf);
-        const exitCode = typeof error?.code === "number" ? error.code : error ? 1 : 0;
-
-        finish(() =>
-          resolve({
-            exitCode,
-            stdoutSummary: outStd.text,
-            stderrSummary: outErr.text,
-            durationMs,
-            outputTruncated: outStd.truncated || outErr.truncated,
-          }),
-        );
+        stdio: ["ignore", "pipe", "pipe"],
       },
     );
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout.append(chunk);
+      stdoutArtifact.append(chunk);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr.append(chunk);
+      stderrArtifact.append(chunk);
+    });
+    child.on("error", (error) => {
+      // Match execFile's previous contract: launch failures resolve with a
+      // non-zero exit rather than escaping as an unclassified exception.
+      spawnFailed = true;
+      stderr.append(Buffer.from(error instanceof Error ? error.message : String(error)));
+    });
+    child.on("close", (code, signal) => {
+      if (timedOut) return;
+      const outStd = stdout.summarize();
+      const outErr = stderr.summarize();
+      const artifactStd = stdoutArtifact.summarize();
+      const artifactErr = stderrArtifact.summarize();
+      const outputTruncated = outStd.truncated || outErr.truncated;
+      const exitCode = spawnFailed ? null : (code ?? 1);
+      finish(() =>
+        resolve({
+          commandStatus: commandStatusFromExit(exitCode, spawnFailed),
+          exitCode,
+          terminationSignal: signal,
+          cleanupStatus: "NOT_REQUIRED",
+          stdoutSummary: outStd.text,
+          stderrSummary: outErr.text,
+          durationMs: Date.now() - start,
+          outputTruncated,
+          ...(outputTruncated
+            ? {
+                capturedOutput: {
+                  stdout: artifactStd.text,
+                  stderr: artifactErr.text,
+                  stdoutBytes: artifactStd.totalBytes,
+                  stderrBytes: artifactErr.totalBytes,
+                  artifactTruncated: artifactStd.truncated || artifactErr.truncated,
+                },
+              }
+            : {}),
+        }),
+      );
+    });
 
     timeoutHandle = setTimeout(() => {
       timedOut = true;
-      killProcessTree(child.pid, () => {
-        finish(() =>
-          reject(
-            new DomainError(ErrorCode.TIMEOUT, `command "${commandId}" timed out after ${effectiveTimeoutSec}s`, {
-              commandId,
-              timeoutSec: effectiveTimeoutSec,
-            }),
-          ),
-        );
+      killProcessTree(child.pid, (cleanupStatus) => {
+        const outStd = stdout.summarize();
+        const outErr = stderr.summarize();
+        const artifactStd = stdoutArtifact.summarize();
+        const artifactErr = stderrArtifact.summarize();
+        const outputTruncated = outStd.truncated || outErr.truncated;
+        finish(() => resolve({
+          commandStatus: "TIMEOUT",
+          exitCode: null,
+          terminationSignal: process.platform === "win32" ? null : "SIGKILL",
+          cleanupStatus,
+          stdoutSummary: outStd.text,
+          stderrSummary: outErr.text,
+          durationMs: Date.now() - start,
+          outputTruncated,
+          ...(outputTruncated
+            ? {
+                capturedOutput: {
+                  stdout: artifactStd.text,
+                  stderr: artifactErr.text,
+                  stdoutBytes: artifactStd.totalBytes,
+                  stderrBytes: artifactErr.totalBytes,
+                  artifactTruncated: artifactStd.truncated || artifactErr.truncated,
+                },
+              }
+            : {}),
+        }));
       });
     }, effectiveTimeoutSec * 1000);
   });

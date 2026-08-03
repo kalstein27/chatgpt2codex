@@ -126,6 +126,7 @@ interface RgMatchData {
 
 function execFileAsync(cmd: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
+    // execution-capability: code-search-ripgrep-backend
     execFile(
       cmd,
       args,

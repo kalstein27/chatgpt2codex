@@ -2,11 +2,14 @@ import type { Express, Request, Response } from "express";
 import { promises as fs } from "node:fs";
 import { verifyOwnerToken } from "../auth/owner-token.js";
 import type { ToolContext } from "../types.js";
+import { remoteOwnerSessionScope } from "../state/session-scope.js";
 import { createE2eScreenshotShare, readE2eScreenshotShare } from "../e2e/screenshot-share.js";
-import { CONTROL_TOOL_NAMES, isControlChatGptExposed } from "../control/policy.js";
+import { CONTROL_TOOL_NAMES, isControlChatGptExposed, isDesktopControlSupported } from "../control/policy.js";
+import { NATIVE_E2E_TOOL_NAMES, isNativeE2eSupported } from "../e2e/capabilities.js";
 import { createServer as createMcpServer } from "./mcp-server.js";
+import { toRemoteBoundaryError } from "./error-safety.js";
 import { TOOL_AVAILABILITY_GATE, toolCallProof } from "./tool-proof.js";
-import { normalizeObjectSchema, safeParseAsync, getParseErrorMessage } from "@modelcontextprotocol/sdk/server/zod-compat.js";
+import { normalizeObjectSchema, safeParseAsync } from "@modelcontextprotocol/sdk/server/zod-compat.js";
 
 interface CallToolResultLike {
   content?: Array<{ type?: string; text?: string }>;
@@ -138,6 +141,15 @@ const ACTION_ROUTES: ActionRoute[] = [
     schema: "FileApplyPatchInput",
   },
   {
+    path: "/actions/file-edit-lines",
+    tool: "file_edit_lines",
+    operationId: "file_edit_lines",
+    summary: "Edit project file lines safely",
+    description:
+      "Apply redaction-safe line-addressed replacements using a whole-file fileHash from file_read_slice. Use this when displayed source contains [REDACTED] or exact old context cannot be echoed safely.",
+    schema: "FileEditLinesInput",
+  },
+  {
     path: "/actions/file-create",
     tool: "file_create",
     operationId: "file_create",
@@ -162,12 +174,12 @@ const ACTION_ROUTES: ActionRoute[] = [
     schema: "CommandRunInput",
   },
   {
-    path: "/actions/local-shell-run",
-    tool: "local_shell_run",
-    operationId: "local_shell_run",
-    summary: "Run local project shell",
-    description: "Run a guarded local shell command inside the project through chatgpt2codex. Network/destructive intents remain approval-gated by the tool.",
-    schema: "LocalShellRunInput",
+    path: "/actions/output-read",
+    tool: "output_read",
+    operationId: "output_read",
+    summary: "Read retained command output",
+    description: "Read a resumable byte range from redacted command output referenced by outputRef.",
+    schema: "OutputReadInput",
   },
   {
     path: "/actions/e2e-start-server",
@@ -226,7 +238,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "repo_status",
     operationId: "repo_status",
     summary: "Read repository status",
-    description: "Read local git branch, dirty files, staged files, upstream, and sync state.",
+    description: "Read explicit local Git repository/head state, branch or detached commit, dirty files, staged files, upstream, and sync state.",
     schema: "ProjectOnlyInput",
   },
   {
@@ -324,9 +336,10 @@ const OPENAPI_ACTION_TOOL_NAMES = new Set([
   "code_search",
   "file_read_slice",
   "file_apply_patch",
+  "file_edit_lines",
   "file_create",
   "command_run",
-  "local_shell_run",
+  "output_read",
   "e2e_start_server",
   "e2e_open_target",
   "e2e_run_command",
@@ -340,11 +353,14 @@ const OPENAPI_ACTION_TOOL_NAMES = new Set([
   "git_push",
   "save_chatgpt_image",
   "save_chatgpt_image_from_url",
-  "list_images",
 ]);
 
 function openApiActionRoutes(): ActionRoute[] {
-  return ACTION_ROUTES.filter((route) => OPENAPI_ACTION_TOOL_NAMES.has(route.tool));
+  return ACTION_ROUTES.filter(
+    (route) =>
+      OPENAPI_ACTION_TOOL_NAMES.has(route.tool) &&
+      (isNativeE2eSupported() || !NATIVE_E2E_TOOL_NAMES.has(route.tool)),
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -390,7 +406,7 @@ async function requireOwnerBearer(ctx: ToolContext, req: Request, res: Response)
   if (!token || !(await verifyOwnerToken(ctx.stateDir, token))) {
     res.status(401).json({
       ok: false,
-      error: "Missing or invalid Bearer token. Use the chatgpt2codex owner token as the GPT Action API key.",
+      error: "Missing or invalid Bearer token.",
     });
     return false;
   }
@@ -402,6 +418,22 @@ async function callRegisteredTool(
   toolName: string,
   input: Record<string, unknown>,
 ): Promise<CallToolResultLike> {
+  if (CONTROL_TOOL_NAMES.has(toolName) && !isDesktopControlSupported()) {
+    const message = "This operation is not supported on this platform.";
+    return {
+      isError: true,
+      structuredContent: { code: "PLATFORM_UNSUPPORTED", error: message },
+      content: [{ type: "text", text: message }],
+    };
+  }
+  if (NATIVE_E2E_TOOL_NAMES.has(toolName) && !isNativeE2eSupported()) {
+    const message = "This operation is not supported on this platform.";
+    return {
+      isError: true,
+      structuredContent: { code: "PLATFORM_UNSUPPORTED", error: message },
+      content: [{ type: "text", text: message }],
+    };
+  }
   // Desktop-control tools are blocked on the generic action bridge (even for
   // the owner-bearer /actions/call-tool route, even if isControlEnabled() is
   // on) unless the owner has separately opted in to exposing them to ChatGPT
@@ -442,8 +474,8 @@ async function callRegisteredTool(
   if (!handler) {
     return {
       isError: true,
-      structuredContent: { code: "TOOL_NOT_FOUND", error: `Tool not found: ${toolName}` },
-      content: [{ type: "text", text: `Tool not found: ${toolName}` }],
+      structuredContent: { code: "TOOL_NOT_FOUND", error: "Tool not found." },
+      content: [{ type: "text", text: "Tool not found." }],
     };
   }
   // This bridge calls the raw registered handler directly, bypassing the
@@ -458,7 +490,7 @@ async function callRegisteredTool(
     const schemaToParse = objSchema ?? registered.inputSchema;
     const parsed = await safeParseAsync(schemaToParse as never, input);
     if (!parsed.success) {
-      const message = `Invalid arguments for tool ${toolName}: ${getParseErrorMessage((parsed as { error: unknown }).error)}`;
+      const message = "Invalid input.";
       return {
         isError: true,
         structuredContent: { code: "INVALID_INPUT", error: message },
@@ -529,6 +561,25 @@ async function actionResponse(ctx: ToolContext, publicOrigin: string, tool: stri
     imageMarkdownList: enriched.markdown,
     structuredContent: enriched.value,
     ...(result.isError ? { isError: true } : {}),
+  };
+}
+
+async function actionErrorResponse(ctx: ToolContext, tool: string, error: unknown): Promise<Record<string, unknown>> {
+  const boundary = toRemoteBoundaryError(error);
+  const diagnostic = await ctx.diagnostics
+    ?.record({ event: "actions.request_failed", outcome: "failure", tool, errorCode: boundary.code })
+    .catch(() => undefined);
+  return {
+    ok: false,
+    tool,
+    toolCall: toolCallProof(tool, false),
+    text: boundary.message,
+    structuredContent: {
+      code: boundary.code,
+      error: boundary.message,
+      ...(diagnostic?.diagnosticId ? { diagnosticId: diagnostic.diagnosticId } : {}),
+    },
+    isError: true,
   };
 }
 
@@ -603,7 +654,11 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
       title: "chatgpt2codex Custom GPT Actions",
       version: "0.1.6",
       description:
-        "OpenAPI bridge for Custom GPTs. This does not call OpenAI Codex or spend Codex quota; ChatGPT drives local coding actions through chatgpt2codex. Hard gate: do not claim local project inspection, edits, tests, commits, or image saves unless a current-turn ActionToolResponse includes ok=true and toolCall.namespace=ChatGPT_To_Codex. If the active ChatGPT app was Image Generation/ImageGen, image_gen, python_user_visible, or a text-only answer, no chatgpt2codex local work happened; reselect/reconnect ChatGPT To Codex or refresh this Action schema. For /goal or broad implementation prompts, call goal_intake or goal_loop immediately before long reasoning. This compact schema stays under 30 operations including action_health and call_tool, and exposes exact tool names such as workspace_list_projects, project_select, code_search, file_read_slice, file_apply_patch, file_create, local_shell_run, and e2e_test_and_show_screenshot for source editing and E2E proof. It avoids broad context-pack actions that ChatGPT safety may block; inspect with code_search followed by narrow file_read_slice calls instead. It also exposes E2E server/app launch plus screenshot capture. Hidden tools remain reachable through call_tool. ChatGPT's sandbox cannot write /Users/... directly; use these actions. For generated images, use a Share/Copy Link/content URL, copied image, download, or local path with save_chatgpt_image/save_chatgpt_image_from_url.",
+        "OpenAPI bridge for Custom GPTs. This does not call OpenAI Codex or spend Codex quota; ChatGPT drives local coding actions through chatgpt2codex. Hard gate: do not claim local project inspection, edits, tests, commits, or image saves unless a current-turn ActionToolResponse includes ok=true and toolCall.namespace=ChatGPT_To_Codex. If the active ChatGPT app was Image Generation/ImageGen, image_gen, python_user_visible, or a text-only answer, no chatgpt2codex local work happened; reselect/reconnect ChatGPT To Codex or refresh this Action schema. For /goal or broad implementation prompts, call goal_intake or goal_loop immediately before long reasoning. This compact schema stays under 30 operations including action_health and call_tool, and exposes exact tool names such as workspace_list_projects, project_select, code_search, file_read_slice, file_edit_lines, file_apply_patch, file_create, and command_run for source editing. It avoids broad context-pack actions that ChatGPT safety may block; inspect with code_search followed by narrow file_read_slice calls instead. " +
+        (isNativeE2eSupported()
+          ? "On macOS it also exposes e2e_test_and_show_screenshot plus E2E server/app launch and screenshot capture. "
+          : `Native E2E screenshot actions are omitted on ${process.platform}; use command_run for verification. `) +
+        "Registered platform-compatible tools without a dedicated route remain reachable through call_tool. ChatGPT's sandbox cannot write /Users/... directly; use these actions. For generated images, use a Share/Copy Link/content URL, copied image, download, or local path with save_chatgpt_image/save_chatgpt_image_from_url.",
       "x-chatgpt2codex-tool-proof": TOOL_AVAILABILITY_GATE,
       "x-chatgpt2codex-openapi-operation-count": Object.keys(paths).length,
       "x-chatgpt2codex-tool-names": openApiActionRoutes().map((route) => route.tool),
@@ -629,7 +684,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
             toolName: {
               type: "string",
               description:
-                "Registered chatgpt2codex MCP tool name, e.g. file_apply_patch, file_create, local_shell_run, repo_status, git_commit, git_push.",
+                "Registered chatgpt2codex MCP tool name, e.g. file_apply_patch, file_create, command_run, repo_status, git_commit, git_push.",
             },
             input: {
               type: "object",
@@ -743,6 +798,12 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
             start: { type: "integer", minimum: 1 },
             end: { type: "integer", minimum: 1 },
             offset: { type: "integer", minimum: 0 },
+            hashMode: {
+              type: "string",
+              enum: ["none", "file", "range", "lines"],
+              default: "lines",
+              description: "Hash detail level. file is sufficient for file_apply_patch preconditions.",
+            },
           },
         },
         FileApplyPatchInput: {
@@ -753,6 +814,46 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
             projectId: { type: "string" },
             patch: { type: "string", description: "Codex-style *** Begin Patch envelope." },
             preconditionHashes: { type: "object", additionalProperties: { type: "string" } },
+          },
+        },
+        FileEditLinesInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["projectId", "edits"],
+          properties: {
+            projectId: { type: "string" },
+            edits: {
+              type: "array",
+              minItems: 1,
+              maxItems: 100,
+              items: {
+                type: "object",
+                additionalProperties: false,
+                required: ["path", "startLine", "deleteCount", "lines", "fileHash"],
+                properties: {
+                  path: { type: "string" },
+                  startLine: {
+                    type: "integer",
+                    minimum: 1,
+                    description: "1-based logical line index matching file_read_slice.",
+                  },
+                  deleteCount: { type: "integer", minimum: 0 },
+                  lines: {
+                    type: "array",
+                    items: {
+                      type: "string",
+                      pattern: "^[^\\r\\n\\u0000]*$",
+                      description: "One replacement logical line; no CR, LF, or NUL.",
+                    },
+                  },
+                  fileHash: {
+                    type: "string",
+                    pattern: "^[a-fA-F0-9]{64}$",
+                    description: "Whole-file fileHash returned by file_read_slice before response redaction.",
+                  },
+                },
+              },
+            },
           },
         },
         FileCreateInput: {
@@ -804,6 +905,16 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
                 destructive: { type: "boolean" },
               },
             },
+          },
+        },
+        OutputReadInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["outputRef"],
+          properties: {
+            outputRef: { type: "string", pattern: "^out_[a-z0-9]+_[a-f0-9]{16}$" },
+            offset: { type: "integer", minimum: 0 },
+            maxBytes: { type: "integer", minimum: 1, maximum: 262144 },
           },
         },
         E2eStartServerInput: {
@@ -1067,21 +1178,31 @@ export function registerActionRoutes(app: Express, ctx: ToolContext, publicUrl: 
   });
 
   app.post("/actions/call-tool", async (req, res) => {
-    if (!(await requireOwnerBearer(ctx, req, res))) return;
-    const { toolName, input } = genericToolInput(req.body);
-    if (!toolName) {
-      res.status(400).json({ ok: false, error: "Missing toolName" });
-      return;
+    try {
+      if (!(await requireOwnerBearer(ctx, req, res))) return;
+      const scopedCtx = { ...ctx, remote: true, sessionScope: remoteOwnerSessionScope() };
+      const { toolName, input } = genericToolInput(req.body);
+      if (!toolName) {
+        res.status(400).json({ ok: false, error: "Missing toolName" });
+        return;
+      }
+      const result = await callRegisteredTool(scopedCtx, toolName, input);
+      res.json(await actionResponse(scopedCtx, publicOrigin, toolName, result));
+    } catch (error) {
+      if (!res.headersSent) res.status(200).json(await actionErrorResponse(ctx, "call_tool", error));
     }
-    const result = await callRegisteredTool(ctx, toolName, input);
-    res.json(await actionResponse(ctx, publicOrigin, toolName, result));
   });
 
   for (const route of ACTION_ROUTES) {
     app.post(route.path, async (req, res) => {
-      if (!(await requireOwnerBearer(ctx, req, res))) return;
-      const result = await callRegisteredTool(ctx, route.tool, actionInputForRoute(route, req.body));
-      res.json(await actionResponse(ctx, publicOrigin, route.tool, result));
+      try {
+        if (!(await requireOwnerBearer(ctx, req, res))) return;
+        const scopedCtx = { ...ctx, remote: true, sessionScope: remoteOwnerSessionScope() };
+        const result = await callRegisteredTool(scopedCtx, route.tool, actionInputForRoute(route, req.body));
+        res.json(await actionResponse(scopedCtx, publicOrigin, route.tool, result));
+      } catch (error) {
+        if (!res.headersSent) res.status(200).json(await actionErrorResponse(ctx, route.tool, error));
+      }
     });
   }
 }

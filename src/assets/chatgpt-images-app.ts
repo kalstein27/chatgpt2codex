@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { DomainError, ErrorCode } from "../types.js";
 
+// execution-capability: macos-open-chatgpt-images
 const promisifiedExecFile = promisify(execFile);
 
 const execFileAsync: ExecFileLike = async (file, args, options) => {

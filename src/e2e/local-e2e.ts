@@ -67,6 +67,7 @@ async function e2eDir(projectRoot: string): Promise<string> {
 
 function execFileAsync(file: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
+    // execution-capability: e2e-fixed-tool
     execFile(file, args, { env: buildSafeChildEnv(), windowsHide: true }, (error, stdout, stderr) => {
       if (error) {
         reject(error);
@@ -229,6 +230,7 @@ export async function startE2eServer(
   const runId = e2eId(input.command);
   const logPath = path.join(dir, `${runId}-${slug(input.label ?? "server")}.log`);
   const out = await fs.open(logPath, "a");
+  // execution-capability: e2e-project-server-shell
   const child = spawn("/bin/zsh", ["-lc", input.command], {
     cwd: commandCwd,
     env: buildSafeChildEnv(),

@@ -38,7 +38,7 @@ async function resolveProjectRoot(ctx: ToolContext, projectId: string): Promise<
  * project_select), ignoring it if expired. Returns null if there is no
  * active project/lease at all. */
 async function getActiveLease(ctx: ToolContext): Promise<{ projectId: string; lease: Lease | null } | null> {
-  const session = (await ctx.store.getSession()) as
+  const session = (await ctx.store.getSession(ctx.sessionScope)) as
     | { activeProjectId?: string | null; lease?: Lease | null }
     | undefined;
   const activeProjectId = session?.activeProjectId ?? null;
