@@ -1,10 +1,14 @@
-import { exec } from "node:child_process";
+import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { DomainError, ErrorCode } from "../types.js";
 import { redact } from "../policy/secrets.js";
 import { resolveInProject } from "../policy/paths.js";
-import { buildSafeChildEnv } from "./command-runner.js";
+import { BoundedOutputCollector } from "./bounded-output.js";
+import { OUTPUT_ARTIFACT_STREAM_BYTES } from "./output-artifacts.js";
+import { buildSafeChildEnv, killProcessTree } from "./command-runner.js";
+import { detectCommandNotFound, type CommandNotFoundHint } from "./runtime-environment.js";
+import { commandStatusFromExit, type ProcessExecutionResult } from "./process-result.js";
 
 const DEFAULT_TIMEOUT_SEC = 60;
 const MAX_TIMEOUT_SEC = 900;
@@ -52,19 +56,6 @@ const NETWORK_COMMAND_PATTERNS = [
   /\bgit\s+(pull|fetch|clone|push)\b/i,
 ];
 
-function truncateOutput(buf: Buffer): { text: string; truncated: boolean } {
-  const limit = OUTPUT_HEAD_BYTES + OUTPUT_TAIL_BYTES;
-  if (buf.length <= limit) {
-    return { text: buf.toString("utf8"), truncated: false };
-  }
-  const head = buf.subarray(0, OUTPUT_HEAD_BYTES).toString("utf8");
-  const tail = buf.subarray(buf.length - OUTPUT_TAIL_BYTES).toString("utf8");
-  return {
-    text: `${head}\n...[truncated ${buf.length - limit} bytes]...\n${tail}`,
-    truncated: true,
-  };
-}
-
 export function guardShellCommand(command: string): void {
   for (const pattern of SECRET_COMMAND_PATTERNS) {
     if (pattern.test(command)) {
@@ -103,13 +94,9 @@ export async function runLocalShell(
   command: string,
   cwd?: string,
   timeoutSec?: number,
-): Promise<{
+): Promise<ProcessExecutionResult & {
   cwd: string;
-  exitCode: number;
-  stdoutSummary: string;
-  stderrSummary: string;
-  durationMs: number;
-  outputTruncated: boolean;
+  commandNotFound?: CommandNotFoundHint;
 }> {
   guardShellCommand(command);
 
@@ -128,44 +115,112 @@ export async function runLocalShell(
   const effectiveTimeoutSec = Math.min(Math.max(requestedTimeout, 1), MAX_TIMEOUT_SEC);
   const start = Date.now();
 
-  return await new Promise((resolve, reject) => {
-    exec(
-      command,
-      {
-        cwd: commandCwd,
-        env: buildSafeChildEnv(),
-        timeout: effectiveTimeoutSec * 1000,
-        killSignal: "SIGKILL",
-        maxBuffer: 64 * 1024 * 1024,
-        windowsHide: true,
-      },
-      (error, stdout, stderr) => {
-        const durationMs = Date.now() - start;
-        const stdoutBuf = Buffer.from(stdout ?? "", "utf8");
-        const stderrBuf = Buffer.from(stderr ?? "", "utf8");
+  return await new Promise((resolve) => {
+    let settled = false;
+    let timedOut = false;
+    let spawnFailed = false;
+    let timeoutHandle: NodeJS.Timeout | undefined;
+    const stdout = new BoundedOutputCollector(OUTPUT_HEAD_BYTES, OUTPUT_TAIL_BYTES);
+    const stderr = new BoundedOutputCollector(OUTPUT_HEAD_BYTES, OUTPUT_TAIL_BYTES);
+    const stdoutArtifact = new BoundedOutputCollector(OUTPUT_ARTIFACT_STREAM_BYTES, 0);
+    const stderrArtifact = new BoundedOutputCollector(OUTPUT_ARTIFACT_STREAM_BYTES, 0);
+    const finish = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      fn();
+    };
 
-        if (error && (error as NodeJS.ErrnoException & { killed?: boolean }).killed) {
-          reject(
-            new DomainError(ErrorCode.TIMEOUT, `local shell command timed out after ${effectiveTimeoutSec}s`, {
-              timeoutSec: effectiveTimeoutSec,
-            }),
-          );
-          return;
-        }
-
-        const outStd = truncateOutput(stdoutBuf);
-        const outErr = truncateOutput(stderrBuf);
-        const exitCode = typeof error?.code === "number" ? error.code : error ? 1 : 0;
-
+    // execution-capability: guarded-project-shell
+    const child = spawn(command, {
+      cwd: commandCwd,
+      env: buildSafeChildEnv(),
+      detached: process.platform !== "win32",
+      shell: true,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout.append(chunk);
+      stdoutArtifact.append(chunk);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr.append(chunk);
+      stderrArtifact.append(chunk);
+    });
+    child.on("error", (error) => {
+      spawnFailed = true;
+      stderr.append(Buffer.from(error instanceof Error ? error.message : String(error)));
+    });
+    child.on("close", (code, signal) => {
+      if (timedOut) return;
+      const outStd = stdout.summarize();
+      const outErr = stderr.summarize();
+      const artifactStd = stdoutArtifact.summarize();
+      const artifactErr = stderrArtifact.summarize();
+      const outputTruncated = outStd.truncated || outErr.truncated;
+      const exitCode = spawnFailed ? null : (code ?? 1);
+      const commandNotFound = exitCode === null
+        ? undefined
+        : detectCommandNotFound(exitCode, outStd.text, outErr.text);
+      finish(() =>
         resolve({
           cwd: path.relative(baseRoot, commandCwd) || ".",
+          commandStatus: commandStatusFromExit(exitCode, spawnFailed),
           exitCode,
+          terminationSignal: signal,
+          cleanupStatus: "NOT_REQUIRED",
           stdoutSummary: redact(outStd.text),
           stderrSummary: redact(outErr.text),
-          durationMs,
-          outputTruncated: outStd.truncated || outErr.truncated,
-        });
-      },
-    );
+          durationMs: Date.now() - start,
+          outputTruncated,
+          ...(commandNotFound ? { commandNotFound } : {}),
+          ...(outputTruncated
+            ? {
+                capturedOutput: {
+                  stdout: artifactStd.text,
+                  stderr: artifactErr.text,
+                  stdoutBytes: artifactStd.totalBytes,
+                  stderrBytes: artifactErr.totalBytes,
+                  artifactTruncated: artifactStd.truncated || artifactErr.truncated,
+                },
+              }
+            : {}),
+        }),
+      );
+    });
+
+    timeoutHandle = setTimeout(() => {
+      timedOut = true;
+      killProcessTree(child.pid, (cleanupStatus) => {
+        const outStd = stdout.summarize();
+        const outErr = stderr.summarize();
+        const artifactStd = stdoutArtifact.summarize();
+        const artifactErr = stderrArtifact.summarize();
+        const outputTruncated = outStd.truncated || outErr.truncated;
+        finish(() => resolve({
+          cwd: path.relative(baseRoot, commandCwd) || ".",
+          commandStatus: "TIMEOUT",
+          exitCode: null,
+          terminationSignal: process.platform === "win32" ? null : "SIGKILL",
+          cleanupStatus,
+          stdoutSummary: redact(outStd.text),
+          stderrSummary: redact(outErr.text),
+          durationMs: Date.now() - start,
+          outputTruncated,
+          ...(outputTruncated
+            ? {
+                capturedOutput: {
+                  stdout: artifactStd.text,
+                  stderr: artifactErr.text,
+                  stdoutBytes: artifactStd.totalBytes,
+                  stderrBytes: artifactErr.totalBytes,
+                  artifactTruncated: artifactStd.truncated || artifactErr.truncated,
+                },
+              }
+            : {}),
+        }));
+      });
+    }, effectiveTimeoutSec * 1000);
   });
 }

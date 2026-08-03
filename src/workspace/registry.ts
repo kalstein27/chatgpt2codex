@@ -4,6 +4,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { DomainError, ErrorCode, type ProjectRegistryEntry } from "../types.js";
 
+// execution-capability: workspace-registry-git-read
 const execFileAsync = promisify(execFile);
 
 /** Package/tooling marker files used to detect `packageHints` (PRD §8.1). */

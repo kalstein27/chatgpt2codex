@@ -21,15 +21,22 @@ function execFileAsync(
   file: string,
   args: string[],
   extraEnv: Record<string, string> = {},
+  timeoutMs = 15_000,
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    execFile(file, args, { env: { ...buildSafeChildEnv(), ...extraEnv }, windowsHide: true }, (error, stdout, stderr) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve({ stdout: String(stdout ?? ""), stderr: String(stderr ?? "") });
-    });
+    // execution-capability: macos-control-subprocess
+    execFile(
+      file,
+      args,
+      { env: { ...buildSafeChildEnv(), ...extraEnv }, windowsHide: true, timeout: timeoutMs, killSignal: "SIGKILL" },
+      (error, stdout, stderr) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve({ stdout: String(stdout ?? ""), stderr: String(stderr ?? "") });
+      },
+    );
   });
 }
 
@@ -68,7 +75,7 @@ export async function resolveFrontmostApp(): Promise<string | undefined> {
     const { stdout } = await execFileAsync("/usr/bin/osascript", [
       "-e",
       `tell application "System Events" to get name of first process whose frontmost is true`,
-    ]);
+    ], {}, 1_000);
     const name = stdout.trim();
     return name.length > 0 ? name : undefined;
   } catch {
@@ -287,6 +294,7 @@ function resolveHelperPath(): string | null {
 
 function runHelper(helperPath: string, subcommand: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
+    // execution-capability: macos-ax-helper-stream
     const child = spawn(helperPath, [subcommand], { env: buildSafeChildEnv(), windowsHide: true });
     let stdout = "";
     let stderr = "";
@@ -351,7 +359,7 @@ async function resolveAxElementViaSystemEvents(appName: string, target: AxResolv
         end tell
       end tell
       `,
-    ]);
+    ], {}, 3_000);
     const parts = stdout.trimEnd().split(AX_FRAME_DELIM);
     const [role, title, description, frameStr, matchCountStr, window] = parts;
     const frameNums = (frameStr ?? "").match(/-?\d+/g)?.map((n) => Number.parseInt(n, 10));

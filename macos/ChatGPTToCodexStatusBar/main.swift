@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
 import CoreGraphics
 import Foundation
 import Security
@@ -12,9 +13,26 @@ private func appleScriptString(_ value: String) -> String {
     "\"" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
 }
 
+private func versionIsNewer(_ candidate: String, than current: String) -> Bool {
+    let candidateParts = candidate.split(separator: ".").map { Int($0.prefix { $0.isNumber }) ?? 0 }
+    let currentParts = current.split(separator: ".").map { Int($0.prefix { $0.isNumber }) ?? 0 }
+    let count = max(candidateParts.count, currentParts.count)
+    for index in 0..<count {
+        let left = index < candidateParts.count ? candidateParts[index] : 0
+        let right = index < currentParts.count ? currentParts[index] : 0
+        if left != right { return left > right }
+    }
+    return false
+}
+
 private struct LanguageOption {
     let code: String
     let name: String
+}
+
+private struct RuntimeUpdate {
+    let version: String
+    let dmgURL: URL
 }
 
 private final class FlippedView: NSView {
@@ -70,6 +88,17 @@ private let desktopLocalizationRows: [String: [String]] = [
     "restartAfterSaveInfo": ["Settings were saved, but the running MCP server keeps using the previous workspace, tunnel, port, and related options until it restarts.", "설정은 저장됐지만 실행 중인 MCP 서버는 재시작 전까지 이전 프로젝트 폴더, 터널, 포트 설정을 계속 사용합니다."],
     "selectProjectFolderMenu": ["Select Project Folder...", "프로젝트 폴더 선택...", "プロジェクトフォルダを選択...", "选择项目文件夹...", "選擇專案資料夾...", "Seleccionar carpeta del proyecto...", "Choisir le dossier du projet...", "Projektordner auswählen...", "Selecionar pasta do projeto...", "Seleziona cartella progetto...", "Projectmap kiezen...", "Wybierz folder projektu...", "Выбрать папку проекта...", "Proje klasörü seç...", "Chọn thư mục dự án...", "Pilih folder proyek...", "เลือกโฟลเดอร์โปรเจกต์...", "اختيار مجلد المشروع...", "प्रोजेक्ट फ़ोल्डर चुनें...", "Вибрати теку проєкту..."],
     "settingsMenu": ["Settings...", "설정...", "設定...", "设置...", "設定...", "Ajustes...", "Réglages...", "Einstellungen...", "Configurações...", "Impostazioni...", "Instellingen...", "Ustawienia...", "Настройки...", "Ayarlar...", "Cài đặt...", "Pengaturan...", "การตั้งค่า...", "الإعدادات...", "सेटिंग्स...", "Налаштування..."],
+    "rgPermissionMenu": ["External search tool (rg)", "외부 검색 도구 (rg)"],
+    "rgAskEveryTime": ["Ask every time", "사용할 때마다 묻기"],
+    "rgCodeSearchOnly": ["Use code_search only", "code_search만 사용"],
+    "rgPendingNone": ["No pending rg approval requests", "대기 중인 rg 승인 요청 없음"],
+    "rgUnavailable": ["Verified rg is unavailable", "검증된 rg를 사용할 수 없음"],
+    "rgApprovalTitle": ["External rg search approval", "외부 rg 검색 승인 요청"],
+    "rgApproveOnce": ["Allow once", "이번만 허용"],
+    "rgApproveSession": ["Allow for this project session", "현재 프로젝트 세션 동안 허용"],
+    "rgApproveAlways": ["Always allow this verified rg", "검증된 rg 항상 허용"],
+    "rgReject": ["Reject", "거부"],
+    "connectionDiagnosticsMenu": ["Connection Diagnostics...", "연결 진단 로그..."],
     "launchAtLoginMenu": ["Launch at Login", "로그인 시 실행", "ログイン時に起動", "登录时启动", "登入時啟動", "Iniciar al acceder", "Lancer à la connexion", "Beim Anmelden starten", "Abrir ao iniciar sessão", "Avvia al login", "Start bij inloggen", "Uruchamiaj przy logowaniu", "Запускать при входе", "Girişte başlat", "Mở khi đăng nhập", "Jalankan saat login", "เปิดเมื่อเข้าสู่ระบบ", "التشغيل عند تسجيل الدخول", "लॉगिन पर शुरू करें", "Запускати під час входу"],
     "startOnOpenMenu": ["Start MCP When App Opens", "앱 열 때 MCP 시작", "アプリ起動時に MCP を開始", "应用打开时启动 MCP", "App 開啟時啟動 MCP", "Iniciar MCP al abrir la app", "Démarrer MCP à l'ouverture", "MCP beim Öffnen starten", "Iniciar MCP ao abrir o app", "Avvia MCP all'apertura", "Start MCP bij openen", "Uruchamiaj MCP przy otwarciu", "Запускать MCP при открытии", "Uygulama açılınca MCP başlat", "Khởi động MCP khi mở ứng dụng", "Mulai MCP saat app dibuka", "เริ่ม MCP เมื่อเปิดแอป", "بدء MCP عند فتح التطبيق", "ऐप खुलने पर MCP शुरू करें", "Запускати MCP під час відкриття"],
     "screenshotPermissionMenu": ["Screenshot Permission...", "스크린샷 권한..."],
@@ -88,6 +117,12 @@ private let desktopLocalizationRows: [String: [String]] = [
     "controlReject": ["Reject", "거부"],
     "agentArmStatusMenu": ["Agent Arm: local approval required", "Agent Arm: 로컬 승인 필요"],
     "agentArmStatusDetail": ["Remote ChatGPT can request control actions, but execution still requires this Mac's control lease, allowlist, sensitive-app checks, and kill switch.", "원격 ChatGPT는 제어 작업을 요청할 수 있지만 실행에는 이 Mac의 제어 lease, 허용 목록, 민감 앱 검사, kill switch가 계속 필요합니다."],
+    "agentArmOnMenu": ["Agent Arm: on", "Agent Arm: 켜짐"],
+    "agentArmOffMenu": ["Agent Arm: off", "Agent Arm: 꺼짐"],
+    "activeSessionsMenu": ["Active session status", "활성 세션 상태"],
+    "sessionNoActive": ["No active sessions", "활성 세션 없음"],
+    "permissionAllowed": ["allowed", "허용됨"],
+    "permissionRequired": ["permission required", "권한 필요"],
     "killControlMenu": ["Kill Control", "제어 강제 종료"],
     "killControlConfirmTitle": ["Kill control session?", "제어 세션을 강제 종료할까요?"],
     "killControlConfirmInfo": ["This immediately rejects every pending control action and blocks new ones until a fresh control lease is granted.", "대기 중인 모든 제어 작업을 즉시 거부하고, 새 제어 lease를 부여하기 전까지 새 작업을 차단합니다."],
@@ -157,7 +192,12 @@ private let desktopLocalizationRows: [String: [String]] = [
     "updatePageReady": ["Update page is ready.", "업데이트 페이지를 열 수 있습니다.", "更新ページを開けます。", "更新页面已准备好。", "更新頁面已就緒。", "La página de actualizaciones está lista.", "La page des mises à jour est prête.", "Die Update-Seite ist bereit.", "A página de atualizações está pronta.", "La pagina aggiornamenti è pronta.", "De updatepagina is klaar.", "Strona aktualizacji jest gotowa.", "Страница обновлений готова.", "Güncelleme sayfası hazır.", "Trang cập nhật đã sẵn sàng.", "Halaman pembaruan siap.", "หน้าการอัปเดตพร้อมแล้ว", "صفحة التحديث جاهزة.", "अपडेट पेज तैयार है।", "Сторінка оновлень готова."],
     "updateCheckFailed": ["Could not check releases automatically. Open the releases page instead.", "릴리즈를 자동 확인하지 못했습니다. 릴리즈 페이지를 여세요.", "リリースを自動確認できませんでした。リリースページを開いてください。", "无法自动检查发布。请打开发布页面。", "無法自動檢查發行版。請開啟發行頁。", "No se pudieron comprobar releases automáticamente. Abre la página de releases.", "Impossible de vérifier les versions automatiquement. Ouvrez la page des versions.", "Releases konnten nicht automatisch geprüft werden. Öffne die Releases-Seite.", "Não foi possível verificar releases automaticamente. Abra a página de releases.", "Impossibile controllare le release automaticamente. Apri la pagina release.", "Kan releases niet automatisch controleren. Open de releases-pagina.", "Nie można automatycznie sprawdzić wydań. Otwórz stronę wydań.", "Не удалось автоматически проверить релизы. Откройте страницу релизов.", "Sürümler otomatik denetlenemedi. Sürümler sayfasını açın.", "Không thể tự động kiểm tra bản phát hành. Hãy mở trang phát hành.", "Tidak dapat memeriksa rilis otomatis. Buka halaman rilis.", "ตรวจสอบ releases อัตโนมัติไม่ได้ ให้เปิดหน้า releases", "تعذر التحقق من الإصدارات تلقائيا. افتح صفحة الإصدارات.", "रिलीज़ अपने-आप नहीं जांच सके। रिलीज़ पेज खोलें।", "Не вдалося автоматично перевірити релізи. Відкрийте сторінку релізів."],
     "upToDate": ["ChatGPT To Codex is up to date (%@).", "ChatGPT To Codex가 최신입니다 (%@).", "ChatGPT To Codex は最新です (%@)。", "ChatGPT To Codex 已是最新版本（%@）。", "ChatGPT To Codex 已是最新版本（%@）。", "ChatGPT To Codex está actualizado (%@).", "ChatGPT To Codex est à jour (%@).", "ChatGPT To Codex ist aktuell (%@).", "ChatGPT To Codex está atualizado (%@).", "ChatGPT To Codex è aggiornato (%@).", "ChatGPT To Codex is up-to-date (%@).", "ChatGPT To Codex jest aktualny (%@).", "ChatGPT To Codex обновлен (%@).", "ChatGPT To Codex güncel (%@).", "ChatGPT To Codex đã mới nhất (%@).", "ChatGPT To Codex sudah terbaru (%@).", "ChatGPT To Codex เป็นเวอร์ชันล่าสุด (%@)", "ChatGPT To Codex محدث (%@).", "ChatGPT To Codex अप टू डेट है (%@)।", "ChatGPT To Codex оновлено (%@)."],
-    "updateAvailable": ["Update available: %@. Installed: %@.", "업데이트 가능: %@. 설치됨: %@.", "更新があります: %@。インストール済み: %@。", "有可用更新：%@。已安装：%@。", "有可用更新：%@。已安裝：%@。", "Actualización disponible: %@. Instalado: %@.", "Mise à jour disponible : %@. Installé : %@.", "Update verfügbar: %@. Installiert: %@.", "Atualização disponível: %@. Instalado: %@.", "Aggiornamento disponibile: %@. Installato: %@.", "Update beschikbaar: %@. Geïnstalleerd: %@.", "Dostępna aktualizacja: %@. Zainstalowano: %@.", "Доступно обновление: %@. Установлено: %@.", "Güncelleme var: %@. Kurulu: %@.", "Có bản cập nhật: %@. Đã cài: %@.", "Pembaruan tersedia: %@. Terpasang: %@.", "มีอัปเดต: %@ ติดตั้งอยู่: %@", "يتوفر تحديث: %@. المثبت: %@.", "अपडेट उपलब्ध: %@. इंस्टॉल: %@.", "Доступне оновлення: %@. Встановлено: %@."]
+    "updateAvailable": ["Update available: %@. Installed: %@.", "업데이트 가능: %@. 설치됨: %@.", "更新があります: %@。インストール済み: %@。", "有可用更新：%@。已安装：%@。", "有可用更新：%@。已安裝：%@。", "Actualización disponible: %@. Instalado: %@.", "Mise à jour disponible : %@. Installé : %@.", "Update verfügbar: %@. Installiert: %@.", "Atualização disponível: %@. Instalado: %@.", "Aggiornamento disponibile: %@. Installato: %@.", "Update beschikbaar: %@. Geïnstalleerd: %@.", "Dostępna aktualizacja: %@. Zainstalowano: %@.", "Доступно обновление: %@. Установлено: %@.", "Güncelleme var: %@. Kurulu: %@.", "Có bản cập nhật: %@. Đã cài: %@.", "Pembaruan tersedia: %@. Terpasang: %@.", "มีอัปเดต: %@ ติดตั้งอยู่: %@", "يتوفر تحديث: %@. المثبت: %@.", "अपडेट उपलब्ध: %@. इंस्टॉल: %@.", "Доступне оновлення: %@. Встановлено: %@."],
+    "installRuntimeUpdate": ["Apply Runtime Update", "런타임 업데이트 적용"],
+    "updateDownloading": ["Downloading and verifying the update...", "업데이트를 다운로드하고 서명을 확인하는 중..."],
+    "updateRuntimeExplanation": ["The MCP runtime will restart briefly while the menu bar app and Cloudflare tunnel stay running. The connector URL should not change. Native menu bar UI changes take effect after the next app launch.", "메뉴 막대 앱과 Cloudflare 터널은 유지한 채 MCP 런타임만 잠깐 재시작합니다. 커넥터 URL은 바뀌지 않습니다. 메뉴 막대 UI 같은 네이티브 변경은 다음 앱 실행 때 반영됩니다."],
+    "updateApplyFailed": ["Runtime update failed", "런타임 업데이트 실패"],
+    "updateApplyComplete": ["Runtime update complete", "런타임 업데이트 완료"]
 ]
 
 private func resolveDesktopLanguage(_ configured: String?) -> String {
@@ -205,12 +245,14 @@ private final class ServiceController {
     private let launchAtLoginKey = "launchAtLogin"
     private let startMCPOnLaunchKey = "startMCPOnLaunch"
     private let autoCheckUpdatesKey = "autoCheckUpdates"
+    private let appliedRuntimeVersionKey = "appliedRuntimeVersion"
     private(set) var process: Process?
 
     let appName = "ChatGPT To Codex"
     let defaultWorkspace: String
     let runtimeRoot: URL
     let logFile: URL
+    let connectionDiagnosticsFile: URL
 
     var appVersion: String {
         let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
@@ -218,11 +260,29 @@ private final class ServiceController {
         return short?.isEmpty == false ? short! : (build?.isEmpty == false ? build! : "0.0.0")
     }
 
+    private var effectiveRuntimeRoot: URL {
+        let pointer = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local/share/chatgpt2codex/active-runtime")
+        guard let value = try? String(contentsOf: pointer, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty
+        else {
+            return runtimeRoot
+        }
+        let candidate = URL(fileURLWithPath: value)
+        return FileManager.default.fileExists(
+            atPath: candidate.appendingPathComponent("dist/cli.js").path
+        ) ? candidate : runtimeRoot
+    }
+
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         defaultWorkspace = environment["CHATGPT2CODEX_WORKSPACE"] ?? "\(home)/workspace"
 
-        if let resourceRoot = Bundle.main.resourceURL?.appendingPathComponent("chatgpt2codex"),
+        if let developmentRoot = Bundle.main.object(forInfoDictionaryKey: "ChatGPT2CodexRuntimeRoot") as? String,
+           FileManager.default.fileExists(atPath: URL(fileURLWithPath: developmentRoot).appendingPathComponent("start-chatgpt.sh").path) {
+            runtimeRoot = URL(fileURLWithPath: developmentRoot)
+        } else if let resourceRoot = Bundle.main.resourceURL?.appendingPathComponent("chatgpt2codex"),
            FileManager.default.fileExists(atPath: resourceRoot.appendingPathComponent("start-chatgpt.sh").path) {
             runtimeRoot = resourceRoot
         } else {
@@ -235,6 +295,11 @@ private final class ServiceController {
             .appendingPathComponent(appName)
         try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
         logFile = logDir.appendingPathComponent("chatgpt2codex.log")
+        connectionDiagnosticsFile = URL(fileURLWithPath: home)
+            .appendingPathComponent(".local")
+            .appendingPathComponent("share")
+            .appendingPathComponent("chatgpt2codex")
+            .appendingPathComponent("connection-events.jsonl")
     }
 
     var port: Int {
@@ -379,6 +444,70 @@ private final class ServiceController {
         let resolvedSummary: String?
     }
 
+    struct ActiveSessionSummary {
+        let label: String
+        let clientName: String?
+        let state: String
+        let tool: String?
+        let elapsedMs: Int
+    }
+
+    struct PendingArmRequest {
+        let requestId: String
+        let projectName: String
+        let clientLabel: String
+        let reason: String
+        let createdAt: TimeInterval
+        let expiresAt: TimeInterval
+    }
+
+    struct PendingOperationApproval {
+        let requestId: String
+        let projectId: String
+        let tool: String
+        let risk: String
+        let preview: String
+        let createdAt: TimeInterval
+        let expiresAt: TimeInterval
+    }
+
+    struct PendingRgRequest {
+        let requestId: String
+        let projectId: String
+        let queryPreview: String
+        let patternMode: String
+        let caseSensitive: Bool
+        let maxResults: Int
+        let binaryPath: String
+        let binaryVersion: String
+        let binarySha256: String
+        let createdAt: TimeInterval
+        let expiresAt: TimeInterval
+    }
+
+    struct RgCapabilitySnapshot {
+        let preference: String
+        let binaryAvailable: Bool
+        let binaryPath: String?
+        let binaryVersion: String?
+        let binarySha256: String?
+        let unavailableReason: String?
+        let pendingRequests: [PendingRgRequest]
+    }
+
+    struct LocalControlSnapshot {
+        let armed: Bool
+        let killed: Bool
+        let pendingActions: [PendingControlAction]
+        let pendingArmRequests: [PendingArmRequest]
+        let operationApprovals: [PendingOperationApproval]
+        let autoEnabled: Bool
+        let autoRemainingMs: Int
+        let allowlistedAppCount: Int
+        let sessions: [ActiveSessionSummary]
+        let rg: RgCapabilitySnapshot
+    }
+
     private func summarizeControlTarget(_ target: [String: Any]?) -> String {
         guard let target else { return "" }
         if let ax = target["ax"] as? [String: Any] {
@@ -428,110 +557,162 @@ private final class ServiceController {
         return "Will act on \(target)"
     }
 
-    /// `chatgpt2codex control list`, filtered to actions still awaiting local
-    /// human approval. See src/control/queue.ts listActions/toSummary.
-    func listPendingControlActions() -> [PendingControlAction] {
-        guard let result = try? runCli(["control", "list"]), result.status == 0,
-              let data = result.stdout.data(using: .utf8),
-              let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+    private var localControlTokenURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local/share/chatgpt2codex/local-control-token")
+    }
+
+    private func localControlToken() -> String? {
+        guard let value = try? String(contentsOf: localControlTokenURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty
+        else { return nil }
+        return value
+    }
+
+    private func localControlRequest(
+        _ path: String,
+        method: String = "GET",
+        completion: @escaping (Data?, Bool) -> Void
+    ) {
+        guard let token = localControlToken(),
+              let url = URL(string: "http://127.0.0.1:\(port)/local-control/v1\(path)")
         else {
-            return []
+            DispatchQueue.main.async { completion(nil, false) }
+            return
         }
-        return array.compactMap { entry in
-            guard entry["status"] as? String == "pending", let actionId = entry["actionId"] as? String else {
-                return nil
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.timeoutInterval = 1.5
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            let ok = error == nil && (response as? HTTPURLResponse)?.statusCode == 200
+            DispatchQueue.main.async { completion(data, ok) }
+        }.resume()
+    }
+
+    func fetchLocalControlStatus(completion: @escaping (LocalControlSnapshot?) -> Void) {
+        localControlRequest("/status") { data, ok in
+            guard ok, let data,
+                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let control = root["control"] as? [String: Any]
+            else {
+                completion(nil)
+                return
             }
-            return PendingControlAction(
-                actionId: actionId,
-                appName: entry["appName"] as? String ?? "",
-                kind: entry["kind"] as? String ?? "",
-                targetSummary: summarizeControlTarget(entry["target"] as? [String: Any]),
-                resolvedSummary: summarizeResolvedPreview(entry["resolved"] as? [String: Any])
+            let pending = (control["pendingActions"] as? [[String: Any]] ?? []).compactMap { entry -> PendingControlAction? in
+                guard entry["status"] as? String == "pending", let actionId = entry["actionId"] as? String else {
+                    return nil
+                }
+                return PendingControlAction(
+                    actionId: actionId,
+                    appName: entry["appName"] as? String ?? "",
+                    kind: entry["kind"] as? String ?? "",
+                    targetSummary: self.summarizeControlTarget(entry["target"] as? [String: Any]),
+                    resolvedSummary: self.summarizeResolvedPreview(entry["resolved"] as? [String: Any])
+                )
+            }
+            let pendingArmRequests = (control["pendingArmRequests"] as? [[String: Any]] ?? []).compactMap { entry -> PendingArmRequest? in
+                guard entry["status"] as? String == "pending",
+                      let requestId = entry["requestId"] as? String
+                else { return nil }
+                return PendingArmRequest(
+                    requestId: requestId,
+                    projectName: entry["projectName"] as? String ?? entry["projectId"] as? String ?? "Project",
+                    clientLabel: entry["clientName"] as? String ?? entry["clientLabel"] as? String ?? "Remote client",
+                    reason: entry["reason"] as? String ?? "Remote desktop-control request",
+                    createdAt: TimeInterval(entry["createdAt"] as? Int ?? 0) / 1000.0,
+                    expiresAt: TimeInterval(entry["expiresAt"] as? Int ?? 0) / 1000.0
+                )
+            }
+            let operationApprovalsRoot = root["operationApprovals"] as? [String: Any] ?? [:]
+            let pendingOperationApprovals = (operationApprovalsRoot["pendingRequests"] as? [[String: Any]] ?? []).compactMap { entry -> PendingOperationApproval? in
+                guard entry["status"] as? String == "pending",
+                      let requestId = entry["requestId"] as? String
+                else { return nil }
+                return PendingOperationApproval(
+                    requestId: requestId,
+                    projectId: entry["projectId"] as? String ?? "Project",
+                    tool: entry["tool"] as? String ?? "operation",
+                    risk: entry["risk"] as? String ?? "destructive",
+                    preview: entry["preview"] as? String ?? "Protected operation",
+                    createdAt: TimeInterval(entry["createdAt"] as? Int ?? 0) / 1000.0,
+                    expiresAt: TimeInterval(entry["expiresAt"] as? Int ?? 0) / 1000.0
+                )
+            }
+            let sessions = (root["sessions"] as? [[String: Any]] ?? []).map { entry -> ActiveSessionSummary in
+                let operation = entry["operation"] as? [String: Any]
+                return ActiveSessionSummary(
+                    label: entry["sessionLabel"] as? String ?? "session",
+                    clientName: entry["clientName"] as? String,
+                    state: entry["state"] as? String ?? "idle",
+                    tool: operation?["tool"] as? String,
+                    elapsedMs: operation?["elapsedMs"] as? Int ?? 0
+                )
+            }
+            let externalSearch = root["externalSearch"] as? [String: Any]
+            let rgRoot = externalSearch?["rg"] as? [String: Any] ?? [:]
+            let rgBinary = rgRoot["binary"] as? [String: Any] ?? [:]
+            let pendingRgRequests = (rgRoot["pendingRequests"] as? [[String: Any]] ?? []).compactMap { entry -> PendingRgRequest? in
+                guard entry["status"] as? String == "pending",
+                      let requestId = entry["requestId"] as? String
+                else { return nil }
+                return PendingRgRequest(
+                    requestId: requestId,
+                    projectId: entry["projectId"] as? String ?? "Project",
+                    queryPreview: entry["queryPreview"] as? String ?? "",
+                    patternMode: entry["patternMode"] as? String ?? "literal",
+                    caseSensitive: entry["caseSensitive"] as? Bool ?? true,
+                    maxResults: entry["maxResults"] as? Int ?? 200,
+                    binaryPath: entry["binaryPath"] as? String ?? "",
+                    binaryVersion: entry["binaryVersion"] as? String ?? "ripgrep",
+                    binarySha256: entry["binarySha256"] as? String ?? "",
+                    createdAt: TimeInterval(entry["createdAt"] as? Int ?? 0) / 1000.0,
+                    expiresAt: TimeInterval(entry["expiresAt"] as? Int ?? 0) / 1000.0
+                )
+            }
+            let rgSnapshot = RgCapabilitySnapshot(
+                preference: rgRoot["preference"] as? String ?? "ask",
+                binaryAvailable: rgBinary["available"] as? Bool ?? false,
+                binaryPath: (rgBinary["realPath"] as? String) ?? (rgBinary["path"] as? String),
+                binaryVersion: rgBinary["version"] as? String,
+                binarySha256: rgBinary["sha256"] as? String,
+                unavailableReason: rgBinary["reason"] as? String,
+                pendingRequests: pendingRgRequests
             )
+            completion(LocalControlSnapshot(
+                armed: control["armed"] as? Bool ?? false,
+                killed: control["killed"] as? Bool ?? false,
+                pendingActions: pending,
+                pendingArmRequests: pendingArmRequests,
+                operationApprovals: pendingOperationApprovals,
+                autoEnabled: control["autoEnabled"] as? Bool ?? false,
+                autoRemainingMs: control["autoRemainingMs"] as? Int ?? 0,
+                allowlistedAppCount: control["allowlistedAppCount"] as? Int ?? 0,
+                sessions: sessions,
+                rg: rgSnapshot
+            ))
         }
     }
 
-    /// `chatgpt2codex control approve <actionId>`.
-    @discardableResult
-    func approveControlAction(_ actionId: String) -> Bool {
-        (try? runCli(["control", "approve", actionId]))?.status == 0
-    }
-
-    /// `chatgpt2codex control reject <actionId>`.
-    @discardableResult
-    func rejectControlAction(_ actionId: String) -> Bool {
-        (try? runCli(["control", "reject", actionId]))?.status == 0
-    }
-
-    /// `chatgpt2codex control kill`: rejects every pending action and blocks
-    /// new ones until a fresh control lease is granted.
-    @discardableResult
-    func killControl() -> Bool {
-        (try? runCli(["control", "kill"]))?.status == 0
-    }
-
-    /// `chatgpt2codex control approve-all`: local-human batch-approve of
-    /// every currently pending action. The CLI itself re-skips any
-    /// sensitive-app/non-allowlisted target and stops on a kill, so this is
-    /// never a way to approve something a single `control approve` couldn't.
-    @discardableResult
-    func approveAllControlActions() -> Bool {
-        (try? runCli(["control", "approve-all"]))?.status == 0
-    }
-
-    /// The same `CHATGPT2CODEX_CONTROL_ALLOWLIST` the managed subprocess
-    /// sees (src/control/policy.ts controlAllowlist), read here only to
-    /// supply `--apps` for the status-bar auto-approve toggle below — this
-    /// never widens the scope beyond what the operator already allowlisted.
-    var controlAllowlistApps: [String] {
-        (environment["CHATGPT2CODEX_CONTROL_ALLOWLIST"] ?? "")
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-    }
-
-    /// `chatgpt2codex control auto status`.
-    func autoApproveStatus() -> (enabled: Bool, remainingMs: Int) {
-        guard let result = try? runCli(["control", "auto", "status"]), result.status == 0,
-              let data = result.stdout.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else {
-            return (false, 0)
-        }
-        return (obj["autoEnabled"] as? Bool ?? false, obj["remainingMs"] as? Int ?? 0)
-    }
-
-    /// `chatgpt2codex control auto on --apps <allowlist>`. Local-human-only
-    /// entrypoint: this status-bar toggle never writes the AUTO scope file
-    /// itself, it only shells out to the same CLI a terminal user would run.
-    /// Scope is always the live control allowlist, so toggling this can
-    /// never reach an app the operator hasn't already explicitly allowed.
-    @discardableResult
-    func enableAutoApprove() -> Bool {
-        let apps = controlAllowlistApps
-        guard !apps.isEmpty else { return false }
-        return (try? runCli(["control", "auto", "on", "--apps", apps.joined(separator: ",")]))?.status == 0
-    }
-
-    /// `chatgpt2codex control auto off`.
-    @discardableResult
-    func disableAutoApprove() -> Bool {
-        (try? runCli(["control", "auto", "off"]))?.status == 0
+    func performLocalControl(_ path: String, completion: @escaping (Bool) -> Void = { _ in }) {
+        localControlRequest(path, method: "POST") { _, ok in completion(ok) }
     }
 
     private var cliScript: URL {
-        runtimeRoot.appendingPathComponent("dist").appendingPathComponent("cli.js")
+        effectiveRuntimeRoot.appendingPathComponent("dist").appendingPathComponent("cli.js")
     }
 
     private func runCli(_ arguments: [String], stdin: String? = nil) throws -> (status: Int32, stdout: String, stderr: String) {
-        let bundledNode = runtimeRoot.appendingPathComponent("bin").appendingPathComponent("node")
+        let activeRoot = effectiveRuntimeRoot
+        let bundledNode = activeRoot.appendingPathComponent("bin").appendingPathComponent("node")
         let useBundledNode = FileManager.default.fileExists(atPath: bundledNode.path)
         let process = Process()
         process.executableURL = useBundledNode ? bundledNode : URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = useBundledNode ? [cliScript.path] + arguments : ["node", cliScript.path] + arguments
 
         var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = "\(runtimeRoot.appendingPathComponent("bin").path):\(NSHomeDirectory())/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:\(environment["PATH"] ?? "")"
+        environment["PATH"] = "\(activeRoot.appendingPathComponent("bin").path):\(NSHomeDirectory())/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:\(environment["PATH"] ?? "")"
         process.environment = environment
 
         let stdoutPipe = Pipe()
@@ -745,11 +926,17 @@ private final class ServiceController {
         }
     }
 
-    func stop() {
-        if let process, process.isRunning {
-            process.terminate()
+    func stop(terminateExternalRuntime: Bool = true) {
+        let managedProcess = process
+        let ownsRuntime = managedProcess != nil
+        if let managedProcess, managedProcess.isRunning {
+            managedProcess.terminate()
         }
         process = nil
+
+        if !terminateExternalRuntime && !ownsRuntime {
+            return
+        }
 
         let startPattern = shellQuote("start-chatgpt.sh")
         let servePattern = shellQuote("dist/cli.js serve --http --port \(port)")
@@ -856,13 +1043,13 @@ private final class ServiceController {
         return URL(string: String(text[matchRange]))
     }
 
-    func checkForUpdates(completion: @escaping (String, URL?) -> Void) {
-        let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
+    func checkForUpdates(completion: @escaping (String, RuntimeUpdate?) -> Void) {
+        let currentVersion = defaults.string(forKey: appliedRuntimeVersionKey) ?? appVersion
         let apiPath = githubRepoURL.path
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             .replacingOccurrences(of: ".git", with: "")
         guard let apiURL = URL(string: "https://api.github.com/repos/\(apiPath)/releases/latest") else {
-            completion(localized("updatePageReady"), releasesURL)
+            completion(localized("updatePageReady"), nil)
             return
         }
         var request = URLRequest(url: apiURL)
@@ -870,28 +1057,84 @@ private final class ServiceController {
         request.setValue("chatgpt2codex", forHTTPHeaderField: "User-Agent")
         URLSession.shared.dataTask(with: request) { data, response, _ in
             let status = (response as? HTTPURLResponse)?.statusCode
-            let latest = data.flatMap {
+            let json = data.flatMap {
                 try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
-            }.flatMap { json in
+            }
+            let latest = json.flatMap { json in
                 (json["tag_name"] as? String) ?? (json["name"] as? String)
             }?.trimmingCharacters(in: CharacterSet(charactersIn: "vV "))
+            let dmgURL = (json?["assets"] as? [[String: Any]])?
+                .first(where: { asset in
+                    (asset["name"] as? String)?.lowercased().hasSuffix(".dmg") == true
+                })
+                .flatMap { asset in
+                    (asset["browser_download_url"] as? String).flatMap(URL.init(string:))
+                }
             DispatchQueue.main.async {
                 guard status == 200, let latest, !latest.isEmpty else {
-                    completion(self.localized("updateCheckFailed"), self.releasesURL)
+                    completion(self.localized("updateCheckFailed"), nil)
                     return
                 }
-                if latest == currentVersion {
+                if !versionIsNewer(latest, than: currentVersion) {
                     completion(String(format: self.localized("upToDate"), currentVersion), nil)
                 } else {
-                    completion(String(format: self.localized("updateAvailable"), latest, currentVersion), self.releasesURL)
+                    let update = dmgURL.map { RuntimeUpdate(version: latest, dmgURL: $0) }
+                    completion(String(format: self.localized("updateAvailable"), latest, currentVersion), update)
                 }
             }
         }.resume()
     }
 
+    func applyRuntimeUpdate(
+        _ update: RuntimeUpdate,
+        completion: @escaping (Bool, String) -> Void
+    ) {
+        guard let executableDirectory = Bundle.main.executableURL?.deletingLastPathComponent() else {
+            completion(false, "Could not locate the application executable directory.")
+            return
+        }
+        let updater = executableDirectory.appendingPathComponent("chatgpt2codex-runtime-updater")
+        guard FileManager.default.isExecutableFile(atPath: updater.path) else {
+            completion(false, "Runtime updater helper is missing. Install this release's DMG once, then retry.")
+            return
+        }
+
+        let process = Process()
+        process.executableURL = updater
+        process.arguments = [
+            "--dmg-url", update.dmgURL.absoluteString,
+            "--version", update.version,
+            "--port", "\(port)",
+            "--current-app", Bundle.main.bundleURL.path,
+        ]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        process.terminationHandler = { [weak self] process in
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            let text = String(data: data, encoding: .utf8) ?? ""
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            let message = json?["message"] as? String
+                ?? text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let ok = process.terminationStatus == 0
+            if ok, let self {
+                self.defaults.set(update.version, forKey: self.appliedRuntimeVersionKey)
+            }
+            DispatchQueue.main.async {
+                completion(ok, message.isEmpty ? "Runtime updater did not return a result." : message)
+            }
+        }
+        do {
+            try process.run()
+        } catch {
+            completion(false, error.localizedDescription)
+        }
+    }
+
     func runDoctor(repair: Bool = true) -> String {
-        let direct = runtimeRoot.appendingPathComponent("macos-dependency-doctor.sh")
-        let source = runtimeRoot.appendingPathComponent("scripts/macos-dependency-doctor.sh")
+        let activeRoot = effectiveRuntimeRoot
+        let direct = activeRoot.appendingPathComponent("macos-dependency-doctor.sh")
+        let source = activeRoot.appendingPathComponent("scripts/macos-dependency-doctor.sh")
         let script = FileManager.default.fileExists(atPath: direct.path) ? direct : source
         guard FileManager.default.fileExists(atPath: script.path) else {
             return "Doctor script not found.\nExpected: \(direct.path)"
@@ -901,7 +1144,7 @@ private final class ServiceController {
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = repair ? [script.path, "--repair"] : [script.path]
         var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = "\(runtimeRoot.appendingPathComponent("bin").path):\(runtimeRoot.appendingPathComponent("node/bin").path):\(NSHomeDirectory())/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:\(environment["PATH"] ?? "")"
+        environment["PATH"] = "\(activeRoot.appendingPathComponent("bin").path):\(activeRoot.appendingPathComponent("node/bin").path):\(NSHomeDirectory())/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:\(environment["PATH"] ?? "")"
         environment["WORKSPACE"] = workspace
         environment["PORT"] = "\(port)"
         environment["CHATGPT2CODEX_DOCTOR_REPAIR"] = repair ? "1" : "0"
@@ -957,9 +1200,25 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     private var openPublicHealthItem = NSMenuItem()
     private var copyConnectorItem = NSMenuItem()
     private var pendingControlSubmenu: NSMenu?
+    private var pendingArmRequestSubmenu: NSMenu?
+    private var pendingArmRequestMenuItem = NSMenuItem()
+    private var pendingOperationApprovalSubmenu: NSMenu?
+    private var pendingOperationApprovalMenuItem = NSMenuItem()
+    private var sessionStatusSubmenu: NSMenu?
+    private var rgPermissionSubmenu: NSMenu?
+    private var rgPermissionMenuItem = NSMenuItem()
+    private var armMenuItem = NSMenuItem()
+    private var screenPermissionItem = NSMenuItem()
+    private var accessibilityPermissionItem = NSMenuItem()
+    private var latestControlSnapshot: ServiceController.LocalControlSnapshot?
     private var timer: Timer?
     private var killHotkeyGlobalMonitor: Any?
     private var killHotkeyLocalMonitor: Any?
+    private var settingsHotKeyRef: EventHotKeyRef?
+    private var settingsHotKeyEventHandler: EventHandlerRef?
+    private var presentedArmRequestIDs = Set<String>()
+    private var presentedOperationApprovalIDs = Set<String>()
+    private var presentedRgRequestIDs = Set<String>()
     private var latestHealth = false
     private var settingsWindow: NSWindow?
     private var logWindow: NSWindow?
@@ -983,19 +1242,25 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        let isDevelopmentBuild = (Bundle.main.object(forInfoDictionaryKey: "ChatGPT2CodexDevelopmentBuild") as? Bool) == true
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
             if let image = NSImage(named: "AppIcon") ?? NSImage(named: "StatusIconTemplate") {
                 image.isTemplate = false
                 image.size = NSSize(width: 22, height: 22)
                 button.image = image
-                button.imagePosition = .imageOnly
+                button.imagePosition = isDevelopmentBuild ? .imageLeading : .imageOnly
             }
-            button.toolTip = "ChatGPT To Codex"
+            if isDevelopmentBuild {
+                button.title = "DEV"
+                button.font = NSFont.systemFont(ofSize: 10, weight: .bold)
+            }
+            button.toolTip = isDevelopmentBuild ? "ChatGPT To Codex Dev" : "ChatGPT To Codex"
         }
         rebuildMenu()
         refreshStatus()
         registerGlobalKillHotkeyIfNeeded()
+        registerSettingsHotKey()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
             self?.promptScreenRecordingPermissionIfNeeded(force: false)
         }
@@ -1026,7 +1291,8 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         timer?.invalidate()
         if let monitor = killHotkeyGlobalMonitor { NSEvent.removeMonitor(monitor) }
         if let monitor = killHotkeyLocalMonitor { NSEvent.removeMonitor(monitor) }
-        controller.stop()
+        unregisterSettingsHotKey()
+        controller.stop(terminateExternalRuntime: false)
     }
 
     private func rebuildMenu() {
@@ -1035,6 +1301,31 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         statusMenuItem.isEnabled = false
         statusMenuItem.image = symbol("circle.dashed")
         menu.addItem(statusMenuItem)
+
+        let sessionsSubmenu = NSMenu()
+        sessionsSubmenu.delegate = self
+        sessionStatusSubmenu = sessionsSubmenu
+        let sessionsItem = NSMenuItem(title: t("activeSessionsMenu"), action: nil, keyEquivalent: "")
+        sessionsItem.image = symbol("person.2.wave.2")
+        sessionsItem.submenu = sessionsSubmenu
+        menu.addItem(sessionsItem)
+
+        let rgSubmenu = NSMenu()
+        rgSubmenu.delegate = self
+        rgPermissionSubmenu = rgSubmenu
+        rgPermissionMenuItem = NSMenuItem(title: t("rgPermissionMenu"), action: nil, keyEquivalent: "")
+        rgPermissionMenuItem.image = symbol("text.magnifyingglass")
+        rgPermissionMenuItem.submenu = rgSubmenu
+        menu.addItem(rgPermissionMenuItem)
+
+        let operationApprovalSubmenu = NSMenu()
+        operationApprovalSubmenu.delegate = self
+        pendingOperationApprovalSubmenu = operationApprovalSubmenu
+        pendingOperationApprovalMenuItem = NSMenuItem(title: "작업 승인 요청 대기 (0)", action: nil, keyEquivalent: "")
+        pendingOperationApprovalMenuItem.image = symbol("exclamationmark.shield")
+        pendingOperationApprovalMenuItem.submenu = operationApprovalSubmenu
+        pendingOperationApprovalMenuItem.isEnabled = false
+        menu.addItem(pendingOperationApprovalMenuItem)
         menu.addItem(.separator())
 
         // Desktop-control (Option B) human-approval surface. Hidden entirely
@@ -1044,11 +1335,18 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         // placed at the very top of the control section so it is reachable
         // in one click without hunting through a submenu.
         if controller.controlEnabled {
-            let armItem = NSMenuItem(title: t("agentArmStatusMenu"), action: nil, keyEquivalent: "")
-            armItem.isEnabled = false
-            armItem.image = symbol("shield.lefthalf.filled")
-            armItem.toolTip = t("agentArmStatusDetail")
-            menu.addItem(armItem)
+            let armRequestsSubmenu = NSMenu()
+            armRequestsSubmenu.delegate = self
+            pendingArmRequestSubmenu = armRequestsSubmenu
+            pendingArmRequestMenuItem = NSMenuItem(title: "제어 승인 요청 대기 (0)", action: nil, keyEquivalent: "")
+            pendingArmRequestMenuItem.image = symbol("person.crop.circle.badge.questionmark")
+            pendingArmRequestMenuItem.submenu = armRequestsSubmenu
+            pendingArmRequestMenuItem.isEnabled = false
+            menu.addItem(pendingArmRequestMenuItem)
+
+            armMenuItem = menuItem("\(t("agentArmOffMenu")) · 로컬 직접 제어", #selector(toggleAgentArm), "shield.lefthalf.filled")
+            armMenuItem.toolTip = "\(t("agentArmStatusDetail")) · 원격 승인 요청과 별도"
+            menu.addItem(armMenuItem)
 
             let killItem = menuItem(t("killControlMenu"), #selector(killControlAction), "hand.raised.fill")
             menu.addItem(killItem)
@@ -1072,14 +1370,21 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         restartItem.target = self
         restartItem.image = symbol("arrow.clockwise.circle")
         menu.addItem(restartItem)
-        menu.addItem(menuItem(t("screenshotPermissionMenu"), #selector(showScreenRecordingPermission), "camera.viewfinder"))
+        screenPermissionItem = menuItem(t("screenshotPermissionMenu"), #selector(showScreenRecordingPermission), "camera.viewfinder")
+        menu.addItem(screenPermissionItem)
         if controller.controlEnabled {
-            menu.addItem(menuItem(t("accessibilityPermissionMenu"), #selector(showAccessibilityPermission), "figure.roll"))
+            accessibilityPermissionItem = menuItem(t("accessibilityPermissionMenu"), #selector(showAccessibilityPermission), "figure.roll")
+            menu.addItem(accessibilityPermissionItem)
         }
-        menu.addItem(menuItem(t("settingsMenu"), #selector(showSettings), "gearshape"))
+        menu.addItem(menuItem(t("connectionDiagnosticsMenu"), #selector(showConnectionDiagnostics), "stethoscope"))
+        let settingsItem = menuItem(t("settingsMenu"), #selector(showSettings), "gearshape")
+        settingsItem.keyEquivalent = ","
+        settingsItem.keyEquivalentModifierMask = [.control, .option, .command]
+        menu.addItem(settingsItem)
         menu.addItem(.separator())
         menu.addItem(menuItem(t("quit"), #selector(quit), "power"))
         statusItem.menu = menu
+        updatePermissionMenuItems()
     }
 
     private func menuItem(_ title: String, _ action: Selector, _ symbolName: String) -> NSMenuItem {
@@ -1120,6 +1425,68 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             self.openPublicHealthItem.isEnabled = hasPublicURL
             self.copyConnectorItem.isEnabled = hasPublicURL
             self.statusItem.button?.toolTip = String(format: self.t("tooltipState"), state)
+            self.updatePermissionMenuItems()
+            if ok {
+                self.controller.fetchLocalControlStatus { [weak self] snapshot in
+                    guard let self else { return }
+                    self.latestControlSnapshot = snapshot
+                    self.applyControlSnapshot()
+                    self.applyRgSnapshot()
+                    self.applyOperationApprovalSnapshot()
+                }
+            } else {
+                self.latestControlSnapshot = nil
+                self.applyControlSnapshot()
+                self.applyRgSnapshot()
+                self.applyOperationApprovalSnapshot()
+            }
+        }
+    }
+
+    private func updatePermissionMenuItems() {
+        let screenAllowed = controller.screenRecordingAllowed
+        screenPermissionItem.title = "\(t("screenshotPermissionTitle")): \(t(screenAllowed ? "permissionAllowed" : "permissionRequired"))"
+        screenPermissionItem.state = screenAllowed ? .on : .off
+        if controller.controlEnabled {
+            let accessibilityAllowed = controller.accessibilityTrusted
+            accessibilityPermissionItem.title = "\(t("accessibilityPermissionTitle")): \(t(accessibilityAllowed ? "permissionAllowed" : "permissionRequired"))"
+            accessibilityPermissionItem.state = accessibilityAllowed ? .on : .off
+        }
+    }
+
+    private func applyControlSnapshot() {
+        guard controller.controlEnabled else { return }
+        let armed = latestControlSnapshot?.armed == true
+        armMenuItem.title = "\(t(armed ? "agentArmOnMenu" : "agentArmOffMenu")) · 로컬 직접 제어"
+        armMenuItem.image = symbol(armed ? "shield.fill" : "shield.lefthalf.filled")
+        armMenuItem.state = armed ? .on : .off
+        armMenuItem.isEnabled = latestHealth
+        let pendingArmRequests = latestControlSnapshot?.pendingArmRequests ?? []
+        pendingArmRequestMenuItem.title = "제어 승인 요청 대기 (\(pendingArmRequests.count))"
+        pendingArmRequestMenuItem.isEnabled = latestHealth && !pendingArmRequests.isEmpty
+        presentFirstSeenArmRequest(from: pendingArmRequests)
+    }
+
+    private func applyOperationApprovalSnapshot() {
+        let requests = latestControlSnapshot?.operationApprovals ?? []
+        pendingOperationApprovalMenuItem.title = "작업 승인 요청 대기 (\(requests.count))"
+        pendingOperationApprovalMenuItem.isEnabled = latestHealth && !requests.isEmpty
+        presentFirstSeenOperationApproval(from: requests)
+    }
+
+    private func applyRgSnapshot() {
+        let rg = latestControlSnapshot?.rg
+        let pendingCount = rg?.pendingRequests.count ?? 0
+        let availability: String
+        if rg?.binaryAvailable == true {
+            availability = rg?.binaryVersion ?? "ripgrep"
+        } else {
+            availability = t("rgUnavailable")
+        }
+        rgPermissionMenuItem.title = "\(t("rgPermissionMenu")) · \(availability) · \(pendingCount)"
+        rgPermissionMenuItem.isEnabled = latestHealth
+        if let requests = rg?.pendingRequests {
+            presentFirstSeenRgRequest(from: requests)
         }
     }
 
@@ -1245,34 +1612,366 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         }
     }
 
+    private func armRequestExpiryText(_ request: ServiceController.PendingArmRequest) -> String {
+        guard request.expiresAt > 0 else { return "알 수 없음" }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .none
+        formatter.timeStyle = .medium
+        return formatter.string(from: Date(timeIntervalSince1970: request.expiresAt))
+    }
+
+    private func rgRequestExpiryText(_ request: ServiceController.PendingRgRequest) -> String {
+        guard request.expiresAt > 0 else { return "알 수 없음" }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .none
+        formatter.timeStyle = .medium
+        return formatter.string(from: Date(timeIntervalSince1970: request.expiresAt))
+    }
+
+    private func operationApprovalExpiryText(_ request: ServiceController.PendingOperationApproval) -> String {
+        guard request.expiresAt > 0 else { return "알 수 없음" }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .none
+        formatter.timeStyle = .medium
+        return formatter.string(from: Date(timeIntervalSince1970: request.expiresAt))
+    }
+
+    private func operationApprovalRiskText(_ risk: String) -> String {
+        risk == "network" ? "네트워크 접근" : "파괴적 변경 가능"
+    }
+
+    private func presentFirstSeenOperationApproval(from requests: [ServiceController.PendingOperationApproval]) {
+        guard let request = requests.first(where: { !presentedOperationApprovalIDs.contains($0.requestId) }) else { return }
+        presentedOperationApprovalIDs.insert(request.requestId)
+        presentOperationApproval(request)
+    }
+
+    private func presentOperationApproval(_ request: ServiceController.PendingOperationApproval) {
+        let alert = NSAlert()
+        alert.messageText = "작업 승인 요청"
+        alert.informativeText = [
+            "프로젝트: \(request.projectId)",
+            "도구: \(request.tool)",
+            "위험 유형: \(operationApprovalRiskText(request.risk))",
+            "작업: \(request.preview)",
+            "만료: \(operationApprovalExpiryText(request))",
+            "",
+            "승인은 현재 프로젝트·현재 lease·이 정확한 작업에만 묶이며 한 번 실행하면 즉시 소모됩니다."
+        ].joined(separator: "\n")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "한 번 허용")
+        alert.addButton(withTitle: "거부")
+        alert.addButton(withTitle: "나중에")
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            resolveOperationApproval(request.requestId, decision: "approve")
+        } else if response == .alertSecondButtonReturn {
+            resolveOperationApproval(request.requestId, decision: "reject")
+        }
+    }
+
+    private func resolveOperationApproval(_ requestId: String, decision: String) {
+        controller.performLocalControl("/operation-approvals/\(requestId)/\(decision)") { [weak self] _ in
+            self?.refreshStatus()
+        }
+    }
+
+    @objc private func reviewPendingOperationApproval(_ sender: NSMenuItem) {
+        guard let requestId = sender.representedObject as? String,
+              let request = latestControlSnapshot?.operationApprovals.first(where: { $0.requestId == requestId })
+        else { return }
+        presentOperationApproval(request)
+    }
+
+    private func presentFirstSeenRgRequest(from requests: [ServiceController.PendingRgRequest]) {
+        guard let request = requests.first(where: { !presentedRgRequestIDs.contains($0.requestId) }) else { return }
+        presentedRgRequestIDs.insert(request.requestId)
+        presentRgRequest(request)
+    }
+
+    private func presentRgRequest(_ request: ServiceController.PendingRgRequest) {
+        let shortHash = String(request.binarySha256.prefix(16))
+        let alert = NSAlert()
+        alert.messageText = t("rgApprovalTitle")
+        alert.informativeText = [
+            "프로젝트: \(request.projectId)",
+            "검색: \(request.queryPreview)",
+            "방식: \(request.patternMode) · 대소문자 \(request.caseSensitive ? "구분" : "무시") · 최대 \(request.maxResults)개",
+            "도구: \(request.binaryVersion)",
+            "경로: \(request.binaryPath)",
+            "SHA-256: \(shortHash)…",
+            "만료: \(rgRequestExpiryText(request))",
+            "",
+            "승인은 이 프로젝트와 현재 lease, 검증된 rg 실행 파일에만 적용됩니다."
+        ].joined(separator: "\n")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: t("rgApproveOnce"))
+        alert.addButton(withTitle: t("rgApproveSession"))
+        alert.addButton(withTitle: t("rgApproveAlways"))
+        alert.addButton(withTitle: t("rgReject"))
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        let index = response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+        switch index {
+        case 0: resolveRgRequest(request.requestId, decision: "once")
+        case 1: resolveRgRequest(request.requestId, decision: "session")
+        case 2: resolveRgRequest(request.requestId, decision: "always")
+        default: resolveRgRequest(request.requestId, decision: "reject")
+        }
+    }
+
+    private func resolveRgRequest(_ requestId: String, decision: String) {
+        controller.performLocalControl("/external-search/rg/requests/\(requestId)/\(decision)") { [weak self] _ in
+            self?.refreshStatus()
+        }
+    }
+
+    @objc private func reviewPendingRgRequest(_ sender: NSMenuItem) {
+        guard let requestId = sender.representedObject as? String,
+              let request = latestControlSnapshot?.rg.pendingRequests.first(where: { $0.requestId == requestId })
+        else { return }
+        presentRgRequest(request)
+    }
+
+    @objc private func approveRgOnce(_ sender: NSMenuItem) {
+        guard let requestId = sender.representedObject as? String else { return }
+        resolveRgRequest(requestId, decision: "once")
+    }
+
+    @objc private func approveRgSession(_ sender: NSMenuItem) {
+        guard let requestId = sender.representedObject as? String else { return }
+        resolveRgRequest(requestId, decision: "session")
+    }
+
+    @objc private func approveRgAlways(_ sender: NSMenuItem) {
+        guard let requestId = sender.representedObject as? String else { return }
+        resolveRgRequest(requestId, decision: "always")
+    }
+
+    @objc private func rejectRgRequest(_ sender: NSMenuItem) {
+        guard let requestId = sender.representedObject as? String else { return }
+        resolveRgRequest(requestId, decision: "reject")
+    }
+
+    @objc private func setRgAskPreference() {
+        controller.performLocalControl("/external-search/rg/preference/ask") { [weak self] _ in
+            self?.refreshStatus()
+        }
+    }
+
+    @objc private func setRgCodeSearchOnlyPreference() {
+        controller.performLocalControl("/external-search/rg/preference/code-search-only") { [weak self] _ in
+            self?.refreshStatus()
+        }
+    }
+
+    private func presentFirstSeenArmRequest(from requests: [ServiceController.PendingArmRequest]) {
+        guard let request = requests.first(where: { !presentedArmRequestIDs.contains($0.requestId) }) else { return }
+        presentedArmRequestIDs.insert(request.requestId)
+        presentArmRequest(request)
+    }
+
+    private func presentArmRequest(_ request: ServiceController.PendingArmRequest) {
+        let alert = NSAlert()
+        alert.messageText = "원격 제어 승인 요청"
+        alert.informativeText = [
+            "프로젝트: \(request.projectName)",
+            "클라이언트: \(request.clientLabel)",
+            "사유: \(request.reason)",
+            "만료: \(armRequestExpiryText(request))",
+            "",
+            "허용할 때만 로컬 control lease가 발급되고 KILL 상태가 해제됩니다."
+        ].joined(separator: "\n")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "제어 허용")
+        alert.addButton(withTitle: "거부")
+        alert.addButton(withTitle: "나중에")
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            controller.performLocalControl("/control/arm-requests/\(request.requestId)/approve") { [weak self] _ in
+                self?.refreshStatus()
+            }
+        } else if response == .alertSecondButtonReturn {
+            controller.performLocalControl("/control/arm-requests/\(request.requestId)/reject") { [weak self] _ in
+                self?.refreshStatus()
+            }
+        } else if response == .alertThirdButtonReturn {
+            // Keep the request pending. The user can reopen it from the status menu.
+        }
+    }
+
+    @objc private func reviewPendingArmRequest(_ sender: NSMenuItem) {
+        guard let requestId = sender.representedObject as? String,
+              let request = latestControlSnapshot?.pendingArmRequests.first(where: { $0.requestId == requestId })
+        else { return }
+        presentArmRequest(request)
+    }
+
     /// NSMenuDelegate: rebuild the pending-control-actions submenu with the
     /// live queue state each time the user opens it, rather than on a timer,
     /// so approve/reject always act on current data.
     func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === pendingOperationApprovalSubmenu {
+            menu.removeAllItems()
+            let requests = latestControlSnapshot?.operationApprovals ?? []
+            if requests.isEmpty {
+                let empty = NSMenuItem(title: "대기 중인 작업 승인 요청 없음", action: nil, keyEquivalent: "")
+                empty.isEnabled = false
+                menu.addItem(empty)
+                return
+            }
+            for request in requests {
+                let item = NSMenuItem(
+                    title: "\(request.tool) · \(operationApprovalRiskText(request.risk)) · \(operationApprovalExpiryText(request))",
+                    action: #selector(reviewPendingOperationApproval(_:)),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                item.representedObject = request.requestId
+                item.toolTip = request.preview
+                menu.addItem(item)
+            }
+            return
+        }
+        if menu === rgPermissionSubmenu {
+            menu.removeAllItems()
+            let rg = latestControlSnapshot?.rg
+            let binaryTitle: String
+            if rg?.binaryAvailable == true {
+                binaryTitle = "✓ \(rg?.binaryVersion ?? "ripgrep") · \(rg?.binaryPath ?? "")"
+            } else {
+                binaryTitle = "⚠︎ \(t("rgUnavailable")) · \(rg?.unavailableReason ?? "")"
+            }
+            let binaryItem = NSMenuItem(title: binaryTitle, action: nil, keyEquivalent: "")
+            binaryItem.isEnabled = false
+            binaryItem.toolTip = rg?.binarySha256
+            menu.addItem(binaryItem)
+            menu.addItem(.separator())
+
+            let askItem = NSMenuItem(title: t("rgAskEveryTime"), action: #selector(setRgAskPreference), keyEquivalent: "")
+            askItem.target = self
+            askItem.state = rg?.preference == "ask" ? .on : .off
+            menu.addItem(askItem)
+            let codeSearchOnlyItem = NSMenuItem(title: t("rgCodeSearchOnly"), action: #selector(setRgCodeSearchOnlyPreference), keyEquivalent: "")
+            codeSearchOnlyItem.target = self
+            codeSearchOnlyItem.state = rg?.preference == "code-search-only" ? .on : .off
+            menu.addItem(codeSearchOnlyItem)
+            menu.addItem(.separator())
+
+            let requests = rg?.pendingRequests ?? []
+            if requests.isEmpty {
+                let empty = NSMenuItem(title: t("rgPendingNone"), action: nil, keyEquivalent: "")
+                empty.isEnabled = false
+                menu.addItem(empty)
+                return
+            }
+            for request in requests {
+                let requestMenu = NSMenu()
+                let detail = NSMenuItem(
+                    title: "\(request.queryPreview) · \(rgRequestExpiryText(request))",
+                    action: #selector(reviewPendingRgRequest(_:)),
+                    keyEquivalent: ""
+                )
+                detail.target = self
+                detail.representedObject = request.requestId
+                detail.submenu = requestMenu
+
+                let metadata = NSMenuItem(
+                    title: "\(request.binaryVersion) · \(request.patternMode) · max \(request.maxResults)",
+                    action: nil,
+                    keyEquivalent: ""
+                )
+                metadata.isEnabled = false
+                requestMenu.addItem(metadata)
+                requestMenu.addItem(.separator())
+
+                let actions: [(String, Selector)] = [
+                    (t("rgApproveOnce"), #selector(approveRgOnce(_:))),
+                    (t("rgApproveSession"), #selector(approveRgSession(_:))),
+                    (t("rgApproveAlways"), #selector(approveRgAlways(_:))),
+                    (t("rgReject"), #selector(rejectRgRequest(_:)))
+                ]
+                for (title, selector) in actions {
+                    let action = NSMenuItem(title: title, action: selector, keyEquivalent: "")
+                    action.target = self
+                    action.representedObject = request.requestId
+                    requestMenu.addItem(action)
+                }
+                menu.addItem(detail)
+            }
+            return
+        }
+        if menu === pendingArmRequestSubmenu {
+            menu.removeAllItems()
+            let requests = latestControlSnapshot?.pendingArmRequests ?? []
+            if requests.isEmpty {
+                let empty = NSMenuItem(title: "대기 중인 원격 제어 승인 요청 없음", action: nil, keyEquivalent: "")
+                empty.isEnabled = false
+                menu.addItem(empty)
+                return
+            }
+            for request in requests {
+                let item = NSMenuItem(
+                    title: "\(request.projectName) · \(request.clientLabel) · \(armRequestExpiryText(request))",
+                    action: #selector(reviewPendingArmRequest(_:)),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                item.representedObject = request.requestId
+                item.toolTip = request.reason
+                menu.addItem(item)
+            }
+            return
+        }
+        if menu === sessionStatusSubmenu {
+            menu.removeAllItems()
+            let sessions = latestControlSnapshot?.sessions ?? []
+            if sessions.isEmpty {
+                let empty = NSMenuItem(title: t("sessionNoActive"), action: nil, keyEquivalent: "")
+                empty.isEnabled = false
+                menu.addItem(empty)
+                return
+            }
+            for session in sessions {
+                let identity = [session.clientName, session.label].compactMap { $0 }.joined(separator: " · ")
+                let header = NSMenuItem(title: identity, action: nil, keyEquivalent: "")
+                header.isEnabled = false
+                menu.addItem(header)
+                let elapsed = session.elapsedMs > 0 ? " · \(max(1, session.elapsedMs / 1000))s" : ""
+                let operation = session.tool.map { "\($0) · \(session.state)\(elapsed)" } ?? session.state
+                let detail = NSMenuItem(title: "  \(operation)", action: nil, keyEquivalent: "")
+                detail.isEnabled = false
+                menu.addItem(detail)
+                menu.addItem(.separator())
+            }
+            return
+        }
         guard menu === pendingControlSubmenu else { return }
         menu.removeAllItems()
 
-        // Auto-approve toggle: local-human-only (runCli(["control", "auto",
-        // ...]) — see ServiceController.enableAutoApprove/disableAutoApprove
-        // above). Shown disabled when the current control allowlist is empty
-        // since there is nothing it could ever scope to.
-        let autoStatus = controller.autoApproveStatus()
+        // Auto-approve toggle: local-human-only through the authenticated
+        // loopback control API. Shown disabled when the current control
+        // allowlist is empty since there is nothing it could ever scope to.
+        let autoEnabled = latestControlSnapshot?.autoEnabled == true
+        let autoRemainingMs = latestControlSnapshot?.autoRemainingMs ?? 0
         let autoItem: NSMenuItem
-        if autoStatus.enabled {
-            let minutesLeft = max(1, autoStatus.remainingMs / 60000)
+        if autoEnabled {
+            let minutesLeft = max(1, autoRemainingMs / 60000)
             autoItem = NSMenuItem(title: "\(t("autoApproveStatusMenu")) (\(minutesLeft)m) — \(t("autoApproveOffMenu"))", action: #selector(toggleAutoApprove), keyEquivalent: "")
         } else {
             autoItem = NSMenuItem(title: t("autoApproveOnMenu"), action: #selector(toggleAutoApprove), keyEquivalent: "")
         }
         autoItem.target = self
-        autoItem.isEnabled = autoStatus.enabled || !controller.controlAllowlistApps.isEmpty
-        if !autoStatus.enabled && controller.controlAllowlistApps.isEmpty {
+        autoItem.isEnabled = autoEnabled || (latestControlSnapshot?.allowlistedAppCount ?? 0) > 0
+        if !autoEnabled && (latestControlSnapshot?.allowlistedAppCount ?? 0) == 0 {
             autoItem.toolTip = t("autoApproveUnavailableMenu")
         }
         menu.addItem(autoItem)
         menu.addItem(.separator())
 
-        let pending = controller.listPendingControlActions()
+        let pending = latestControlSnapshot?.pendingActions ?? []
         if pending.isEmpty {
             let empty = NSMenuItem(title: t("controlNoPendingActions"), action: nil, keyEquivalent: "")
             empty.isEnabled = false
@@ -1316,27 +2015,102 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
 
     @objc private func approvePendingControlAction(_ sender: NSMenuItem) {
         guard let actionId = sender.representedObject as? String else { return }
-        controller.approveControlAction(actionId)
+        controller.performLocalControl("/control/actions/\(actionId)/approve") { [weak self] _ in self?.refreshStatus() }
     }
 
     @objc private func rejectPendingControlAction(_ sender: NSMenuItem) {
         guard let actionId = sender.representedObject as? String else { return }
-        controller.rejectControlAction(actionId)
+        controller.performLocalControl("/control/actions/\(actionId)/reject") { [weak self] _ in self?.refreshStatus() }
     }
 
     @objc private func approveAllPendingControlActions() {
-        controller.approveAllControlActions()
+        controller.performLocalControl("/control/actions/approve-all") { [weak self] _ in self?.refreshStatus() }
     }
 
     /// Local-human-only auto-approve toggle: always shells out to
     /// `chatgpt2codex control auto on|off` (ServiceController above), never
     /// writes the AUTO scope file directly.
     @objc private func toggleAutoApprove() {
-        if controller.autoApproveStatus().enabled {
-            controller.disableAutoApprove()
-        } else {
-            controller.enableAutoApprove()
+        let path = latestControlSnapshot?.autoEnabled == true ? "/control/auto/off" : "/control/auto/on"
+        controller.performLocalControl(path) { [weak self] _ in self?.refreshStatus() }
+    }
+
+    @objc private func toggleAgentArm() {
+        let path = latestControlSnapshot?.armed == true ? "/control/disarm" : "/control/arm"
+        controller.performLocalControl(path) { [weak self] _ in self?.refreshStatus() }
+    }
+
+    private static let settingsHotKeySignature: OSType = 0x43324353 // C2CS
+    private static let settingsHotKeyIdentifier: UInt32 = 1
+    private static let settingsHotKeyHandler: EventHandlerUPP = { _, event, userData in
+        guard let event, let userData else { return OSStatus(eventNotHandledErr) }
+        var hotKeyID = EventHotKeyID()
+        let readStatus = GetEventParameter(
+            event,
+            EventParamName(kEventParamDirectObject),
+            EventParamType(typeEventHotKeyID),
+            nil,
+            MemoryLayout<EventHotKeyID>.size,
+            nil,
+            &hotKeyID
+        )
+        guard readStatus == noErr,
+              hotKeyID.signature == settingsHotKeySignature,
+              hotKeyID.id == settingsHotKeyIdentifier
+        else { return OSStatus(eventNotHandledErr) }
+        let delegate = Unmanaged<StatusBarAppDelegate>.fromOpaque(userData).takeUnretainedValue()
+        DispatchQueue.main.async { delegate.showSettingsFromGlobalHotKey() }
+        return noErr
+    }
+
+    private func registerSettingsHotKey() {
+        guard settingsHotKeyRef == nil, settingsHotKeyEventHandler == nil else { return }
+        var eventType = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
+        )
+        var handler: EventHandlerRef?
+        let installStatus = InstallEventHandler(
+            GetApplicationEventTarget(),
+            Self.settingsHotKeyHandler,
+            1,
+            &eventType,
+            Unmanaged.passUnretained(self).toOpaque(),
+            &handler
+        )
+        guard installStatus == noErr, let handler else {
+            NSLog("ChatGPT To Codex: settings hotkey event handler registration failed: %d", installStatus)
+            return
         }
+        var hotKey: EventHotKeyRef?
+        let hotKeyID = EventHotKeyID(signature: Self.settingsHotKeySignature, id: Self.settingsHotKeyIdentifier)
+        let modifiers = UInt32(controlKey) | UInt32(optionKey) | UInt32(cmdKey)
+        let registrationStatus = RegisterEventHotKey(
+            UInt32(kVK_ANSI_Comma),
+            modifiers,
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &hotKey
+        )
+        guard registrationStatus == noErr, let hotKey else {
+            RemoveEventHandler(handler)
+            NSLog("ChatGPT To Codex: settings hotkey registration failed: %d", registrationStatus)
+            return
+        }
+        settingsHotKeyEventHandler = handler
+        settingsHotKeyRef = hotKey
+    }
+
+    private func unregisterSettingsHotKey() {
+        if let hotKey = settingsHotKeyRef { UnregisterEventHotKey(hotKey) }
+        if let handler = settingsHotKeyEventHandler { RemoveEventHandler(handler) }
+        settingsHotKeyRef = nil
+        settingsHotKeyEventHandler = nil
+    }
+
+    private func showSettingsFromGlobalHotKey() {
+        showSettings()
     }
 
     /// Global emergency-stop hotkey (⌃⌥⌘.) for Option B desktop control:
@@ -1358,12 +2132,12 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         guard controller.controlEnabled else { return }
         killHotkeyGlobalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, self.isKillHotkeyEvent(event) else { return }
-            self.controller.killControl()
+            self.controller.performLocalControl("/control/kill")
         }
         killHotkeyLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
             if self.isKillHotkeyEvent(event) {
-                self.controller.killControl()
+                self.controller.performLocalControl("/control/kill")
                 return nil
             }
             return event
@@ -1379,7 +2153,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         alert.addButton(withTitle: t("cancel"))
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        controller.killControl()
+        controller.performLocalControl("/control/kill") { [weak self] _ in self?.refreshStatus() }
     }
 
     @objc private func selectProjectFolder() {
@@ -1402,7 +2176,11 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     @objc private func showSettings() {
-        settingsWindow?.close()
+        if let existingWindow = settingsWindow {
+            NSApp.activate(ignoringOtherApps: true)
+            existingWindow.makeKeyAndOrderFront(nil)
+            return
+        }
         let width: CGFloat = 540
         let hintWidth: CGFloat = 322
         let publicHintY: CGFloat = 398
@@ -1567,12 +2345,14 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             rebuildMenu()
             refreshStatus()
             settingsWindow?.close()
+            settingsWindow = nil
             showSettings()
         }
     }
 
     @objc private func cancelSettings() {
         settingsWindow?.close()
+        settingsWindow = nil
     }
 
     @objc private func showFixedDomainSetup() {
@@ -1636,6 +2416,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         }
         let shouldRestart = latestHealth || controller.isManagedProcessRunning
         settingsWindow?.close()
+        settingsWindow = nil
         rebuildMenu()
         restartAfterSavedSettingsIfConfirmed(shouldRestart)
     }
@@ -1808,16 +2589,36 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     @objc private func checkForUpdates() {
-        controller.checkForUpdates { [weak self] message, url in
+        controller.checkForUpdates { [weak self] message, update in
             guard let self else { return }
             let alert = NSAlert()
             alert.messageText = self.t("updatesTitle")
-            alert.informativeText = message
-            alert.addButton(withTitle: url == nil ? self.t("ok") : self.t("openReleases"))
-            alert.addButton(withTitle: self.t("close"))
+            alert.informativeText = update == nil
+                ? message
+                : "\(message)\n\n\(self.t("updateRuntimeExplanation"))"
+            if update != nil {
+                alert.addButton(withTitle: self.t("installRuntimeUpdate"))
+                alert.addButton(withTitle: self.t("openReleases"))
+                alert.addButton(withTitle: self.t("close"))
+            } else {
+                alert.addButton(withTitle: self.t("ok"))
+                alert.addButton(withTitle: self.t("openReleases"))
+            }
             NSApp.activate(ignoringOtherApps: true)
-            if alert.runModal() == .alertFirstButtonReturn, let url {
-                NSWorkspace.shared.open(url)
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn, let update {
+                self.statusMenuItem.title = self.t("updateDownloading")
+                self.controller.applyRuntimeUpdate(update) { [weak self] ok, result in
+                    guard let self else { return }
+                    self.showInfo(
+                        ok ? self.t("updateApplyComplete") : self.t("updateApplyFailed"),
+                        result
+                    )
+                    self.refreshStatus()
+                }
+            } else if (update != nil && response == .alertSecondButtonReturn)
+                        || (update == nil && response == .alertSecondButtonReturn) {
+                NSWorkspace.shared.open(self.controller.releasesURL)
             }
             self.refreshStatus()
         }
@@ -1841,6 +2642,17 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         }
         let text = (try? String(contentsOf: controller.logFile, encoding: .utf8)) ?? ""
         showTextWindow(title: t("showLogs"), text: text.isEmpty ? controller.logFile.path : text, doctor: false)
+    }
+
+    @objc private func showConnectionDiagnostics() {
+        let file = controller.connectionDiagnosticsFile
+        let text = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
+        let emptyMessage = "No connection events recorded yet.\n\(file.path)"
+        showTextWindow(
+            title: t("connectionDiagnosticsMenu").replacingOccurrences(of: "...", with: ""),
+            text: text.isEmpty ? emptyMessage : text,
+            doctor: false
+        )
     }
 
     @objc private func runDoctor() {

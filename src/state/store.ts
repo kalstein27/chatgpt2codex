@@ -1,5 +1,5 @@
-import { randomBytes } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
 import { DomainError, ErrorCode, type ProjectRegistryEntry } from "../types.js";
@@ -49,7 +49,7 @@ const SessionSchema = z.object({
       projectId: z.string(),
       leaseId: z.string(),
       projectRoot: z.string(),
-      preset: z.enum(["read-only", "tests-only", "full-write", "image-only"]),
+      preset: z.enum(["read-only", "tests-only", "full-write", "image-only", "control"]),
       issuedAt: z.number().int().nonnegative(),
       expiresAt: z.number().int().nonnegative(),
     })
@@ -63,6 +63,14 @@ const FILE_MODE = 0o600;
 
 const PROJECTS_FILE = "projects.json";
 const SESSIONS_FILE = "sessions.json";
+const MAX_SCOPED_SESSION_FILES = 64;
+const SCOPED_SESSION_FILE_RE = /^sessions\.[a-f0-9]{64}\.json$/;
+
+function sessionFilename(scope?: string): string {
+  if (!scope) return SESSIONS_FILE;
+  const digest = createHash("sha256").update(scope).digest("hex");
+  return `sessions.${digest}.json`;
+}
 
 function emptyProjectsFile(): ProjectsFile {
   return { version: 1, updatedAt: Date.now(), projects: [] };
@@ -131,6 +139,33 @@ export class Store {
     }
   }
 
+  /** Keep remote/session-scoped state bounded without touching sessions.json. */
+  private async pruneScopedSessionFiles(keepFilename: string): Promise<void> {
+    await this.ensureStateDir();
+    const entries = await readdir(this.stateDir, { withFileTypes: true });
+    const candidates = await Promise.all(
+      entries
+        .filter((entry) => entry.isFile() && SCOPED_SESSION_FILE_RE.test(entry.name))
+        .map(async (entry) => ({
+          filename: entry.name,
+          mtimeMs: (await stat(join(this.stateDir, entry.name))).mtimeMs,
+        })),
+    );
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs || a.filename.localeCompare(b.filename));
+
+    const removable = candidates.filter((entry) => entry.filename !== keepFilename);
+    const overflow = removable.slice(Math.max(0, MAX_SCOPED_SESSION_FILES - 1));
+    await Promise.all(
+      overflow.map(async (entry) => {
+        try {
+          await unlink(join(this.stateDir, entry.filename));
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        }
+      }),
+    );
+  }
+
   async loadProjects(): Promise<ProjectRegistryEntry[]> {
     const raw = await this.readJson(PROJECTS_FILE);
     if (raw === undefined) return [];
@@ -154,20 +189,21 @@ export class Store {
     await this.atomicWriteJson(PROJECTS_FILE, doc);
   }
 
-  async getSession(): Promise<SessionDocument> {
-    const raw = await this.readJson(SESSIONS_FILE);
+  async getSession(scope?: string): Promise<SessionDocument> {
+    const filename = sessionFilename(scope);
+    const raw = await this.readJson(filename);
     if (raw === undefined) return emptySession();
     const parsed = SessionSchema.safeParse(raw);
     if (!parsed.success) {
       throw new DomainError(
         ErrorCode.NOT_IMPLEMENTED,
-        `Store: ${SESSIONS_FILE} failed validation: ${parsed.error.message}`,
+        `Store: ${filename} failed validation: ${parsed.error.message}`,
       );
     }
     return parsed.data;
   }
 
-  async setSession(s: unknown): Promise<void> {
+  async setSession(s: unknown, scope?: string): Promise<void> {
     const merged = {
       ...emptySession(),
       ...(typeof s === "object" && s !== null ? s : {}),
@@ -175,6 +211,8 @@ export class Store {
     // updatedAt is always server-recomputed, never trusted from caller input.
     merged.updatedAt = Date.now();
     const validated = SessionSchema.parse(merged);
-    await this.atomicWriteJson(SESSIONS_FILE, validated);
+    const filename = sessionFilename(scope);
+    await this.atomicWriteJson(filename, validated);
+    if (scope) await this.pruneScopedSessionFiles(filename);
   }
 }

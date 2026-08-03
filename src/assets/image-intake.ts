@@ -9,6 +9,7 @@ import { resolveInProject } from "../policy/paths.js";
 import { isSecretPath } from "../policy/secrets.js";
 import { detect, writeImageMetadata, writeVersionedImage, type SavedImage } from "./images.js";
 
+// execution-capability: macos-image-intake-helper
 const execFileAsync = promisify(execFile);
 
 /** Local-file intake gets a much higher cap than the base64 tool-call path

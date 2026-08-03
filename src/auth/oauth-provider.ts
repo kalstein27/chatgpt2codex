@@ -58,6 +58,8 @@ const CODE_TTL_MS = 5 * 60 * 1000;
 const MAX_ATTEMPTS_BEFORE_BACKOFF = 5;
 const LOCKOUT_WINDOW_MS = 15 * 60 * 1000;
 const MAX_TRACKED_IPS = 1000;
+const GLOBAL_FAILURE_WINDOW_MS = 60 * 1000;
+const MAX_GLOBAL_FAILURES_PER_WINDOW = 60;
 
 function randomToken(): string {
   return randomBytes(32).toString("base64url");
@@ -696,10 +698,25 @@ function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("base64url");
 }
 
-/** SR-05: exponential-backoff lockout tracker for `/authorize` POSTs, keyed
- * by client IP. Bounded map (SR-09) — oldest entries evicted past the cap. */
+/** SR-05: exponential-backoff lockout tracker for `/authorize` POSTs. The
+ * per-client identity map is bounded, and a separate small global failure
+ * window prevents attackers from bypassing lockout by rotating forwarded IPs
+ * or dynamically registering clients behind the same proxy. */
 class LoginAttemptTracker {
   private readonly attempts = new Map<string, { count: number; lockedUntilMs: number }>();
+  private readonly globalFailures: number[] = [];
+
+  private sweepGlobal(now: number): void {
+    const cutoff = now - GLOBAL_FAILURE_WINDOW_MS;
+    while (this.globalFailures.length > 0 && this.globalFailures[0]! <= cutoff) {
+      this.globalFailures.shift();
+    }
+  }
+
+  isGloballyLimited(now = Date.now()): boolean {
+    this.sweepGlobal(now);
+    return this.globalFailures.length >= MAX_GLOBAL_FAILURES_PER_WINDOW;
+  }
 
   private evictIfFull(): void {
     if (this.attempts.size < MAX_TRACKED_IPS) return;
@@ -727,8 +744,9 @@ class LoginAttemptTracker {
     return true;
   }
 
-  recordFailure(key: string): void {
-    const now = Date.now();
+  recordFailure(key: string, now = Date.now()): void {
+    this.sweepGlobal(now);
+    this.globalFailures.push(now);
     const existing = this.attempts.get(key);
     const count = (existing?.count ?? 0) + 1;
     let lockedUntilMs = 0;
@@ -776,12 +794,11 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
 
     const clientIp = res.req.ip ?? res.req.socket.remoteAddress ?? "unknown";
-    // The lockout key must not be forgeable by a local client sitting directly
-    // on the loopback TCP peer (trust proxy is "loopback", so such a client's
-    // X-Forwarded-For is trusted and would otherwise let it rotate req.ip on
-    // every request). Key the brute-force lockout on the raw socket peer;
-    // keep req.ip only for the audited/display value.
-    const lockoutKey = res.req.socket.remoteAddress ?? clientIp;
+    // Express resolves forwarded client addresses only when the immediate
+    // peer is a trusted loopback proxy. Include the registered client id so
+    // one noisy connector cannot lock out every client, while the global
+    // limiter below still bounds forwarded-IP rotation.
+    const lockoutKey = `${client.client_id}:${clientIp}`;
     const locale = localeFromRequest(res);
 
     if (res.req.method !== "POST") {
@@ -811,6 +828,23 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       res.send(
         formHtml({
           error: copyForLocale(locale).expiredError,
+          clientName: client.client_name ?? client.client_id,
+          scopes: params.scopes ?? this.config.scopes,
+          resource: params.resource,
+          csrfToken: this.issueCsrfToken(),
+          fields: authorizationFormFields(client, params),
+          locale,
+        }),
+      );
+      return;
+    }
+
+    if (this.loginAttempts.isGloballyLimited()) {
+      await this.recordOwnerTokenAttempt("locked_out", clientIp, client);
+      res.status(429).setHeader("Content-Type", "text/html; charset=utf-8");
+      res.send(
+        formHtml({
+          error: copyForLocale(locale).lockedError,
           clientName: client.client_name ?? client.client_id,
           scopes: params.scopes ?? this.config.scopes,
           resource: params.resource,

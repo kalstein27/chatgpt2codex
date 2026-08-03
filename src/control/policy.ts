@@ -19,6 +19,17 @@ const CONTROL_ENV_FLAG = "CHATGPT2CODEX_CONTROL";
 const CONTROL_ALLOWLIST_ENV_FLAG = "CHATGPT2CODEX_CONTROL_ALLOWLIST";
 const CONTROL_CHATGPT_ENV_FLAG = "CHATGPT2CODEX_CONTROL_CHATGPT";
 
+/**
+ * Whether this build has a real synthetic-input backend for the current OS.
+ * The queue and local approval API are cross-platform, but approved
+ * click/type/key execution is currently implemented only by the macOS
+ * backend. Native shells use this capability bit to avoid offering an Arm
+ * control that cannot actually execute on the host.
+ */
+export function isDesktopControlSupported(platform: NodeJS.Platform = process.platform): boolean {
+  return platform === "darwin";
+}
+
 /** Names of the 4 desktop-control MCP tools. Shared denylist used by:
  *  - src/server/tools.ts installChatGptToolListHandler (hide from ChatGPT tools/list)
  *  - src/server/actions.ts callRegisteredTool (block the generic call-tool/action bridge) */

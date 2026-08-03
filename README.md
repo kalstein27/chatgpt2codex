@@ -14,8 +14,13 @@ Your source stays on your machine. ChatGPT connects to the local app you run.
 You choose the workspace, approve the token, and keep control of what gets
 edited.
 
-[Download v0.2.0](https://github.com/ezBuilder/chatgpt2codex/releases/tag/v0.2.0) ·
-[Beginner installation guide](docs/INSTALL.md)
+> **Development fork:** This repository is a development fork of
+> [ezBuilder/chatgpt2codex](https://github.com/ezBuilder/chatgpt2codex), with
+> separate modifications applied here.
+
+[Installation guide](docs/INSTALL.md) ·
+[Build guide](docs/BUILDING.md) ·
+[Official releases](https://github.com/ezBuilder/chatgpt2codex/releases)
 
 > Help us get this in front of more builders: star the repo if you want
 > ChatGPT to stop talking about code and start safely doing the repo loop.
@@ -29,7 +34,7 @@ ChatGPT To Codex fills that gap:
 - local project selection instead of uploading a source tree
 - guarded file reads and hash-checked patching
 - allowlisted local commands for tests and checks
-- macOS/Windows app, window, and browser screenshot capture for visual E2E proof
+- macOS app/window screenshot capture for visual E2E proof (Windows native capture planned)
 - temporary or fixed HTTPS connector URL for ChatGPT web
 - OAuth-style owner-token approval so random clients cannot just attach
 - multilingual menu bar app for non-English users
@@ -40,27 +45,25 @@ The mental model is simple:
 ChatGPT thinks. Your computer acts. You review the result.
 ```
 
-## Current Release
+## Build and release status
 
-| Platform | Status | Package |
+| Platform | Status | Package/build path |
 | --- | --- | --- |
-| macOS | Public release | `chatgpt2codex-0.2.0.pkg` |
-| Windows | Public release | `chatgpt2codex-0.2.0-windows-setup.exe` |
+| macOS | Local/source workflow validated; publish only a signed and notarized release asset | See [the build guide](docs/BUILDING.md) |
+| Windows | Tray and installer source exist; real Windows CI/E2E acceptance is still required before publishing | See [the Windows quick start](docs/WINDOWS-QUICKSTART.ko.md) |
 | Linux | Developer path only | Not published |
 
-### Why PKG Instead Of DMG?
+Installers are distributed as GitHub Release assets when the matching platform
+release gates pass. They are not committed to the Git tree. A version in
+`package.json` or a successful build on another operating system is not proof
+that a signed installer has been published.
 
-For this release, **PKG is the better fit**. A DMG is nicer for drag-and-drop
-apps, but this app needs to install a menu bar runtime under Applications,
-bundle Node/cloudflared helpers, and run a non-blocking post-install Doctor.
-PKG gives beginners a clearer "install and open" path. A signed/notarized DMG
-can still be added later for a more consumer-style download.
+### Why DMG?
 
-Current macOS package SHA-256:
-
-```text
-317193f796ee0bdeb09dac0164d01b4ff930372116bdc91aeb4378b56cd2df44  chatgpt2codex-0.2.0.pkg
-```
+The macOS release uses the familiar drag-to-Applications DMG flow. The app
+bundle already contains Node.js, cloudflared, the MCP runtime, and its native
+helpers, so an installer package is not required. Public artifacts should be
+Developer ID signed and notarized.
 
 ## What ChatGPT Can Do With It
 
@@ -74,7 +77,7 @@ project:
 - run project commands and tests
 - start a dev server and wait for a URL
 - open a browser URL or installed desktop app
-- capture macOS/Windows E2E screenshots
+- capture macOS E2E screenshots (Windows native capture is not implemented yet)
 - return inline screenshot previews through Actions
 - save generated image assets into the repo
 - summarize diffs, blockers, and verification evidence
@@ -95,11 +98,16 @@ local folders.
 
 Full beginner guide: [docs/INSTALL.md](docs/INSTALL.md)
 
+Use an installer only when the matching asset is attached to an official
+GitHub Release. Otherwise build from source and keep platform-specific steps
+marked as unverified until they run on that platform.
+
 macOS short version:
 
-1. Download `chatgpt2codex-0.2.0.pkg` from the [latest release](https://github.com/ezBuilder/chatgpt2codex/releases/tag/v0.2.0).
-2. Open the installer.
-3. If macOS blocks the unsigned package, Control-click it, choose **Open**, and
+1. When a signed and notarized DMG is attached, download it from the
+   [official releases](https://github.com/ezBuilder/chatgpt2codex/releases).
+2. Open the DMG and drag **ChatGPT To Codex** onto the **Applications** shortcut.
+3. If macOS blocks the app, Control-click it, choose **Open**, and
    confirm in **System Settings** -> **Privacy & Security** if needed.
 4. Open **ChatGPT To Codex** from Applications.
 5. Open **Settings...** from the menu bar icon.
@@ -112,7 +120,9 @@ macOS short version:
 
 Windows short version:
 
-1. Download `chatgpt2codex-0.2.0-windows-setup.exe` from the [latest release](https://github.com/ezBuilder/chatgpt2codex/releases/tag/v0.2.0).
+1. When a Windows installer has passed its Windows runner checks and is
+   attached, download it from the
+   [official releases](https://github.com/ezBuilder/chatgpt2codex/releases).
 2. Double-click the installer.
 3. If Windows SmartScreen warns, choose **More info** -> **Run anyway** only if
    the file came from this GitHub release.
@@ -148,7 +158,9 @@ automation.
 - File operations are scoped to the selected project.
 - Patch application uses line/hash context.
 - Owner Token approval is required for remote Actions access.
-- Secret-looking values are redacted from tool output.
+- Secret-looking values are redacted from tool output while labelled hashes,
+  project-relative evidence paths, and readable classification values remain
+  available for verification.
 - Destructive, network, and sensitive operations remain approval-gated.
 
 Do not expose the connector URL publicly unless you understand the tunnel and
@@ -164,22 +176,39 @@ Vietnamese, Indonesian, Thai, Arabic, Hindi, and Ukrainian.
 The install guide currently includes Korean, English, Japanese, and Simplified
 Chinese. More documentation languages are welcome.
 
-## Windows Status
+## Windows status
 
-Windows now has a public beginner installer. It includes the tray launcher,
-owner-token setup flow, ChatGPT web connector settings, stale runtime cleanup,
-and Windows E2E screenshot proof. See [docs/INSTALL.md](docs/INSTALL.md) and
-[windows/README.md](windows/README.md) for the full Windows guide.
+Windows has tray, portable-bundle, installer, and installer-E2E source paths.
+The shared workspace, file, patch, command, Git, image intake, OAuth, and
+session-status runtime is implemented, but a Windows release is not accepted
+until those paths run on a real Windows runner. Native Windows desktop
+screenshot/click/type control is not implemented, so the tray deliberately
+shows `Agent Arm: unavailable on Windows` instead of accepting a lease it
+cannot execute. See
+[docs/WINDOWS-QUICKSTART.ko.md](docs/WINDOWS-QUICKSTART.ko.md),
+[docs/INSTALL.md](docs/INSTALL.md), and [windows/README.md](windows/README.md).
 
-## Repository Contents
+## Connection Diagnostics
+
+When tools are visible in ChatGPT but a real call fails, open **Connection
+Diagnostics...** from the macOS menu bar or Windows tray. The bounded JSONL log
+records only status codes, event/tool names, timing, and diagnostic IDs; it
+does not record tokens, headers, request bodies, tool inputs, or tool outputs.
+When a tool call still works, call `connection_status` for the same summary.
+See [docs/CONNECTION-DIAGNOSTICS.ko.md](docs/CONNECTION-DIAGNOSTICS.ko.md).
+
+## Repository contents
 
 This public repository is intended to contain only the product source, public
-documentation, assets, scripts, and published installer artifacts. Local agent
-state, personal automation rules, generated memory, hooks, private MCP config,
-build output, and machine-local logs are ignored.
+documentation, reviewed assets, and reproducible scripts. Release binaries are
+published as GitHub Release assets rather than committed. Local agent state,
+personal automation rules, generated memory, hooks, private MCP config, build
+output, installation backups, signing credentials, IDE state, E2E captures,
+local databases, and machine-local logs are ignored.
 
 If you see local-only files in a clone, they came from your machine, not from
-the public repo.
+the public repo. The public tree intentionally contains only product source,
+reviewed assets, and the small set of user-facing guides linked above.
 
 ## Build From Source
 
@@ -188,18 +217,18 @@ For developers:
 ```bash
 npm ci
 npm run typecheck
-npm test
 npm run build
 ```
 
-Build the macOS package:
+The shared runtime starts with:
 
 ```bash
-npm run macos:package
+npm start
 ```
 
-The packaging script creates a `.pkg` under `build/macos/`. Published packages
-are copied to `installers/macos/`.
+Platform packaging, signing, notarization, live connector reload, and Windows
+runner acceptance are intentionally kept outside the public source tree. See
+[docs/BUILDING.md](docs/BUILDING.md) for the reproducible source build boundary.
 
 ## Star Pitch
 

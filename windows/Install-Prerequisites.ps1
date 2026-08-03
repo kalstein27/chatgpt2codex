@@ -14,7 +14,10 @@ function Ensure-Command([string]$Command, [string]$WingetId) {
         throw "Missing $Command and winget is not available. Install $Command manually, then run ChatGPT To Codex again."
     }
     Write-Host "[chatgpt2codex] installing $Command via winget..."
-    winget install --id $WingetId --silent --accept-package-agreements --accept-source-agreements
+    winget install --exact --source winget --id $WingetId --silent --disable-interactivity --accept-package-agreements --accept-source-agreements
+    if ($LASTEXITCODE -ne 0) {
+        throw "winget failed to install $Command (exit code $LASTEXITCODE). Install it manually, then run ChatGPT To Codex again."
+    }
     Refresh-Path
     if (-not (Get-Command $Command -ErrorAction SilentlyContinue)) {
         throw "$Command was installed but is not on PATH yet. Open a new PowerShell window and run ChatGPT To Codex again."

@@ -5,27 +5,93 @@ import { lineHashes, rangeHash } from "../util/hash.js";
 
 const MAX_FILE_BYTES = 10 * 1024 * 1024; // 10MB (PRD §8.3 FILE_TOO_LARGE)
 
+export type ReadSliceHashMode = "none" | "file" | "range" | "lines";
+
+interface ReadSliceBaseResult {
+  path: string;
+  start: number;
+  end: number;
+  content: string;
+  hashMode: ReadSliceHashMode;
+  eol: "lf" | "crlf";
+}
+
+export type ReadSliceNoneResult = ReadSliceBaseResult & { hashMode: "none" };
+export type ReadSliceFileResult = ReadSliceBaseResult & { hashMode: "file"; fileHash: string };
+export type ReadSliceRangeResult = ReadSliceBaseResult & {
+  hashMode: "range";
+  rangeHash: string;
+  fileHash: string;
+};
+export type ReadSliceLinesResult = ReadSliceBaseResult & {
+  hashMode: "lines";
+  lineHashes: string[];
+  rangeHash: string;
+  fileHash: string;
+};
+export type ReadSliceResult =
+  | ReadSliceNoneResult
+  | ReadSliceFileResult
+  | ReadSliceRangeResult
+  | ReadSliceLinesResult;
+
 /**
- * Read a line-range slice of a project file, returning line-numbered
- * content plus per-line and range SHA-256 hashes (PRD §8.3 file_read_slice).
- * These hashes are the hash-precondition source for file_apply_patch (§9.2).
+ * Read a line-range slice of a project file, returning line-numbered content
+ * and the selected SHA-256 hash level (PRD §8.3 file_read_slice). The default
+ * "lines" mode preserves the original response contract. Every mode that
+ * includes fileHash computes it from the whole normalized file, so it remains
+ * the precondition source for file_apply_patch (§9.2) after a partial read.
  *
  * @throws {DomainError} PATH_OUTSIDE_PROJECT, FILE_TOO_LARGE (>10MB), NOT_A_FILE
  */
+export function readSlice(
+  root: string,
+  rel: string,
+  start?: number,
+  end?: number,
+): Promise<ReadSliceLinesResult>;
+export function readSlice(
+  root: string,
+  rel: string,
+  start: number | undefined,
+  end: number | undefined,
+  hashMode: "none",
+): Promise<ReadSliceNoneResult>;
+export function readSlice(
+  root: string,
+  rel: string,
+  start: number | undefined,
+  end: number | undefined,
+  hashMode: "file",
+): Promise<ReadSliceFileResult>;
+export function readSlice(
+  root: string,
+  rel: string,
+  start: number | undefined,
+  end: number | undefined,
+  hashMode: "range",
+): Promise<ReadSliceRangeResult>;
+export function readSlice(
+  root: string,
+  rel: string,
+  start: number | undefined,
+  end: number | undefined,
+  hashMode: "lines",
+): Promise<ReadSliceLinesResult>;
+export function readSlice(
+  root: string,
+  rel: string,
+  start: number | undefined,
+  end: number | undefined,
+  hashMode: ReadSliceHashMode,
+): Promise<ReadSliceResult>;
 export async function readSlice(
   root: string,
   rel: string,
   start?: number,
   end?: number,
-): Promise<{
-  path: string;
-  start: number;
-  end: number;
-  content: string;
-  lineHashes: string[];
-  fileHash: string;
-  eol: string;
-}> {
+  hashMode: ReadSliceHashMode = "lines",
+): Promise<ReadSliceResult> {
   const abs = await resolveInProject(root, rel, { allowSymlink: false });
 
   const stat = await fs.lstat(abs);
@@ -54,15 +120,14 @@ export async function readSlice(
 
   if (startLine > totalLines) {
     // Nothing to return; produce an empty but well-formed slice.
-    return {
+    return withSelectedHashes({
       path: rel,
       start: startLine,
       end: startLine - 1,
       content: "",
-      lineHashes: [],
-      fileHash: rangeHash(""),
+      hashMode,
       eol,
-    };
+    }, hashMode, "", normalized);
   }
 
   const sliceLines = allLines.slice(startLine - 1, endLine);
@@ -72,14 +137,42 @@ export async function readSlice(
     .map((line, idx) => `${startLine + idx}\t${line}`)
     .join("\n");
 
-  return {
+  return withSelectedHashes({
     path: rel,
     start: startLine,
     end: startLine + sliceLines.length - 1,
     content: numbered,
-    lineHashes: lineHashes(rangeText),
-    fileHash: rangeHash(rangeText),
+    hashMode,
     eol,
+  }, hashMode, rangeText, normalized);
+}
+
+function withSelectedHashes(
+  base: ReadSliceBaseResult,
+  hashMode: ReadSliceHashMode,
+  rangeText: string,
+  normalizedFile: string,
+): ReadSliceResult {
+  if (hashMode === "none") {
+    return { ...base, hashMode };
+  }
+
+  const fileHash = rangeHash(normalizedFile);
+  if (hashMode === "file") {
+    return { ...base, hashMode, fileHash };
+  }
+
+  const selectedRangeHash = rangeHash(rangeText);
+  if (hashMode === "range") {
+    return { ...base, hashMode, rangeHash: selectedRangeHash, fileHash };
+  }
+
+  return {
+    ...base,
+    hashMode,
+    lineHashes: lineHashes(rangeText),
+    rangeHash: selectedRangeHash,
+    fileHash,
   };
 }
 

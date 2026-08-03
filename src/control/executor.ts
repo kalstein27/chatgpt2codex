@@ -2,6 +2,7 @@ import type { ToolContext } from "../types.js";
 import { resolveActiveProject } from "../workspace/active.js";
 import { captureE2eAppScreenshot, captureE2eScreenshot } from "../e2e/local-e2e.js";
 import { redact } from "../policy/secrets.js";
+import { summarizeControlTarget, summarizePath, summarizePrivateText } from "../policy/audit-input.js";
 import { assertAllowedTarget, controlAllowlist, isSensitiveApp } from "./policy.js";
 import { maskSensitiveRegions } from "./screenshot-mask.js";
 import { autoDecision, recordAutoUse } from "./auto.js";
@@ -117,7 +118,7 @@ export async function executeApprovedAction(ctx: ToolContext, record: ControlAct
       actionId: record.actionId,
       appName: record.appName,
       frontmostApp,
-      reason: err instanceof Error ? err.message : String(err),
+      reason: summarizePrivateText(err instanceof Error ? err.message : String(err)),
     });
     await markDone(ctx.stateDir, record.actionId, { ok: false, error: "blocked" });
     return;
@@ -194,11 +195,14 @@ export async function executeApprovedAction(ctx: ToolContext, record: ControlAct
       actionId: record.actionId,
       appName: record.appName,
       kind: record.kind,
-      axSummary,
+      axSummary: axSummary ? summarizeControlTarget({ ax: axSummary }) : undefined,
       windowPoint,
       keySummary: keySummary(record.keyCode),
       textSummary: toSummary(record).textSummary,
-      evidence,
+      evidence: {
+        before: evidence.before ? summarizePath(evidence.before) : undefined,
+        after: evidence.after ? summarizePath(evidence.after) : undefined,
+      },
       approvedVia: record.approvedVia ?? "human",
       ok: true,
     });
@@ -220,7 +224,10 @@ export async function executeApprovedAction(ctx: ToolContext, record: ControlAct
       actionId: record.actionId,
       appName: record.appName,
       kind: record.kind,
-      evidence,
+      evidence: {
+        before: evidence.before ? summarizePath(evidence.before) : undefined,
+        after: evidence.after ? summarizePath(evidence.after) : undefined,
+      },
       approvedVia: record.approvedVia ?? "human",
       ok: false,
       error: message,

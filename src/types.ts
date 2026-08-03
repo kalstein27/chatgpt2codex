@@ -9,6 +9,8 @@
  * dependent module. Implementers fill in *other* modules' bodies, not this
  * file's shape.
  */
+import type { RuntimeActivityContext } from "./runtime/activity.js";
+import type { ConnectionDiagnosticsSink } from "./runtime/connection-diagnostics.js";
 
 // ---------------------------------------------------------------------------
 // Domain data model (PRD §10)
@@ -94,9 +96,12 @@ export interface ToolContext {
   store: {
     loadProjects(): Promise<ProjectRegistryEntry[]>;
     saveProjects(p: ProjectRegistryEntry[]): Promise<void>;
-    getSession(): Promise<unknown>;
-    setSession(s: unknown): Promise<void>;
+    getSession(scope?: string): Promise<unknown>;
+    setSession(s: unknown, scope?: string): Promise<void>;
   };
+  /** Opaque scope for active-project and lease persistence. Absent means the
+   * historical local/default session. Raw credentials must never be stored. */
+  sessionScope?: string;
   config: Config;
   /** True for an MCP server instance handed a remote/network transport
    * session (currently: src/server/http.ts's /mcp endpoint, which is how
@@ -107,6 +112,12 @@ export interface ToolContext {
    * desktop-control tools are exposed to ChatGPT
    * (src/control/policy.ts isControlChatGptExposed). */
   remote?: boolean;
+  /** Optional per-transport activity sink used only for bounded local
+   * operational status. Tool inputs and outputs are never passed to it. */
+  activity?: RuntimeActivityContext;
+  /** Secret-free local connection event sink. Never pass tool inputs,
+   * authorization headers, tokens, or tool outputs to this interface. */
+  diagnostics?: ConnectionDiagnosticsSink;
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +131,7 @@ export enum ErrorCode {
   PATH_OUTSIDE_WORKSPACE = "PATH_OUTSIDE_WORKSPACE",
   HASH_MISMATCH = "HASH_MISMATCH",
   LEASE_REQUIRED = "LEASE_REQUIRED",
+  LEASE_EXPIRED = "LEASE_EXPIRED",
   COMMAND_NOT_ALLOWED = "COMMAND_NOT_ALLOWED",
   ARBITRARY_SHELL_DENIED = "ARBITRARY_SHELL_DENIED",
   APPROVAL_REQUIRED = "APPROVAL_REQUIRED",
@@ -142,6 +154,7 @@ export enum ErrorCode {
   CHECKPOINT_NOT_FOUND = "CHECKPOINT_NOT_FOUND",
   INVALID_IMAGE_DATA = "INVALID_IMAGE_DATA",
   UNSUPPORTED_MEDIA_TYPE = "UNSUPPORTED_MEDIA_TYPE",
+  PLATFORM_UNSUPPORTED = "PLATFORM_UNSUPPORTED",
   QUOTA_EXCEEDED = "QUOTA_EXCEEDED",
   PERMISSION_DENIED = "PERMISSION_DENIED",
   // Option B desktop-control codes (src/control/**).

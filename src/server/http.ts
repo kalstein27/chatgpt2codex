@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { Express, Request, Response } from "express";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import {
@@ -9,12 +9,25 @@ import {
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { classifyMcpRequest } from "./mcp-request-classification.js";
+import { isModernMcpRequest, modernClientName } from "./mcp-discovery.js";
+import { dispatchModernMcpRequest } from "./mcp-modern.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
 import type { ToolContext } from "../types.js";
 import { createServer as createMcpServer } from "./mcp-server.js";
 import { SingleUserOAuthProvider, type OAuthConfig } from "../auth/oauth-provider.js";
 import { verifyOwnerToken } from "../auth/owner-token.js";
 import { registerActionRoutes } from "./actions.js";
+import { registerLocalControlRoutes, type LocalControlRouteConfig } from "./local-control.js";
+import { RuntimeActivityTracker, type RuntimeSessionHandle } from "../runtime/activity.js";
+import { isDesktopControlSupported } from "../control/policy.js";
+import { FileConnectionDiagnostics } from "../runtime/connection-diagnostics.js";
+import { toRemoteBoundaryError } from "./error-safety.js";
+import { remoteOwnerSessionScope } from "../state/session-scope.js";
+import {
+  McpSessionLifecycleDiagnostics,
+  type McpSessionCloseReason,
+} from "../runtime/mcp-session-lifecycle.js";
 
 /**
  * HTTP + OAuth 2.1 transport gateway (PRD §4 Transport Gateway, §5 CLI,
@@ -47,6 +60,14 @@ export interface HttpServerConfig {
   sessionTtlMs: number;
   /** Hard cap on concurrently tracked session transports (SR-09/NFR-03). */
   maxSessions: number;
+  /** File-protected capability used only by the native loopback UI. */
+  localControlToken: string;
+  /** Real synthetic-input backend availability for this host platform. */
+  desktopControlSupported: boolean;
+  /** Test-only failure injection for the local approval transaction. */
+  localControlApprovalState?: LocalControlRouteConfig["approvalState"];
+  /** Test/embedded override for the verified external rg binary inspection. */
+  localControlRgBinary?: LocalControlRouteConfig["rgBinary"];
   /** Optional process-level idle shutdown when no MCP sessions are active. */
   idleShutdownMs?: number;
   /** Called once after idleShutdownMs elapses with no active MCP sessions. */
@@ -54,7 +75,7 @@ export interface HttpServerConfig {
 }
 
 export function defaultHttpServerConfig(overrides: Partial<HttpServerConfig> = {}): HttpServerConfig {
-  return {
+  const config = {
     host: "127.0.0.1",
     port: 7979,
     publicUrl: "http://127.0.0.1:7979",
@@ -65,18 +86,44 @@ export function defaultHttpServerConfig(overrides: Partial<HttpServerConfig> = {
       allowedRedirectHosts: ["chatgpt.com", "chat.openai.com"],
     },
     sessionTtlMs: 30 * 60 * 1000,
-    maxSessions: 100,
+    maxSessions: 8,
+    localControlToken: randomBytes(32).toString("base64url"),
+    desktopControlSupported: isDesktopControlSupported(),
     ...overrides,
   };
+  config.maxSessions = Math.min(16, Math.max(1, config.maxSessions));
+  return config;
 }
 
 interface TrackedSession {
+  sessionId: string;
   transport: StreamableHTTPServerTransport;
   lastActiveAtMs: number;
+  activitySession: RuntimeSessionHandle;
+  clientName?: string;
+  openedAtMs: number;
+  requestCount: number;
+  reusedRequestCount: number;
+  closeReason?: McpSessionCloseReason;
+  finalizePromise?: Promise<void>;
 }
 
-function sendJsonRpcError(res: Response, status: number, code: number, message: string): void {
-  res.status(status).json({ jsonrpc: "2.0", error: { code, message }, id: null });
+function diagnosticEventForPath(pathname: string): string | undefined {
+  if (pathname === "/mcp") return "mcp.request";
+  if (pathname === "/authorize" || pathname === "/token" || pathname === "/register") return "oauth.request";
+  if (pathname.startsWith("/.well-known/")) return "oauth.metadata";
+  if (pathname.startsWith("/actions/")) return "actions.request";
+  return undefined;
+}
+
+function sendJsonRpcError(
+  res: Response,
+  status: number,
+  code: number,
+  message: string,
+  data?: Record<string, unknown>,
+): void {
+  res.status(status).json({ jsonrpc: "2.0", error: { code, message, ...(data ? { data } : {}) }, id: null });
 }
 
 function hashAuditValue(value: string): string {
@@ -84,6 +131,36 @@ function hashAuditValue(value: string): string {
 }
 
 const TRUSTED_CHATGPT_ORIGINS = ["https://chatgpt.com", "https://chat.openai.com"] as const;
+const REGISTER_RATE_LIMIT_MAX = 10;
+const REGISTER_RATE_LIMIT_WINDOW_MS = 60_000;
+
+/**
+ * Single-user OAuth registration is intentionally global and bounded. Per-IP
+ * limits are not sufficient behind a Cloudflare loopback proxy, and a map of
+ * attacker-controlled IPs would itself become an unbounded state sink.
+ *
+ * This is a bounded sliding window rather than a fixed window so an attacker
+ * cannot obtain a second burst by straddling a minute boundary. Only accepted
+ * request timestamps are retained, with a hard cap of ten entries.
+ */
+export class RegisterRateLimiter {
+  private readonly acceptedAtMs: number[] = [];
+
+  consume(now = Date.now()): number | undefined {
+    const cutoff = now - REGISTER_RATE_LIMIT_WINDOW_MS;
+    // Keep an event exactly at the boundary so ten requests cannot be
+    // followed by a second ten-request burst at the same instant.
+    while (this.acceptedAtMs.length > 0 && this.acceptedAtMs[0]! < cutoff) {
+      this.acceptedAtMs.shift();
+    }
+    if (this.acceptedAtMs.length >= REGISTER_RATE_LIMIT_MAX) {
+      const retryAt = this.acceptedAtMs[0]! + REGISTER_RATE_LIMIT_WINDOW_MS;
+      return Math.max(1, Math.ceil((retryAt - now) / 1000));
+    }
+    this.acceptedAtMs.push(now);
+    return undefined;
+  }
+}
 const OWNER_TOKEN_TOGGLE_SCRIPT = `
 (() => {
   const input = document.getElementById("owner_token");
@@ -164,10 +241,14 @@ function isOAuthBrowserFlowPath(pathName: string): boolean {
 export interface RunningHttpServer {
   app: Express;
   config: HttpServerConfig;
-  close(): void;
+  close(): Promise<void>;
 }
 
 export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): RunningHttpServer {
+  const startedAt = Date.now();
+  const activityTracker = new RuntimeActivityTracker();
+  const diagnostics = new FileConnectionDiagnostics(ctx.stateDir);
+  ctx.diagnostics = diagnostics;
   const publicUrl = new URL(config.publicUrl);
   const mcpUrl = new URL("/mcp", publicUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
@@ -192,6 +273,31 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
     host: config.host,
     allowedHosts: allowedHostHeaders,
   });
+  diagnostics.record({ event: "server.started", outcome: "success" }).catch(() => undefined);
+  app.use((req, res, next) => {
+    const event = diagnosticEventForPath(req.path);
+    if (!event) {
+      next();
+      return;
+    }
+    const requestStartedAt = Date.now();
+    res.once("finish", () => {
+      const failure = res.statusCode >= 400;
+      const bearerChallenge = req.path === "/mcp" && res.statusCode === 401 && !req.header("authorization");
+      diagnostics
+        .record({
+          event: bearerChallenge ? "oauth.challenge" : event,
+          outcome: bearerChallenge ? "info" : failure ? "failure" : "success",
+          method: req.method,
+          path: req.path,
+          status: res.statusCode,
+          durationMs: Date.now() - requestStartedAt,
+          ...(failure && !bearerChallenge ? { errorCode: `HTTP_${res.statusCode}` } : {}),
+        })
+        .catch(() => undefined);
+    });
+    next();
+  });
   // Cloudflare tunnels terminate on loopback and forward X-Forwarded-For; trust
   // only loopback proxies so express-rate-limit keys clients without warning.
   app.set("trust proxy", "loopback");
@@ -205,6 +311,28 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
   ]);
   app.use(makeOriginAllowlist(allowedOrigins));
 
+  // Dynamic client registration is intentionally global and bounded. This
+  // route is unauthenticated by OAuth design, so a single process-wide window
+  // prevents an attacker from rotating source IPs behind a proxy and forcing
+  // unbounded JSON-file writes.
+  const registerRateLimiter = new RegisterRateLimiter();
+  app.use("/register", (req, res, next) => {
+    if (req.method !== "POST") {
+      next();
+      return;
+    }
+    const retryAfter = registerRateLimiter.consume();
+    if (retryAfter === undefined) {
+      next();
+      return;
+    }
+    res.setHeader("Retry-After", String(retryAfter));
+    res.status(429).json({
+      error: "temporarily_unavailable",
+      error_description: "OAuth client registration is temporarily rate limited; retry later",
+    });
+  });
+
   const oauthConfig: OAuthConfig = {
     verifyOwnerToken: (candidate) => verifyOwnerToken(ctx.stateDir, candidate),
     accessTokenTtlSeconds: config.oauth.accessTokenTtlSeconds,
@@ -212,13 +340,21 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
     scopes: config.oauth.scopes,
     allowedRedirectHosts: config.oauth.allowedRedirectHosts,
     onOwnerTokenAttempt: (event) =>
-      ctx.ledger.append({
-        type: "oauth.owner_token_attempt",
-        outcome: event.outcome,
-        clientIpHash: hashAuditValue(event.clientIp),
-        clientIdHash: hashAuditValue(event.clientId),
-        hasClientName: event.clientName !== undefined,
-      }),
+      Promise.all([
+        ctx.ledger.append({
+          type: "oauth.owner_token_attempt",
+          outcome: event.outcome,
+          clientIpHash: hashAuditValue(event.clientIp),
+          clientIdHash: hashAuditValue(event.clientId),
+          hasClientName: event.clientName !== undefined,
+        }),
+        diagnostics.record({
+          event: "oauth.owner_token_attempt",
+          outcome: "failure",
+          errorCode: event.outcome === "locked_out" ? "OWNER_TOKEN_LOCKED_OUT" : "OWNER_TOKEN_REJECTED",
+          clientName: event.clientName,
+        }),
+      ]).then(() => undefined),
   };
   const oauthProvider = new SingleUserOAuthProvider(oauthConfig, mcpUrl, ctx.stateDir);
   const oauthMetadata = createOAuthMetadata({
@@ -255,8 +391,45 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
     res.json(oauthMetadata);
   });
 
-  app.get("/healthz", (_req, res) => {
-    res.json({ ok: true, name: "chatgpt2codex" });
+  app.get("/healthz", (req, res) => {
+    const host = String(req.header("host") ?? "").toLowerCase();
+    const localHealthHosts = new Set([
+      "127.0.0.1",
+      `127.0.0.1:${config.port}`,
+      "localhost",
+      `localhost:${config.port}`,
+      "[::1]",
+      `[::1]:${config.port}`,
+      "::1",
+      `::1:${config.port}`,
+    ]);
+    const remoteAddress = String(req.ip ?? req.socket.remoteAddress ?? "");
+    const loopbackClient = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]).has(remoteAddress);
+    const payload: Record<string, unknown> = {
+      ok: true,
+      name: "chatgpt2codex",
+      schemaVersion: 2,
+      transport: "http",
+    };
+    // Keep public health checks useful without disclosing process start time,
+    // runtime build labels, or host platform. Loopback callers (the updater,
+    // local diagnostics, and CI smoke checks) retain the detailed payload.
+    if (loopbackClient && localHealthHosts.has(host)) {
+      payload.startedAt = startedAt;
+      payload.runtimeVersion = process.env.CHATGPT2CODEX_RUNTIME_VERSION ?? "development";
+      payload.platform = process.platform;
+    }
+    res.json(payload);
+  });
+
+  registerLocalControlRoutes(app, ctx, activityTracker, {
+    port: config.port,
+    token: config.localControlToken,
+    startedAt,
+    desktopControlSupported: config.desktopControlSupported,
+    diagnostics,
+    approvalState: config.localControlApprovalState,
+    rgBinary: config.localControlRgBinary,
   });
 
   app.get("/privacy", (_req, res) => {
@@ -281,10 +454,43 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
   // Idle sessions are swept on a timer; the map never grows unbounded even
   // under a client that never sends a clean close.
   const sessions = new Map<string, TrackedSession>();
+  const sessionLifecycle = new McpSessionLifecycleDiagnostics(diagnostics);
   let lastSessionActivityAtMs = Date.now();
   let idleShutdownQueued = false;
 
-  function evictOldestSession(): void {
+  function finalizeTrackedSession(
+    session: TrackedSession,
+    reason: McpSessionCloseReason,
+    errorCode?: string,
+  ): Promise<void> {
+    if (session.finalizePromise) return session.finalizePromise;
+    session.finalizePromise = (async () => {
+      if (sessions.get(session.sessionId) === session) sessions.delete(session.sessionId);
+      activityTracker.closeSession(session.activitySession);
+      await sessionLifecycle.closed({
+        clientName: session.clientName,
+        openedAtMs: session.openedAtMs,
+        closedAtMs: Date.now(),
+        requestCount: session.requestCount,
+        reusedRequestCount: session.reusedRequestCount,
+        reason,
+        activeSessionCount: sessions.size,
+        errorCode,
+      });
+    })();
+    return session.finalizePromise;
+  }
+
+  async function closeTrackedSession(session: TrackedSession, reason: McpSessionCloseReason): Promise<void> {
+    session.closeReason = reason;
+    try {
+      await session.transport.close();
+    } finally {
+      await finalizeTrackedSession(session, reason);
+    }
+  }
+
+  async function evictOldestSession(): Promise<void> {
     let oldestId: string | undefined;
     let oldestAt = Infinity;
     for (const [id, session] of sessions) {
@@ -294,17 +500,16 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
       }
     }
     if (oldestId) {
-      sessions.get(oldestId)?.transport.close();
-      sessions.delete(oldestId);
+      const session = sessions.get(oldestId);
+      if (session) await closeTrackedSession(session, "capacity");
     }
   }
 
-  const sweepInterval = setInterval(() => {
+  async function sweepSessions(): Promise<void> {
     const now = Date.now();
-    for (const [id, session] of sessions) {
+    for (const session of [...sessions.values()]) {
       if (now - session.lastActiveAtMs > config.sessionTtlMs) {
-        session.transport.close();
-        sessions.delete(id);
+        await closeTrackedSession(session, "idle_ttl");
       }
     }
     if (
@@ -317,12 +522,17 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
       idleShutdownQueued = true;
       setImmediate(() => config.onIdleTimeout?.());
     }
+  }
+
+  const sweepInterval = setInterval(() => {
+    void sweepSessions().catch(() => undefined);
   }, Math.min(config.sessionTtlMs, config.idleShutdownMs ?? 60_000, 60_000));
   sweepInterval.unref();
 
   app.all("/mcp", async (req, res) => {
     const sessionId = req.header("mcp-session-id");
     const initializeRequest = req.method === "POST" && isInitializeRequest(req.body);
+    const requestClassification = classifyMcpRequest(req.body, Boolean(sessionId));
 
     await new Promise<void>((resolve, reject) => {
       bearerAuth(req, res, (error?: unknown) => {
@@ -340,6 +550,69 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
       return;
     }
 
+    if (
+      isModernMcpRequest(
+        req.method,
+        req.body,
+        requestClassification,
+        req.header("mcp-protocol-version"),
+      )
+    ) {
+      const clientName = modernClientName(req.body);
+      const activitySession = activityTracker.openSession({ transport: "http", clientName });
+      const now = Date.now();
+      lastSessionActivityAtMs = now;
+      activityTracker.touch(activitySession, now);
+      try {
+        const result = await dispatchModernMcpRequest(
+          {
+            ...ctx,
+            remote: true,
+            sessionScope: remoteOwnerSessionScope(),
+            activity: { tracker: activityTracker, session: activitySession },
+          },
+          req.body,
+          {
+            name: "chatgpt2codex",
+            version: process.env.CHATGPT2CODEX_RUNTIME_VERSION ?? "development",
+          },
+          {
+            protocolVersion: req.header("mcp-protocol-version"),
+            method: req.header("mcp-method"),
+            name: req.header("mcp-name"),
+          },
+        );
+        const jsonRpcFailure =
+          result.response !== undefined &&
+          typeof result.response.error === "object" &&
+          result.response.error !== null;
+        const failure = result.status >= 400 || jsonRpcFailure;
+        diagnostics
+          .record({
+            event: "mcp.modern_request",
+            outcome: failure ? "failure" : "success",
+            method: req.method,
+            status: result.status,
+            ...(failure
+              ? { errorCode: result.status >= 400 ? `HTTP_${result.status}` : "MCP_JSONRPC_ERROR" }
+              : {}),
+            clientName,
+            jsonRpcMethod: requestClassification.jsonRpcMethod,
+            requestKind: requestClassification.requestKind,
+            hasSessionHeader: false,
+            initializeRequest: false,
+            notification: requestClassification.notification,
+          })
+          .catch(() => undefined);
+        if (result.response) res.status(result.status).json(result.response);
+        else res.status(result.status).end();
+      } finally {
+        activityTracker.closeSession(activitySession);
+      }
+      return;
+    }
+
+    let trackedForRequest: TrackedSession | undefined;
     try {
       let transport: StreamableHTTPServerTransport | undefined;
 
@@ -351,23 +624,71 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
         }
         tracked.lastActiveAtMs = Date.now();
         lastSessionActivityAtMs = tracked.lastActiveAtMs;
+        activityTracker.touch(tracked.activitySession, tracked.lastActiveAtMs);
+        tracked.requestCount += 1;
+        tracked.reusedRequestCount += 1;
+        trackedForRequest = tracked;
         transport = tracked.transport;
       } else if (initializeRequest) {
-        if (sessions.size >= config.maxSessions) evictOldestSession();
+        if (sessions.size >= config.maxSessions) await evictOldestSession();
 
+        const clientName =
+          typeof req.body?.params?.clientInfo?.name === "string" ? req.body.params.clientInfo.name : undefined;
+        const activitySession = activityTracker.openSession({ transport: "http", clientName });
+        const initializeStartedAtMs = Date.now();
+        const sessionScope = remoteOwnerSessionScope();
+        let trackedSession: TrackedSession | undefined;
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId) => {
             if (transport) {
               lastSessionActivityAtMs = Date.now();
-              sessions.set(newSessionId, { transport, lastActiveAtMs: lastSessionActivityAtMs });
+              activityTracker.updateSession(activitySession, {
+                externalId: newSessionId,
+                clientName,
+                now: lastSessionActivityAtMs,
+              });
+              trackedSession = {
+                sessionId: newSessionId,
+                transport,
+                lastActiveAtMs: lastSessionActivityAtMs,
+                activitySession,
+                clientName,
+                openedAtMs: lastSessionActivityAtMs,
+                requestCount: 1,
+                reusedRequestCount: 0,
+              };
+              trackedForRequest = trackedSession;
+              sessions.set(newSessionId, trackedSession);
+              void sessionLifecycle.opened({
+                clientName,
+                openedAtMs: lastSessionActivityAtMs,
+                sessionSetupMs: Math.max(0, lastSessionActivityAtMs - initializeStartedAtMs),
+                activeSessionCount: sessions.size,
+              }).catch(() => undefined);
             }
           },
         });
 
         transport.onclose = () => {
-          const closedSessionId = transport?.sessionId;
-          if (closedSessionId) sessions.delete(closedSessionId);
+          if (trackedSession) {
+            void finalizeTrackedSession(trackedSession, trackedSession.closeReason ?? "client").catch(() => undefined);
+          } else {
+            activityTracker.closeSession(activitySession);
+          }
+        };
+        transport.onerror = (error) => {
+          if (!trackedSession) return;
+          void sessionLifecycle.transportError({
+            clientName,
+            openedAtMs: trackedSession.openedAtMs,
+            closedAtMs: Date.now(),
+            requestCount: trackedSession.requestCount,
+            reusedRequestCount: trackedSession.reusedRequestCount,
+            reason: "transport_error",
+            activeSessionCount: sessions.size,
+            errorCode: error instanceof Error && error.name ? `MCP_${error.name.toUpperCase()}` : "MCP_TRANSPORT_ERROR",
+          }).catch(() => undefined);
         };
 
         // Mark this session remote: it's how ChatGPT (and any other network
@@ -375,32 +696,74 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
         // refused here even when the desktop-control tools are exposed to
         // ChatGPT (see src/server/tools.ts project_select handler /
         // isControlChatGptExposed) — lease arming stays local-only (stdio).
-        const mcpServer = await createMcpServer({ ...ctx, remote: true });
+        const mcpServer = await createMcpServer({
+          ...ctx,
+          remote: true,
+          sessionScope,
+          activity: { tracker: activityTracker, session: activitySession },
+        });
         await mcpServer.connect(transport);
       } else {
         sendJsonRpcError(res, 400, -32000, "No valid MCP session");
+        diagnostics
+          .record({
+            event: "mcp.session_rejected",
+            outcome: "failure",
+            errorCode: "MCP_SESSION_REQUIRED",
+            method: req.method,
+            jsonRpcMethod: requestClassification.jsonRpcMethod,
+            requestKind: requestClassification.requestKind,
+            hasSessionHeader: requestClassification.hasSessionHeader,
+            initializeRequest: requestClassification.initializeRequest,
+            notification: requestClassification.notification,
+          })
+          .catch(() => undefined);
         return;
       }
 
       await transport.handleRequest(req, res, req.body);
     } catch (error) {
+      if (trackedForRequest) {
+        await sessionLifecycle.transportError({
+          clientName: trackedForRequest.clientName,
+          openedAtMs: trackedForRequest.openedAtMs,
+          closedAtMs: Date.now(),
+          requestCount: trackedForRequest.requestCount,
+          reusedRequestCount: trackedForRequest.reusedRequestCount,
+          reason: "transport_error",
+          activeSessionCount: sessions.size,
+          errorCode: "MCP_REQUEST_FAILED",
+        }).catch(() => undefined);
+      }
+      const boundary = toRemoteBoundaryError(error);
+      const diagnostic = await diagnostics
+        .record({ event: "mcp.request_failed", outcome: "failure", errorCode: boundary.code })
+        .catch(() => undefined);
       if (!res.headersSent) {
-        sendJsonRpcError(res, 500, -32603, error instanceof Error ? error.message : "Internal server error");
+        sendJsonRpcError(res, 500, -32603, boundary.message, {
+          code: boundary.code,
+          ...(diagnostic?.diagnosticId ? { diagnosticId: diagnostic.diagnosticId } : {}),
+        });
       }
     }
   });
 
-  let closed = false;
+  let closePromise: Promise<void> | undefined;
   return {
     app,
     config,
-    close: () => {
-      if (closed) return;
-      closed = true;
-      clearInterval(sweepInterval);
-      for (const session of sessions.values()) session.transport.close();
-      sessions.clear();
-      oauthProvider.close();
+    close: async () => {
+      if (closePromise) return closePromise;
+      closePromise = (async () => {
+        clearInterval(sweepInterval);
+        await Promise.all(
+          [...sessions.values()].map((session) => closeTrackedSession(session, "shutdown").catch(() => undefined)),
+        );
+        sessionLifecycle.dispose();
+        oauthProvider.close();
+        await diagnostics.record({ event: "server.stopped", outcome: "info" }).catch(() => undefined);
+      })();
+      return closePromise;
     },
   };
 }

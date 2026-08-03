@@ -24,21 +24,33 @@ PUBLIC_HOSTNAME="${PUBLIC_HOSTNAME:-}"
 EXPOSE_WEB="${CHATGPT2CODEX_EXPOSE_WEB:-0}"
 IDLE_SHUTDOWN_MINUTES="${CHATGPT2CODEX_IDLE_SHUTDOWN_MINUTES:-}"
 CLOUDFLARED_TUNNEL_NAME="${CLOUDFLARED_TUNNEL_NAME:-}"
+STATE_DIR="${CHATGPT2CODEX_STATE_DIR:-$HOME/.local/share/chatgpt2codex}"
+ACTIVE_RUNTIME_FILE="$STATE_DIR/active-runtime"
+RUNTIME_RELOAD_FILE="$STATE_DIR/runtime-reload-request"
 CFLOG="$(mktemp -t chatgpt2codex-cf.XXXX.log)"
 SRVLOG="$(mktemp -t chatgpt2codex-server.XXXX.log)"
 DOCTOR_SCRIPT="$ROOT/macos-dependency-doctor.sh"
 if [[ ! -f "$DOCTOR_SCRIPT" && -f "$ROOT/scripts/macos-dependency-doctor.sh" ]]; then
   DOCTOR_SCRIPT="$ROOT/scripts/macos-dependency-doctor.sh"
 fi
+LAUNCHER_SUBSHELL_LEVEL="${BASH_SUBSHELL:-0}"
+CLEANED_UP=0
 
 cleanup() {
+  # Command substitutions run in Bash subshells and inherit EXIT traps on some
+  # macOS Bash versions. Only the top-level launcher may own/stop these PIDs.
+  [[ "${BASH_SUBSHELL:-0}" == "$LAUNCHER_SUBSHELL_LEVEL" ]] || return 0
+  [[ "$CLEANED_UP" == "0" ]] || return 0
+  CLEANED_UP=1
   echo
   echo "[chatgpt2codex] stopping server/tunnel..."
   [[ -n "${SRV_PID:-}" ]] && kill "$SRV_PID" 2>/dev/null || true
   [[ -n "${CF_PID:-}" ]] && kill "$CF_PID" 2>/dev/null || true
   rm -f "$CFLOG" "$SRVLOG"
 }
-trap cleanup EXIT INT TERM
+trap 'cleanup' EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -75,6 +87,93 @@ wait_http_ok() {
     sleep_1s
   done
   echo "[chatgpt2codex] $label did not become ready: $url" >&2
+  return 1
+}
+
+resolve_server_runtime_root() {
+  local candidate=""
+  if [[ -f "$ACTIVE_RUNTIME_FILE" ]]; then
+    IFS= read -r candidate <"$ACTIVE_RUNTIME_FILE" || true
+  fi
+  if [[ -n "$candidate" && -f "$candidate/dist/cli.js" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  if [[ -n "$candidate" ]]; then
+    echo "[chatgpt2codex] ignoring invalid active runtime: $candidate" >&2
+  fi
+  printf '%s\n' "$ROOT"
+}
+
+resolve_server_node() {
+  local runtime_root="$1"
+  local candidate
+  for candidate in \
+    "$runtime_root/bin/node" \
+    "$runtime_root/node/bin/node" \
+    "$ROOT/bin/node" \
+    "$ROOT/node/bin/node"; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  command -v node
+}
+
+start_server_process() {
+  SERVER_RUNTIME_ROOT="$(resolve_server_runtime_root)"
+  SERVER_NODE="$(resolve_server_node "$SERVER_RUNTIME_ROOT")"
+  if [[ ! -f "$SERVER_RUNTIME_ROOT/dist/cli.js" ]]; then
+    echo "[chatgpt2codex] runtime is missing dist/cli.js: $SERVER_RUNTIME_ROOT" >&2
+    return 1
+  fi
+  SERVER_RUNTIME_VERSION="$("$SERVER_NODE" -e \
+    'try { process.stdout.write(require(process.argv[1]).version || "unknown") } catch { process.stdout.write("unknown") }' \
+    "$SERVER_RUNTIME_ROOT/package.json" 2>/dev/null || printf 'unknown')"
+  printf '\n[chatgpt2codex] starting runtime from %s\n' "$SERVER_RUNTIME_ROOT" >>"$SRVLOG"
+  CHATGPT2CODEX_RUNTIME_VERSION="$SERVER_RUNTIME_VERSION" \
+    "$SERVER_NODE" "$SERVER_RUNTIME_ROOT/dist/cli.js" "${SERVER_ARGS[@]}" \
+    ${ACTIVE_PROJECT_ARGS[@]+"${ACTIVE_PROJECT_ARGS[@]}"} >>"$SRVLOG" 2>&1 &
+  SRV_PID=$!
+  echo "[chatgpt2codex] runtime process started (supervisor=$$, server=$SRV_PID, version=$SERVER_RUNTIME_VERSION)."
+}
+
+restore_runtime_pointer() {
+  local previous_root="$1"
+  if [[ "$previous_root" == "$ROOT" ]]; then
+    rm -f "$ACTIVE_RUNTIME_FILE"
+  else
+    printf '%s\n' "$previous_root" >"$ACTIVE_RUNTIME_FILE"
+    chmod 600 "$ACTIVE_RUNTIME_FILE" 2>/dev/null || true
+  fi
+}
+
+reload_server_runtime() {
+  local previous_root="$SERVER_RUNTIME_ROOT"
+  rm -f "$RUNTIME_RELOAD_FILE"
+  echo "[chatgpt2codex] applying runtime update without restarting the Cloudflare tunnel..."
+  echo "[chatgpt2codex] stopping runtime process $SRV_PID (supervisor=$$)."
+  kill "$SRV_PID" 2>/dev/null || true
+  wait "$SRV_PID" 2>/dev/null || true
+  SRV_PID=""
+
+  if start_server_process &&
+     wait_http_ok "http://127.0.0.1:$PORT/healthz" 20 "updated local server"; then
+    echo "[chatgpt2codex] runtime updated; connector URL is unchanged."
+    return 0
+  fi
+
+  echo "[chatgpt2codex] updated runtime failed health check; rolling back." >&2
+  [[ -n "${SRV_PID:-}" ]] && kill "$SRV_PID" 2>/dev/null || true
+  [[ -n "${SRV_PID:-}" ]] && wait "$SRV_PID" 2>/dev/null || true
+  restore_runtime_pointer "$previous_root"
+  start_server_process
+  if wait_http_ok "http://127.0.0.1:$PORT/healthz" 20 "rolled-back local server"; then
+    echo "[chatgpt2codex] previous runtime restored; connector URL is unchanged." >&2
+    return 1
+  fi
+  echo "[chatgpt2codex] rollback runtime also failed. Log: $SRVLOG" >&2
   return 1
 }
 
@@ -194,7 +293,7 @@ stop_stale_runtime_processes() {
       [[ -z "$pid" || "$pid" == "$$" || "$pid" == "${PPID:-}" ]] && continue
       command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
       [[ -z "$command" ]] && continue
-      if [[ "$command" == *"$ROOT"* || "$command" == *"cloudflared"* ]]; then
+      if [[ "$command" == *"$ROOT"* || "$command" == *"$STATE_DIR/runtime"* || "$command" == *"cloudflared"* ]]; then
         kill "$pid" 2>/dev/null || true
         stopped+=("$pid")
       fi
@@ -213,6 +312,8 @@ need_cmd curl
 
 mkdir -p "$WORKSPACE"
 WORKSPACE="$(cd "$WORKSPACE" && pwd)"
+mkdir -p "$STATE_DIR"
+chmod 700 "$STATE_DIR" 2>/dev/null || true
 
 cd "$ROOT"
 
@@ -228,7 +329,9 @@ if port_busy; then
   exit 1
 fi
 
-if ! node "$ROOT/dist/cli.js" doctor 2>/dev/null | grep -q "owner token configured"; then
+INITIAL_RUNTIME_ROOT="$(resolve_server_runtime_root)"
+INITIAL_NODE="$(resolve_server_node "$INITIAL_RUNTIME_ROOT")"
+if ! "$INITIAL_NODE" "$INITIAL_RUNTIME_ROOT/dist/cli.js" doctor 2>/dev/null | grep -q "owner token configured"; then
   echo "[chatgpt2codex] owner token is not configured." >&2
   echo "[chatgpt2codex] Open ChatGPT To Codex settings and generate or set an owner token first." >&2
   echo "[chatgpt2codex] CLI fallback: node \"$ROOT/dist/cli.js\" owner-token --generate --workspace \"$WORKSPACE\"" >&2
@@ -294,8 +397,7 @@ SERVER_ARGS=(serve --http --port "$PORT" --public-url "$PUBLIC_URL" --workspace 
 if [[ -n "$IDLE_SHUTDOWN_MINUTES" ]]; then
   SERVER_ARGS+=(--idle-shutdown-minutes "$IDLE_SHUTDOWN_MINUTES")
 fi
-node "$ROOT/dist/cli.js" "${SERVER_ARGS[@]}" ${ACTIVE_PROJECT_ARGS[@]+"${ACTIVE_PROJECT_ARGS[@]}"} >"$SRVLOG" 2>&1 &
-SRV_PID=$!
+start_server_process
 if ! wait_http_ok "http://127.0.0.1:$PORT/healthz" 20 "local server"; then
   echo "[chatgpt2codex] server log: $SRVLOG" >&2
   cat "$SRVLOG" >&2
@@ -349,6 +451,9 @@ EOF
 fi
 
 while true; do
+  if [[ -f "$RUNTIME_RELOAD_FILE" ]]; then
+    reload_server_runtime || true
+  fi
   if ! kill -0 "$SRV_PID" 2>/dev/null; then
     if wait "$SRV_PID"; then
       echo "[chatgpt2codex] server stopped."

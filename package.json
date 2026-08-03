@@ -15,32 +15,23 @@
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
     "chatgpt": "bash start-chatgpt.sh",
     "chatgpt:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File start-chatgpt.ps1",
-    "chatgpt:linux": "bash linux/start-chatgpt2codex.sh",
-    "dev": "tsx src/cli.ts",
-    "macos:icon": "python3 scripts/generate-macos-icon.py",
-    "macos:package": "bash scripts/build-macos-app.sh",
-    "macos:e2e:statusbar": "bash scripts/e2e-macos-statusbar-menu.sh",
     "start": "node dist/cli.js",
-    "windows:exe": "powershell -NoProfile -ExecutionPolicy Bypass -File windows/Build-ChatGPTToCodexExe.ps1",
-    "windows:package": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-installer.ps1",
-    "windows:portable": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-app.ps1",
-    "windows:install": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/install-windows.ps1",
-    "windows:e2e": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/e2e-windows-installer.ps1",
-    "linux:package": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-linux-installer.ps1",
-    "linux:e2e": "bash scripts/e2e-linux-installer.sh",
-    "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "express": "^5.2.1",
     "zod": "^3.23.8"
+  },
+  "overrides": {
+    "@hono/node-server": "2.0.12",
+    "fast-uri": "3.1.5"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",
     "@types/node": "^22.0.0",
-    "typescript": "^5.5.0",
     "tsx": "^4.16.0",
-    "vitest": "^2.0.0"
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.10"
   }
 }
