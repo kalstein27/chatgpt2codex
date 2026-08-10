@@ -13,7 +13,7 @@ Requirements:
 - npm
 
 ```bash
-npm ci
+npm ci --ignore-scripts
 npm run typecheck
 npm run build
 ```

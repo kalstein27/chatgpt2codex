@@ -5,10 +5,10 @@ export const MCP_PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVe
 export const MCP_CLIENT_INFO_META_KEY = "io.modelcontextprotocol/clientInfo";
 export const MCP_CLIENT_CAPABILITIES_META_KEY = "io.modelcontextprotocol/clientCapabilities";
 export const MCP_SERVER_INFO_META_KEY = "io.modelcontextprotocol/serverInfo";
-export const MCP_SCHEMA_CACHE_TTL_MS = 30 * 60 * 1000;
+export const MCP_SCHEMA_CACHE_TTL_MS = 5 * 60 * 1000;
 export const MCP_DISCOVERY_TTL_MS = MCP_SCHEMA_CACHE_TTL_MS;
 export const MCP_TOOL_LIST_TTL_MS = MCP_SCHEMA_CACHE_TTL_MS;
-export const MCP_SCHEMA_CONTRACT_VERSION = 1;
+export const MCP_SCHEMA_CONTRACT_VERSION = 2;
 export const MCP_SCHEMA_REVISION_META_KEY = "io.ezbuilder.chatgpt2codex/schemaRevision";
 export const MCP_SCHEMA_EXPIRED_META_KEY = "io.ezbuilder.chatgpt2codex/schemaExpired";
 export const MCP_CORE_TOOLS_META_KEY = "io.ezbuilder.chatgpt2codex/coreToolNames";
@@ -16,7 +16,9 @@ export const MCP_CORE_TOOLS_META_KEY = "io.ezbuilder.chatgpt2codex/coreToolNames
 export const MCP_CORE_TOOL_NAMES = [
   "c2ct_invoke",
   "connection_status",
+  "connection_audit",
   "project_select",
+  "project_release",
   "project_renew_lease",
   "project_status",
   "project_rules",

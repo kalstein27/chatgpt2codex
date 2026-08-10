@@ -24,7 +24,7 @@ Windows에는 트레이 앱, portable bundle, installer, installer E2E 소스가
 ## 2. 소스에서 검증·빌드
 
 ```powershell
-npm ci
+npm ci --ignore-scripts
 npm run typecheck
 npm run build
 ```

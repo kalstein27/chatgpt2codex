@@ -285,15 +285,24 @@ function syncState(
  */
 export async function gitDiffSummary(
   root: string,
-): Promise<{ files: { path: string; added: number; removed: number }[]; summary: string }> {
+): Promise<{
+  status: "OK" | "NOT_A_GIT_REPOSITORY";
+  isGitRepository: boolean;
+  files: { path: string; added: number; removed: number }[];
+  summary: string;
+}> {
   let files: { path: string; added: number; removed: number }[];
   try {
     const result = await runGit(root, ["diff", "--numstat"]);
     files = parseNumstat(result.stdout);
   } catch (err) {
     if (isNonGitError(err)) {
-      // Non-git repos have no diff to summarize; nothing textual to redact.
-      return { files: [], summary: "No changes." };
+      return {
+        status: "NOT_A_GIT_REPOSITORY",
+        isGitRepository: false,
+        files: [],
+        summary: "Git diff unavailable: project is not a git repository.",
+      };
     }
     throw new DomainError(
       ErrorCode.NOT_IMPLEMENTED,
@@ -301,7 +310,7 @@ export async function gitDiffSummary(
     );
   }
   const summary = redact(buildSummary(files));
-  return { files, summary };
+  return { status: "OK", isGitRepository: true, files, summary };
 }
 
 export async function gitStageAndCommit(

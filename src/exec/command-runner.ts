@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { delimiter, dirname, join } from "node:path";
@@ -8,6 +9,7 @@ import { OUTPUT_ARTIFACT_STREAM_BYTES } from "./output-artifacts.js";
 import { resolveNpmInvocation } from "./runtime-environment.js";
 import {
   commandStatusFromExit,
+  type CommandStatus,
   type CleanupStatus,
   type ProcessExecutionResult,
 } from "./process-result.js";
@@ -23,6 +25,27 @@ interface DiscoveredCommand {
   source: string;
   riskTier: string;
   argv: string[];
+}
+
+export interface CommandLifecycleEvent {
+  phase: "running" | "cleanup" | "completed";
+  subprocessStarted: boolean;
+  subprocessStillRunning: boolean;
+  cleanupStarted: boolean;
+  cleanupCompleted: boolean;
+  durationMs?: number;
+  commandStatus?: CommandStatus;
+  cleanupStatus?: CleanupStatus;
+}
+
+export type CommandLifecycleObserver = (event: CommandLifecycleEvent) => void;
+
+function emitCommandLifecycle(observer: CommandLifecycleObserver | undefined, event: CommandLifecycleEvent): void {
+  try {
+    observer?.(event);
+  } catch {
+    // Observation must never be able to change process execution semantics.
+  }
 }
 
 const MAX_TIMEOUT_SEC = 300;
@@ -201,16 +224,46 @@ async function discoverAllCommands(root: string): Promise<DiscoveredCommand[]> {
  * Detect safe, allowlist-eligible commands from project manifests
  * (package.json scripts, Makefile, pubspec.yaml, etc.) (PRD §8.5 command_list).
  */
-export async function listCommands(
-  root: string,
-): Promise<{ commandId: string; display: string; source: string; riskTier: string }[]> {
+export interface ListedCommand {
+  commandId: string;
+  display: string;
+  source: string;
+  riskTier: string;
+  argForwarding?: "npm-script";
+  requiresDoubleDashForOptionArgs?: boolean;
+}
+
+export async function listCommands(root: string): Promise<ListedCommand[]> {
   const commands = await discoverAllCommands(root);
-  return commands.map(({ commandId, display, source, riskTier }) => ({
-    commandId,
-    display,
-    source,
-    riskTier,
-  }));
+  return commands.map(({ commandId, display, source, riskTier }) => {
+    const npmScript = source === "package.json" && commandId.startsWith("npm:");
+    return {
+      commandId,
+      display,
+      source,
+      riskTier,
+      ...(npmScript
+        ? {
+            argForwarding: "npm-script" as const,
+            requiresDoubleDashForOptionArgs: true,
+          }
+        : {}),
+    };
+  });
+}
+
+export function commandCatalogVersion(commands: readonly ListedCommand[]): string {
+  const canonical = [...commands]
+    .sort((left, right) => left.commandId.localeCompare(right.commandId))
+    .map((command) => ({
+      commandId: command.commandId,
+      display: command.display,
+      source: command.source,
+      riskTier: command.riskTier,
+      argForwarding: command.argForwarding ?? null,
+      requiresDoubleDashForOptionArgs: command.requiresDoubleDashForOptionArgs ?? null,
+    }));
+  return `sha256:${createHash("sha256").update(JSON.stringify(canonical)).digest("hex").slice(0, 24)}`;
 }
 
 function buildChildEnv(): NodeJS.ProcessEnv {
@@ -282,6 +335,7 @@ export async function runCommand(
   args?: string[],
   timeoutSec?: number,
   approval?: { granted: boolean },
+  lifecycleObserver?: CommandLifecycleObserver,
 ): Promise<ProcessExecutionResult> {
   const discovered = await discoverAllCommands(root);
   const found = discovered.find((c) => c.commandId === commandId);
@@ -329,6 +383,7 @@ export async function runCommand(
     let settled = false;
     let timedOut = false;
     let spawnFailed = false;
+    let subprocessStarted = false;
     let timeoutHandle: NodeJS.Timeout | undefined;
     const stdout = new BoundedOutputCollector(OUTPUT_HEAD_BYTES, OUTPUT_TAIL_BYTES);
     const stderr = new BoundedOutputCollector(OUTPUT_HEAD_BYTES, OUTPUT_TAIL_BYTES);
@@ -353,6 +408,16 @@ export async function runCommand(
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
+    child.once("spawn", () => {
+      subprocessStarted = true;
+      emitCommandLifecycle(lifecycleObserver, {
+        phase: "running",
+        subprocessStarted: true,
+        subprocessStillRunning: true,
+        cleanupStarted: false,
+        cleanupCompleted: false,
+      });
+    });
     child.stdout.on("data", (chunk: Buffer) => {
       stdout.append(chunk);
       stdoutArtifact.append(chunk);
@@ -375,9 +440,20 @@ export async function runCommand(
       const artifactErr = stderrArtifact.summarize();
       const outputTruncated = outStd.truncated || outErr.truncated;
       const exitCode = spawnFailed ? null : (code ?? 1);
+      const commandStatus = commandStatusFromExit(exitCode, spawnFailed);
+      emitCommandLifecycle(lifecycleObserver, {
+        phase: "completed",
+        subprocessStarted,
+        subprocessStillRunning: false,
+        cleanupStarted: false,
+        cleanupCompleted: true,
+        durationMs: Date.now() - start,
+        commandStatus,
+        cleanupStatus: "NOT_REQUIRED",
+      });
       finish(() =>
         resolve({
-          commandStatus: commandStatusFromExit(exitCode, spawnFailed),
+          commandStatus,
           exitCode,
           terminationSignal: signal,
           cleanupStatus: "NOT_REQUIRED",
@@ -402,12 +478,29 @@ export async function runCommand(
 
     timeoutHandle = setTimeout(() => {
       timedOut = true;
+      emitCommandLifecycle(lifecycleObserver, {
+        phase: "cleanup",
+        subprocessStarted,
+        subprocessStillRunning: subprocessStarted,
+        cleanupStarted: true,
+        cleanupCompleted: false,
+      });
       killProcessTree(child.pid, (cleanupStatus) => {
         const outStd = stdout.summarize();
         const outErr = stderr.summarize();
         const artifactStd = stdoutArtifact.summarize();
         const artifactErr = stderrArtifact.summarize();
         const outputTruncated = outStd.truncated || outErr.truncated;
+        emitCommandLifecycle(lifecycleObserver, {
+          phase: "completed",
+          subprocessStarted,
+          subprocessStillRunning: false,
+          cleanupStarted: true,
+          cleanupCompleted: cleanupStatus === "COMPLETED",
+          durationMs: Date.now() - start,
+          commandStatus: "TIMEOUT",
+          cleanupStatus,
+        });
         finish(() => resolve({
           commandStatus: "TIMEOUT",
           exitCode: null,

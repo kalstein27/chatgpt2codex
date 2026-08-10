@@ -27,17 +27,25 @@ import {
   makeLease,
   renewLease,
 } from "../workspace/project-select.js";
-import { requireProjectLease } from "../workspace/lease-guard.js";
+import { requireProjectLease, type LeaseCapability } from "../workspace/lease-guard.js";
 import { codeSearch } from "../code/search.js";
 import { readSlice } from "../code/read-slice.js";
 import { applyPatch, createFile } from "../code/patch.js";
 import { editFileLines } from "../code/line-edit.js";
-import { createCheckpoint, getWorkingDiff, listCheckpoints, readCheckpoint, restoreCheckpoint } from "../state/checkpoints.js";
+import {
+  createFileCheckpoint,
+  createMutationCheckpoint,
+  getWorkingDiff,
+  listCheckpoints,
+  readCheckpoint,
+  restoreCheckpoint,
+  toPublicCheckpoint,
+} from "../state/checkpoints.js";
 import { listImages, retrieveImage, saveImage, writeVersionedImage } from "../assets/images.js";
 import { intakeFromClipboard, intakeFromDownload, intakeFromPath, readClipboardText } from "../assets/image-intake.js";
 import { fetchImageFromUrl } from "../assets/image-url.js";
 import { prepareChatGptImagesApp } from "../assets/chatgpt-images-app.js";
-import { listCommands, runCommand } from "../exec/command-runner.js";
+import { commandCatalogVersion, listCommands, runCommand } from "../exec/command-runner.js";
 import { guardShellCommand, runLocalShell } from "../exec/local-shell.js";
 import { inspectExecutionEnvironment } from "../exec/runtime-environment.js";
 import { ensureRgAuthorized, executeRgSearch, getRgCapabilityStatus } from "../exec/rg-capability.js";
@@ -60,6 +68,16 @@ import {
   readOutputArtifactAll,
   readOutputMetadata,
 } from "../exec/output-artifacts.js";
+import {
+  startToolProgressReporter,
+  type ToolProgressHandlerExtra,
+  type ToolProgressPhase,
+  type ToolProgressReporter,
+} from "../runtime/tool-progress.js";
+import type {
+  ConnectionDiagnosticPhase,
+  ConnectionDiagnosticSafeInputs,
+} from "../runtime/connection-diagnostics.js";
 import { createE2eScreenshotShare } from "../e2e/screenshot-share.js";
 import { addToolCallProof, TOOL_AVAILABILITY_GATE } from "./tool-proof.js";
 import {
@@ -466,15 +484,104 @@ function toCallToolResult(toolName: string, result: ToolResult<Record<string, un
   };
 }
 
+interface ToolProgressConfig {
+  extra?: ToolProgressHandlerExtra;
+  initialPhase: ToolProgressPhase;
+  initialMessage: string;
+  requiredCapability?: LeaseCapability;
+}
+
+function connectionSafeInputsFrom(input: unknown): ConnectionDiagnosticSafeInputs {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
+  const record = input as Record<string, unknown>;
+  const intent = record.intent && typeof record.intent === "object" && !Array.isArray(record.intent)
+    ? record.intent as Record<string, unknown>
+    : undefined;
+  return {
+    ...(typeof record.captureScreenshot === "boolean" ? { captureScreenshot: record.captureScreenshot } : {}),
+    ...(typeof record.label === "string" ? { label: redact(record.label) } : {}),
+    ...(typeof intent?.writesWorkspace === "boolean" ? { writesWorkspace: intent.writesWorkspace } : {}),
+    ...(typeof intent?.needsNetwork === "boolean" ? { needsNetwork: intent.needsNetwork } : {}),
+    ...(typeof intent?.destructive === "boolean" ? { destructive: intent.destructive } : {}),
+  };
+}
+
+function diagnosticPhaseFromToolProgress(phase: ToolProgressPhase): ConnectionDiagnosticPhase {
+  if (phase === "preparing") return "queued";
+  if (phase === "finalizing") return "serialize";
+  if (
+    phase === "queued"
+    || phase === "approval"
+    || phase === "spawn"
+    || phase === "running"
+    || phase === "cleanup"
+    || phase === "serialize"
+    || phase === "completed"
+  ) return phase;
+  return "running";
+}
+
+async function connectionSafeInputsForCall(
+  ctx: ToolContext,
+  input: unknown,
+  requiredCapability: LeaseCapability | undefined,
+): Promise<ConnectionDiagnosticSafeInputs | undefined> {
+  const safeInputs = connectionSafeInputsFrom(input);
+  if (requiredCapability) safeInputs.requiredCapability = requiredCapability;
+  const session = await loadSession(ctx).catch(() => undefined);
+  if (session?.lease) safeInputs.leasePreset = session.lease.preset;
+  return Object.keys(safeInputs).length > 0 ? safeInputs : undefined;
+}
+
+function withoutConnectionSafeInputs<T extends { safeInputs?: ConnectionDiagnosticSafeInputs }>(
+  event: T,
+): Omit<T, "safeInputs"> & { projectId?: string; commandId?: string } {
+  const { safeInputs, ...publicEvent } = event;
+  return {
+    ...publicEvent,
+    ...(safeInputs?.projectId ? { projectId: safeInputs.projectId } : {}),
+    ...(safeInputs?.commandId ? { commandId: safeInputs.commandId } : {}),
+  };
+}
+
 async function withErrorMapping<T extends Record<string, unknown>>(
   ctx: ToolContext,
   toolName: string,
   input: unknown,
-  fn: () => Promise<ToolResult<T>>,
+  fn: (progress?: ToolProgressReporter, operationId?: string) => Promise<ToolResult<T>>,
+  progressConfig?: ToolProgressConfig,
 ): Promise<CallToolResultLike> {
+  const callStartedAt = Date.now();
   const operationId = ctx.activity?.tracker.startOperation(ctx.activity.session, toolName);
+  const progressSafeInputs = connectionSafeInputsFrom(input);
+  if (progressConfig?.requiredCapability) progressSafeInputs.requiredCapability = progressConfig.requiredCapability;
+  const progressReporter = progressConfig
+    ? await startToolProgressReporter({
+        extra: progressConfig.extra,
+        initialPhase: progressConfig.initialPhase,
+        initialMessage: progressConfig.initialMessage,
+        onProgress: (event) => {
+          ctx.activity?.tracker.progressOperation(ctx.activity.session, operationId, {
+            phase: event.phase,
+            message: event.message,
+            progress: event.progress,
+            now: event.at,
+          });
+          void ctx.diagnostics?.record({
+            event: "tool.progress",
+            outcome: "info",
+            tool: toolName,
+            operationId,
+            phase: diagnosticPhaseFromToolProgress(event.phase),
+            progressHeartbeat: event.heartbeat,
+            ...(Object.keys(progressSafeInputs).length > 0 ? { safeInputs: progressSafeInputs } : {}),
+          }).catch(() => undefined);
+        },
+      })
+    : undefined;
   try {
-    const result = await fn();
+    const result = await fn(progressReporter, operationId);
+    await progressReporter?.stop(result.isError ? "Operation finished with an error" : "Operation finished");
     await ctx.ledger.append({
       type: "tool.call.completed",
       tool: toolName,
@@ -484,16 +591,21 @@ async function withErrorMapping<T extends Record<string, unknown>>(
     ctx.activity?.tracker.finishOperation(ctx.activity.session, operationId, {
       errorCode: result.isError ? "TOOL_RESULT_ERROR" : undefined,
     });
+    const safeInputs = await connectionSafeInputsForCall(ctx, input, progressConfig?.requiredCapability);
     await ctx.diagnostics
       ?.record({
         event: "tool.call",
         outcome: result.isError ? "failure" : "success",
         tool: toolName,
+        operationId,
+        durationMs: Date.now() - callStartedAt,
         ...(result.isError ? { errorCode: "TOOL_RESULT_ERROR" } : {}),
+        ...(safeInputs ? { safeInputs } : {}),
       })
       .catch(() => undefined);
     return toCallToolResult(toolName, await attachLeaseHealth(ctx, result));
   } catch (err) {
+    await progressReporter?.stop("Operation failed");
     const mapped = mapError(err, ctx.remote === true);
     await ctx.ledger.append({
       type: "tool.call.failed",
@@ -505,12 +617,16 @@ async function withErrorMapping<T extends Record<string, unknown>>(
     ctx.activity?.tracker.finishOperation(ctx.activity.session, operationId, {
       errorCode: String(mapped.structuredContent.code),
     });
+    const safeInputs = await connectionSafeInputsForCall(ctx, input, progressConfig?.requiredCapability);
     const diagnostic = await ctx.diagnostics
       ?.record({
         event: "tool.call",
         outcome: "failure",
         tool: toolName,
+        operationId,
+        durationMs: Date.now() - callStartedAt,
         errorCode: String(mapped.structuredContent.code),
+        ...(safeInputs ? { safeInputs } : {}),
       })
       .catch(() => undefined);
     const withLease = await attachLeaseHealth(ctx, mapped);
@@ -1104,7 +1220,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             ],
             toolSurfaceMap: {
               discover: ["workspace_list_projects", "workspace_refresh_index", "workspace_get_project", "project_select"],
-              inspect: ["connection_status", "project_rules", "project_status", "repo_status", "repo_diff_summary", "code_search", "file_read_slice"],
+              inspect: ["connection_status", "connection_audit", "project_rules", "project_status", "repo_status", "repo_diff_summary", "code_search", "file_read_slice"],
               modify: ["file_edit_lines", "file_apply_patch", "file_create", ...(canRunLocalShell ? ["local_shell_run"] : [])],
               verify: verificationTools,
               release: ["git_diff_summary", "git_commit", "git_push", "checkpoint_list"],
@@ -1200,11 +1316,74 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
   );
 
   registerTool(
+    "connection_audit",
+    {
+      title: "Audit recent connection activity",
+      description:
+        "Aggregate secret-free current and archived connection diagnostics without shell access. Prefer exact ISO-8601 since/until bounds; since overrides sinceHours. Safe input metadata is returned only when includeSafeInputs=true.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: chatGptToolMeta("Auditing connection activity...", "Connection audit loaded"),
+      inputSchema: {
+        sinceHours: z.number().int().min(1).max(168).optional(),
+        since: z.string().datetime({ offset: true }).optional(),
+        until: z.string().datetime({ offset: true }).optional(),
+        includeSafeInputs: z.boolean().optional(),
+        slowRequestThresholdMs: z.number().int().min(0).max(900_000).optional(),
+        maxSlowRequests: z.number().int().min(1).max(50).optional(),
+        maxRecentFailures: z.number().int().min(1).max(50).optional(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "connection_audit", input, async () => {
+        if (!ctx.diagnostics) {
+          throw new DomainError(
+            ErrorCode.NOT_IMPLEMENTED,
+            "Connection diagnostics are unavailable on this transport",
+          );
+        }
+        const until = input.until ?? new Date().toISOString();
+        const untilMs = Date.parse(until);
+        const sinceHours = input.since === undefined ? input.sinceHours ?? 24 : undefined;
+        const since = input.since ?? new Date(untilMs - (sinceHours ?? 24) * 60 * 60 * 1_000).toISOString();
+        const sinceMs = Date.parse(since);
+        if (sinceMs > untilMs) {
+          throw new DomainError(ErrorCode.INVALID_ARGUMENT, "connection_audit since must be before or equal to until");
+        }
+        if (untilMs - sinceMs > 168 * 60 * 60 * 1_000) {
+          throw new DomainError(ErrorCode.INVALID_ARGUMENT, "connection_audit range must not exceed 168 hours");
+        }
+        const audit = await ctx.diagnostics.audit({
+          since,
+          until,
+          slowRequestThresholdMs: input.slowRequestThresholdMs,
+          maxSlowRequests: input.maxSlowRequests,
+          maxRecentFailures: input.maxRecentFailures,
+        });
+        const publicAudit = input.includeSafeInputs === true
+          ? audit
+          : {
+              ...audit,
+              slowRequests: audit.slowRequests.map(withoutConnectionSafeInputs),
+              recentFailures: audit.recentFailures.map(withoutConnectionSafeInputs),
+            };
+        return makeResult(
+          {
+            ...publicAudit,
+            ...(sinceHours !== undefined ? { sinceHours } : {}),
+            includeSafeInputs: input.includeSafeInputs === true,
+          } as Record<string, unknown>,
+          `Audited ${audit.eventCount} connection event(s) from ${since} through ${until}.`,
+        );
+      });
+    },
+  );
+
+  registerTool(
     "connection_status",
     {
       title: "Get connection status",
       description:
-        "Return the current runtime platform, selected project lease, and recent secret-free connection diagnostics. Use this when a connector, OAuth, MCP session, or tool call appears unhealthy.",
+        "Return the current runtime platform, selected project lease, active operation elapsed state, and recent secret-free connection diagnostics. After a client cancellation, inspect diagnostics.clientCancellationRecovery before retrying the operation.",
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: chatGptToolMeta("Checking connection status...", "Connection status loaded"),
       inputSchema: {
@@ -1219,6 +1398,16 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           return emptySession();
         });
         const diagnostics = await ctx.diagnostics?.summary(input.recentEvents ?? 20);
+        const publicDiagnostics = diagnostics
+          ? {
+              ...diagnostics,
+              ...(diagnostics.lastFailure
+                ? { lastFailure: withoutConnectionSafeInputs(diagnostics.lastFailure) }
+                : {}),
+              recentEvents: diagnostics.recentEvents.map(withoutConnectionSafeInputs),
+              recentCommandEvents: diagnostics.recentCommandEvents.map(withoutConnectionSafeInputs),
+            }
+          : undefined;
         const armRequests = await listArmRequests(ctx.stateDir);
         for (const expired of armRequests.expired) {
           await ctx.ledger.append({
@@ -1269,10 +1458,16 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         const currentLeaseHealth = session.lease ? leaseHealth(session.lease) : null;
         const leaseActive = Boolean(session.lease && !currentLeaseHealth?.leaseExpired);
         const controlLeaseGranted = Boolean(leaseActive && session.lease?.preset === "control");
+        const activeOperations = ctx.activity?.tracker.activeOperations({
+          excludeTools: ["connection_status"],
+          now: Date.now(),
+        }) ?? [];
         return makeResult(
           {
-            schemaVersion: 3,
+            schemaVersion: 5,
             platform: process.platform,
+            runtimeVersion: process.env.CHATGPT2CODEX_RUNTIME_VERSION ?? "development",
+            runtimePid: process.pid,
             nativeE2eSupported: isNativeE2eSupported(),
             sessionStateAvailable: sessionAvailable,
             activeProjectId: session.activeProjectId,
@@ -1284,6 +1479,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             rgAvailable,
             rgTrusted,
             rgVersion,
+            activeOperations,
             lease: session.lease
               ? {
                   leaseId: session.lease.leaseId,
@@ -1305,7 +1501,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               pendingArmRequests,
               localApprovalRequired: pendingArmRequests.length > 0,
             },
-            diagnostics: diagnostics ?? null,
+            diagnostics: publicDiagnostics ?? null,
           },
           diagnostics?.lastFailure
             ? `Connection status loaded; last failure ${diagnostics.lastFailure.errorCode ?? diagnostics.lastFailure.status ?? "unknown"} (${diagnostics.lastFailure.diagnosticId ?? "no diagnostic id"}).`
@@ -1701,19 +1897,53 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         const entry = result.entry;
 
         const session = await loadSession(ctx);
-        if (
-          session.activeProjectId &&
-          session.activeProjectId !== entry.projectId &&
-          session.lease &&
-          Date.now() <= session.lease.expiresAt
-        ) {
-          if (!input.confirmSwitch) {
+        const now = Date.now();
+        const switchingProject = Boolean(
+          session.activeProjectId && session.activeProjectId !== entry.projectId,
+        );
+        const currentLease = session.lease;
+        const privilegedLeaseHeld = Boolean(
+          switchingProject &&
+            currentLease &&
+            now <= currentLease.expiresAt &&
+            currentLease.preset !== "read-only",
+        );
+        if (privilegedLeaseHeld && currentLease) {
+          const activeOperations =
+            ctx.activity?.tracker.activeOperations({ excludeTools: ["project_select"], now }) ?? [];
+          if (activeOperations.length > 0) {
             throw new DomainError(
-              ErrorCode.PENDING_WORK_IN_ACTIVE,
-              `Active project "${session.activeProjectId}" has an unexpired lease; pass confirmSwitch=true to switch projects`,
-              { activeProjectId: session.activeProjectId, required: "confirmSwitch" },
+              ErrorCode.ACTIVE_OPERATION_IN_PROGRESS,
+              `Active project "${session.activeProjectId}" still has a running operation`,
+              {
+                activeProjectId: session.activeProjectId,
+                leasePreset: currentLease.preset,
+                leaseExpiresInSec: Math.max(0, Math.ceil((currentLease.expiresAt - now) / 1_000)),
+                activeOperationCount: activeOperations.length,
+                activeTools: [...new Set(activeOperations.map((operation) => operation.tool))],
+              },
             );
           }
+          if (!input.confirmSwitch) {
+            throw new DomainError(
+              ErrorCode.ACTIVE_PROJECT_LEASE_HELD,
+              `Active project "${session.activeProjectId}" has an unexpired privileged lease; pass confirmSwitch=true to release it and switch projects`,
+              {
+                activeProjectId: session.activeProjectId,
+                leasePreset: currentLease.preset,
+                leaseExpiresInSec: Math.max(0, Math.ceil((currentLease.expiresAt - now) / 1_000)),
+                required: "confirmSwitch",
+              },
+            );
+          }
+          await ctx.ledger.append({
+            type: "project.lease.released",
+            projectId: currentLease.projectId,
+            leaseId: currentLease.leaseId,
+            preset: currentLease.preset,
+            reason: "project_switch",
+            keepProjectSelected: false,
+          });
         }
 
         const preset: LeasePreset = input.preset ?? "read-only";
@@ -1729,6 +1959,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             entry.projectId,
             sessionIdentity,
           );
+          let approvalRecoveryReason: "fresh_approval_required_after_invisible_grant" | undefined;
           if (prior?.status === "approved") {
             const requesterSession = await loadSession(ctx);
             const lease = requesterSession.lease;
@@ -1754,19 +1985,11 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                 `Control approval already granted for ${entry.name}; the existing scoped lease is active.`,
               );
             }
-            throw new DomainError(
-              ErrorCode.APPROVAL_REQUIRED,
-              "Local approval was recorded, but the approved lease is not visible to this requester scope.",
-              {
-                reason: "approval_already_granted_but_not_visible",
-                requestId: prior.requestId,
-                sessionKey: prior.sessionKey,
-                grantedSessionScope: prior.sessionScope ?? null,
-                visibleToRequester: false,
-                leaseGranted: false,
-                localApprovalRequired: true,
-              },
-            );
+            // A terminal approval record is not an authorization capability.
+            // If its scoped lease was lost or expired, require a new local
+            // approval instead of copying a global lease or deadlocking this
+            // requester behind an old approved request.
+            approvalRecoveryReason = "fresh_approval_required_after_invisible_grant";
           }
           const created = await createArmRequest(ctx.stateDir, {
             projectId: entry.projectId,
@@ -1793,11 +2016,16 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           }).catch(() => undefined);
           throw new DomainError(
             ErrorCode.APPROVAL_REQUIRED,
-            created.created
-              ? "A local desktop-control approval request was created on the Mac."
-              : "A matching local desktop-control approval request is already pending on the Mac.",
+            approvalRecoveryReason
+              ? created.created
+                ? "A fresh local desktop-control approval request was created because the prior grant is no longer visible to this requester."
+                : "A fresh local desktop-control approval request is already pending because the prior grant is no longer visible to this requester."
+              : created.created
+                ? "A local desktop-control approval request was created on the Mac."
+                : "A matching local desktop-control approval request is already pending on the Mac.",
             {
               preset,
+              ...(approvalRecoveryReason ? { reason: approvalRecoveryReason } : {}),
               requestCreated: created.created,
               requestDeduplicated: created.deduplicated,
               requestId: created.request.requestId,
@@ -1842,6 +2070,95 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             instruction: `Active project is now "${entry.name}" (${rulesHint}). Scope confined to ${entry.root}.`,
           },
           `Selected project ${entry.name} with preset ${preset}.`,
+        );
+      });
+    },
+  );
+
+  registerTool(
+    "project_release",
+    {
+      title: "Release the active project lease",
+      description:
+        "Explicitly release the current project lease after work completes. Call before the final response after mutation, test, image, or control workflows. The release fails closed while another operation is still running.",
+      annotations: LOCAL_STATE_ANNOTATIONS,
+      _meta: chatGptToolMeta("Releasing project lease...", "Project lease released"),
+      inputSchema: {
+        projectId: z.string(),
+        leaseId: z.string().regex(/^lease_[0-9a-fA-F-]{36}$/).optional(),
+        reason: z.string().min(1),
+        keepProjectSelected: z.boolean().optional(),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "project_release", input, async () => {
+        const session = await loadSession(ctx);
+        const current = session.lease;
+        if (!current) {
+          if (session.activeProjectId !== input.projectId) {
+            throw new DomainError(ErrorCode.LEASE_REQUIRED, "No matching project lease to release", {
+              projectId: input.projectId,
+            });
+          }
+          return makeResult(
+            {
+              released: false,
+              alreadyReleased: true,
+              activeProjectId: session.activeProjectId,
+            } as Record<string, unknown>,
+            `Project ${input.projectId} has no active lease.`,
+          );
+        }
+        if (session.activeProjectId !== input.projectId || current.projectId !== input.projectId) {
+          throw new DomainError(ErrorCode.LEASE_REQUIRED, "No matching project lease to release", {
+            projectId: input.projectId,
+          });
+        }
+        if (input.leaseId && current.leaseId !== input.leaseId) {
+          throw new DomainError(ErrorCode.LEASE_REQUIRED, "Lease identity changed; refresh status before releasing", {
+            projectId: input.projectId,
+            currentLeaseChanged: true,
+          });
+        }
+
+        const activeOperations =
+          ctx.activity?.tracker.activeOperations({ excludeTools: ["project_release"] }) ?? [];
+        if (activeOperations.length > 0) {
+          throw new DomainError(
+            ErrorCode.ACTIVE_OPERATION_IN_PROGRESS,
+            "Cannot release the project lease while another operation is running",
+            {
+              projectId: input.projectId,
+              leasePreset: current.preset,
+              activeOperationCount: activeOperations.length,
+              activeTools: [...new Set(activeOperations.map((operation) => operation.tool))],
+            },
+          );
+        }
+
+        const keepProjectSelected = input.keepProjectSelected ?? true;
+        await saveSession(ctx, {
+          activeProjectId: keepProjectSelected ? input.projectId : null,
+          mode: "read",
+          lease: null,
+        });
+        await ctx.ledger.append({
+          type: "project.lease.released",
+          projectId: input.projectId,
+          leaseId: current.leaseId,
+          preset: current.preset,
+          reason: summarizePrivateText(input.reason),
+          keepProjectSelected,
+        });
+        return makeResult(
+          {
+            released: true,
+            projectId: input.projectId,
+            leaseId: current.leaseId,
+            preset: current.preset,
+            activeProjectId: keepProjectSelected ? input.projectId : null,
+          } as Record<string, unknown>,
+          `Released the ${current.preset} lease for project ${input.projectId}.`,
         );
       });
     },
@@ -2250,7 +2567,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Read file slice",
       description:
-        "Read a line-range slice of a project file with selectable hash detail. hashMode defaults to lines; file is the compact mode for safe patch preconditions.",
+        "Read a line-range slice of a project file with selectable hash detail. hashMode defaults to lines; file is the compact mode for safe patch preconditions. When redaction is applied, the response recommends file_edit_lines instead of copying [REDACTED] into patch context.",
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: chatGptToolMeta("Reading file slice...", "File slice loaded"),
       inputSchema: {
@@ -2270,8 +2587,20 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         const start = input.start ?? (input.offset !== undefined ? input.offset + 1 : undefined);
         const hashMode = input.hashMode ?? "lines";
         const slice = await readSlice(entry.root, input.path, start, input.end, hashMode);
+        const content = redact(slice.content);
+        const redactionApplied = content !== slice.content;
         return makeResult(
-          { ...slice, content: redact(slice.content) },
+          {
+            ...slice,
+            content,
+            redaction: redactionApplied
+              ? {
+                  applied: true,
+                  reason: "secret_pattern",
+                  recommendedEditTool: "file_edit_lines",
+                }
+              : { applied: false },
+          },
           `Read ${input.path} lines ${slice.start}-${slice.end} with hashMode=${hashMode}.`,
         );
       });
@@ -2286,7 +2615,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     "file_apply_patch",
     {
       title: "Apply file patch",
-      description: "Apply a Codex-style patch envelope with hash-precondition and transactional write.",
+      description:
+        "Apply a Codex-style patch envelope with hash-precondition and transactional write. Redacted patch context is rejected with PATCH_CONTEXT_REDACTED; use file_edit_lines with a fresh whole-file hash instead.",
       annotations: LOCAL_WRITE_ANNOTATIONS,
       _meta: chatGptToolMeta("Applying file patch...", "File patch applied"),
       inputSchema: {
@@ -2300,7 +2630,12 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         await requireProjectLease(ctx, input.projectId, "write");
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
         const result = await applyPatch(entry.root, input.patch, input.preconditionHashes);
-        const checkpoint = await createCheckpoint(entry.root, input.projectId, "patch");
+        const checkpoint = await createMutationCheckpoint(
+          entry.root,
+          input.projectId,
+          "patch",
+          result.checkpointFiles,
+        );
         const checkpointId = checkpoint.checkpointId;
         await ctx.ledger.append({
           type: "fs.mutation.staged",
@@ -2363,7 +2698,12 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         await requireProjectLease(ctx, input.projectId, "write");
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
         const result = await editFileLines(entry.root, input.edits);
-        const checkpoint = await createCheckpoint(entry.root, input.projectId, "line-edit");
+        const checkpoint = await createMutationCheckpoint(
+          entry.root,
+          input.projectId,
+          "line-edit",
+          result.checkpointFiles,
+        );
         const checkpointId = checkpoint.checkpointId;
         await ctx.ledger.append({
           type: "fs.mutation.staged",
@@ -2398,7 +2738,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         await requireProjectLease(ctx, input.projectId, "write");
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
         const result = await createFile(entry.root, input.path, input.content, input.overwrite);
-        const checkpoint = await createCheckpoint(entry.root, input.projectId, "create");
+        const checkpoint = await createFileCheckpoint(entry.root, input.projectId, result.path, result.createdNew);
         const checkpointId = checkpoint.checkpointId;
         await ctx.ledger.append({
           type: "fs.mutation.staged",
@@ -2407,7 +2747,14 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           created: summarizePath(result.path),
         });
         return makeResult(
-          { path: result.path, bytes: result.bytes, checkpointId },
+          {
+            path: result.path,
+            bytes: result.bytes,
+            createdNew: result.createdNew,
+            checkpointId,
+            restorable: checkpoint.restorable ?? false,
+            restoreMode: checkpoint.restoreMode ?? "none",
+          },
           `Created ${result.path} (${result.bytes} bytes).`,
         );
       });
@@ -2454,19 +2801,46 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     "command_list",
     {
       title: "List project commands",
-      description: "List allowlist-eligible commands discovered from project manifests.",
+      description:
+        "List or narrowly query allowlist-eligible commands discovered from project manifests. Use commandIds for exact lookup, query for case-insensitive filtering, and catalogVersion to avoid returning an unchanged catalog. Legacy projectId-only calls still include the runtime environment inventory.",
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: chatGptToolMeta("Listing project commands...", "Project commands listed"),
-      inputSchema: { projectId: z.string() },
+      inputSchema: {
+        projectId: z.string(),
+        query: z.string().trim().min(1).max(200).optional(),
+        commandIds: z.array(z.string().min(1).max(200)).min(1).max(100).optional(),
+        includeEnvironment: z.boolean().optional(),
+        catalogVersion: z.string().regex(/^sha256:[a-f0-9]{24}$/).optional(),
+      },
     },
     async (input) => {
       return withErrorMapping(ctx, "command_list", input, async () => {
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
-        const commands = await listCommands(entry.root);
-        const environment = inspectExecutionEnvironment();
+        const allCommands = await listCommands(entry.root);
+        const version = commandCatalogVersion(allCommands);
+        const normalizedQuery = input.query?.toLowerCase();
+        const requestedIds = input.commandIds ? new Set(input.commandIds) : undefined;
+        const matchedCommands = allCommands.filter((command) => {
+          if (requestedIds && !requestedIds.has(command.commandId)) return false;
+          if (!normalizedQuery) return true;
+          return [command.commandId, command.display, command.source, command.riskTier]
+            .some((value) => value.toLowerCase().includes(normalizedQuery));
+        });
+        const unchanged = input.catalogVersion === version;
+        const narrowed = input.query !== undefined || input.commandIds !== undefined || input.catalogVersion !== undefined;
+        const includeEnvironment = input.includeEnvironment ?? !narrowed;
         return makeResult(
-          { commands, environment },
-          `Found ${commands.length} allowlisted command(s); runtime binary inventory included.`,
+          {
+            commands: unchanged ? [] : matchedCommands,
+            catalogVersion: version,
+            unchanged,
+            totalCount: allCommands.length,
+            matchedCount: matchedCommands.length,
+            ...(includeEnvironment ? { environment: inspectExecutionEnvironment() } : {}),
+          },
+          unchanged
+            ? `Command catalog is unchanged at ${version}; command payload omitted.`
+            : `Found ${matchedCommands.length} of ${allCommands.length} allowlisted command(s); runtime binary inventory ${includeEnvironment ? "included" : "omitted"}.`,
         );
       });
     },
@@ -2493,17 +2867,37 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         resultContract: PROCESS_RESULT_CONTRACT_SCHEMA.optional(),
       },
     },
-    async (input) => {
-      return withErrorMapping(ctx, "command_run", input, async () => {
+    async (input, extra) => {
+      return withErrorMapping(ctx, "command_run", input, async (progress, operationId) => {
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
         const commandsForPolicy = await listCommands(entry.root);
         const commandForPolicy = commandsForPolicy.find((c) => c.commandId === input.commandId);
         const capability = commandForPolicy?.riskTier === "verify" ? "verify" : commandForPolicy?.riskTier === "read" ? "read" : "remote";
         const lease = await requireProjectLease(ctx, input.projectId, capability);
+        const lifecycleSafeInputs: ConnectionDiagnosticSafeInputs = {
+          projectId: entry.projectId,
+          commandId: input.commandId,
+          requiredCapability: capability,
+          leasePreset: lease.preset,
+        };
         const operationRisk = commandForPolicy?.riskTier === "network" || commandForPolicy?.riskTier === "destructive"
           ? commandForPolicy.riskTier as OperationRisk
           : null;
         if (operationRisk) {
+          await progress?.update("approval", "Checking command approval");
+          await ctx.diagnostics?.record({
+            event: "command.lifecycle",
+            outcome: "info",
+            tool: "command_run",
+            operationId,
+            phase: "approval",
+            actionStarted: false,
+            subprocessStarted: false,
+            subprocessStillRunning: false,
+            cleanupStarted: false,
+            cleanupCompleted: false,
+            safeInputs: lifecycleSafeInputs,
+          }).catch(() => undefined);
           await ensureOperationAuthorized({
             stateDir: ctx.stateDir,
             lease,
@@ -2513,6 +2907,20 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             preview: redact([commandForPolicy?.display ?? input.commandId, ...(input.args ?? [])].join(" ")),
           });
         }
+        await progress?.update("spawn", "Starting approved project command");
+        await ctx.diagnostics?.record({
+          event: "command.lifecycle",
+          outcome: "info",
+          tool: "command_run",
+          operationId,
+          phase: "spawn",
+          actionStarted: true,
+          subprocessStarted: false,
+          subprocessStillRunning: false,
+          cleanupStarted: false,
+          cleanupCompleted: false,
+          safeInputs: lifecycleSafeInputs,
+        }).catch(() => undefined);
         await ctx.ledger.append({
           type: "process.started",
           projectId: input.projectId,
@@ -2524,6 +2932,32 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           input.args,
           input.intent?.expectedDurationSec,
           { granted: operationRisk !== null },
+          (event) => {
+            void progress?.update(
+              event.phase,
+              event.phase === "running"
+                ? "Project command is running"
+                : event.phase === "cleanup"
+                  ? "Cleaning up project command"
+                  : "Project command completed",
+            );
+            void ctx.diagnostics?.record({
+              event: "command.lifecycle",
+              outcome: "info",
+              tool: "command_run",
+              operationId,
+              phase: event.phase,
+              actionStarted: true,
+              subprocessStarted: event.subprocessStarted,
+              subprocessStillRunning: event.subprocessStillRunning,
+              cleanupStarted: event.cleanupStarted,
+              cleanupCompleted: event.cleanupCompleted,
+              ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
+              ...(event.commandStatus ? { commandStatus: event.commandStatus } : {}),
+              ...(event.cleanupStatus ? { cleanupStatus: event.cleanupStatus } : {}),
+              safeInputs: lifecycleSafeInputs,
+            }).catch(() => undefined);
+          },
         );
         let outputArtifact: Awaited<ReturnType<typeof createOutputArtifact>> | undefined;
         let artifactError: string | undefined;
@@ -2560,6 +2994,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           cleanupStatus: result.cleanupStatus,
           artifactStatus,
         });
+        await progress?.update("serialize", "Preparing command result");
         return makeResult(
           {
             transportStatus: "SUCCESS",
@@ -2586,6 +3021,10 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           },
           `Command ${input.commandId}: transport=SUCCESS, process=${result.commandStatus}, exit=${result.exitCode ?? "n/a"}, artifact=${artifactStatus}, ${result.durationMs}ms.`,
         );
+      }, {
+        extra: extra as ToolProgressHandlerExtra,
+        initialPhase: "queued",
+        initialMessage: "Preparing project command",
       });
     },
   );
@@ -2614,8 +3053,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         resultContract: PROCESS_RESULT_CONTRACT_SCHEMA.optional(),
       },
     },
-    async (input) => {
-      return withErrorMapping(ctx, "local_shell_run", input, async () => {
+    async (input, extra) => {
+      return withErrorMapping(ctx, "local_shell_run", input, async (progress) => {
         // Perform command-static guards before lease/approval lookup. A
         // caller-supplied risk flag must never cause an approval receipt to
         // be consumed for a command that the shell guard will reject anyway.
@@ -2647,6 +3086,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           command: summarizeCommandAudit(input.command),
           shell: true,
         });
+        await progress?.update("running", "Local shell command is running");
         const result = await runLocalShell(entry.root, input.command, input.cwd, input.timeoutSec);
         let outputArtifact: Awaited<ReturnType<typeof createOutputArtifact>> | undefined;
         let artifactError: string | undefined;
@@ -2683,6 +3123,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           cleanupStatus: result.cleanupStatus,
           artifactStatus,
         });
+        await progress?.update("finalizing", "Preparing shell command result");
         return makeResult(
           {
             cwd: result.cwd,
@@ -2711,6 +3152,10 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           },
           `Local shell: transport=SUCCESS, process=${result.commandStatus}, exit=${result.exitCode ?? "n/a"}, artifact=${artifactStatus}, ${result.durationMs}ms.`,
         );
+      }, {
+        extra: extra as ToolProgressHandlerExtra,
+        initialPhase: "preparing",
+        initialMessage: "Preparing local shell command",
       });
     },
   );
@@ -2852,9 +3297,9 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Run E2E command",
       description:
-        "Run a guarded project E2E/test command and capture a macOS screenshot by default. Use after e2e_start_server when a dev server is needed.",
+        "Run a guarded project E2E/test command. A tests-only or full-write lease is required even when captureScreenshot=false because nonvisual execution still requires the verify capability. For visual proof, use e2e_screenshot, e2e_open_url_screenshot, or e2e_test_and_show_screenshot.",
       annotations: COMMAND_RUN_ANNOTATIONS,
-      _meta: chatGptToolMeta("Running E2E command...", "E2E command finished", E2E_WIDGET_TOOL_META),
+      _meta: chatGptToolMeta("Running E2E command...", "E2E command finished"),
       inputSchema: {
         projectId: z.string(),
         command: z.string(),
@@ -2874,18 +3319,23 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           .optional(),
       },
     },
-    async (input) => {
-      return withErrorMapping(ctx, "e2e_run_command", { ...input, command: redact(input.command) }, async () => {
+    async (input, extra) => {
+      const operationRisk: OperationRisk | null = input.intent?.destructive
+        ? "destructive"
+        : input.intent?.needsNetwork
+          ? "network"
+          : null;
+      const requiredCapability: LeaseCapability = operationRisk
+        ? "remote"
+        : input.intent?.writesWorkspace
+          ? "write"
+          : "verify";
+      return withErrorMapping(ctx, "e2e_run_command", { ...input, command: redact(input.command) }, async (progress) => {
         requireNativeE2eSupport();
-        const operationRisk: OperationRisk | null = input.intent?.destructive
-          ? "destructive"
-          : input.intent?.needsNetwork
-            ? "network"
-            : null;
         const lease = await requireProjectLease(
           ctx,
           input.projectId,
-          operationRisk ? "remote" : input.intent?.writesWorkspace ? "write" : "verify",
+          requiredCapability,
         );
         if (operationRisk) {
           await ensureOperationAuthorized({
@@ -2897,7 +3347,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               command: input.command,
               cwd: input.cwd ?? null,
               screenshotUrl: input.screenshotUrl ?? null,
-              captureScreenshot: input.captureScreenshot ?? true,
+              captureScreenshot: input.captureScreenshot ?? false,
             },
             preview: redact(input.command),
           });
@@ -2908,6 +3358,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           projectId: input.projectId,
           command: summarizeCommandAudit(input.command),
         });
+        await progress?.update("running", "E2E command is running");
         const result = await runLocalShell(entry.root, input.command, input.cwd, input.timeoutSec);
         let screenshot:
           | {
@@ -2917,7 +3368,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               markdown: string;
             }
           | undefined;
-        if (input.captureScreenshot !== false) {
+        if (input.captureScreenshot === true) {
+          await progress?.update("capturing", "Capturing visual proof");
           let captured: Awaited<ReturnType<typeof captureE2eScreenshot>>;
           if (input.screenshotUrl) {
             captured = await captureE2eUrlScreenshot(entry.root, {
@@ -2942,6 +3394,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           exitCode: result.exitCode,
           screenshotPath: screenshot?.path,
         });
+        await progress?.update("finalizing", "Preparing E2E result");
         return withE2eImageContent(
           makeResult(
             {
@@ -2957,6 +3410,11 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           ),
           screenshot ? [screenshot] : [],
         );
+      }, {
+        extra: extra as ToolProgressHandlerExtra,
+        initialPhase: "preparing",
+        initialMessage: "Preparing E2E command",
+        requiredCapability,
       });
     },
   );
@@ -3243,6 +3701,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         const result = await gitDiffSummary(entry.root);
         return makeResult(
           {
+            status: result.status,
+            isGitRepository: result.isGitRepository,
             files: result.files.map((f) => ({ path: f.path, "+": f.added, "-": f.removed })),
             summary: result.summary,
           },
@@ -3299,6 +3759,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         const result = await gitDiffSummary(entry.root);
         return makeResult(
           {
+            status: result.status,
+            isGitRepository: result.isGitRepository,
             files: result.files.map((f) => ({ path: f.path, "+": f.added, "-": f.removed })),
             summary: result.summary,
           },
@@ -3432,7 +3894,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     "checkpoint_show",
     {
       title: "Show checkpoint",
-      description: "Show the redacted diff stored in a checkpoint.",
+      description: "Show secret-safe checkpoint metadata. Private scoped rollback snapshots are never returned.",
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: chatGptToolMeta("Loading checkpoint...", "Checkpoint loaded"),
       inputSchema: { projectId: z.string(), checkpointId: z.string() },
@@ -3440,7 +3902,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     async (input) => {
       return withErrorMapping(ctx, "checkpoint_show", input, async () => {
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
-        const checkpoint = await readCheckpoint(entry.root, input.checkpointId);
+        const checkpoint = toPublicCheckpoint(await readCheckpoint(entry.root, input.checkpointId));
         return makeResult({ checkpoint }, `Checkpoint ${input.checkpointId} loaded.`);
       });
     },
@@ -3450,7 +3912,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     "checkpoint_restore",
     {
       title: "Restore checkpoint",
-      description: "Reverse-apply the stored checkpoint diff. Requires a write lease.",
+      description:
+        "Restore only the files captured by a scoped mutation checkpoint after verifying their post-mutation hashes. Legacy workspace-wide reverse-diff checkpoints fail closed. Requires a write lease.",
       annotations: LOCAL_WRITE_ANNOTATIONS,
       _meta: chatGptToolMeta("Restoring checkpoint...", "Checkpoint restored"),
       inputSchema: { projectId: z.string(), checkpointId: z.string() },

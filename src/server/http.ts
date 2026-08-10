@@ -12,6 +12,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { classifyMcpRequest } from "./mcp-request-classification.js";
 import { isModernMcpRequest, modernClientName } from "./mcp-discovery.js";
 import { dispatchModernMcpRequest } from "./mcp-modern.js";
+import { classifyModernMcpDiagnostic } from "./mcp-diagnostic-classification.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
 import type { ToolContext } from "../types.js";
 import { createServer as createMcpServer } from "./mcp-server.js";
@@ -21,7 +22,10 @@ import { registerActionRoutes } from "./actions.js";
 import { registerLocalControlRoutes, type LocalControlRouteConfig } from "./local-control.js";
 import { RuntimeActivityTracker, type RuntimeSessionHandle } from "../runtime/activity.js";
 import { isDesktopControlSupported } from "../control/policy.js";
-import { FileConnectionDiagnostics } from "../runtime/connection-diagnostics.js";
+import {
+  FileConnectionDiagnostics,
+  type ConnectionDiagnosticSafeInputs,
+} from "../runtime/connection-diagnostics.js";
 import { toRemoteBoundaryError } from "./error-safety.js";
 import { remoteOwnerSessionScope } from "../state/session-scope.js";
 import {
@@ -116,6 +120,42 @@ function diagnosticEventForPath(pathname: string): string | undefined {
   return undefined;
 }
 
+function safeMcpToolAttribution(body: unknown, knownProjectIds: ReadonlySet<string>): {
+  tool?: string;
+  safeInputs?: ConnectionDiagnosticSafeInputs;
+} {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return {};
+  const envelope = body as Record<string, unknown>;
+  if (envelope.method !== "tools/call") return {};
+  if (!envelope.params || typeof envelope.params !== "object" || Array.isArray(envelope.params)) return {};
+  const params = envelope.params as Record<string, unknown>;
+  const tool = typeof params.name === "string"
+    && /^[a-z][a-z0-9_]{0,63}$/u.test(params.name)
+    && !/(?:token|secret|credential|password|api[_-]?key)/iu.test(params.name)
+    ? params.name
+    : undefined;
+  if (!tool) return {};
+  if (!params.arguments || typeof params.arguments !== "object" || Array.isArray(params.arguments)) return { tool };
+  const args = params.arguments as Record<string, unknown>;
+  const projectId = typeof args.projectId === "string" && knownProjectIds.has(args.projectId)
+    ? args.projectId
+    : undefined;
+  const commandId = tool === "command_run"
+    && typeof args.commandId === "string"
+    && /^(?:npm|make|flutter):[A-Za-z0-9._:-]{1,96}$/u.test(args.commandId)
+    && !/(?:token|secret|credential|password|api[_-]?key)/iu.test(args.commandId)
+    ? args.commandId
+    : undefined;
+  const safeInputs: ConnectionDiagnosticSafeInputs = {
+    ...(projectId ? { projectId } : {}),
+    ...(commandId ? { commandId } : {}),
+  };
+  return {
+    tool,
+    ...(Object.keys(safeInputs).length > 0 ? { safeInputs } : {}),
+  };
+}
+
 function sendJsonRpcError(
   res: Response,
   status: number,
@@ -129,6 +169,15 @@ function sendJsonRpcError(
 function hashAuditValue(value: string): string {
   return createHash("sha256").update(value).digest("base64url");
 }
+
+function jsonRpcErrorCode(response: Record<string, unknown> | undefined): number | undefined {
+  if (!response || typeof response.error !== "object" || response.error === null || Array.isArray(response.error)) {
+    return undefined;
+  }
+  const code = (response.error as Record<string, unknown>).code;
+  return typeof code === "number" && Number.isFinite(code) ? code : undefined;
+}
+
 
 const TRUSTED_CHATGPT_ORIGINS = ["https://chatgpt.com", "https://chat.openai.com"] as const;
 const REGISTER_RATE_LIMIT_MAX = 10;
@@ -281,7 +330,13 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
       return;
     }
     const requestStartedAt = Date.now();
+    const attribution = req.path === "/mcp"
+      ? safeMcpToolAttribution(req.body, new Set(ctx.registry.map((entry) => entry.projectId)))
+      : {};
+    let responseFinished = false;
+    let clientCancelRecorded = false;
     res.once("finish", () => {
+      responseFinished = true;
       const failure = res.statusCode >= 400;
       const bearerChallenge = req.path === "/mcp" && res.statusCode === 401 && !req.header("authorization");
       diagnostics
@@ -292,9 +347,30 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
           path: req.path,
           status: res.statusCode,
           durationMs: Date.now() - requestStartedAt,
+          ...(req.path === "/mcp" ? { phase: "transport" as const } : {}),
+          ...attribution,
           ...(failure && !bearerChallenge ? { errorCode: `HTTP_${res.statusCode}` } : {}),
         })
         .catch(() => undefined);
+    });
+    res.once("close", () => {
+      if (req.path !== "/mcp" || responseFinished || clientCancelRecorded) return;
+      clientCancelRecorded = true;
+      const activitySession = res.locals.c2ctActivitySession as RuntimeSessionHandle | undefined;
+      const cancelledOperation = activitySession
+        ? activityTracker.markClientCancelled(activitySession, attribution.tool)
+        : undefined;
+      diagnostics.record({
+        event: "mcp.client_cancelled",
+        outcome: "info",
+        method: req.method,
+        path: req.path,
+        durationMs: Date.now() - requestStartedAt,
+        phase: "transport",
+        cancelledByClient: true,
+        ...(cancelledOperation?.operationId ? { operationId: cancelledOperation.operationId } : {}),
+        ...attribution,
+      }).catch(() => undefined);
     });
     next();
   });
@@ -560,6 +636,7 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
     ) {
       const clientName = modernClientName(req.body);
       const activitySession = activityTracker.openSession({ transport: "http", clientName });
+      res.locals.c2ctActivitySession = activitySession;
       const now = Date.now();
       lastSessionActivityAtMs = now;
       activityTracker.touch(activitySession, now);
@@ -582,20 +659,19 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
             name: req.header("mcp-name"),
           },
         );
-        const jsonRpcFailure =
-          result.response !== undefined &&
-          typeof result.response.error === "object" &&
-          result.response.error !== null;
-        const failure = result.status >= 400 || jsonRpcFailure;
+        const rpcErrorCode = jsonRpcErrorCode(result.response);
+        const diagnosticClassification = classifyModernMcpDiagnostic({
+          status: result.status,
+          jsonRpcMethod: requestClassification.jsonRpcMethod,
+          jsonRpcErrorCode: rpcErrorCode,
+          body: req.body,
+        });
         diagnostics
           .record({
-            event: "mcp.modern_request",
-            outcome: failure ? "failure" : "success",
+            ...diagnosticClassification,
+            ...safeMcpToolAttribution(req.body, new Set(ctx.registry.map((entry) => entry.projectId))),
             method: req.method,
             status: result.status,
-            ...(failure
-              ? { errorCode: result.status >= 400 ? `HTTP_${result.status}` : "MCP_JSONRPC_ERROR" }
-              : {}),
             clientName,
             jsonRpcMethod: requestClassification.jsonRpcMethod,
             requestKind: requestClassification.requestKind,
@@ -628,6 +704,7 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
         tracked.requestCount += 1;
         tracked.reusedRequestCount += 1;
         trackedForRequest = tracked;
+        res.locals.c2ctActivitySession = tracked.activitySession;
         transport = tracked.transport;
       } else if (initializeRequest) {
         if (sessions.size >= config.maxSessions) await evictOldestSession();
@@ -635,6 +712,7 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
         const clientName =
           typeof req.body?.params?.clientInfo?.name === "string" ? req.body.params.clientInfo.name : undefined;
         const activitySession = activityTracker.openSession({ transport: "http", clientName });
+        res.locals.c2ctActivitySession = activitySession;
         const initializeStartedAtMs = Date.now();
         const sessionScope = remoteOwnerSessionScope();
         let trackedSession: TrackedSession | undefined;

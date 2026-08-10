@@ -366,8 +366,10 @@ export function armRequestSummary(record: ArmRequestRecord): Record<string, unkn
 
 /**
  * Find the controlling request for one project and stable requester identity.
- * An approved record wins over newer terminal noise so a replay cannot create
- * a fresh pending request after a prior local grant.
+ * An approved record wins over newer terminal noise so callers can first
+ * verify whether its scoped control lease is still active. An approved record
+ * is not itself a reusable grant: if that lease is missing or expired, the
+ * caller must create a fresh pending request and require local approval again.
  */
 export function findArmRequestForSession(
   requests: ArmRequestRecord[],

@@ -49,6 +49,53 @@ Owner Token, OAuth 토큰, Authorization 헤더, 요청 본문, 도구 입력·�
 이벤트를 한 번에 반환합니다. 다만 ChatGPT가 도구를 호출하기 전 단계에서 발생한
 400은 이 도구도 호출할 수 없으므로 데스크톱 메뉴의 로그를 사용해야 합니다.
 
+### 장시간 `command_run`과 Stop forensic
+
+장시간 명령은 secret-free lifecycle을 별도로 기록합니다. `connection_status`의
+`activeOperations`와 `diagnostics.recentCommandEvents`, 또는 `connection_audit`의
+`slowRequests`/`toolLatency`를 먼저 확인합니다.
+
+`activeOperations`는 각 실행의 `operationId`, `startedAt`, `elapsedMs`, 현재 `phase`,
+최근 progress 시각을 제공합니다. client 연결이 먼저 닫힌 실행에는
+`clientCancellation.operationContinues=true`와
+`recommendedAction=wait-and-recheck-connection-status`를 표시합니다. 이 표시는
+서버가 취소를 무시한다는 뜻이 아니라 **transport 취소만으로 실제 작업 종료를
+증명할 수 없다는 뜻**입니다.
+
+- `phase=approval`: 위험 명령의 로컬 승인 경계를 확인 중입니다. 아직 subprocess가
+  시작됐다고 해석하지 않습니다.
+- `phase=spawn`, `actionStarted=true`: 승인/정책 경계를 통과해 spawn 직전입니다.
+  one-shot 승인이 실제 실행에 소비됐다고 단정하려면 뒤따르는
+  `subprocessStarted=true`를 확인합니다.
+- `phase=running`, `subprocessStarted=true`, `subprocessStillRunning=true`: 실제 child
+  process가 시작되어 실행 중입니다.
+- `phase=cleanup`: timeout 등으로 process-tree 정리가 시작됐습니다.
+- `phase=completed`: `commandStatus`, `cleanupStatus`, `durationMs`와 함께 완료 상태를
+  판정합니다.
+- 응답 완료 전에 client 연결이 닫히면 별도 `mcp.client_cancelled`,
+  `cancelledByClient=true`를 기록합니다. 이는 **client가 기다리기를 중단했다는
+  transport 증거**이며 이미 시작된 subprocess를 자동 kill했다는 뜻은 아닙니다.
+
+`connection_status.diagnostics.clientCancellationRecovery`는 가장 최근 client 취소를
+동일한 `operationId`의 후속 lifecycle과만 연결합니다.
+
+- `still-running`: 실행 또는 cleanup이 계속되므로 기다린 뒤 status를 다시 봅니다.
+- `completed`: 실행은 끝났지만 원래 응답을 client가 받지 못했을 수 있으므로 결과와
+  산출물을 확인한 뒤에만 재실행합니다.
+- `failed`: 실패·timeout·spawn/cleanup 결과를 확인한 뒤 재시도 여부를 판단합니다.
+- `unknown`: operation ID가 없거나 동시 실행 때문에 안전하게 연결할 수 없습니다.
+  `connection_audit`로 조사하기 전에는 재실행하지 않습니다.
+
+모든 상태에서 `automaticRetrySafe=false`입니다. client 취소는 명령의 멱등성이나
+approval/receipt 소비 여부를 증명하지 않기 때문입니다. 같은 session에서 같은 tool이
+동시에 실행돼 상관관계가 모호하면 runtime은 최신 실행을 추측하지 않고 `unknown`으로
+남깁니다.
+
+MCP client가 progress token을 제공하는 경로에서는 `notifications/progress`를 보내며
+5초 heartbeat를 유지합니다. 현재 ChatGPT modern stateless one-shot 경로는 handler에
+progress token을 전달하지 않으므로 live UI heartbeat를 보장할 수 없습니다. 이 경우
+다음 턴의 `connection_status`/`connection_audit` forensic이 canonical fallback입니다.
+
 ### 런타임 reload 때 정상적으로 보이는 이벤트
 
 앱의 런타임 업데이트 기능이 동작하면 다음 순서가 짧게 나타날 수 있습니다.

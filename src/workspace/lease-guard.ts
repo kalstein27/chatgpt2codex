@@ -9,6 +9,16 @@ import { requireLease } from "./project-select.js";
  */
 export type LeaseCapability = "read" | "verify" | "write" | "image" | "remote" | "control";
 
+/** Smallest lease preset that grants each capability without widening access. */
+export const RECOMMENDED_PRESET_BY_CAPABILITY: Readonly<Record<LeaseCapability, LeasePreset>> = {
+  read: "read-only",
+  verify: "tests-only",
+  write: "full-write",
+  image: "image-only",
+  remote: "full-write",
+  control: "control",
+};
+
 const ALLOWED_CAPABILITIES: Record<LeasePreset, ReadonlySet<LeaseCapability>> = {
   "read-only": new Set(["read"]),
   "tests-only": new Set(["read", "verify"]),
@@ -34,7 +44,8 @@ export async function requireProjectLease(
     throw new DomainError(ErrorCode.PERMISSION_DENIED, `Lease preset ${lease.preset} does not allow ${capability}`, {
       projectId,
       preset: lease.preset,
-      capability,
+      requiredCapability: capability,
+      recommendedPreset: RECOMMENDED_PRESET_BY_CAPABILITY[capability],
     });
   }
   return lease;

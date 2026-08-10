@@ -69,6 +69,24 @@ const ACTION_ROUTES: ActionRoute[] = [
     schema: "ProjectSelectInput",
   },
   {
+    path: "/actions/project-release",
+    tool: "project_release",
+    operationId: "project_release",
+    summary: "Release the active local project lease",
+    description:
+      "Call this after mutation, test, image-save, or control work is complete and before the final response. It releases the privileged lease while keeping the project selected by default, and fails closed if another operation is still running.",
+    schema: "ProjectReleaseInput",
+  },
+  {
+    path: "/actions/connection-audit",
+    tool: "connection_audit",
+    operationId: "connection_audit",
+    summary: "Audit recent connection activity",
+    description:
+      "Aggregate secret-free current and archived connection diagnostics without shell access. Prefer exact ISO-8601 since/until bounds; since overrides sinceHours. Safe input metadata is returned only when includeSafeInputs=true.",
+    schema: "ConnectionAuditInput",
+  },
+  {
     path: "/actions/workspace-list-projects",
     tool: "workspace_list_projects",
     operationId: "workspace_list_projects",
@@ -129,7 +147,8 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "file_read_slice",
     operationId: "file_read_slice",
     summary: "Read project file slice",
-    description: "Read a line range from a project file with hash anchors for safe patching.",
+    description:
+      "Read a line range from a project file with hash anchors for safe patching. If redaction is reported, use file_edit_lines rather than copying [REDACTED] into patch context.",
     schema: "FileReadSliceInput",
   },
   {
@@ -137,7 +156,8 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "file_apply_patch",
     operationId: "file_apply_patch",
     summary: "Apply a project file patch",
-    description: "Apply a Codex-style patch directly to the selected local project. Requires project_select preset=full-write; do not return shell scripts for the user to paste.",
+    description:
+      "Apply a Codex-style patch directly to the selected local project. Requires project_select preset=full-write. Redacted patch context is rejected; use file_edit_lines with a fresh whole-file hash instead.",
     schema: "FileApplyPatchInput",
   },
   {
@@ -161,9 +181,10 @@ const ACTION_ROUTES: ActionRoute[] = [
     path: "/actions/command-list",
     tool: "command_list",
     operationId: "command_list",
-    summary: "List project commands",
-    description: "List allowlisted project commands discovered by chatgpt2codex.",
-    schema: "ProjectOnlyInput",
+    summary: "List or query project commands",
+    description:
+      "List allowlisted project commands, query by text, or fetch exact command IDs. Narrow queries omit runtime environment details unless includeEnvironment=true; projectId-only calls retain the legacy full response.",
+    schema: "CommandListInput",
   },
   {
     path: "/actions/command-run",
@@ -202,9 +223,9 @@ const ACTION_ROUTES: ActionRoute[] = [
     path: "/actions/e2e-run-command",
     tool: "e2e_run_command",
     operationId: "e2e_run_command",
-    summary: "Run E2E command and capture proof",
+    summary: "Run a guarded E2E command",
     description:
-      "Run a guarded project E2E/test command and capture a macOS screenshot by default so the user can inspect visual proof.",
+      "Run a guarded project E2E/test command. A tests-only or full-write lease is required even when captureScreenshot=false because nonvisual execution still requires verify capability. Capture visual proof only when captureScreenshot=true is explicitly requested.",
     schema: "E2eRunCommandInput",
   },
   {
@@ -270,7 +291,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "checkpoint_show",
     operationId: "checkpoint_show",
     summary: "Show project checkpoint",
-    description: "Show the redacted diff stored in a chatgpt2codex checkpoint.",
+    description: "Show secret-safe checkpoint metadata without private rollback snapshots.",
     schema: "CheckpointShowInput",
   },
   {
@@ -278,7 +299,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "checkpoint_restore",
     operationId: "checkpoint_restore",
     summary: "Restore project checkpoint",
-    description: "Reverse-apply a checkpoint diff through chatgpt2codex. Requires a write lease.",
+    description: "Restore only files captured by a scoped mutation checkpoint after hash verification. Requires a write lease.",
     schema: "CheckpointShowInput",
   },
   {
@@ -330,6 +351,8 @@ const OPENAPI_ACTION_TOOL_NAMES = new Set([
   "goal_intake",
   "goal_loop",
   "project_select",
+  "project_release",
+  "connection_audit",
   "workspace_list_projects",
   "project_status",
   "project_rules",
@@ -348,7 +371,6 @@ const OPENAPI_ACTION_TOOL_NAMES = new Set([
   "e2e_open_url_screenshot",
   "repo_status",
   "repo_diff_summary",
-  "show_changes",
   "git_commit",
   "git_push",
   "save_chatgpt_image",
@@ -762,6 +784,23 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId"],
           properties: { projectId: { type: "string" } },
         },
+        CommandListInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["projectId"],
+          properties: {
+            projectId: { type: "string" },
+            query: { type: "string", minLength: 1, maxLength: 200 },
+            commandIds: {
+              type: "array",
+              minItems: 1,
+              maxItems: 100,
+              items: { type: "string", minLength: 1, maxLength: 200 },
+            },
+            includeEnvironment: { type: "boolean" },
+            catalogVersion: { type: "string", pattern: "^sha256:[a-f0-9]{24}$" },
+          },
+        },
         ProjectSelectInput: {
           type: "object",
           additionalProperties: false,
@@ -775,6 +814,44 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
               description: "Defaults to full-write on the GPT Actions bridge when omitted.",
             },
             confirmSwitch: { type: "boolean" },
+          },
+        },
+        ProjectReleaseInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["projectId", "reason"],
+          properties: {
+            projectId: { type: "string" },
+            leaseId: { type: "string", pattern: "^lease_[0-9a-fA-F-]{36}$" },
+            reason: { type: "string", minLength: 1 },
+            keepProjectSelected: {
+              type: "boolean",
+              default: true,
+              description: "Keep the project selected in read mode after releasing its lease.",
+            },
+          },
+        },
+        ConnectionAuditInput: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            sinceHours: {
+              type: "integer",
+              minimum: 1,
+              maximum: 168,
+              default: 24,
+              description: "Backward-compatible relative window. Ignored when since is provided.",
+            },
+            since: { type: "string", format: "date-time", description: "Exact inclusive ISO-8601 start timestamp." },
+            until: { type: "string", format: "date-time", description: "Exact inclusive ISO-8601 end timestamp. Defaults to now." },
+            includeSafeInputs: {
+              type: "boolean",
+              default: false,
+              description: "Include only allowlisted safe input metadata; raw commands, URLs, paths, file contents, clipboard data, environment values, tokens, and credentials are never returned.",
+            },
+            slowRequestThresholdMs: { type: "integer", minimum: 0, maximum: 900000 },
+            maxSlowRequests: { type: "integer", minimum: 1, maximum: 50 },
+            maxRecentFailures: { type: "integer", minimum: 1, maximum: 50 },
           },
         },
         CodeSearchInput: {
@@ -960,7 +1037,11 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
             cwd: { type: "string", description: "Optional project-relative working directory." },
             timeoutSec: { type: "integer", minimum: 1, maximum: 900 },
             label: { type: "string" },
-            captureScreenshot: { type: "boolean", description: "Defaults to true. Set false only for non-visual E2E checks." },
+            captureScreenshot: {
+              type: "boolean",
+              description:
+                "Defaults to false. Nonvisual execution still requires verify capability, so use tests-only or full-write. Prefer dedicated screenshot actions for visual proof.",
+            },
             screenshotUrl: { type: "string", description: "Optional URL to open before the screenshot after the command exits." },
             screenshotWaitMs: { type: "integer", minimum: 0, maximum: 30000 },
             openAfterCapture: { type: "boolean" },
