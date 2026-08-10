@@ -1,10 +1,14 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { isUtf8 } from "node:buffer";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { resolveInProject } from "../policy/paths.js";
 import { DomainError, ErrorCode } from "../types.js";
 import { rangeHash } from "../util/hash.js";
+import {
+  MAX_CHECKPOINT_SNAPSHOT_BYTES,
+  type MutationCheckpointFile,
+} from "../state/checkpoints.js";
 
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_EDIT_BYTES = 10 * 1024 * 1024;
@@ -98,7 +102,10 @@ function assertConsistentEol(raw: string, rel: string): void {
  * Coordinates match file_read_slice: normalized content is split on `\n`, so a
  * file ending in a newline has a final empty logical line.
  */
-export async function editFileLines(root: string, edits: LineEdit[]): Promise<{ applied: AppliedLineEdit[] }> {
+export async function editFileLines(
+  root: string,
+  edits: LineEdit[],
+): Promise<{ applied: AppliedLineEdit[]; checkpointFiles: MutationCheckpointFile[] }> {
   if (edits.length === 0) {
     throw new DomainError(ErrorCode.HASH_MISMATCH, "At least one line edit is required", {
       reason: "empty_line_edits",
@@ -150,11 +157,12 @@ export async function editFileLines(root: string, edits: LineEdit[]): Promise<{ 
     const normalized = raw.replace(/\r\n/g, "\n");
     const beforeHash = rangeHash(normalized);
     if (beforeHash !== edit.fileHash) {
-      throw new DomainError(ErrorCode.HASH_MISMATCH, `Hash precondition failed for ${edit.path}`, {
+      throw new DomainError(ErrorCode.STALE_FILE_HASH, `Hash precondition failed for ${edit.path}`, {
         path: edit.path,
         expected: edit.fileHash,
         actual: beforeHash,
         reason: "stale_file_hash",
+        recommendedTool: "file_read_slice",
       });
     }
 
@@ -202,6 +210,34 @@ export async function editFileLines(root: string, edits: LineEdit[]): Promise<{ 
     });
   }
 
+  for (const item of staged) {
+    let current: Buffer;
+    try {
+      current = await fs.readFile(item.abs);
+    } catch {
+      throw new DomainError(ErrorCode.CONCURRENT_MUTATION, "File disappeared while the line edit was being prepared", {
+        reason: "concurrent_mutation",
+        recommendedTool: "file_read_slice",
+      });
+    }
+    if (!current.equals(item.previous)) {
+      throw new DomainError(ErrorCode.CONCURRENT_MUTATION, "File changed while the line edit was being prepared", {
+        reason: "concurrent_mutation",
+        recommendedTool: "file_read_slice",
+      });
+    }
+  }
+
+  const checkpointBytes = staged.reduce(
+    (total, item) => total + (item.result.changed ? item.previous.byteLength : 0),
+    0,
+  );
+  if (checkpointBytes > MAX_CHECKPOINT_SNAPSHOT_BYTES) {
+    throw new DomainError(ErrorCode.FILE_TOO_LARGE, "Line edit rollback snapshot is too large", {
+      bytes: checkpointBytes,
+    });
+  }
+
   const committed: StagedLineEdit[] = [];
   try {
     for (const item of staged) {
@@ -226,5 +262,15 @@ export async function editFileLines(root: string, edits: LineEdit[]): Promise<{ 
     throw err;
   }
 
-  return { applied: staged.map((item) => item.result) };
+  return {
+    applied: staged.map((item) => item.result),
+    checkpointFiles: staged
+      .filter((item) => item.result.changed)
+      .map((item) => ({
+        path: item.result.path,
+        beforeContent: item.previous,
+        beforeMode: item.mode,
+        afterSha256: createHash("sha256").update(Buffer.from(item.content, "utf8")).digest("hex"),
+      })),
+  };
 }

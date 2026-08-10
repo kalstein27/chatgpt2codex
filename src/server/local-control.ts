@@ -276,6 +276,7 @@ export function registerLocalControlRoutes(
               lastSuccessAt: diagnosticSummary.lastSuccessAt,
               lastFailureAt: diagnosticSummary.lastFailureAt,
               lastFailure: diagnosticSummary.lastFailure,
+              clientCancellationRecovery: diagnosticSummary.clientCancellationRecovery ?? null,
             }
           : null,
       });

@@ -215,7 +215,7 @@ reviewed assets, and the small set of user-facing guides linked above.
 For developers:
 
 ```bash
-npm ci
+npm ci --ignore-scripts
 npm run typecheck
 npm run build
 ```

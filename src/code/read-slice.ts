@@ -94,7 +94,12 @@ export async function readSlice(
 ): Promise<ReadSliceResult> {
   const abs = await resolveInProject(root, rel, { allowSymlink: false });
 
-  const stat = await fs.lstat(abs);
+  let stat;
+  try {
+    stat = await fs.lstat(abs);
+  } catch (error) {
+    throwReadPathError(error, rel);
+  }
   if (!stat.isFile()) {
     throw new DomainError(ErrorCode.NOT_A_FILE, `Not a regular file: ${rel}`, { path: rel });
   }
@@ -105,7 +110,12 @@ export async function readSlice(
     });
   }
 
-  const buf = await fs.readFile(abs);
+  let buf: Buffer;
+  try {
+    buf = await fs.readFile(abs);
+  } catch (error) {
+    throwReadPathError(error, rel);
+  }
   const raw = buf.toString("utf8");
   const eol = detectEol(raw);
   const normalized = raw.replace(/\r\n/g, "\n");
@@ -189,4 +199,15 @@ function clampEnd(end: number | undefined, totalLines: number): number {
 
 function detectEol(raw: string): "lf" | "crlf" {
   return raw.includes("\r\n") ? "crlf" : "lf";
+}
+
+function throwReadPathError(error: unknown, rel: string): never {
+  const code = error instanceof Error && "code" in error ? (error as NodeJS.ErrnoException).code : undefined;
+  if (code === "ENOENT" || code === "ENOTDIR") {
+    throw new DomainError(ErrorCode.FILE_NOT_FOUND, `File not found: ${rel}`, { path: rel });
+  }
+  if (code === "EACCES" || code === "EPERM") {
+    throw new DomainError(ErrorCode.PERMISSION_DENIED, `Permission denied reading file: ${rel}`, { path: rel });
+  }
+  throw error;
 }

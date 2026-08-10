@@ -10,6 +10,7 @@ const HARD_MAX_RESULTS = 200;
 /** Directory names the JS fallback walker never descends into. */
 const SKIP_DIRS = new Set([
   ".git",
+  ".chatgpt2codex",
   "node_modules",
   ".ai",
   ".codex",
@@ -59,7 +60,7 @@ export async function codeSearch(
   return { matches, backend: "ripgrep-js-fallback" };
 }
 
-async function tryRipgrep(
+export async function tryRipgrep(
   root: string,
   query: string,
   cap: number,
@@ -150,7 +151,7 @@ function execFileAsync(cmd: string, args: string[]): Promise<{ stdout: string; s
  * line-by-line. Used only when `rg` is unavailable so search never
  * hard-fails.
  */
-async function jsFallbackSearch(root: string, query: string, cap: number): Promise<Match[]> {
+export async function jsFallbackSearch(root: string, query: string, cap: number): Promise<Match[]> {
   const matches: Match[] = [];
   await walk(root, async (absFile, rel) => {
     if (matches.length >= cap) return;

@@ -121,6 +121,10 @@ private let desktopLocalizationRows: [String: [String]] = [
     "agentArmOffMenu": ["Agent Arm: off", "Agent Arm: 꺼짐"],
     "activeSessionsMenu": ["Active session status", "활성 세션 상태"],
     "sessionNoActive": ["No active sessions", "활성 세션 없음"],
+    "sessionPhase": ["Phase", "단계"],
+    "sessionHeartbeat": ["heartbeat", "하트비트"],
+    "sessionClientCancelled": ["Client stopped waiting", "클라이언트가 대기를 중단함"],
+    "sessionNoAutomaticRetry": ["do not retry automatically", "자동 재실행 금지"],
     "permissionAllowed": ["allowed", "허용됨"],
     "permissionRequired": ["permission required", "권한 필요"],
     "killControlMenu": ["Kill Control", "제어 강제 종료"],
@@ -448,8 +452,21 @@ private final class ServiceController {
         let label: String
         let clientName: String?
         let state: String
+        let operationId: String?
         let tool: String?
         let elapsedMs: Int
+        let phase: String?
+        let message: String?
+        let lastProgressAt: Int?
+        let clientCancellationObservedAt: Int?
+        let operationContinuesAfterCancellation: Bool
+    }
+
+    struct ClientCancellationRecovery {
+        let operationId: String?
+        let state: String
+        let automaticRetrySafe: Bool
+        let recommendedAction: String
     }
 
     struct PendingArmRequest {
@@ -505,6 +522,7 @@ private final class ServiceController {
         let autoRemainingMs: Int
         let allowlistedAppCount: Int
         let sessions: [ActiveSessionSummary]
+        let clientCancellationRecovery: ClientCancellationRecovery?
         let rg: RgCapabilitySnapshot
     }
 
@@ -642,12 +660,29 @@ private final class ServiceController {
             }
             let sessions = (root["sessions"] as? [[String: Any]] ?? []).map { entry -> ActiveSessionSummary in
                 let operation = entry["operation"] as? [String: Any]
+                let cancellation = operation?["clientCancellation"] as? [String: Any]
                 return ActiveSessionSummary(
                     label: entry["sessionLabel"] as? String ?? "session",
                     clientName: entry["clientName"] as? String,
                     state: entry["state"] as? String ?? "idle",
+                    operationId: operation?["operationId"] as? String,
                     tool: operation?["tool"] as? String,
-                    elapsedMs: operation?["elapsedMs"] as? Int ?? 0
+                    elapsedMs: operation?["elapsedMs"] as? Int ?? 0,
+                    phase: operation?["phase"] as? String,
+                    message: operation?["message"] as? String,
+                    lastProgressAt: operation?["lastProgressAt"] as? Int,
+                    clientCancellationObservedAt: cancellation?["observedAt"] as? Int,
+                    operationContinuesAfterCancellation: cancellation?["operationContinues"] as? Bool ?? false
+                )
+            }
+            let diagnostics = root["diagnostics"] as? [String: Any]
+            let recoveryEntry = diagnostics?["clientCancellationRecovery"] as? [String: Any]
+            let cancellationRecovery = recoveryEntry.map { entry in
+                ClientCancellationRecovery(
+                    operationId: entry["operationId"] as? String,
+                    state: entry["state"] as? String ?? "unknown",
+                    automaticRetrySafe: entry["automaticRetrySafe"] as? Bool ?? false,
+                    recommendedAction: entry["recommendedAction"] as? String ?? "inspect-connection-audit-before-retry"
                 )
             }
             let externalSearch = root["externalSearch"] as? [String: Any]
@@ -690,6 +725,7 @@ private final class ServiceController {
                 autoRemainingMs: control["autoRemainingMs"] as? Int ?? 0,
                 allowlistedAppCount: control["allowlistedAppCount"] as? Int ?? 0,
                 sessions: sessions,
+                clientCancellationRecovery: cancellationRecovery,
                 rg: rgSnapshot
             ))
         }
@@ -1433,14 +1469,21 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
                     self.applyControlSnapshot()
                     self.applyRgSnapshot()
                     self.applyOperationApprovalSnapshot()
+                    self.refreshSessionSubmenu()
                 }
             } else {
                 self.latestControlSnapshot = nil
                 self.applyControlSnapshot()
                 self.applyRgSnapshot()
                 self.applyOperationApprovalSnapshot()
+                self.refreshSessionSubmenu()
             }
         }
+    }
+
+    private func refreshSessionSubmenu() {
+        guard let menu = sessionStatusSubmenu else { return }
+        menuNeedsUpdate(menu)
     }
 
     private func updatePermissionMenuItems() {
@@ -1944,6 +1987,37 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
                 let detail = NSMenuItem(title: "  \(operation)", action: nil, keyEquivalent: "")
                 detail.isEnabled = false
                 menu.addItem(detail)
+                if let phase = session.phase {
+                    let heartbeatAge: String
+                    if let lastProgressAt = session.lastProgressAt {
+                        let ageSeconds = max(0, (Int(Date().timeIntervalSince1970 * 1000) - lastProgressAt) / 1000)
+                        heartbeatAge = " · \(t("sessionHeartbeat")) \(ageSeconds)s"
+                    } else {
+                        heartbeatAge = ""
+                    }
+                    let phaseItem = NSMenuItem(
+                        title: "  \(t("sessionPhase")): \(phase)\(heartbeatAge)",
+                        action: nil,
+                        keyEquivalent: ""
+                    )
+                    phaseItem.isEnabled = false
+                    phaseItem.toolTip = session.message
+                    menu.addItem(phaseItem)
+                }
+                if session.clientCancellationObservedAt != nil {
+                    let recovery = latestControlSnapshot?.clientCancellationRecovery
+                    let matchingRecovery = recovery?.operationId == session.operationId ? recovery : nil
+                    let recoveryState = matchingRecovery?.state
+                        ?? (session.operationContinuesAfterCancellation ? "still-running" : session.state)
+                    let cancellationItem = NSMenuItem(
+                        title: "  ⚠︎ \(t("sessionClientCancelled")) · \(recoveryState) · \(t("sessionNoAutomaticRetry"))",
+                        action: nil,
+                        keyEquivalent: ""
+                    )
+                    cancellationItem.isEnabled = false
+                    cancellationItem.toolTip = matchingRecovery?.recommendedAction
+                    menu.addItem(cancellationItem)
+                }
                 menu.addItem(.separator())
             }
             return

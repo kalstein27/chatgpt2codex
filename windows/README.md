@@ -45,7 +45,7 @@ Prerequisites:
 - .NET Framework C# compiler available to the launcher build script
 
 ```powershell
-npm ci
+npm ci --ignore-scripts
 npm run typecheck
 npm run build
 ```

@@ -1,9 +1,13 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { DomainError, ErrorCode } from "../types.js";
 import { resolveInProject } from "../policy/paths.js";
 import { rangeHash } from "../util/hash.js";
+import {
+  MAX_CHECKPOINT_SNAPSHOT_BYTES,
+  type MutationCheckpointFile,
+} from "../state/checkpoints.js";
 
 const MAX_PATCH_BYTES = 10 * 1024 * 1024; // 10MB (PRD §8.4 PATCH_TOO_LARGE)
 
@@ -228,9 +232,17 @@ function applyHunks(original: string, hunks: Hunk[]): string {
     }
 
     if (matchAt === -1) {
-      throw new DomainError(ErrorCode.HASH_MISMATCH, "Patch hunk context did not match file content", {
-        reason: "hunk_context_mismatch",
-      });
+      const containsRedactedContext = searchLines.some((line) => line.includes("[REDACTED]"));
+      throw new DomainError(
+        containsRedactedContext ? ErrorCode.PATCH_CONTEXT_REDACTED : ErrorCode.PATCH_CONTEXT_NOT_FOUND,
+        containsRedactedContext
+          ? "Patch hunk contains redacted context; use file_edit_lines with a fresh whole-file hash"
+          : "Patch hunk context did not match file content",
+        {
+          reason: containsRedactedContext ? "patch_context_redacted" : "patch_context_not_found",
+          recommendedTool: containsRedactedContext ? "file_edit_lines" : "file_read_slice",
+        },
+      );
     }
 
     // Copy any untouched lines before this hunk.
@@ -257,6 +269,8 @@ function applyHunks(original: string, hunks: Hunk[]): string {
 interface StagedWrite {
   abs: string;
   content: string | null; // null => delete
+  /** Whole-file hash observed while the edit was staged. */
+  baselineHash?: string;
   tempPath?: string;
 }
 
@@ -292,7 +306,7 @@ export async function applyPatch(
   root: string,
   patch: string,
   preconditionHashes?: Record<string, string>,
-): Promise<{ applied: AppliedEntry[] }> {
+): Promise<{ applied: AppliedEntry[]; checkpointFiles: MutationCheckpointFile[] }> {
   const ops = parsePatch(patch);
 
   const staged: StagedWrite[] = [];
@@ -308,18 +322,17 @@ export async function applyPatch(
 
     if (op.action === "delete") {
       const abs = await resolveInProject(root, op.path, { allowSymlink: false, rejectRoot: true });
-      await enforcePrecondition(abs, op.path, preconditionHashes);
-      staged.push({ abs, content: null });
+      const original = await readMutationSource(abs, op.path, preconditionHashes);
+      staged.push({ abs, content: null, baselineHash: rangeHash(original) });
       applied.push({ path: op.path, action: "delete", added: 0, removed: 0 });
       continue;
     }
 
     if (op.action === "update") {
       const abs = await resolveInProject(root, op.path, { allowSymlink: false, rejectRoot: true });
-      await enforcePrecondition(abs, op.path, preconditionHashes);
-      const original = await fs.readFile(abs, "utf8");
+      const original = await readMutationSource(abs, op.path, preconditionHashes);
       const next = applyHunks(original, op.hunks);
-      staged.push({ abs, content: next });
+      staged.push({ abs, content: next, baselineHash: rangeHash(original) });
       const delta = countDelta(op.hunks);
       applied.push({ path: op.path, action: "update", added: delta.added, removed: delta.removed });
       continue;
@@ -327,11 +340,10 @@ export async function applyPatch(
 
     if (op.action === "move") {
       const abs = await resolveInProject(root, op.path, { allowSymlink: false, rejectRoot: true });
-      await enforcePrecondition(abs, op.path, preconditionHashes);
       const newAbs = await resolveInProject(root, op.newPath, { allowSymlink: false, rejectRoot: true });
-      const original = await fs.readFile(abs, "utf8");
+      const original = await readMutationSource(abs, op.path, preconditionHashes);
       const next = op.hunks.length > 0 ? applyHunks(original, op.hunks) : original;
-      staged.push({ abs, content: null }); // remove old location
+      staged.push({ abs, content: null, baselineHash: rangeHash(original) }); // remove old location
       staged.push({ abs: newAbs, content: next }); // write new location
       const delta = countDelta(op.hunks);
       applied.push({ path: op.path, action: "move", added: delta.added, removed: delta.removed });
@@ -339,9 +351,44 @@ export async function applyPatch(
     }
   }
 
+  const checkpointBefore = new Map<string, { path: string; content: Buffer | null; mode?: number }>();
+  const checkpointAfter = new Map<string, Buffer | null>();
+  for (const write of staged) {
+    if (!checkpointBefore.has(write.abs)) {
+      try {
+        const stat = await fs.lstat(write.abs);
+        if (!stat.isFile()) {
+          throw new DomainError(ErrorCode.NOT_A_FILE, "Patch target is not a regular file");
+        }
+        checkpointBefore.set(write.abs, {
+          path: path.relative(root, write.abs).split(path.sep).join("/"),
+          content: await fs.readFile(write.abs),
+          mode: stat.mode & 0o7777,
+        });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        checkpointBefore.set(write.abs, {
+          path: path.relative(root, write.abs).split(path.sep).join("/"),
+          content: null,
+        });
+      }
+    }
+    checkpointAfter.set(write.abs, write.content === null ? null : Buffer.from(write.content, "utf8"));
+  }
+  const checkpointBytes = [...checkpointBefore.values()].reduce(
+    (total, file) => total + (file.content?.byteLength ?? 0),
+    0,
+  );
+  if (checkpointBytes > MAX_CHECKPOINT_SNAPSHOT_BYTES) {
+    throw new DomainError(ErrorCode.FILE_TOO_LARGE, "Patch rollback snapshot is too large", {
+      bytes: checkpointBytes,
+    });
+  }
+
   // Transactional commit: write every staged change to a temp file first,
   // then rename into place. If any write fails, roll back everything that
   // already landed.
+  await assertStagedSourcesUnchanged(staged);
   const committed: { finalPath: string; hadPrevious: boolean; prevContent: Buffer | null }[] = [];
   try {
     for (const write of staged) {
@@ -392,31 +439,64 @@ export async function applyPatch(
     throw new DomainError(ErrorCode.HASH_MISMATCH, `Patch apply failed: ${(err as Error).message}`);
   }
 
-  return { applied };
+  const checkpointFiles: MutationCheckpointFile[] = [];
+  for (const [abs, before] of checkpointBefore) {
+    const after = checkpointAfter.get(abs) ?? null;
+    if (before.content === null ? after === null : after !== null && before.content.equals(after)) continue;
+    checkpointFiles.push({
+      path: before.path,
+      beforeContent: before.content,
+      beforeMode: before.mode,
+      afterSha256: after === null ? null : createHash("sha256").update(after).digest("hex"),
+    });
+  }
+  return { applied, checkpointFiles };
 }
 
-async function enforcePrecondition(
+async function readMutationSource(
   abs: string,
   relPath: string,
   preconditionHashes?: Record<string, string>,
-): Promise<void> {
+): Promise<string> {
   const expected = preconditionHashes?.[relPath];
-  if (!expected) return;
   let current: string;
   try {
     current = await fs.readFile(abs, "utf8");
   } catch {
-    throw new DomainError(ErrorCode.HASH_MISMATCH, `File missing for precondition check: ${relPath}`, {
-      path: relPath,
-    });
+    throw new DomainError(ErrorCode.FILE_NOT_FOUND, `File missing for mutation: ${relPath}`, { path: relPath });
   }
+  if (!expected) return current;
   const actualHash = rangeHash(current);
   if (actualHash !== expected) {
-    throw new DomainError(ErrorCode.HASH_MISMATCH, `Hash precondition failed for ${relPath}`, {
+    throw new DomainError(ErrorCode.STALE_FILE_HASH, `Hash precondition failed for ${relPath}`, {
       path: relPath,
       expected,
       actual: actualHash,
+      reason: "stale_file_hash",
+      recommendedTool: "file_read_slice",
     });
+  }
+  return current;
+}
+
+async function assertStagedSourcesUnchanged(staged: StagedWrite[]): Promise<void> {
+  for (const item of staged) {
+    if (!item.baselineHash) continue;
+    let current: string;
+    try {
+      current = await fs.readFile(item.abs, "utf8");
+    } catch {
+      throw new DomainError(ErrorCode.CONCURRENT_MUTATION, "File disappeared while the patch was being prepared", {
+        reason: "concurrent_mutation",
+        recommendedTool: "file_read_slice",
+      });
+    }
+    if (rangeHash(current) !== item.baselineHash) {
+      throw new DomainError(ErrorCode.CONCURRENT_MUTATION, "File changed while the patch was being prepared", {
+        reason: "concurrent_mutation",
+        recommendedTool: "file_read_slice",
+      });
+    }
   }
 }
 
@@ -430,16 +510,16 @@ export async function createFile(
   rel: string,
   content: string,
   overwrite?: boolean,
-): Promise<{ path: string; bytes: number }> {
+): Promise<{ path: string; bytes: number; createdNew: boolean }> {
   if (content.includes("\0")) {
     throw new DomainError(ErrorCode.NULLBYTE_REJECTED, "Content contains a null byte");
   }
 
   const abs = await resolveInProject(root, rel, { allowSymlink: false, rejectRoot: true });
 
+  const existed = await fileExists(abs);
   if (!overwrite) {
-    const exists = await fileExists(abs);
-    if (exists) {
+    if (existed) {
       throw new DomainError(ErrorCode.FILE_EXISTS, `File already exists: ${rel}`, { path: rel });
     }
   }
@@ -451,7 +531,7 @@ export async function createFile(
   await fs.rename(tempPath, abs);
 
   const bytes = Buffer.byteLength(content, "utf8");
-  return { path: rel, bytes };
+  return { path: rel, bytes, createdNew: !existed };
 }
 
 async function fileExists(abs: string): Promise<boolean> {

@@ -234,6 +234,22 @@ export async function intakeFromPath(
   destRel: string,
   metadata?: Record<string, unknown>,
 ): Promise<IntakeResult> {
+  const normalizedSource = sourceAbsOrTilde.trim();
+  if (/^\/mnt\/data(?:\/|$)/u.test(normalizedSource) || /^sandbox:/iu.test(normalizedSource)) {
+    throw new DomainError(
+      ErrorCode.CHATGPT_SANDBOX_PATH_UNAVAILABLE,
+      "ChatGPT sandbox paths cannot be read from the connected Mac. Use save_chatgpt_image_from_url, save_image_from_url, save_image_from_clipboard, save_image_from_download, or an actual Mac filesystem path.",
+      {
+        sourceKind: normalizedSource.startsWith("/mnt/data") ? "mnt-data" : "sandbox-uri",
+        recommendedTools: [
+          "save_chatgpt_image_from_url",
+          "save_image_from_url",
+          "save_image_from_clipboard",
+          "save_image_from_download",
+        ],
+      },
+    );
+  }
   const expanded = expandHome(sourceAbsOrTilde);
   const absSource = path.resolve(expanded);
 
