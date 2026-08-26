@@ -4,7 +4,8 @@ export type CommandStatus =
   | "SUCCESS"
   | "NONZERO_EXIT"
   | "SPAWN_FAILED"
-  | "TIMEOUT";
+  | "TIMEOUT"
+  | "CANCELLED";
 
 export type CleanupStatus = "NOT_REQUIRED" | "COMPLETED" | "FAILED";
 
@@ -68,6 +69,12 @@ export function resolveDomainStatus(
   if (result.commandStatus === "SPAWN_FAILED") {
     return {
       domainStatus: contract.spawnFailedStatus ?? contract.failureStatus ?? "SPAWN_FAILED",
+      domainStatusSource: "caller-contract",
+    };
+  }
+  if (result.commandStatus === "CANCELLED") {
+    return {
+      domainStatus: contract.failureStatus ?? "CANCELLED",
       domainStatusSource: "caller-contract",
     };
   }

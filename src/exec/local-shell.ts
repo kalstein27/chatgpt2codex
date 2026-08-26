@@ -56,7 +56,9 @@ const NETWORK_COMMAND_PATTERNS = [
   /\bgit\s+(pull|fetch|clone|push)\b/i,
 ];
 
-export function guardShellCommand(command: string): void {
+export type ApprovedShellRisk = "network" | "destructive";
+
+export function guardShellCommand(command: string, approvedRisk?: ApprovedShellRisk): void {
   for (const pattern of SECRET_COMMAND_PATTERNS) {
     if (pattern.test(command)) {
       throw new DomainError(
@@ -67,20 +69,16 @@ export function guardShellCommand(command: string): void {
   }
   for (const pattern of OS_DESTRUCTIVE_PATTERNS) {
     if (pattern.test(command)) {
+      if (approvedRisk === "destructive") continue;
       throw new DomainError(
         ErrorCode.APPROVAL_REQUIRED,
         "local_shell_run blocked an OS-level destructive command",
       );
     }
   }
-  // The caller (src/server/tools.ts local_shell_run) only requires approval
-  // when the model *self-declares* intent.needsNetwork/destructive — a
-  // prompt-injected model can simply omit that flag. Make this guard, not
-  // the declared intent, the actual authority for network/egress commands:
-  // reject them here unconditionally, matching how a declared needsNetwork
-  // is already always rejected by the caller.
   for (const pattern of NETWORK_COMMAND_PATTERNS) {
     if (pattern.test(command)) {
+      if (approvedRisk === "network") continue;
       throw new DomainError(
         ErrorCode.APPROVAL_REQUIRED,
         "local_shell_run blocked a network/egress command that requires explicit approval",
@@ -94,12 +92,12 @@ export async function runLocalShell(
   command: string,
   cwd?: string,
   timeoutSec?: number,
+  approvedRisk?: ApprovedShellRisk,
 ): Promise<ProcessExecutionResult & {
   cwd: string;
   commandNotFound?: CommandNotFoundHint;
 }> {
-  guardShellCommand(command);
-
+  guardShellCommand(command, approvedRisk);
   const baseRoot = await fs.realpath(root);
   const commandCwd = cwd
     ? await resolveInProject(baseRoot, cwd, { allowSymlink: false })

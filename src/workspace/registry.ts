@@ -162,6 +162,43 @@ export async function scanWorkspace(root: string): Promise<ProjectRegistryEntry[
   return entries;
 }
 
+/**
+ * Scan multiple explicitly-authorized workspace roots while preserving stable,
+ * unique project ids. Duplicate canonical project roots are ignored. If two
+ * different roots produce the same slug, the later one receives a deterministic
+ * numeric suffix while retaining the original slug as an alias.
+ */
+export async function scanWorkspaces(roots: readonly string[]): Promise<ProjectRegistryEntry[]> {
+  const entries: ProjectRegistryEntry[] = [];
+  const seenRoots = new Set<string>();
+  const usedProjectIds = new Set<string>();
+
+  for (const root of roots) {
+    const scanned = await scanWorkspace(root);
+    for (const entry of scanned) {
+      const canonicalRoot = await fs.realpath(entry.root).catch(() => path.resolve(entry.root));
+      if (seenRoots.has(canonicalRoot)) continue;
+      seenRoots.add(canonicalRoot);
+
+      const baseProjectId = entry.projectId;
+      let projectId = baseProjectId;
+      let suffix = 2;
+      while (usedProjectIds.has(projectId)) {
+        projectId = `${baseProjectId}-${suffix}`;
+        suffix += 1;
+      }
+      usedProjectIds.add(projectId);
+      entries.push(projectId === baseProjectId ? entry : {
+        ...entry,
+        projectId,
+        aliases: Array.from(new Set([...entry.aliases, baseProjectId])),
+      });
+    }
+  }
+
+  return entries;
+}
+
 /** Levenshtein edit distance between two strings. */
 function editDistance(a: string, b: string): number {
   const m = a.length;

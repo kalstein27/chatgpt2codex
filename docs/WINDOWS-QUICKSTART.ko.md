@@ -40,7 +40,7 @@ Installer·portable bundle·installer E2E 자동화는 최소 공개 소스 트�
 
 서명은 아직 TBD입니다. 실제 Windows 서명·검증 게이트가 추가되기 전에는 signed release로 표현하지 않습니다. 생성된 `.exe`, zip과 설치 백업은 Git에 커밋하지 않고 GitHub Release artifact로 게시합니다.
 
-현재 Release workflow는 서명 전 산출물을 **draft + prerelease 검증 릴리스**로만 만들며, unsigned stable release로 자동 공개하지 않습니다. 실제 Windows runner 검증과 수동 검토가 끝나기 전에는 설치 파일을 배포용으로 안내하지 않습니다.
+Release workflow는 최소 공개 소스 트리에 포함하지 않습니다. 로컬 release pipeline을 별도로 운용하더라도 서명 전 산출물은 **draft + prerelease 검증 릴리스**로만 취급하고, 실제 Windows runner 검증과 수동 검토가 끝나기 전에는 설치 파일을 배포용으로 안내하지 않습니다.
 
 ## 3. 트레이 메뉴 읽는 법
 

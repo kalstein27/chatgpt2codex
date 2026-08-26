@@ -17,12 +17,27 @@ const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 const DEFAULT_TTL_MS = 5 * 60 * 1000; // 5 minutes to get local human approval
 
-export type ControlActionKind = "click" | "type" | "key";
+export type ControlActionKind =
+  | "click"
+  | "double_click"
+  | "drag"
+  | "scroll"
+  | "move"
+  | "type"
+  | "key"
+  | "keypress"
+  | "wait";
 export type ControlActionStatus = "pending" | "approved" | "rejected" | "done";
+export type ControlMouseButton = "left" | "right" | "middle";
+
+export interface ControlRelativePoint {
+  xRel: number;
+  yRel: number;
+}
 
 export interface ControlActionTarget {
   ax?: { role: string; title?: string; label?: string; description?: string };
-  windowPoint?: { xRel: number; yRel: number };
+  windowPoint?: ControlRelativePoint;
 }
 
 /** Non-secret dry-run preview of an accessibility resolve, computed
@@ -43,7 +58,7 @@ export interface ResolvedTargetPreview {
   window?: string;
   matchCount?: number;
   actions?: string[];
-  source?: "ax-helper" | "system-events";
+  source?: "menu-bar" | "ax-helper" | "system-events";
   reason?: string;
 }
 
@@ -56,6 +71,12 @@ export interface ControlActionRecord {
   target: ControlActionTarget;
   text?: string;
   keyCode?: number;
+  keys?: string[];
+  button?: ControlMouseButton;
+  path?: ControlRelativePoint[];
+  scrollX?: number;
+  scrollY?: number;
+  durationMs?: number;
   reason: string;
   createdAt: number;
   expiresAt: number;
@@ -218,6 +239,12 @@ export interface EnqueueInput {
   target: ControlActionTarget;
   text?: string;
   keyCode?: number;
+  keys?: string[];
+  button?: ControlMouseButton;
+  path?: ControlRelativePoint[];
+  scrollX?: number;
+  scrollY?: number;
+  durationMs?: number;
   reason: string;
   ttlMs?: number;
   resolved?: ResolvedTargetPreview;
@@ -235,6 +262,12 @@ export async function enqueue(stateDir: string, input: EnqueueInput): Promise<Co
     target: input.target,
     text: input.text,
     keyCode: input.keyCode,
+    keys: input.keys,
+    button: input.button,
+    path: input.path,
+    scrollX: input.scrollX,
+    scrollY: input.scrollY,
+    durationMs: input.durationMs,
     reason: input.reason,
     createdAt: now,
     expiresAt: now + (input.ttlMs ?? DEFAULT_TTL_MS),

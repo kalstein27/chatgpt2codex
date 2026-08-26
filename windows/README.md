@@ -31,9 +31,10 @@ The Windows release publishes three related assets:
 - `SHA256SUMS.txt` — SHA-256 manifest for both files
 
 Authenticode signing remains TBD. A release containing these assets must not be
-described as signed until a Windows signing and verification gate is added. The
-current GitHub Actions release workflow therefore creates only a draft
-prerelease for verification; it does not publish an unsigned stable release.
+described as signed until a Windows signing and verification gate is added. A
+release workflow is not included in the minimal public source tree. Any local
+release pipeline must keep unsigned artifacts in a draft prerelease until a
+real Windows runner and a human reviewer complete the required checks.
 
 ## Build from source
 

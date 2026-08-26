@@ -173,9 +173,42 @@ function Get-ActiveProjectRoot {
 }
 
 function Get-EnablePublicTunnel {
-    if ($env:CHATGPT2CODEX_EXPOSE_WEB -eq "1") { return $true }
-    if ($env:PUBLIC_HOSTNAME) { return $true }
-    return [bool]$script:Settings.EnablePublicTunnel
+    return (Get-TunnelMode) -ne "loopback"
+}
+
+function Get-TunnelMode {
+    if ($env:CHATGPT2CODEX_TUNNEL_MODE -in @("loopback", "cloudflare-quick", "cloudflare-named", "external")) {
+        return $env:CHATGPT2CODEX_TUNNEL_MODE
+    }
+    if ($env:CHATGPT2CODEX_PUBLIC_URL) { return "external" }
+    if ($env:CLOUDFLARED_TUNNEL_TOKEN -or $env:CLOUDFLARED_TUNNEL_NAME) { return "cloudflare-named" }
+    if (-not [bool]$script:Settings.EnablePublicTunnel) { return "loopback" }
+    $value = [string]$script:Settings.PublicHostname
+    if ($value) {
+        $value = $value.Trim()
+        if ($value.StartsWith("https://", [System.StringComparison]::OrdinalIgnoreCase) -or $value -match '^[A-Za-z0-9.-]+\.ts\.net$') {
+            return "external"
+        }
+        return "cloudflare-named"
+    }
+    return "cloudflare-quick"
+}
+
+function Get-ExternalPublicBaseUrl {
+    $value = if ($env:CHATGPT2CODEX_PUBLIC_URL) { [string]$env:CHATGPT2CODEX_PUBLIC_URL } else { [string]$script:Settings.PublicHostname }
+    if (-not $value) { return $null }
+    $value = $value.Trim()
+    if (-not $value.StartsWith("https://", [System.StringComparison]::OrdinalIgnoreCase)) { $value = "https://$value" }
+    $uri = $null
+    if (-not [System.Uri]::TryCreate($value, [System.UriKind]::Absolute, [ref]$uri)) { return $null }
+    $normalizedHost = (($uri.Host.TrimEnd('.')) -replace '^\[|\]$', '')
+    $ip = $null
+    $loopback = [System.Net.IPAddress]::TryParse($normalizedHost, [ref]$ip) -and [System.Net.IPAddress]::IsLoopback($ip)
+    if ($uri.Scheme -ne "https" -or $uri.UserInfo -or $uri.Query -or $uri.Fragment -or
+        ($uri.AbsolutePath -and $uri.AbsolutePath -ne "/") -or
+        $normalizedHost.Equals("localhost", [System.StringComparison]::OrdinalIgnoreCase) -or
+        $normalizedHost.EndsWith(".localhost", [System.StringComparison]::OrdinalIgnoreCase) -or $loopback) { return $null }
+    return $uri.GetLeftPart([System.UriPartial]::Authority).TrimEnd('/')
 }
 
 function Test-Health {
@@ -188,8 +221,10 @@ function Test-Health {
 }
 
 function Discover-PublicBaseUrl {
-    if (-not (Get-EnablePublicTunnel)) { return $null }
-    if ($script:Settings.PublicHostname) {
+    $mode = Get-TunnelMode
+    if ($mode -eq "loopback") { return $null }
+    if ($mode -eq "external") { return Get-ExternalPublicBaseUrl }
+    if ($mode -eq "cloudflare-named" -and $script:Settings.PublicHostname) {
         return "https://$($script:Settings.PublicHostname)"
     }
     if (Test-Path $LogPath) {
@@ -261,14 +296,23 @@ function Start-Service {
     $psi.EnvironmentVariables["WORKSPACE"] = Get-Workspace
     $psi.EnvironmentVariables["PORT"] = "$(Get-Port)"
     $psi.EnvironmentVariables["PATH"] = "$RuntimeRoot\bin;$env:USERPROFILE\.local\bin;$($psi.EnvironmentVariables["PATH"])"
-    if ($script:Settings.PublicHostname) {
+    $tunnelMode = Get-TunnelMode
+    $psi.EnvironmentVariables["CHATGPT2CODEX_TUNNEL_MODE"] = $tunnelMode
+    if ($tunnelMode -eq "external") {
+        $externalUrl = Get-ExternalPublicBaseUrl
+        if ($externalUrl) { $psi.EnvironmentVariables["CHATGPT2CODEX_PUBLIC_URL"] = $externalUrl }
+        $psi.EnvironmentVariables.Remove("PUBLIC_HOSTNAME")
+    } elseif ($tunnelMode -eq "cloudflare-named" -and $script:Settings.PublicHostname) {
         $psi.EnvironmentVariables["PUBLIC_HOSTNAME"] = $script:Settings.PublicHostname
+        $psi.EnvironmentVariables.Remove("CHATGPT2CODEX_PUBLIC_URL")
+    } else {
+        $psi.EnvironmentVariables.Remove("PUBLIC_HOSTNAME")
+        $psi.EnvironmentVariables.Remove("CHATGPT2CODEX_PUBLIC_URL")
     }
-    if (Get-EnablePublicTunnel) {
+    if ($tunnelMode -ne "loopback") {
         $psi.EnvironmentVariables["CHATGPT2CODEX_EXPOSE_WEB"] = "1"
     } else {
         $psi.EnvironmentVariables.Remove("CHATGPT2CODEX_EXPOSE_WEB")
-        $psi.EnvironmentVariables.Remove("PUBLIC_HOSTNAME")
     }
     $activeRoot = Get-ActiveProjectRoot
     if ($activeRoot) {
@@ -412,13 +456,17 @@ function Show-Settings {
     })
 
     $hostLabel = [System.Windows.Forms.Label]::new()
-    $hostLabel.Text = L "publicHostname"
+    $hostLabel.Text = if ($script:Settings.Language -eq "ko") { "공개 호스트 / 외부 HTTPS URL" } else { "Public host / external HTTPS URL" }
     $hostLabel.SetBounds(18, 142, 210, 24)
     $hostBox = [System.Windows.Forms.TextBox]::new()
     $hostBox.Text = $script:Settings.PublicHostname
     $hostBox.SetBounds(18, 166, 300, 26)
     $hostHint = [System.Windows.Forms.Label]::new()
-    $hostHint.Text = L "publicHostnameHint"
+    $hostHint.Text = if ($script:Settings.Language -eq "ko") {
+        "비워두면 Cloudflare Quick Tunnel. 호스트명은 기존 Cloudflare named tunnel token/name이 함께 설정된 경우에만 고정 주소로 사용됩니다. https:// URL은 외부 관리 터널이며 앱이 시작/종료하지 않습니다."
+    } else {
+        "Blank = Cloudflare Quick Tunnel. A hostname is fixed only with an existing Cloudflare named-tunnel token/name. https:// URL = externally managed; this app does not start/stop it."
+    }
     $hostHint.SetBounds(18, 194, 472, 52)
     $portLabel = [System.Windows.Forms.Label]::new()
     $portLabel.Text = L "portPrefix"

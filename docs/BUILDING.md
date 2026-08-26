@@ -41,6 +41,9 @@ swiftc -O \
   -framework Carbon \
   -framework CoreGraphics \
   -framework Foundation \
+  -framework ScreenCaptureKit \
+  -framework WebKit \
+  macos/ChatGPTToCodexStatusBar/accessibility-bridge.swift \
   macos/ChatGPTToCodexStatusBar/main.swift \
   -o build/macos/bin/ChatGPTToCodexStatusBar
 
@@ -61,6 +64,53 @@ swiftc -O \
 A distributable macOS application additionally requires bundle assembly,
 resources, an embedded Node runtime and dependencies, code signing, and Apple
 notarization. Maintain those environment-specific steps locally.
+
+### Safe local app and runtime replacement
+
+Keep application installation and runtime activation as separate transactions.
+Before installing a local app candidate, verify its bundle identifier,
+non-ad-hoc Team Identifier, designated requirement, and
+`codesign --verify --deep --strict` result. Record the candidate main-executable
+SHA-256 and verify the installed executable matches it. Stop the existing app
+cleanly before swapping the bundle so an old launcher cannot resolve binaries
+from a partially replaced `/Applications` path. Stage and verify the candidate
+before moving the installed app, retain one exact rollback copy during the
+transaction, and relaunch only after the installed signature is rechecked.
+The live runtime must not perform that swap inline: a fixed detached worker
+owns the drain barrier and persists a `0600` receipt so the result remains
+queryable if graceful app termination closes the initiating MCP response. The
+worker asks AppKit to quit first, uses bounded exact-PID signals only as a
+fallback, stops a supervisor only when its parent proves that the old app owns
+it, and waits for healthy runtime recovery after launching the new app. An
+externally managed supervisor is observed but never signalled by app apply.
+
+Runtime activation should use a private immutable snapshot rather than point at
+the mutable source or build directory. The safe contract is:
+
+1. compare the live and candidate runtime manifests and exact fingerprints;
+2. prepare the snapshot and persist an idempotent request/operation receipt;
+3. reject activation while any foreground or background operation or unrelated
+   approval remains active;
+4. acquire the bounded runtime-update drain barrier before requesting reload;
+5. preserve the supervisor and externally managed connector/tunnel identity;
+   immediately before pointer mutation, re-check that the approved supervisor
+   PID is still alive and is still the supervisor reported by live health;
+6. verify the new fingerprint through loopback health, otherwise restore the
+   previous active-runtime pointer and prove the previous runtime is healthy;
+7. release the barrier in a `finally` path.
+
+Do not automatically replay a command whose subprocess may have crossed a
+runtime restart. Such a record is forensic state with
+`automaticRetrySafe=false`; inspect its process and artifacts before deciding
+whether a fresh execution is safe.
+
+Immutable snapshot cleanup is a separate approved transaction. Inventory
+first, and always protect the active pointer, current process root, recent
+apply/rollback roots, the newest three snapshots, and snapshots younger than
+seven days. Never prune by a broad glob or storage pressure alone. The fixed
+prune path accepts only `runtime-<64 lowercase hex>` directories below the
+private release root, ignores symlinks, re-evaluates protection immediately
+before deletion, and requires full-write plus local destructive approval.
 
 ## Windows launcher
 

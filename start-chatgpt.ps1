@@ -2,6 +2,8 @@ param(
     [string]$Workspace = $env:WORKSPACE,
     [int]$Port = $(if ($env:PORT) { [int]$env:PORT } else { 7979 }),
     [string]$PublicHostname = $env:PUBLIC_HOSTNAME,
+    [string]$PublicUrl = $env:CHATGPT2CODEX_PUBLIC_URL,
+    [string]$TunnelMode = $env:CHATGPT2CODEX_TUNNEL_MODE,
     [string]$ActiveProjectRoot = $env:CHATGPT2CODEX_ACTIVE_PROJECT_ROOT,
     [string]$ActiveProjectPreset = $(if ($env:CHATGPT2CODEX_ACTIVE_PROJECT_PRESET) { $env:CHATGPT2CODEX_ACTIVE_PROJECT_PRESET } else { "full-write" }),
     [switch]$ExposeWeb,
@@ -133,7 +135,7 @@ function Test-HttpOkWithCurlResolve([string]$Url) {
     return $false
 }
 
-function Wait-PublicHttpOk([string]$Url, [int]$Tries, [string]$Label) {
+function Wait-PublicHttpOk([string]$Url, [int]$Tries, [string]$Label, [bool]$AllowCloudflareFallback = $false) {
     for ($i = 0; $i -lt $Tries; $i++) {
         $standardError = $null
         try {
@@ -144,13 +146,57 @@ function Wait-PublicHttpOk([string]$Url, [int]$Tries, [string]$Label) {
         } catch {
             $standardError = $_.Exception.Message
         }
-        if ($standardError -and ($i % 5 -eq 0) -and
+        if ($AllowCloudflareFallback -and $standardError -and ($i % 5 -eq 0) -and
             (Test-HttpOkWithCurlResolve $Url)) {
             return
         }
         Start-Sleep -Seconds 1
     }
     throw "$Label did not become ready: $Url"
+}
+
+function Resolve-TunnelMode {
+    if ($TunnelMode) {
+        $normalized = $TunnelMode.Trim().ToLowerInvariant()
+        if ($normalized -notin @("loopback", "cloudflare-quick", "cloudflare-named", "external")) {
+            throw "Invalid CHATGPT2CODEX_TUNNEL_MODE."
+        }
+        return $normalized
+    }
+    if ($PublicUrl) { return "external" }
+    if ($cloudflaredToken -or $cloudflaredName) { return "cloudflare-named" }
+    if ($PublicHostname) {
+        $candidate = $PublicHostname.Trim()
+        if ($candidate.StartsWith("https://", [System.StringComparison]::OrdinalIgnoreCase)) { return "external" }
+        if ($candidate -match '^[A-Za-z0-9.-]+\.ts\.net$') { return "external" }
+        return "cloudflare-named"
+    }
+    if ($ExposeWeb -or $env:CHATGPT2CODEX_EXPOSE_WEB -eq "1") { return "cloudflare-quick" }
+    return "loopback"
+}
+
+function Resolve-ExternalPublicUrl {
+    $candidate = if ($PublicUrl) { $PublicUrl.Trim() } elseif ($PublicHostname) {
+        if ($PublicHostname.Trim().StartsWith("https://", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $PublicHostname.Trim()
+        } else {
+            "https://$($PublicHostname.Trim())"
+        }
+    } else { "" }
+    $uri = $null
+    if (-not $candidate -or -not [System.Uri]::TryCreate($candidate, [System.UriKind]::Absolute, [ref]$uri)) {
+        throw "Externally managed tunnel requires a valid HTTPS public origin."
+    }
+    $normalizedHost = (($uri.Host.TrimEnd('.')) -replace '^\[|\]$', '')
+    $ip = $null
+    $isLoopbackIp = [System.Net.IPAddress]::TryParse($normalizedHost, [ref]$ip) -and [System.Net.IPAddress]::IsLoopback($ip)
+    if ($uri.Scheme -ne "https" -or $uri.UserInfo -or $uri.Query -or $uri.Fragment -or
+        ($uri.AbsolutePath -and $uri.AbsolutePath -ne "/") -or
+        $normalizedHost.Equals("localhost", [System.StringComparison]::OrdinalIgnoreCase) -or
+        $normalizedHost.EndsWith(".localhost", [System.StringComparison]::OrdinalIgnoreCase) -or $isLoopbackIp) {
+        throw "Externally managed tunnel requires an HTTPS origin without credentials, query, fragment, path, localhost, or loopback."
+    }
+    return $uri.GetLeftPart([System.UriPartial]::Authority).TrimEnd('/')
 }
 
 function Get-QuickTunnelUrl {
@@ -219,7 +265,7 @@ function Test-PathUnder([string]$Value, [string]$Parent) {
     }
 }
 
-function Stop-StaleRuntimeProcesses([int]$PortToStop) {
+function Stop-StaleRuntimeProcesses([int]$PortToStop, [string]$ResolvedTunnelMode) {
     $currentPid = $PID
     $escapedRoot = [regex]::Escape($Root)
     $stopped = @()
@@ -238,7 +284,8 @@ function Stop-StaleRuntimeProcesses([int]$PortToStop) {
         $isSamePortServer = $cmd -match "dist[\\/]+cli\.js" -and
             $cmd -match "\bserve\b" -and
             $cmd -match "\b--port\s+$PortToStop\b"
-        $isSamePortTunnel = $cmd -match "\bcloudflared(\.exe)?\b" -and
+        $isSamePortTunnel = $ResolvedTunnelMode.StartsWith("cloudflare-", [System.StringComparison]::Ordinal) -and
+            $cmd -match "\bcloudflared(\.exe)?\b" -and
             ($cmd -match "127\.0\.0\.1:$PortToStop" -or $cmd -match "localhost:$PortToStop")
         $isLauncherScript = $cmd -match "start-chatgpt\.ps1" -and
             ($cmd -match "\b-Port\s+$PortToStop\b" -or $cmd -match $escapedRoot)
@@ -267,7 +314,8 @@ if (-not (Test-Path (Join-Path $Root "dist\cli.js"))) {
     npm run build
 }
 
-Stop-StaleRuntimeProcesses $Port
+$resolvedTunnelMode = Resolve-TunnelMode
+Stop-StaleRuntimeProcesses $Port $resolvedTunnelMode
 if (Test-PortBusy $Port) {
     throw "Port $Port is already in use. Set PORT or stop the other process."
 }
@@ -298,24 +346,30 @@ if (($doctor -join "`n") -notmatch "owner token configured") {
 $cfProc = $null
 $srvProc = $null
 try {
-    $useTunnel = $ExposeWeb -or $env:CHATGPT2CODEX_EXPOSE_WEB -eq "1" -or $PublicHostname -or $cloudflaredToken -or $cloudflaredName
+    $usePublicEndpoint = $resolvedTunnelMode -ne "loopback"
+    $managesCloudflared = $resolvedTunnelMode.StartsWith("cloudflare-", [System.StringComparison]::Ordinal)
     $idleShutdownMinutes = $env:CHATGPT2CODEX_IDLE_SHUTDOWN_MINUTES
-    if ($useTunnel) {
+    if ($resolvedTunnelMode -eq "external") {
+        $publicUrl = Resolve-ExternalPublicUrl
+        Write-Host "[chatgpt2codex] 1/3 using externally managed HTTPS tunnel; no cloudflared process will be started."
+    } elseif ($managesCloudflared) {
+        if ($resolvedTunnelMode -eq "cloudflare-named") {
+            if (-not $PublicHostname) {
+                throw "PUBLIC_HOSTNAME is required for cloudflare-named mode."
+            }
+            if (-not $cloudflaredToken -and -not $cloudflaredName) {
+                throw "cloudflare-named mode requires CLOUDFLARED_TUNNEL_TOKEN or CLOUDFLARED_TUNNEL_NAME; a hostname alone is not sufficient."
+            }
+        }
         Need-Command cloudflared
         Write-Host "[chatgpt2codex] 1/3 starting public tunnel..."
-        if ($cloudflaredToken -or $cloudflaredName) {
-            if (-not $PublicHostname) {
-                throw "PUBLIC_HOSTNAME is required with CLOUDFLARED_TUNNEL_TOKEN or CLOUDFLARED_TUNNEL_NAME."
-            }
+        if ($resolvedTunnelMode -eq "cloudflare-named") {
             $publicUrl = "https://$PublicHostname"
             if ($cloudflaredToken) {
                 $cfProc = Start-LoggedProcess "cloudflared" @("tunnel", "--no-autoupdate", "run", "--token", $cloudflaredToken) $cfOut $cfErr
             } else {
                 $cfProc = Start-LoggedProcess "cloudflared" @("tunnel", "--no-autoupdate", "run", "--url", "http://127.0.0.1:$Port", $cloudflaredName) $cfOut $cfErr
             }
-        } elseif ($PublicHostname) {
-            $publicUrl = "https://$PublicHostname"
-            $cfProc = Start-LoggedProcess "cloudflared" @("tunnel", "--hostname", $PublicHostname, "--url", "http://127.0.0.1:$Port", "--no-autoupdate") $cfOut $cfErr
         } else {
             $quickTunnel = Start-QuickTunnelWithRetry 4
             $cfProc = $quickTunnel.Process
@@ -342,10 +396,10 @@ try {
     Write-Host "   $publicUrl/mcp"
     Write-Host ""
 
-    if ($useTunnel) {
+    if ($usePublicEndpoint) {
         Write-Host "[chatgpt2codex] 3/3 checking public health..."
         try {
-            Wait-PublicHttpOk "$publicUrl/healthz" 60 "public endpoint"
+            Wait-PublicHttpOk "$publicUrl/healthz" 60 "public endpoint" $managesCloudflared
         } catch {
             Write-Host "[chatgpt2codex] public health check is still warming up: $($_.Exception.Message)"
             Write-Host "[chatgpt2codex] keeping the server and tunnel alive; retry health from the app or ChatGPT."
@@ -365,7 +419,7 @@ try {
     Write-Host "   - Default mode is loopback-only and is not reachable from ChatGPT web."
     Write-Host "   - Enable ChatGPT web tunnel only while a public URL is needed."
     Write-Host "   - Web mode stays running unless CHATGPT2CODEX_IDLE_SHUTDOWN_MINUTES is set."
-    if ($useTunnel -and -not $PublicHostname -and -not $cloudflaredToken -and -not $cloudflaredName) {
+    if ($resolvedTunnelMode -eq "cloudflare-quick") {
         Write-Host "   - This trycloudflare.com URL is temporary and changes when the tunnel restarts."
         Write-Host "   - For a ChatGPT app you keep using, configure PUBLIC_HOSTNAME with a named tunnel."
     }
@@ -380,7 +434,7 @@ try {
             }
             throw "server exited. See $srvOut and $srvErr"
         }
-        if ($useTunnel -and $cfProc.HasExited) { throw "cloudflared exited. See $cfOut and $cfErr" }
+        if ($managesCloudflared -and $cfProc -and $cfProc.HasExited) { throw "cloudflared exited. See $cfOut and $cfErr" }
         Start-Sleep -Seconds 1
     }
 } finally {

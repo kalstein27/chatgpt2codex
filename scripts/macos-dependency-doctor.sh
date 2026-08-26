@@ -43,7 +43,23 @@ node_major() {
 }
 
 need_cloudflared=0
-if [[ "${CHATGPT2CODEX_EXPOSE_WEB:-0}" == "1" || -n "${PUBLIC_HOSTNAME:-}" || -n "${CLOUDFLARED_TUNNEL_TOKEN:-}" || -n "${CLOUDFLARED_TUNNEL_NAME:-}" ]]; then
+doctor_tunnel_mode="${CHATGPT2CODEX_TUNNEL_MODE:-}"
+if [[ -z "$doctor_tunnel_mode" ]]; then
+  if [[ -n "${CHATGPT2CODEX_PUBLIC_URL:-}" ]]; then
+    doctor_tunnel_mode="external"
+  elif [[ -n "${CLOUDFLARED_TUNNEL_TOKEN:-}" || -n "${CLOUDFLARED_TUNNEL_NAME:-}" ]]; then
+    doctor_tunnel_mode="cloudflare-named"
+  elif [[ "${PUBLIC_HOSTNAME:-}" == *.ts.net && "${PUBLIC_HOSTNAME:-}" != *"/"* && "${PUBLIC_HOSTNAME:-}" != *"@"* ]]; then
+    doctor_tunnel_mode="external"
+  elif [[ -n "${PUBLIC_HOSTNAME:-}" ]]; then
+    doctor_tunnel_mode="cloudflare-named"
+  elif [[ "${CHATGPT2CODEX_EXPOSE_WEB:-0}" == "1" ]]; then
+    doctor_tunnel_mode="cloudflare-quick"
+  else
+    doctor_tunnel_mode="loopback"
+  fi
+fi
+if [[ "$doctor_tunnel_mode" == cloudflare-* ]]; then
   need_cloudflared=1
 fi
 
@@ -87,8 +103,10 @@ else
   ok "runtime CLI found"
 fi
 
-if [[ ! -x "$ROOT/start-chatgpt.sh" ]]; then
-  block "start-chatgpt.sh is missing or not executable. Reinstall ChatGPT To Codex."
+if [[ ! -f "$ROOT/start-chatgpt.sh" ]]; then
+  block "start-chatgpt.sh is missing. Reinstall ChatGPT To Codex."
+elif [[ ! -x "$ROOT/start-chatgpt.sh" ]]; then
+  warn "start-chatgpt.sh is not executable; app/npm launches remain available through bash, but direct ./start-chatgpt.sh execution is unavailable."
 else
   ok "launcher script executable"
 fi

@@ -16,6 +16,7 @@ export interface OutputArtifactMetadata {
   outputRef: string;
   resourceUri: string;
   projectId: string;
+  laneDigest?: string;
   tool: string;
   createdAt: string;
   totalBytes: number;
@@ -90,6 +91,7 @@ async function pruneOutputArtifacts(stateDir: string): Promise<void> {
 export async function createOutputArtifact(input: {
   stateDir: string;
   projectId: string;
+  laneDigest?: string;
   tool: string;
   stdout: string;
   stderr: string;
@@ -126,6 +128,7 @@ export async function createOutputArtifact(input: {
     outputRef,
     resourceUri,
     projectId: input.projectId,
+    ...(input.laneDigest ? { laneDigest: input.laneDigest } : {}),
     tool: input.tool,
     createdAt: new Date().toISOString(),
     totalBytes: bytes,

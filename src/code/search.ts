@@ -6,6 +6,8 @@ import { resolveInProject } from "../policy/paths.js";
 
 const DEFAULT_MAX_RESULTS = 200;
 const HARD_MAX_RESULTS = 200;
+const RIPGREP_TIMEOUT_MS = 10_000;
+const JS_FALLBACK_TIMEOUT_MS = 10_000;
 
 /** Directory names the JS fallback walker never descends into. */
 const SKIP_DIRS = new Set([
@@ -53,10 +55,10 @@ export async function codeSearch(
   // are still confined per-result below).
   const realRoot = await resolveInProject(root, ".", { allowSymlink: false });
 
-  const rgResult = await tryRipgrep(realRoot, query, cap);
+  const rgResult = await tryRipgrep(realRoot, query, cap, RIPGREP_TIMEOUT_MS);
   if (rgResult) return rgResult;
 
-  const matches = await jsFallbackSearch(realRoot, query, cap);
+  const matches = await jsFallbackSearch(realRoot, query, cap, JS_FALLBACK_TIMEOUT_MS);
   return { matches, backend: "ripgrep-js-fallback" };
 }
 
@@ -64,7 +66,9 @@ export async function tryRipgrep(
   root: string,
   query: string,
   cap: number,
+  timeoutMs = RIPGREP_TIMEOUT_MS,
 ): Promise<{ matches: Match[]; backend: string } | null> {
+  if (timeoutMs <= 0) throw searchTimeout("ripgrep", timeoutMs);
   try {
     const args = [
       "--json",
@@ -76,7 +80,7 @@ export async function tryRipgrep(
       query,
       root,
     ];
-    const { stdout } = await execFileAsync("rg", args);
+    const { stdout } = await execFileAsync("rg", args, timeoutMs);
     const matches: Match[] = [];
     for (const line of stdout.split("\n")) {
       if (!line.trim()) continue;
@@ -104,6 +108,13 @@ export async function tryRipgrep(
     return { matches, backend: "ripgrep" };
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code;
+    const processError = err as NodeJS.ErrnoException & { killed?: boolean; signal?: string | null };
+    if (code === "ETIMEDOUT" || processError.killed === true) {
+      throw new DomainError(ErrorCode.TIMEOUT, "code_search ripgrep backend timed out", {
+        backend: "ripgrep",
+        timeoutMs,
+      });
+    }
     if (code === "ENOENT") {
       // rg binary not present -> fall back to JS search.
       return null;
@@ -125,13 +136,13 @@ interface RgMatchData {
   lines: { text: string };
 }
 
-function execFileAsync(cmd: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+function execFileAsync(cmd: string, args: string[], timeoutMs: number): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     // execution-capability: code-search-ripgrep-backend
     execFile(
       cmd,
       args,
-      { maxBuffer: 1024 * 1024 * 32, windowsHide: true },
+      { maxBuffer: 1024 * 1024 * 32, windowsHide: true, timeout: timeoutMs, killSignal: "SIGKILL" },
       (error, stdout, stderr) => {
         if (error) {
           const e = error as NodeJS.ErrnoException & { code?: number | string };
@@ -151,35 +162,58 @@ function execFileAsync(cmd: string, args: string[]): Promise<{ stdout: string; s
  * line-by-line. Used only when `rg` is unavailable so search never
  * hard-fails.
  */
-export async function jsFallbackSearch(root: string, query: string, cap: number): Promise<Match[]> {
+export async function jsFallbackSearch(
+  root: string,
+  query: string,
+  cap: number,
+  timeoutMs = JS_FALLBACK_TIMEOUT_MS,
+): Promise<Match[]> {
+  if (timeoutMs <= 0) throw searchTimeout("ripgrep-js-fallback", timeoutMs);
   const matches: Match[] = [];
-  await walk(root, async (absFile, rel) => {
-    if (matches.length >= cap) return;
-    let content: string;
-    try {
-      const buf = await fs.readFile(absFile);
-      if (buf.includes(0)) return; // skip binary-looking files
-      content = buf.toString("utf8");
-    } catch {
-      return;
-    }
-    const lines = content.split("\n");
-    for (let i = 0; i < lines.length; i++) {
-      if (matches.length >= cap) break;
-      const line = lines[i] ?? "";
-      if (line.includes(query)) {
-        matches.push({ path: rel, line: i + 1, snippet: line.trim().slice(0, 400) });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
+  timer.unref?.();
+  try {
+    await walk(root, async (absFile, rel) => {
+      if (controller.signal.aborted) throw searchTimeout("ripgrep-js-fallback", timeoutMs);
+      if (matches.length >= cap) return;
+      let content: string;
+      try {
+        const buf = await fs.readFile(absFile, { signal: controller.signal });
+        if (buf.includes(0)) return; // skip binary-looking files
+        content = buf.toString("utf8");
+      } catch (error) {
+        if (controller.signal.aborted) throw searchTimeout("ripgrep-js-fallback", timeoutMs);
+        return;
       }
-    }
-  });
-  return matches;
+      const lines = content.split("\n");
+      for (let i = 0; i < lines.length; i++) {
+        if (controller.signal.aborted) throw searchTimeout("ripgrep-js-fallback", timeoutMs);
+        if (matches.length >= cap) break;
+        const line = lines[i] ?? "";
+        if (line.includes(query)) {
+          matches.push({ path: rel, line: i + 1, snippet: line.trim().slice(0, 400) });
+        }
+      }
+    }, root, controller.signal, timeoutMs);
+    return matches;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function searchTimeout(backend: string, timeoutMs: number): DomainError {
+  return new DomainError(ErrorCode.TIMEOUT, "code_search backend timed out", { backend, timeoutMs });
 }
 
 async function walk(
   root: string,
   onFile: (abs: string, rel: string) => Promise<void>,
   dir: string = root,
+  signal?: AbortSignal,
+  timeoutMs = JS_FALLBACK_TIMEOUT_MS,
 ): Promise<void> {
+  if (signal?.aborted) throw searchTimeout("ripgrep-js-fallback", timeoutMs);
   let entries: import("node:fs").Dirent[];
   try {
     entries = await fs.readdir(dir, { withFileTypes: true });
@@ -187,10 +221,11 @@ async function walk(
     return;
   }
   for (const entry of entries) {
+    if (signal?.aborted) throw searchTimeout("ripgrep-js-fallback", timeoutMs);
     if (entry.isSymbolicLink()) continue; // never follow symlinks
     if (entry.isDirectory()) {
       if (SKIP_DIRS.has(entry.name)) continue;
-      await walk(root, onFile, path.join(dir, entry.name));
+      await walk(root, onFile, path.join(dir, entry.name), signal, timeoutMs);
     } else if (entry.isFile()) {
       const abs = path.join(dir, entry.name);
       const rel = path.relative(root, abs);

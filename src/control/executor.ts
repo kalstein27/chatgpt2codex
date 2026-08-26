@@ -9,6 +9,8 @@ import { autoDecision, recordAutoUse } from "./auto.js";
 import { approveAction, getAction, isKilled, listActions, markDone, toSummary, type ControlActionRecord } from "./queue.js";
 import * as macInput from "./mac-input.js";
 
+const executingActionIds = new Set<string>();
+
 /**
  * Session worker that turns an `approved` control action into a real
  * synthetic click/keystroke. Nothing but this module ever calls
@@ -37,6 +39,27 @@ function clampUnitInterval(value: number): number {
  * rejected here instead of being handed to AppleScript/CGEvent. */
 function isValidKeyCode(value: number): boolean {
   return Number.isInteger(value) && value >= 0 && value <= 127;
+}
+
+function isValidRelativePoint(point: { xRel: number; yRel: number } | undefined): point is { xRel: number; yRel: number } {
+  return Boolean(
+    point && Number.isFinite(point.xRel) && Number.isFinite(point.yRel) &&
+    point.xRel >= 0 && point.xRel <= 1 && point.yRel >= 0 && point.yRel <= 1,
+  );
+}
+
+async function resolveRelativePath(
+  appName: string,
+  path: Array<{ xRel: number; yRel: number }>,
+): Promise<Array<{ x: number; y: number }>> {
+  if (path.length < 2 || path.length > 32 || !path.every(isValidRelativePoint)) {
+    throw new Error("drag action has an invalid relative path");
+  }
+  const region = await macInput.getAppWindowRegion(appName);
+  return path.map((point) => ({
+    x: Math.round(region.x + region.width * point.xRel),
+    y: Math.round(region.y + region.height * point.yRel),
+  }));
 }
 
 /** Best-effort before/after screenshot evidence for an approved action.
@@ -78,6 +101,9 @@ async function captureActionEvidence(
  * runExecutorOnce/startExecutor loop or touching any other queued action.
  */
 export async function executeApprovedAction(ctx: ToolContext, record: ControlActionRecord): Promise<void> {
+  if (executingActionIds.has(record.actionId)) return;
+  executingActionIds.add(record.actionId);
+  try {
   if (await isKilled(ctx.stateDir)) {
     await ctx.ledger.append({
       type: "control.action.blocked",
@@ -89,15 +115,15 @@ export async function executeApprovedAction(ctx: ToolContext, record: ControlAct
     return;
   }
 
-  // Live permission preflight: a definitive (source === "ax-helper") answer
+  // Live permission preflight: a definitive menu-bar/packaged-helper answer
   // that Accessibility isn't trusted blocks with a clear, reportable reason
   // instead of letting the actual click/type/key attempt fail partway
-  // through with an opaque AppleScript/AX error. A dev/source run without
-  // the packaged helper (source === "unavailable") can't answer this
+  // through with an opaque AppleScript/AX error. A dev/source run with no
+  // native permission source (source === "unavailable") can't answer this
   // definitively, so it fails open here rather than blocking every action.
   if (process.platform === "darwin") {
     const preflight = await macInput.preflightPermissions().catch(() => undefined);
-    if (preflight && preflight.source === "ax-helper" && !preflight.accessibilityTrusted) {
+    if (preflight && preflight.source !== "unavailable" && !preflight.accessibilityTrusted) {
       await ctx.ledger.append({
         type: "control.action.blocked",
         actionId: record.actionId,
@@ -130,7 +156,7 @@ export async function executeApprovedAction(ctx: ToolContext, record: ControlAct
     let windowPoint: { x: number; y: number } | undefined;
 
     if (record.kind === "click") {
-      if (record.target.ax) {
+      if (record.target.ax && (record.button === undefined || record.button === "left")) {
         // AX targets are re-resolved by pressAxElement itself right before
         // acting (never reusing the request-time dry-run preview frame), so
         // an element that moved or vanished since approval fails cleanly
@@ -147,7 +173,7 @@ export async function executeApprovedAction(ctx: ToolContext, record: ControlAct
             clampUnitInterval(record.target.windowPoint.xRel),
             clampUnitInterval(record.target.windowPoint.yRel),
           );
-          await macInput.clickAtPoint(record.appName, resolved.x, resolved.y);
+          await macInput.clickAtPoint(record.appName, resolved.x, resolved.y, record.button ?? "left", 1);
           windowPoint = resolved;
         }
       } else if (record.target.windowPoint) {
@@ -156,11 +182,35 @@ export async function executeApprovedAction(ctx: ToolContext, record: ControlAct
           clampUnitInterval(record.target.windowPoint.xRel),
           clampUnitInterval(record.target.windowPoint.yRel),
         );
-        await macInput.clickAtPoint(record.appName, resolved.x, resolved.y);
+        await macInput.clickAtPoint(record.appName, resolved.x, resolved.y, record.button ?? "left", 1);
         windowPoint = resolved;
       } else {
         throw new Error("click action has neither an ax nor a windowPoint target");
       }
+    } else if (record.kind === "double_click") {
+      if (!isValidRelativePoint(record.target.windowPoint)) throw new Error("double_click action requires windowPoint");
+      const resolved = await macInput.resolveWindowPoint(record.appName, record.target.windowPoint.xRel, record.target.windowPoint.yRel);
+      await macInput.clickAtPoint(record.appName, resolved.x, resolved.y, record.button ?? "left", 2);
+      windowPoint = resolved;
+    } else if (record.kind === "move") {
+      if (!isValidRelativePoint(record.target.windowPoint)) throw new Error("move action requires windowPoint");
+      const resolved = await macInput.resolveWindowPoint(record.appName, record.target.windowPoint.xRel, record.target.windowPoint.yRel);
+      await macInput.moveMouseToPoint(record.appName, resolved.x, resolved.y);
+      windowPoint = resolved;
+    } else if (record.kind === "drag") {
+      const path = await resolveRelativePath(record.appName, record.path ?? []);
+      await macInput.dragPoints(record.appName, path, record.button ?? "left");
+      windowPoint = path[path.length - 1];
+    } else if (record.kind === "scroll") {
+      if (!isValidRelativePoint(record.target.windowPoint)) throw new Error("scroll action requires windowPoint");
+      const scrollX = record.scrollX ?? 0;
+      const scrollY = record.scrollY ?? 0;
+      if (![scrollX, scrollY].every(Number.isFinite) || Math.abs(scrollX) > 4000 || Math.abs(scrollY) > 4000) {
+        throw new Error("scroll action has invalid deltas");
+      }
+      const resolved = await macInput.resolveWindowPoint(record.appName, record.target.windowPoint.xRel, record.target.windowPoint.yRel);
+      await macInput.scrollAtPoint(record.appName, resolved.x, resolved.y, scrollX, scrollY);
+      windowPoint = resolved;
     } else if (record.kind === "type") {
       if (record.target.ax) {
         try {
@@ -186,6 +236,16 @@ export async function executeApprovedAction(ctx: ToolContext, record: ControlAct
         throw new Error("key action has an out-of-range keyCode");
       }
       await macInput.pressKey(record.appName, keyCode);
+    } else if (record.kind === "keypress") {
+      const keys = record.keys ?? [];
+      if (keys.length < 1 || keys.length > 8 || keys.some((key) => !key.trim() || key.length > 32)) {
+        throw new Error("keypress action has invalid keys");
+      }
+      await macInput.pressKeyNames(record.appName, keys);
+    } else if (record.kind === "wait") {
+      const durationMs = record.durationMs ?? 1_000;
+      if (!Number.isFinite(durationMs) || durationMs < 0 || durationMs > 10_000) throw new Error("wait action has invalid durationMs");
+      await new Promise<void>((resolve) => setTimeout(resolve, Math.round(durationMs)));
     }
 
     const evidenceAfter = await captureActionEvidence(ctx, record, "after");
@@ -198,6 +258,11 @@ export async function executeApprovedAction(ctx: ToolContext, record: ControlAct
       axSummary: axSummary ? summarizeControlTarget({ ax: axSummary }) : undefined,
       windowPoint,
       keySummary: keySummary(record.keyCode),
+      keys: record.keys,
+      button: record.button,
+      pathPoints: record.path?.length,
+      scroll: record.scrollX !== undefined || record.scrollY !== undefined ? { x: record.scrollX ?? 0, y: record.scrollY ?? 0 } : undefined,
+      durationMs: record.durationMs,
       textSummary: toSummary(record).textSummary,
       evidence: {
         before: evidence.before ? summarizePath(evidence.before) : undefined,
@@ -233,6 +298,9 @@ export async function executeApprovedAction(ctx: ToolContext, record: ControlAct
       error: message,
     });
     await markDone(ctx.stateDir, record.actionId, { ok: false, error: message, evidence });
+  }
+  } finally {
+    executingActionIds.delete(record.actionId);
   }
 }
 

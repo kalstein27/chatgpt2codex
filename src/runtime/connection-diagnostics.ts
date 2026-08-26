@@ -16,7 +16,10 @@ export type ConnectionDiagnosticOutcome = "success" | "failure" | "info";
 
 export interface ConnectionDiagnosticSafeInputs {
   leasePreset?: "read-only" | "tests-only" | "full-write" | "image-only" | "control";
+  requestedPreset?: "read-only" | "tests-only" | "full-write" | "image-only" | "control";
   requiredCapability?: "read" | "verify" | "write" | "image" | "remote" | "control";
+  projectSelectPurpose?: "legacy-admin" | "control";
+  confirmSwitch?: boolean;
   captureScreenshot?: boolean;
   label?: string;
   writesWorkspace?: boolean;
@@ -69,7 +72,7 @@ export interface ConnectionDiagnosticInput {
   subprocessStillRunning?: boolean;
   cleanupStarted?: boolean;
   cleanupCompleted?: boolean;
-  commandStatus?: "SUCCESS" | "NONZERO_EXIT" | "TIMEOUT" | "SPAWN_FAILED";
+  commandStatus?: "SUCCESS" | "NONZERO_EXIT" | "TIMEOUT" | "SPAWN_FAILED" | "CANCELLED";
   cleanupStatus?: "NOT_REQUIRED" | "COMPLETED" | "FAILED";
   cancelledByClient?: boolean;
   progressHeartbeat?: boolean;
@@ -85,6 +88,11 @@ export interface ConnectionDiagnosticSummary {
   lastEventAt?: string;
   lastSuccessAt?: string;
   lastFailureAt?: string;
+  lastServerRequestAt?: string;
+  lastToolDispatchAt?: string;
+  serverObservedTransportError: boolean;
+  hostFailureObservable: false;
+  recommendedRecovery: "compare-server-receipt-and-dispatch";
   lastFailure?: ConnectionDiagnosticEvent;
   lifecycle: ConnectionLifecycleSummary;
   recentEvents: ConnectionDiagnosticEvent[];
@@ -102,7 +110,7 @@ export interface ClientCancellationRecovery {
   lastPhase?: ConnectionDiagnosticPhase;
   subprocessStarted?: boolean;
   subprocessStillRunning?: boolean;
-  commandStatus?: "SUCCESS" | "NONZERO_EXIT" | "TIMEOUT" | "SPAWN_FAILED";
+  commandStatus?: "SUCCESS" | "NONZERO_EXIT" | "TIMEOUT" | "SPAWN_FAILED" | "CANCELLED";
   cleanupStatus?: "NOT_REQUIRED" | "COMPLETED" | "FAILED";
   automaticRetrySafe: false;
   recommendedAction:
@@ -196,7 +204,7 @@ const SAFE_DIAGNOSTIC_PHASES = new Set<ConnectionDiagnosticPhase>([
   "transport",
   "completed",
 ]);
-const SAFE_COMMAND_STATUSES = new Set(["SUCCESS", "NONZERO_EXIT", "TIMEOUT", "SPAWN_FAILED"]);
+const SAFE_COMMAND_STATUSES = new Set(["SUCCESS", "NONZERO_EXIT", "TIMEOUT", "SPAWN_FAILED", "CANCELLED"]);
 const SAFE_CLEANUP_STATUSES = new Set(["NOT_REQUIRED", "COMPLETED", "FAILED"]);
 
 function safeDiagnosticInputs(
@@ -207,9 +215,16 @@ function safeDiagnosticInputs(
   if (typeof input.leasePreset === "string" && SAFE_LEASE_PRESETS.has(input.leasePreset)) {
     safe.leasePreset = input.leasePreset;
   }
+  if (typeof input.requestedPreset === "string" && SAFE_LEASE_PRESETS.has(input.requestedPreset)) {
+    safe.requestedPreset = input.requestedPreset;
+  }
   if (typeof input.requiredCapability === "string" && SAFE_LEASE_CAPABILITIES.has(input.requiredCapability)) {
     safe.requiredCapability = input.requiredCapability;
   }
+  if (input.projectSelectPurpose === "legacy-admin" || input.projectSelectPurpose === "control") {
+    safe.projectSelectPurpose = input.projectSelectPurpose;
+  }
+  if (typeof input.confirmSwitch === "boolean") safe.confirmSwitch = input.confirmSwitch;
   if (typeof input.captureScreenshot === "boolean") safe.captureScreenshot = input.captureScreenshot;
   const label = bounded(input.label);
   if (label) safe.label = label;
@@ -467,14 +482,22 @@ export class FileConnectionDiagnostics implements ConnectionDiagnosticsSink {
     const recentEvents = events.slice(-boundedLimit);
     const lastSuccess = [...events].reverse().find((event) => event.outcome === "success");
     const lastFailure = [...events].reverse().find((event) => event.outcome === "failure");
+    const lastServerRequest = [...events].reverse().find((event) => event.event === "mcp.authenticated_request_received");
+    const lastToolDispatch = [...events].reverse().find((event) => event.event === "tool.dispatch");
+    const lifecycle = lifecycleSummary(events);
     const cancellationRecovery = clientCancellationRecovery(events);
     return {
       logPath: this.logPath,
       lastEventAt: events.at(-1)?.at,
       lastSuccessAt: lastSuccess?.at,
       lastFailureAt: lastFailure?.at,
+      lastServerRequestAt: lastServerRequest?.at,
+      lastToolDispatchAt: lastToolDispatch?.at,
+      serverObservedTransportError: lifecycle.transportErrors > 0,
+      hostFailureObservable: false,
+      recommendedRecovery: "compare-server-receipt-and-dispatch",
       lastFailure,
-      lifecycle: lifecycleSummary(events),
+      lifecycle,
       recentEvents,
       recentCommandEvents: recentCommandEvents(events),
       ...(cancellationRecovery ? { clientCancellationRecovery: cancellationRecovery } : {}),

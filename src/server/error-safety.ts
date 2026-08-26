@@ -36,7 +36,15 @@ const PUBLIC_DOMAIN_MESSAGES: Partial<Record<ErrorCode, string>> = {
   [ErrorCode.NULLBYTE_REJECTED]: "The request contains an invalid path.",
   [ErrorCode.PENDING_WORK_IN_ACTIVE]: "Another operation is already active.",
   [ErrorCode.ACTIVE_OPERATION_IN_PROGRESS]: "Another operation is still running.",
+  [ErrorCode.RUNTIME_UPDATE_IN_PROGRESS]: "A runtime or app update is in progress. Retry after the drain completes.",
   [ErrorCode.ACTIVE_PROJECT_LEASE_HELD]: "Another project still holds an active privileged lease.",
+  [ErrorCode.RECOVERY_NOT_FOREIGN_WORK_LANE]: "The requested state is not a recoverable foreign work lane.",
+  [ErrorCode.SERIAL_ADMIN_LEASE_HELD]: "A serial or control lease currently holds the project root.",
+  [ErrorCode.CURRENT_SESSION_LANE_USE_NORMAL_RELEASE]: "The current session owns this work lane.",
+  [ErrorCode.ACTIVE_OPERATION_PRESENT]: "An active project operation prevents recovery.",
+  [ErrorCode.LOCK_OWNER_STILL_ACTIVE]: "The privileged lock owner is still active.",
+  [ErrorCode.STALE_ROOT_LOCK_RECOVERABLE]: "The privileged root lock is stale and recoverable.",
+  [ErrorCode.ROOT_LOCK_STATE_INCONSISTENT]: "The privileged root-lock state is inconsistent.",
   [ErrorCode.CHATGPT_SANDBOX_PATH_UNAVAILABLE]:
     "The supplied path belongs to the ChatGPT sandbox, not the connected Mac. Use a ChatGPT image URL, clipboard, download, or an actual Mac path.",
   [ErrorCode.SCAN_DENIED]: "The requested scan is not allowed.",
@@ -61,8 +69,45 @@ const SAFE_APPROVAL_REASONS = new Set([
 ]);
 const SAFE_PROJECT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const SAFE_REQUEST_ID_RE = /^arm_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
+const SAFE_UPDATE_OPERATION_ID_RE = /^(?:rt|app)_[A-Za-z0-9][A-Za-z0-9._:-]{6,155}$/u;
 const SAFE_LEASE_PRESETS = new Set(["read-only", "tests-only", "full-write", "image-only", "control"]);
 const SAFE_LEASE_CAPABILITIES = new Set(["read", "verify", "write", "image", "remote", "control"]);
+const SAFE_PROJECT_SELECT_PURPOSES = new Set(["legacy-admin", "control"]);
+const SAFE_AUTHORIZATION_TOOLS = new Set(["project_lane_open", "project_select"]);
+const SAFE_PROJECT_CONFLICT_KINDS = new Set(["project-lane", "serial-lease", "project-root-lock", "project-root-overlap"]);
+const SAFE_ROOT_OVERLAP_RELATIONS = new Set(["ancestor", "descendant"]);
+const SAFE_ROOT_RELATIONS = new Set(["same-root", "ancestor", "descendant"]);
+const SAFE_LEASE_HINT_ACTIONS = new Set([
+  "project_lane_open",
+  "release-current-blocking-lease",
+  "wait-for-blocking-owner-release",
+  "start-new-session-for-other-project",
+  "register-explicit-workspace-root",
+  "use-required-project-id",
+  "workspace_refresh_index",
+]);
+const SAFE_BLOCKER_KINDS = new Set(["work-lane", "serial-admin-lease", "control-lease", "stale-orphan-root-lock"]);
+const SAFE_OWNER_RELATIONS = new Set(["current", "foreign"]);
+const SAFE_OWNER_STATES = new Set(["live", "abandoned"]);
+const SAFE_RECOVERY_REASONS = new Set([
+  ErrorCode.RECOVERY_NOT_FOREIGN_WORK_LANE,
+  ErrorCode.SERIAL_ADMIN_LEASE_HELD,
+  ErrorCode.CURRENT_SESSION_LANE_USE_NORMAL_RELEASE,
+  ErrorCode.ACTIVE_OPERATION_PRESENT,
+  ErrorCode.LOCK_OWNER_STILL_ACTIVE,
+  ErrorCode.STALE_ROOT_LOCK_RECOVERABLE,
+  ErrorCode.ROOT_LOCK_STATE_INCONSISTENT,
+]);
+const SAFE_RECOVERY_ACTIONS = new Set([
+  "project_release",
+  "project_lane_release",
+  "project_lane_recover",
+  "project_lane_open",
+  "project_lane_release-or-project_lane_recover-if-handle-lost",
+  "wait-for-owner-release",
+  "wait-for-owner-release-or-expiry",
+  "wait-for-active-operation-to-finish",
+]);
 const SAFE_EDIT_RECOVERY: Partial<Record<ErrorCode, Record<string, string>>> = {
   [ErrorCode.STALE_FILE_HASH]: {
     reason: "stale_file_hash",
@@ -93,11 +138,110 @@ function safeRemoteDetails(code: ErrorCode, details: Record<string, unknown> | u
   if (editRecovery) return { ...editRecovery };
   if (!details) return undefined;
 
+  if (code === ErrorCode.PROJECT_NOT_FOUND) {
+    const out: Record<string, unknown> = {};
+    if (details.reason === "path-owned-by-registered-project" || details.reason === "project-path-not-indexed") {
+      out.reason = details.reason;
+    }
+    if (typeof details.requiredProjectId === "string" && SAFE_PROJECT_ID_RE.test(details.requiredProjectId)) {
+      out.requiredProjectId = redact(details.requiredProjectId);
+    }
+    if (details.pathRelation === "inside-registered-project") out.pathRelation = details.pathRelation;
+    if (typeof details.recommendedAction === "string" && SAFE_LEASE_HINT_ACTIONS.has(details.recommendedAction)) {
+      out.recommendedAction = details.recommendedAction;
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
+
+  if (code === ErrorCode.PATH_OUTSIDE_WORKSPACE) {
+    const out: Record<string, unknown> = {};
+    if (details.reason === "target-root-not-authorized") out.reason = details.reason;
+    if (details.recommendedAction === "register-explicit-workspace-root") {
+      out.recommendedAction = details.recommendedAction;
+    }
+    if (typeof details.authorizedWorkspaceRootCount === "number" && Number.isInteger(details.authorizedWorkspaceRootCount)) {
+      out.authorizedWorkspaceRootCount = Math.max(0, details.authorizedWorkspaceRootCount);
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
+  if (code === ErrorCode.LEASE_REQUIRED) {
+    const out: Record<string, unknown> = {};
+    if (typeof details.projectId === "string" && SAFE_PROJECT_ID_RE.test(details.projectId)) {
+      out.projectId = redact(details.projectId);
+    }
+    if (typeof details.requiredCapability === "string" && SAFE_LEASE_CAPABILITIES.has(details.requiredCapability)) {
+      out.requiredCapability = details.requiredCapability;
+    }
+    if (details.required === "workLaneId") out.required = details.required;
+    if (details.leaseReason === "work-lane-required") out.leaseReason = details.leaseReason;
+    if (typeof details.recommendedAction === "string" && SAFE_LEASE_HINT_ACTIONS.has(details.recommendedAction)) {
+      out.recommendedAction = details.recommendedAction;
+    }
+    if (details.ownerMismatch === true) out.ownerMismatch = true;
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
+  if (SAFE_RECOVERY_REASONS.has(code)) {
+    const out: Record<string, unknown> = {};
+    if (typeof details.projectId === "string" && SAFE_PROJECT_ID_RE.test(details.projectId)) {
+      out.projectId = redact(details.projectId);
+    }
+    if (typeof details.blockerKind === "string" && SAFE_BLOCKER_KINDS.has(details.blockerKind)) {
+      out.blockerKind = details.blockerKind;
+    }
+    if (typeof details.preset === "string" && SAFE_LEASE_PRESETS.has(details.preset)) out.preset = details.preset;
+    if (typeof details.ownerRelation === "string" && SAFE_OWNER_RELATIONS.has(details.ownerRelation)) {
+      out.ownerRelation = details.ownerRelation;
+    }
+    if (typeof details.ownerState === "string" && SAFE_OWNER_STATES.has(details.ownerState)) out.ownerState = details.ownerState;
+    if (typeof details.expiresAt === "number" && Number.isFinite(details.expiresAt)) out.expiresAt = details.expiresAt;
+    if (typeof details.recoverEligible === "boolean") out.recoverEligible = details.recoverEligible;
+    if (typeof details.recoveryReason === "string" && SAFE_RECOVERY_REASONS.has(details.recoveryReason as ErrorCode)) {
+      out.recoveryReason = details.recoveryReason;
+    }
+    if (typeof details.recommendedAction === "string" && SAFE_RECOVERY_ACTIONS.has(details.recommendedAction)) {
+      out.recommendedAction = details.recommendedAction;
+    }
+    if (typeof details.activeOperationCount === "number" && Number.isInteger(details.activeOperationCount)) {
+      out.activeOperationCount = Math.max(0, details.activeOperationCount);
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
   if (code === ErrorCode.PERMISSION_DENIED) {
     const projectId = details.projectId;
     const preset = details.preset;
     const requiredCapability = details.requiredCapability;
     const recommendedPreset = details.recommendedPreset;
+    if (
+      typeof projectId === "string"
+      && SAFE_PROJECT_ID_RE.test(projectId)
+      && details.multiProjectLanesEnabled === true
+      && typeof details.attemptedPreset === "string"
+      && SAFE_LEASE_PRESETS.has(details.attemptedPreset)
+      && (details.attemptedPurpose === null
+        || (typeof details.attemptedPurpose === "string" && SAFE_PROJECT_SELECT_PURPOSES.has(details.attemptedPurpose)))
+      && typeof details.requiredPurpose === "string"
+      && SAFE_PROJECT_SELECT_PURPOSES.has(details.requiredPurpose)
+      && typeof details.recommendedTool === "string"
+      && SAFE_AUTHORIZATION_TOOLS.has(details.recommendedTool)
+      && typeof details.recommendedPreset === "string"
+      && SAFE_LEASE_PRESETS.has(details.recommendedPreset)
+      && details.confirmSwitchRelevant === false
+    ) {
+      return {
+        projectId: redact(projectId),
+        multiProjectLanesEnabled: true,
+        attemptedPreset: details.attemptedPreset,
+        attemptedPurpose: details.attemptedPurpose,
+        requiredPurpose: details.requiredPurpose,
+        recommendedTool: details.recommendedTool,
+        recommendedPreset: details.recommendedPreset,
+        confirmSwitchRelevant: false,
+      };
+    }
     if (
       typeof projectId === "string"
       && SAFE_PROJECT_ID_RE.test(projectId)
@@ -115,7 +259,83 @@ function safeRemoteDetails(code: ErrorCode, details: Record<string, unknown> | u
         recommendedPreset,
       };
     }
+    if (
+      typeof projectId === "string"
+      && SAFE_PROJECT_ID_RE.test(projectId)
+      && typeof details.boundProjectId === "string"
+      && SAFE_PROJECT_ID_RE.test(details.boundProjectId)
+    ) {
+      return {
+        projectId: redact(projectId),
+        boundProjectId: redact(details.boundProjectId),
+        reason: "session-bound-to-project",
+        recommendedAction: "start-new-session-for-other-project",
+      };
+    }
     return undefined;
+  }
+
+  if (code === ErrorCode.RUNTIME_UPDATE_IN_PROGRESS) {
+    const operationId = details.operationId;
+    const projectId = details.projectId;
+    const phase = details.phase;
+    const retryAfterMs = details.retryAfterMs;
+    if (
+      typeof operationId === "string"
+      && SAFE_UPDATE_OPERATION_ID_RE.test(operationId)
+      && typeof projectId === "string"
+      && SAFE_PROJECT_ID_RE.test(projectId)
+      && phase === "draining"
+      && typeof retryAfterMs === "number"
+      && Number.isInteger(retryAfterMs)
+      && retryAfterMs > 0
+      && retryAfterMs <= 5 * 60 * 1_000
+    ) {
+      return {
+        operationId,
+        projectId: redact(projectId),
+        phase,
+        retryAfterMs,
+        recommendedAction: "retry-after-runtime-update",
+      };
+    }
+    return undefined;
+  }
+
+  if (code === ErrorCode.ACTIVE_PROJECT_LEASE_HELD) {
+    const out: Record<string, unknown> = {};
+    if (typeof details.projectId === "string" && SAFE_PROJECT_ID_RE.test(details.projectId)) {
+      out.projectId = redact(details.projectId);
+    }
+    if (typeof details.conflictingProjectId === "string" && SAFE_PROJECT_ID_RE.test(details.conflictingProjectId)) {
+      out.conflictingProjectId = redact(details.conflictingProjectId);
+    }
+    if (typeof details.conflictKind === "string" && SAFE_PROJECT_CONFLICT_KINDS.has(details.conflictKind)) {
+      out.conflictKind = details.conflictKind;
+    }
+    if (typeof details.overlapRelation === "string" && SAFE_ROOT_OVERLAP_RELATIONS.has(details.overlapRelation)) {
+      out.overlapRelation = details.overlapRelation;
+    }
+    if (typeof details.blockingProjectId === "string" && SAFE_PROJECT_ID_RE.test(details.blockingProjectId)) {
+      out.blockingProjectId = redact(details.blockingProjectId);
+    }
+    if (typeof details.rootRelation === "string" && SAFE_ROOT_RELATIONS.has(details.rootRelation)) {
+      out.rootRelation = details.rootRelation;
+    }
+    if (typeof details.blockingPreset === "string" && SAFE_LEASE_PRESETS.has(details.blockingPreset)) {
+      out.blockingPreset = details.blockingPreset;
+    }
+    if (details.blockingKind === "lane" || details.blockingKind === "serial") out.blockingKind = details.blockingKind;
+    if (typeof details.ownerRelation === "string" && SAFE_OWNER_RELATIONS.has(details.ownerRelation)) {
+      out.ownerRelation = details.ownerRelation;
+    }
+    if (typeof details.recommendedAction === "string" && SAFE_LEASE_HINT_ACTIONS.has(details.recommendedAction)) {
+      out.recommendedAction = details.recommendedAction;
+    }
+    if (typeof details.conflictingPreset === "string" && SAFE_LEASE_PRESETS.has(details.conflictingPreset)) {
+      out.conflictingPreset = details.conflictingPreset;
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
   }
 
   if (code !== ErrorCode.APPROVAL_REQUIRED) return undefined;

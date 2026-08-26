@@ -268,7 +268,7 @@ private func performUpdate() throws -> (status: String, message: String) {
     if previousHealth == nil {
         return (
             "staged",
-            "Runtime \(expectedVersion) is staged and will be used the next time MCP starts. The menu bar app can stay open."
+            "Runtime \(expectedVersion) is staged and will be used the next time MCP starts. The macOS app can stay open."
         )
     }
 

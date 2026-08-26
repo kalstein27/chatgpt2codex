@@ -66,6 +66,8 @@ export type ExecutionMode = "observe" | "read" | "edit" | "verify" | "danger";
 
 export interface Config {
   workspaceRoot: string;
+  /** Explicit authorized workspace roots. The first entry is workspaceRoot. */
+  workspaceRoots?: string[];
   stateDir: string;
   /** Max bytes returned/read for a single file_read_slice call. */
   maxReadBytes: number;
@@ -75,6 +77,9 @@ export interface Config {
   defaultCommandTimeoutSec: number;
   /** Default lease TTL in ms. */
   defaultLeaseTtlMs: number;
+  /** Experimental parallel project lanes. Default false; never inferred from
+   * an existing serial lease. */
+  multiProjectLanesEnabled?: boolean;
   /** Public HTTP origin used for short-lived inline screenshot links. */
   publicUrl?: string;
 }
@@ -85,6 +90,8 @@ export interface Config {
 
 export interface ToolContext {
   workspaceRoot: string;
+  /** Explicit authorized workspace roots. Falls back to [workspaceRoot]. */
+  workspaceRoots?: string[];
   stateDir: string;
   /** Loaded/loadable project registry entries. */
   registry: ProjectRegistryEntry[];
@@ -98,6 +105,12 @@ export interface ToolContext {
     saveProjects(p: ProjectRegistryEntry[]): Promise<void>;
     getSession(scope?: string): Promise<unknown>;
     setSession(s: unknown, scope?: string): Promise<void>;
+    /** Serialize a complete read/modify/write transaction for one scoped
+     * session. Production stores provide this; narrow test doubles may omit it. */
+    updateSession?(
+      scope: string | undefined,
+      updater: (current: unknown) => unknown | Promise<unknown>,
+    ): Promise<unknown>;
   };
   /** Opaque scope for active-project and lease persistence. Absent means the
    * historical local/default session. Raw credentials must never be stored. */
@@ -154,7 +167,15 @@ export enum ErrorCode {
   NULLBYTE_REJECTED = "NULLBYTE_REJECTED",
   PENDING_WORK_IN_ACTIVE = "PENDING_WORK_IN_ACTIVE",
   ACTIVE_OPERATION_IN_PROGRESS = "ACTIVE_OPERATION_IN_PROGRESS",
+  RUNTIME_UPDATE_IN_PROGRESS = "RUNTIME_UPDATE_IN_PROGRESS",
   ACTIVE_PROJECT_LEASE_HELD = "ACTIVE_PROJECT_LEASE_HELD",
+  RECOVERY_NOT_FOREIGN_WORK_LANE = "RECOVERY_NOT_FOREIGN_WORK_LANE",
+  SERIAL_ADMIN_LEASE_HELD = "SERIAL_ADMIN_LEASE_HELD",
+  CURRENT_SESSION_LANE_USE_NORMAL_RELEASE = "CURRENT_SESSION_LANE_USE_NORMAL_RELEASE",
+  ACTIVE_OPERATION_PRESENT = "ACTIVE_OPERATION_PRESENT",
+  LOCK_OWNER_STILL_ACTIVE = "LOCK_OWNER_STILL_ACTIVE",
+  STALE_ROOT_LOCK_RECOVERABLE = "STALE_ROOT_LOCK_RECOVERABLE",
+  ROOT_LOCK_STATE_INCONSISTENT = "ROOT_LOCK_STATE_INCONSISTENT",
   CHATGPT_SANDBOX_PATH_UNAVAILABLE = "CHATGPT_SANDBOX_PATH_UNAVAILABLE",
   SCAN_DENIED = "SCAN_DENIED",
   PROJECT_NOT_SELECTED = "PROJECT_NOT_SELECTED",
@@ -164,6 +185,8 @@ export enum ErrorCode {
   UNSUPPORTED_MEDIA_TYPE = "UNSUPPORTED_MEDIA_TYPE",
   PLATFORM_UNSUPPORTED = "PLATFORM_UNSUPPORTED",
   QUOTA_EXCEEDED = "QUOTA_EXCEEDED",
+  OPERATION_NOT_FOUND = "OPERATION_NOT_FOUND",
+  OPERATION_NOT_ACTIVE = "OPERATION_NOT_ACTIVE",
   INVALID_ARGUMENT = "INVALID_ARGUMENT",
   PERMISSION_DENIED = "PERMISSION_DENIED",
   // Option B desktop-control codes (src/control/**).

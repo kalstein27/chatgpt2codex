@@ -123,6 +123,7 @@ async function invokeLegacyHandler(
   ctx: ToolContext,
   method: string,
   params: Record<string, unknown>,
+  extra: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   const server = await createMcpServer(ctx);
   const protocol = (server as unknown as {
@@ -130,7 +131,7 @@ async function invokeLegacyHandler(
   }).server;
   const handler = protocol?._requestHandlers?.get(method);
   if (!handler) throw Object.assign(new Error(`Method not found: ${method}`), { code: -32601 });
-  return await handler({ method, params }, {});
+  return await handler({ method, params }, extra);
 }
 
 export async function dispatchModernMcpRequest(
@@ -183,7 +184,9 @@ export async function dispatchModernMcpRequest(
   }
 
   try {
-    const result = await invokeLegacyHandler(ctx, method, params);
+    const result = await invokeLegacyHandler(ctx, method, params, {
+      _meta: modernRequestMeta(body) ?? {},
+    });
     return { status: 200, response: jsonRpcResult(request.id, decorateModernResult(method, result, serverInfo)) };
   } catch (error) {
     const boundary = toRemoteBoundaryError(error);

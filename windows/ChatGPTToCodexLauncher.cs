@@ -523,9 +523,50 @@ internal sealed class LauncherForm : Form
         if (string.IsNullOrWhiteSpace(value)) return null;
 
         value = value.Trim();
-        Uri uri;
-        if (Uri.TryCreate(value, UriKind.Absolute, out uri)) return uri.Host;
         return value.TrimEnd('/');
+    }
+
+    private string ResolveTunnelMode()
+    {
+        var explicitMode = Environment.GetEnvironmentVariable("CHATGPT2CODEX_TUNNEL_MODE");
+        if (!string.IsNullOrWhiteSpace(explicitMode))
+        {
+            var normalized = explicitMode.Trim().ToLowerInvariant();
+            if (normalized == "loopback" || normalized == "cloudflare-quick" ||
+                normalized == "cloudflare-named" || normalized == "external") return normalized;
+        }
+        if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("CHATGPT2CODEX_PUBLIC_URL"))) return "external";
+        if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("CLOUDFLARED_TUNNEL_TOKEN")) ||
+            !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("CLOUDFLARED_TUNNEL_NAME"))) return "cloudflare-named";
+        if (!publicTunnelEnabled) return "loopback";
+        if (!string.IsNullOrWhiteSpace(configuredPublicHost))
+        {
+            var value = configuredPublicHost.Trim();
+            if (value.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return "external";
+            if (Regex.IsMatch(value, @"^[A-Za-z0-9.-]+\.ts\.net$", RegexOptions.IgnoreCase)) return "external";
+            return "cloudflare-named";
+        }
+        return "cloudflare-quick";
+    }
+
+    private string ResolveExternalPublicUrl()
+    {
+        var value = Environment.GetEnvironmentVariable("CHATGPT2CODEX_PUBLIC_URL");
+        if (string.IsNullOrWhiteSpace(value)) value = configuredPublicHost;
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        value = value.Trim();
+        if (!value.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) value = "https://" + value;
+        Uri uri;
+        System.Net.IPAddress address;
+        var normalizedHost = "";
+        if (!Uri.TryCreate(value, UriKind.Absolute, out uri) || uri.Scheme != Uri.UriSchemeHttps ||
+            !string.IsNullOrEmpty(uri.UserInfo) || !string.IsNullOrEmpty(uri.Query) || !string.IsNullOrEmpty(uri.Fragment) ||
+            (uri.AbsolutePath != "/" && uri.AbsolutePath != "")) return null;
+        normalizedHost = uri.Host.TrimEnd('.').Trim('[', ']');
+        if (normalizedHost.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
+            normalizedHost.EndsWith(".localhost", StringComparison.OrdinalIgnoreCase) ||
+            (System.Net.IPAddress.TryParse(normalizedHost, out address) && System.Net.IPAddress.IsLoopback(address))) return null;
+        return uri.GetLeftPart(UriPartial.Authority).TrimEnd('/');
     }
 
     private string LoadSelectedProjectPath()
@@ -598,9 +639,8 @@ internal sealed class LauncherForm : Form
             // Corrupt settings should not block startup.
         }
 
-        if (Environment.GetEnvironmentVariable("CHATGPT2CODEX_EXPOSE_WEB") == "1" ||
-            !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("PUBLIC_HOSTNAME")) ||
-            !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("CHATGPT2CODEX_PUBLIC_HOSTNAME")))
+        if (new[] { "cloudflare-quick", "cloudflare-named", "external" }.Contains((Environment.GetEnvironmentVariable("CHATGPT2CODEX_TUNNEL_MODE") ?? "").Trim().ToLowerInvariant()) ||
+            !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("CHATGPT2CODEX_PUBLIC_URL")))
         {
             publicTunnelEnabled = true;
         }
@@ -656,7 +696,8 @@ internal sealed class LauncherForm : Form
         var values = new List<string>();
         for (var i = 0; i < args.Length; i++)
         {
-            if (IsOption(args[i], "-Workspace") || IsOption(args[i], "-Port") || IsOption(args[i], "-PublicHostname"))
+            if (IsOption(args[i], "-Workspace") || IsOption(args[i], "-Port") || IsOption(args[i], "-PublicHostname") ||
+                IsOption(args[i], "-PublicUrl") || IsOption(args[i], "-TunnelMode"))
             {
                 i++;
                 continue;
@@ -678,10 +719,22 @@ internal sealed class LauncherForm : Form
             values.Add(workspace);
         }
 
-        if (publicTunnelEnabled)
+        var tunnelMode = ResolveTunnelMode();
+        values.Add("-TunnelMode");
+        values.Add(tunnelMode);
+        if (tunnelMode != "loopback")
         {
             values.Add("-ExposeWeb");
-            if (!string.IsNullOrWhiteSpace(configuredPublicHost))
+            if (tunnelMode == "external")
+            {
+                var externalUrl = ResolveExternalPublicUrl();
+                if (!string.IsNullOrWhiteSpace(externalUrl))
+                {
+                    values.Add("-PublicUrl");
+                    values.Add(externalUrl);
+                }
+            }
+            else if (tunnelMode == "cloudflare-named" && !string.IsNullOrWhiteSpace(configuredPublicHost))
             {
                 values.Add("-PublicHostname");
                 values.Add(configuredPublicHost);
@@ -693,8 +746,14 @@ internal sealed class LauncherForm : Form
     private string ConnectorUrl()
     {
         if (!string.IsNullOrEmpty(mcpUrl)) return mcpUrl;
-        if (publicTunnelEnabled && !string.IsNullOrEmpty(configuredPublicHost)) return "https://" + configuredPublicHost + "/mcp";
-        if (publicTunnelEnabled) return null;
+        var tunnelMode = ResolveTunnelMode();
+        if (tunnelMode == "external")
+        {
+            var externalUrl = ResolveExternalPublicUrl();
+            return string.IsNullOrEmpty(externalUrl) ? null : externalUrl + "/mcp";
+        }
+        if (tunnelMode == "cloudflare-named" && !string.IsNullOrEmpty(configuredPublicHost)) return "https://" + configuredPublicHost + "/mcp";
+        if (tunnelMode == "cloudflare-quick") return null;
         return "http://127.0.0.1:" + port + "/mcp";
     }
 
@@ -958,13 +1017,16 @@ internal sealed class LauncherForm : Form
             tunnelCheck.SetBounds(180, 222, 390, 24);
             form.Controls.Add(tunnelCheck);
 
-            form.Controls.Add(NewLabel(L("publicHostname"), 24, 262, 150));
+            form.Controls.Add(NewLabel(preferredLanguage == "ko" ? "공개 호스트 / 외부 HTTPS URL" : "Public host / external HTTPS URL", 24, 262, 150));
             var hostBox = new TextBox();
             hostBox.Text = configuredPublicHost ?? string.Empty;
             hostBox.SetBounds(180, 258, 342, 24);
             form.Controls.Add(hostBox);
 
-            var hostHint = NewLabel(L("publicHostnameHint"), 180, 288, 342);
+            var hostHintText = preferredLanguage == "ko"
+                ? "비워두면 Cloudflare Quick Tunnel. 호스트명은 기존 Cloudflare named tunnel token/name이 함께 설정된 경우에만 고정 주소로 사용됩니다. https:// URL은 외부 관리 터널이며 앱이 시작/종료하지 않습니다."
+                : "Blank = Cloudflare Quick Tunnel. A hostname is fixed only with an existing Cloudflare named-tunnel token/name. https:// URL = externally managed; this app does not start/stop it.";
+            var hostHint = NewLabel(hostHintText, 180, 288, 342);
             hostHint.SetBounds(180, 286, 342, 42);
             hostHint.ForeColor = System.Drawing.SystemColors.GrayText;
             form.Controls.Add(hostHint);
@@ -1634,7 +1696,7 @@ internal sealed class LauncherForm : Form
     private void StartLauncher()
     {
         stopping = false;
-        if (publicTunnelEnabled && string.IsNullOrWhiteSpace(configuredPublicHost))
+        if (ResolveTunnelMode() == "cloudflare-quick")
         {
             mcpUrl = null;
             urlBox.Text = "Waiting for Cloudflare connector URL...";

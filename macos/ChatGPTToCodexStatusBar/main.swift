@@ -4,6 +4,8 @@ import Carbon.HIToolbox
 import CoreGraphics
 import Foundation
 import Security
+import ScreenCaptureKit
+import WebKit
 
 private func shellQuote(_ value: String) -> String {
     "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
@@ -101,10 +103,10 @@ private let desktopLocalizationRows: [String: [String]] = [
     "connectionDiagnosticsMenu": ["Connection Diagnostics...", "연결 진단 로그..."],
     "launchAtLoginMenu": ["Launch at Login", "로그인 시 실행", "ログイン時に起動", "登录时启动", "登入時啟動", "Iniciar al acceder", "Lancer à la connexion", "Beim Anmelden starten", "Abrir ao iniciar sessão", "Avvia al login", "Start bij inloggen", "Uruchamiaj przy logowaniu", "Запускать при входе", "Girişte başlat", "Mở khi đăng nhập", "Jalankan saat login", "เปิดเมื่อเข้าสู่ระบบ", "التشغيل عند تسجيل الدخول", "लॉगिन पर शुरू करें", "Запускати під час входу"],
     "startOnOpenMenu": ["Start MCP When App Opens", "앱 열 때 MCP 시작", "アプリ起動時に MCP を開始", "应用打开时启动 MCP", "App 開啟時啟動 MCP", "Iniciar MCP al abrir la app", "Démarrer MCP à l'ouverture", "MCP beim Öffnen starten", "Iniciar MCP ao abrir o app", "Avvia MCP all'apertura", "Start MCP bij openen", "Uruchamiaj MCP przy otwarciu", "Запускать MCP при открытии", "Uygulama açılınca MCP başlat", "Khởi động MCP khi mở ứng dụng", "Mulai MCP saat app dibuka", "เริ่ม MCP เมื่อเปิดแอป", "بدء MCP عند فتح التطبيق", "ऐप खुलने पर MCP शुरू करें", "Запускати MCP під час відкриття"],
-    "screenshotPermissionMenu": ["Screenshot Permission...", "스크린샷 권한..."],
-    "screenshotPermissionTitle": ["Screen Recording permission", "화면 기록 권한"],
-    "screenshotPermissionMissingInfo": ["ChatGPT To Codex needs macOS Screen Recording permission to capture E2E screenshots and show them inline in ChatGPT. Enable ChatGPT To Codex in System Settings > Privacy & Security > Screen Recording, then restart the app if macOS asks for it.", "E2E 스크린샷을 찍고 ChatGPT 답변에 인라인으로 보여주려면 macOS 화면 기록 권한이 필요합니다. 시스템 설정 > 개인정보 보호 및 보안 > 화면 기록에서 ChatGPT To Codex를 허용하고, macOS가 요청하면 앱을 재시작하세요."],
-    "screenshotPermissionReadyInfo": ["Screen Recording permission is already allowed. E2E screenshots can be captured and returned inline.", "화면 기록 권한이 이미 허용되어 있습니다. E2E 스크린샷을 캡처해 인라인으로 제공할 수 있습니다."],
+    "screenshotPermissionMenu": ["Screen & System Audio Recording Permission...", "화면 및 시스템 오디오 기록 권한..."],
+    "screenshotPermissionTitle": ["Screen & System Audio Recording permission", "화면 및 시스템 오디오 기록 권한"],
+    "screenshotPermissionMissingInfo": ["ChatGPT To Codex needs macOS Screen & System Audio Recording permission to capture E2E screenshots and show them inline in ChatGPT. Enable ChatGPT To Codex in System Settings > Privacy & Security > Screen & System Audio Recording. The app will never request this permission automatically during an E2E capture.", "E2E 스크린샷을 찍고 ChatGPT 답변에 인라인으로 보여주려면 macOS 화면 및 시스템 오디오 기록 권한이 필요합니다. 시스템 설정 > 개인정보 보호 및 보안 > 화면 및 시스템 오디오 기록에서 ChatGPT To Codex를 허용하세요. E2E 캡처 중에는 이 권한을 자동 요청하지 않습니다."],
+    "screenshotPermissionReadyInfo": ["Screen & System Audio Recording permission is already allowed. E2E screenshots can be captured by the menu-bar app and returned inline.", "화면 및 시스템 오디오 기록 권한이 이미 허용되어 있습니다. 메뉴바 앱이 E2E 스크린샷을 캡처해 인라인으로 제공할 수 있습니다."],
     "openPrivacySettings": ["Open Privacy Settings", "개인정보 설정 열기"],
     "requestPermission": ["Request Permission", "권한 요청"],
     "accessibilityPermissionMenu": ["Accessibility Permission...", "손쉬운 사용 권한..."],
@@ -119,8 +121,24 @@ private let desktopLocalizationRows: [String: [String]] = [
     "agentArmStatusDetail": ["Remote ChatGPT can request control actions, but execution still requires this Mac's control lease, allowlist, sensitive-app checks, and kill switch.", "원격 ChatGPT는 제어 작업을 요청할 수 있지만 실행에는 이 Mac의 제어 lease, 허용 목록, 민감 앱 검사, kill switch가 계속 필요합니다."],
     "agentArmOnMenu": ["Agent Arm: on", "Agent Arm: 켜짐"],
     "agentArmOffMenu": ["Agent Arm: off", "Agent Arm: 꺼짐"],
+    "agentArmOnExplanation": ["Desktop control is available; approvals and safety checks still apply", "화면 제어 가능 · 작업 승인과 안전 검사는 계속 적용"],
+    "agentArmOffExplanation": ["Desktop clicks and typing are blocked; normal C2CT tools still work", "화면 클릭·입력 차단 · 일반 C2CT 작업은 계속 가능"],
+    "agentArmRemoteRequestExplanation": ["Remote control requests are approved separately and never turn this on automatically", "원격 제어 요청은 별도 승인 · 자동으로 켜지지 않음"],
     "activeSessionsMenu": ["Active session status", "활성 세션 상태"],
     "sessionNoActive": ["No active sessions", "활성 세션 없음"],
+    "activityWindowMenu": ["Current Work...", "작업 현황..."],
+    "activityWindowTitle": ["Current Work", "현재 작업 현황"],
+    "activityRefresh": ["Refresh", "새로고침"],
+    "activityNoSessions": ["No sessions or operations are active.", "진행 중인 세션이나 작업이 없습니다."],
+    "activityWaitingForTool": ["Connected · waiting for the next C2CT tool call", "연결됨 · 다음 C2CT 도구 호출 대기"],
+    "activityThinkingNotObservable": ["ChatGPT thinking and response drafting happen outside the C2CT runtime and cannot be displayed here.", "ChatGPT의 생각·답변 작성 단계는 C2CT runtime 밖에서 진행되어 여기에 표시되지 않습니다."],
+    "activityWaiting": ["May be waiting for a response", "응답 대기 가능"],
+    "activityLastUpdated": ["Last updated", "최근 갱신"],
+    "activityStartedAt": ["Started", "시작"],
+    "activityFinishedAt": ["Finished", "완료"],
+    "activityConnectedAt": ["Connected", "연결"],
+    "activityChats": ["chats", "채팅"],
+    "activityOlderOperations": ["older operations", "개의 이전 작업"],
     "sessionPhase": ["Phase", "단계"],
     "sessionHeartbeat": ["heartbeat", "하트비트"],
     "sessionClientCancelled": ["Client stopped waiting", "클라이언트가 대기를 중단함"],
@@ -149,6 +167,7 @@ private let desktopLocalizationRows: [String: [String]] = [
     "ownerTokenReady": ["configured", "설정됨"],
     "ownerTokenCopiedStatus": ["configured - copied", "설정됨 · 복사됨"],
     "ownerTokenMissing": ["not set", "미설정"],
+    "ownerTokenCheckFailed": ["status check failed", "상태 확인 실패"],
     "ownerTokenGenerateCopy": ["Generate & Copy Token", "토큰 생성 후 복사"],
     "ownerTokenCopy": ["Copy Token", "토큰 복사"],
     "ownerTokenCopyUnavailable": ["Generate a token first. Existing tokens are stored by hash only unless this app generated them.", "먼저 토큰을 생성하세요. 기존 토큰은 이 앱이 생성한 경우가 아니면 해시로만 저장되어 다시 복사할 수 없습니다."],
@@ -172,6 +191,8 @@ private let desktopLocalizationRows: [String: [String]] = [
     "browse": ["Browse...", "찾아보기...", "参照...", "浏览...", "瀏覽...", "Examinar...", "Parcourir...", "Durchsuchen...", "Procurar...", "Sfoglia...", "Bladeren...", "Przeglądaj...", "Обзор...", "Gözat...", "Duyệt...", "Telusuri...", "เรียกดู...", "استعراض...", "ब्राउज़...", "Огляд..."],
     "launchAtLoginSetting": ["Launch app at login", "로그인 시 앱 실행", "ログイン時にアプリを起動", "登录时启动应用", "登入時啟動 App", "Iniciar la app al acceder", "Lancer l'app à la connexion", "App beim Anmelden starten", "Abrir app ao iniciar sessão", "Avvia app al login", "App starten bij inloggen", "Uruchamiaj aplikację przy logowaniu", "Запускать приложение при входе", "Girişte uygulamayı başlat", "Mở ứng dụng khi đăng nhập", "Jalankan app saat login", "เปิดแอปเมื่อเข้าสู่ระบบ", "تشغيل التطبيق عند تسجيل الدخول", "लॉगिन पर ऐप शुरू करें", "Запускати застосунок під час входу"],
     "startOnOpenSetting": ["Start MCP when the app opens", "앱 열 때 MCP 시작", "アプリ起動時に MCP を開始", "应用打开时启动 MCP", "App 開啟時啟動 MCP", "Iniciar MCP al abrir la app", "Démarrer MCP à l'ouverture", "MCP beim Öffnen der App starten", "Iniciar MCP ao abrir o app", "Avvia MCP all'apertura", "Start MCP bij openen", "Uruchamiaj MCP przy otwarciu aplikacji", "Запускать MCP при открытии приложения", "Uygulama açılınca MCP başlat", "Khởi động MCP khi mở ứng dụng", "Mulai MCP saat app dibuka", "เริ่ม MCP เมื่อเปิดแอป", "بدء MCP عند فتح التطبيق", "ऐप खुलने पर MCP शुरू करें", "Запускати MCP під час відкриття застосунку"],
+    "multiProjectLanesSetting": ["Enable concurrent multi-project work", "여러 프로젝트 동시 작업 사용"],
+    "showIntermediateCommentarySetting": ["Show intermediate work explanations (applies immediately)", "중간 작업 설명 표시 (즉시 적용)"],
     "autoUpdatesSetting": ["Auto check for updates", "업데이트 자동 확인", "更新を自動確認", "自动检查更新", "自動檢查更新", "Buscar actualizaciones automáticamente", "Recherche automatique des mises à jour", "Automatisch nach Updates suchen", "Verificar atualizações automaticamente", "Controlla aggiornamenti automaticamente", "Automatisch updates zoeken", "Automatycznie sprawdzaj aktualizacje", "Автоматически проверять обновления", "Güncellemeleri otomatik denetle", "Tự động kiểm tra cập nhật", "Periksa pembaruan otomatis", "ตรวจอัปเดตอัตโนมัติ", "التحقق التلقائي من التحديثات", "अपडेट अपने-आप जांचें", "Автоматично перевіряти оновлення"],
     "publicTunnelSetting": ["Enable ChatGPT web connector", "ChatGPT 웹 커넥터 사용", "ChatGPT Web コネクタを有効化", "启用 ChatGPT 网页连接器", "啟用 ChatGPT 網頁連接器", "Activar conector web de ChatGPT", "Activer le connecteur web ChatGPT", "ChatGPT-Web-Connector aktivieren", "Ativar conector web do ChatGPT", "Abilita connettore web ChatGPT", "ChatGPT-webconnector inschakelen", "Włącz konektor web ChatGPT", "Включить веб-коннектор ChatGPT", "ChatGPT web bağlayıcısını etkinleştir", "Bật trình kết nối web ChatGPT", "Aktifkan konektor web ChatGPT", "เปิดตัวเชื่อมต่อเว็บ ChatGPT", "تفعيل موصل ChatGPT على الويب", "ChatGPT वेब कनेक्टर चालू करें", "Увімкнути веб-конектор ChatGPT"],
     "publicHostname": ["Owned fixed domain (optional)", "본인 소유 고정 도메인 (선택)", "所有する固定ドメイン (任意)", "自有固定域名（可选）", "自有固定網域（選填）", "Dominio fijo propio (opcional)", "Domaine fixe personnel (facultatif)", "Eigene feste Domain (optional)", "Domínio fixo próprio (opcional)", "Dominio fisso personale (opzionale)", "Eigen vast domein (optioneel)", "Własna stała domena (opcjonalnie)", "Собственный постоянный домен (необязательно)", "Kendi sabit alan adınız (isteğe bağlı)", "Tên miền cố định của bạn (tùy chọn)", "Domain tetap milik Anda (opsional)", "โดเมนคงที่ของคุณ (ไม่บังคับ)", "نطاق ثابت تملكه (اختياري)", "अपना स्थिर डोमेन (वैकल्पिक)", "Власний сталий домен (необов'язково)"],
@@ -199,7 +220,7 @@ private let desktopLocalizationRows: [String: [String]] = [
     "updateAvailable": ["Update available: %@. Installed: %@.", "업데이트 가능: %@. 설치됨: %@.", "更新があります: %@。インストール済み: %@。", "有可用更新：%@。已安装：%@。", "有可用更新：%@。已安裝：%@。", "Actualización disponible: %@. Instalado: %@.", "Mise à jour disponible : %@. Installé : %@.", "Update verfügbar: %@. Installiert: %@.", "Atualização disponível: %@. Instalado: %@.", "Aggiornamento disponibile: %@. Installato: %@.", "Update beschikbaar: %@. Geïnstalleerd: %@.", "Dostępna aktualizacja: %@. Zainstalowano: %@.", "Доступно обновление: %@. Установлено: %@.", "Güncelleme var: %@. Kurulu: %@.", "Có bản cập nhật: %@. Đã cài: %@.", "Pembaruan tersedia: %@. Terpasang: %@.", "มีอัปเดต: %@ ติดตั้งอยู่: %@", "يتوفر تحديث: %@. المثبت: %@.", "अपडेट उपलब्ध: %@. इंस्टॉल: %@.", "Доступне оновлення: %@. Встановлено: %@."],
     "installRuntimeUpdate": ["Apply Runtime Update", "런타임 업데이트 적용"],
     "updateDownloading": ["Downloading and verifying the update...", "업데이트를 다운로드하고 서명을 확인하는 중..."],
-    "updateRuntimeExplanation": ["The MCP runtime will restart briefly while the menu bar app and Cloudflare tunnel stay running. The connector URL should not change. Native menu bar UI changes take effect after the next app launch.", "메뉴 막대 앱과 Cloudflare 터널은 유지한 채 MCP 런타임만 잠깐 재시작합니다. 커넥터 URL은 바뀌지 않습니다. 메뉴 막대 UI 같은 네이티브 변경은 다음 앱 실행 때 반영됩니다."],
+    "updateRuntimeExplanation": ["The MCP runtime will restart briefly while the macOS app and Cloudflare tunnel stay running. The connector URL should not change. Native app UI changes take effect after the next app launch.", "macOS 앱과 Cloudflare 터널은 유지한 채 MCP 런타임만 잠깐 재시작합니다. 커넥터 URL은 바뀌지 않습니다. 네이티브 앱 UI 변경은 다음 앱 실행 때 반영됩니다."],
     "updateApplyFailed": ["Runtime update failed", "런타임 업데이트 실패"],
     "updateApplyComplete": ["Runtime update complete", "런타임 업데이트 완료"]
 ]
@@ -239,18 +260,35 @@ private func localizedText(_ key: String, language: String) -> String {
 }
 
 private final class ServiceController {
+    enum OwnerTokenStatus: Equatable {
+        case configured
+        case missing
+        case checkFailed
+    }
+
     private let environment = ProcessInfo.processInfo.environment
     private let defaults = UserDefaults.standard
     private let selectedProjectFolderKey = "selectedProjectFolder"
+    private let additionalWorkspaceRootsKey = "additionalWorkspaceRoots"
     private let publicHostnameKey = "publicHostname"
+    private let tunnelModeKey = "tunnelMode"
     private let cloudflaredTunnelNameKey = "cloudflaredTunnelName"
     private let enablePublicTunnelKey = "enablePublicTunnel"
     private let portKey = "port"
     private let launchAtLoginKey = "launchAtLogin"
     private let startMCPOnLaunchKey = "startMCPOnLaunch"
+    private let multiProjectLanesEnabledKey = "multiProjectLanesEnabled"
+    private let showIntermediateCommentaryKey = "showIntermediateCommentary"
     private let autoCheckUpdatesKey = "autoCheckUpdates"
     private let appliedRuntimeVersionKey = "appliedRuntimeVersion"
     private(set) var process: Process?
+    private var chatGptRemoteControlSessionOverride: Bool?
+    private var activeScreenshotRequestIds = Set<String>()
+    private var screenshotCompletionBodies: [String: [String: Any]] = [:]
+    private var activeAccessibilityBridgeRequestIds = Set<String>()
+    private var accessibilityBridgeCompletionBodies: [String: [String: Any]] = [:]
+    private var accessibilityBridgePollInFlight = false
+    private let accessibilityBridgeExecutionQueue = DispatchQueue(label: "dev.chatgpttocodex.accessibility-bridge", qos: .userInitiated)
 
     let appName = "ChatGPT To Codex"
     let defaultWorkspace: String
@@ -337,8 +375,62 @@ private final class ServiceController {
         return saved?.isEmpty == false ? saved : nil
     }
 
+    var tunnelMode: String {
+        if let configured = environment["CHATGPT2CODEX_TUNNEL_MODE"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           ["loopback", "cloudflare-quick", "cloudflare-named", "external"].contains(configured) {
+            return configured
+        }
+        if environment["CHATGPT2CODEX_PUBLIC_URL"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
+            return "external"
+        }
+        if environment["CLOUDFLARED_TUNNEL_TOKEN"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false || cloudflaredTunnelName != nil {
+            return "cloudflare-named"
+        }
+        if let saved = defaults.string(forKey: tunnelModeKey),
+           ["loopback", "cloudflare-quick", "cloudflare-named", "external"].contains(saved) {
+            return saved
+        }
+        if let value = publicHost?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+            let lower = value.lowercased()
+            if lower.hasPrefix("https://") || (lower.hasSuffix(".ts.net") && !lower.contains("/") && !lower.contains("@")) {
+                return "external"
+            }
+            return "cloudflare-named"
+        }
+        return enablePublicTunnel ? "cloudflare-quick" : "loopback"
+    }
+
+    private var externalPublicBaseURL: URL? {
+        guard tunnelMode == "external" else { return nil }
+        let configuredUrl = environment["CHATGPT2CODEX_PUBLIC_URL"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let raw = configuredUrl?.isEmpty == false ? configuredUrl! : (publicHost ?? "")
+        let candidate = raw.lowercased().hasPrefix("https://") ? raw : "https://\(raw)"
+        guard var components = URLComponents(string: candidate),
+              let rawHost = components.host
+        else { return nil }
+        let host = rawHost.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]."))
+        guard components.scheme?.lowercased() == "https",
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil,
+              components.path.isEmpty || components.path == "/",
+              !host.isEmpty,
+              host != "localhost",
+              !host.hasSuffix(".localhost"),
+              host != "::1",
+              !host.hasPrefix("127."),
+              host != "0.0.0.0"
+        else { return nil }
+        components.path = ""
+        return components.url
+    }
+
     var enablePublicTunnel: Bool {
         if environment["CHATGPT2CODEX_EXPOSE_WEB"] == "1" { return true }
+        if let mode = environment["CHATGPT2CODEX_TUNNEL_MODE"]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           ["cloudflare-quick", "cloudflare-named", "external"].contains(mode) { return true }
+        if environment["CHATGPT2CODEX_PUBLIC_URL"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false { return true }
         if environment["CHATGPT2CODEX_PUBLIC_HOSTNAME"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
             return true
         }
@@ -351,6 +443,32 @@ private final class ServiceController {
 
     var startMCPOnLaunch: Bool {
         defaults.bool(forKey: startMCPOnLaunchKey)
+    }
+
+    var multiProjectLanesEnabled: Bool {
+        if environment["CHATGPT2CODEX_MULTI_PROJECT_LANES"] == "0" { return false }
+        if environment["CHATGPT2CODEX_MULTI_PROJECT_LANES"] == "1" { return true }
+        if defaults.object(forKey: multiProjectLanesEnabledKey) != nil {
+            return defaults.bool(forKey: multiProjectLanesEnabledKey)
+        }
+        return true
+    }
+
+    var chatGptRemoteControlEnabled: Bool {
+        if let chatGptRemoteControlSessionOverride {
+            return chatGptRemoteControlSessionOverride
+        }
+        if let configured = environment["CHATGPT2CODEX_CONTROL_CHATGPT"] {
+            return configured == "1"
+        }
+        return false
+    }
+
+    var showIntermediateCommentary: Bool {
+        if let configured = environment["CHATGPT2CODEX_SHOW_INTERMEDIATE_COMMENTARY"] {
+            return configured == "1"
+        }
+        return defaults.bool(forKey: showIntermediateCommentaryKey)
     }
 
     var autoCheckUpdates: Bool {
@@ -450,16 +568,53 @@ private final class ServiceController {
 
     struct ActiveSessionSummary {
         let label: String
+        let conversationLabel: String?
         let clientName: String?
+        let connectedAt: Int
+        let lastActiveAt: Int
         let state: String
         let operationId: String?
         let tool: String?
+        let startedAt: Int?
+        let finishedAt: Int?
         let elapsedMs: Int
         let phase: String?
         let message: String?
         let lastProgressAt: Int?
         let clientCancellationObservedAt: Int?
         let operationContinuesAfterCancellation: Bool
+    }
+
+    struct ConversationOperationSummary {
+        let operationId: String
+        let tool: String
+        let state: String
+        let startedAt: Int
+        let finishedAt: Int?
+        let elapsedMs: Int
+        let phase: String?
+        let message: String?
+        let activityHint: String?
+        let lastProgressAt: Int?
+    }
+
+    struct ConversationActivityHighlight {
+        let kind: String
+        let state: String
+        let startedAt: Int
+        let finishedAt: Int?
+    }
+
+    struct ConversationSummary {
+        let label: String
+        let taskLabel: String?
+        let displayTitle: String?
+        let firstSeenAt: Int
+        let lastActiveAt: Int
+        let state: String
+        let dashboardVisibleUntil: Int?
+        let activityHighlights: [ConversationActivityHighlight]
+        let operations: [ConversationOperationSummary]
     }
 
     struct ClientCancellationRecovery {
@@ -513,6 +668,19 @@ private final class ServiceController {
     }
 
     struct LocalControlSnapshot {
+        struct ProjectSummary {
+            let projectId: String
+            let name: String
+        }
+
+        struct LeaseSummary {
+            let preset: String
+            let expiresAt: TimeInterval
+            let active: Bool
+        }
+
+        let project: ProjectSummary?
+        let lease: LeaseSummary?
         let armed: Bool
         let killed: Bool
         let pendingActions: [PendingControlAction]
@@ -522,6 +690,7 @@ private final class ServiceController {
         let autoRemainingMs: Int
         let allowlistedAppCount: Int
         let sessions: [ActiveSessionSummary]
+        let conversations: [ConversationSummary]
         let clientCancellationRecovery: ClientCancellationRecovery?
         let rg: RgCapabilitySnapshot
     }
@@ -591,6 +760,7 @@ private final class ServiceController {
     private func localControlRequest(
         _ path: String,
         method: String = "GET",
+        jsonBody: [String: Any]? = nil,
         completion: @escaping (Data?, Bool) -> Void
     ) {
         guard let token = localControlToken(),
@@ -603,10 +773,195 @@ private final class ServiceController {
         request.httpMethod = method
         request.timeoutInterval = 1.5
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let jsonBody = jsonBody {
+            request.httpBody = try? JSONSerialization.data(withJSONObject: jsonBody)
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
         URLSession.shared.dataTask(with: request) { data, response, error in
             let ok = error == nil && (response as? HTTPURLResponse)?.statusCode == 200
             DispatchQueue.main.async { completion(data, ok) }
         }.resume()
+    }
+
+    private func postScreenshotCompletion(_ requestId: String, body: [String: Any]) {
+        screenshotCompletionBodies[requestId] = body
+        localControlRequest(
+            "/screenshot-capture/\(requestId)/complete",
+            method: "POST",
+            jsonBody: body
+        ) { [weak self] _, ok in
+            guard let self else { return }
+            self.activeScreenshotRequestIds.remove(requestId)
+            if ok {
+                self.screenshotCompletionBodies.removeValue(forKey: requestId)
+            }
+        }
+    }
+
+    private func postAccessibilityBridgeCompletion(_ requestId: String, body: [String: Any]) {
+        accessibilityBridgeCompletionBodies[requestId] = body
+        localControlRequest(
+            "/accessibility-bridge/\(requestId)/complete",
+            method: "POST",
+            jsonBody: body
+        ) { [weak self] _, ok in
+            guard let self else { return }
+            self.activeAccessibilityBridgeRequestIds.remove(requestId)
+            if ok {
+                self.accessibilityBridgeCompletionBodies.removeValue(forKey: requestId)
+            }
+        }
+    }
+
+    private func handleAccessibilityBridgeRequest(_ entry: [String: Any]) {
+        guard let requestId = entry["requestId"] as? String,
+              requestId.hasPrefix("ax_"),
+              requestId.count <= 80,
+              entry["kind"] is String
+        else { return }
+
+        if let body = accessibilityBridgeCompletionBodies[requestId] {
+            postAccessibilityBridgeCompletion(requestId, body: body)
+            return
+        }
+        guard !activeAccessibilityBridgeRequestIds.contains(requestId) else { return }
+        activeAccessibilityBridgeRequestIds.insert(requestId)
+
+        accessibilityBridgeExecutionQueue.async { [weak self] in
+            let body = MenuBarAccessibilityBridge.execute(entry)
+            DispatchQueue.main.async {
+                self?.postAccessibilityBridgeCompletion(requestId, body: body)
+            }
+        }
+    }
+
+    func pollAccessibilityBridgeRequests() {
+        guard controlEnabled, !accessibilityBridgePollInFlight else { return }
+        accessibilityBridgePollInFlight = true
+        localControlRequest("/accessibility-bridge/pending") { [weak self] data, ok in
+            guard let self else { return }
+            self.accessibilityBridgePollInFlight = false
+            guard ok, let data,
+                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let pending = root["pendingRequests"] as? [[String: Any]]
+            else { return }
+            for entry in pending.prefix(8) {
+                self.handleAccessibilityBridgeRequest(entry)
+            }
+        }
+    }
+
+    @available(macOS 14.0, *)
+    private func captureScreenshotImage(_ requestedRect: CGRect?) async throws -> CGImage {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        let display = requestedRect.flatMap { rect in
+            content.displays.first { $0.frame.intersects(rect) }
+        } ?? content.displays.first
+        guard let display else {
+            throw NSError(
+                domain: "ChatGPTToCodexScreenshot",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "No on-screen display is available for capture"]
+            )
+        }
+
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let configuration = SCStreamConfiguration()
+        configuration.showsCursor = false
+
+        if let requestedRect {
+            let clipped = requestedRect.intersection(display.frame)
+            guard !clipped.isNull, !clipped.isEmpty else {
+                throw NSError(
+                    domain: "ChatGPTToCodexScreenshot",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "Requested screenshot region does not intersect the selected display"]
+                )
+            }
+            let sourceRect = CGRect(
+                x: clipped.minX - display.frame.minX,
+                y: clipped.minY - display.frame.minY,
+                width: clipped.width,
+                height: clipped.height
+            )
+            configuration.sourceRect = sourceRect
+            let scale = CGFloat(display.width) / max(display.frame.width, 1)
+            configuration.width = max(1, Int((sourceRect.width * scale).rounded()))
+            configuration.height = max(1, Int((sourceRect.height * scale).rounded()))
+        } else {
+            configuration.width = display.width
+            configuration.height = display.height
+        }
+
+        return try await SCScreenshotManager.captureImage(
+            contentFilter: filter,
+            configuration: configuration
+        )
+    }
+
+    private func handleScreenshotCaptureRequest(_ entry: [String: Any]) {
+        guard let requestId = entry["requestId"] as? String,
+              requestId.hasPrefix("shot_"),
+              requestId.count <= 80,
+              let outputPath = entry["outputPath"] as? String
+        else { return }
+
+        if let body = screenshotCompletionBodies[requestId] {
+            postScreenshotCompletion(requestId, body: body)
+            return
+        }
+        guard !activeScreenshotRequestIds.contains(requestId) else { return }
+        activeScreenshotRequestIds.insert(requestId)
+
+        let outputURL = URL(fileURLWithPath: outputPath).standardizedFileURL
+        guard outputURL.path.contains("/.chatgpt2codex/e2e/screenshots/"),
+              outputURL.path.hasSuffix(".png")
+        else {
+            postScreenshotCompletion(requestId, body: ["ok": false, "error": "invalid-screenshot-output-path"])
+            return
+        }
+
+        var captureRect: CGRect? = nil
+        if let region = entry["region"] as? String {
+            let parts = region.split(separator: ",").compactMap {
+                Double($0.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+            guard parts.count == 4, parts[2] > 0, parts[3] > 0 else {
+                postScreenshotCompletion(requestId, body: ["ok": false, "error": "invalid-screenshot-region"])
+                return
+            }
+            captureRect = CGRect(x: parts[0], y: parts[1], width: parts[2], height: parts[3])
+        }
+
+        guard screenRecordingAllowed else {
+            postScreenshotCompletion(requestId, body: ["ok": false, "error": "screen-recording-not-authorized"])
+            return
+        }
+
+        guard #available(macOS 14.0, *) else {
+            postScreenshotCompletion(requestId, body: ["ok": false, "error": "screen-capturekit-unavailable"])
+            return
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let image = try await self.captureScreenshotImage(captureRect)
+                guard let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else {
+                    self.postScreenshotCompletion(requestId, body: ["ok": false, "error": "screen-capture-encoding-failed"])
+                    return
+                }
+                try FileManager.default.createDirectory(
+                    at: outputURL.deletingLastPathComponent(),
+                    withIntermediateDirectories: true,
+                    attributes: nil
+                )
+                try png.write(to: outputURL, options: .atomic)
+                self.postScreenshotCompletion(requestId, body: ["ok": true])
+            } catch {
+                self.postScreenshotCompletion(requestId, body: ["ok": false, "error": "screen-capture-failed"])
+            }
+        }
     }
 
     func fetchLocalControlStatus(completion: @escaping (LocalControlSnapshot?) -> Void) {
@@ -617,6 +972,14 @@ private final class ServiceController {
             else {
                 completion(nil)
                 return
+            }
+            let screenshotCapture = root["screenshotCapture"] as? [String: Any]
+            if let firstScreenshotRequest = (screenshotCapture?["pendingRequests"] as? [[String: Any]])?.first {
+                self.handleScreenshotCaptureRequest(firstScreenshotRequest)
+            }
+            let accessibilityBridge = root["accessibilityBridge"] as? [String: Any]
+            for entry in (accessibilityBridge?["pendingRequests"] as? [[String: Any]] ?? []).prefix(8) {
+                self.handleAccessibilityBridgeRequest(entry)
             }
             let pending = (control["pendingActions"] as? [[String: Any]] ?? []).compactMap { entry -> PendingControlAction? in
                 guard entry["status"] as? String == "pending", let actionId = entry["actionId"] as? String else {
@@ -663,16 +1026,78 @@ private final class ServiceController {
                 let cancellation = operation?["clientCancellation"] as? [String: Any]
                 return ActiveSessionSummary(
                     label: entry["sessionLabel"] as? String ?? "session",
+                    conversationLabel: entry["conversationLabel"] as? String,
                     clientName: entry["clientName"] as? String,
+                    connectedAt: entry["connectedAt"] as? Int ?? 0,
+                    lastActiveAt: entry["lastActiveAt"] as? Int ?? 0,
                     state: entry["state"] as? String ?? "idle",
                     operationId: operation?["operationId"] as? String,
                     tool: operation?["tool"] as? String,
+                    startedAt: operation?["startedAt"] as? Int,
+                    finishedAt: operation?["finishedAt"] as? Int,
                     elapsedMs: operation?["elapsedMs"] as? Int ?? 0,
                     phase: operation?["phase"] as? String,
                     message: operation?["message"] as? String,
                     lastProgressAt: operation?["lastProgressAt"] as? Int,
                     clientCancellationObservedAt: cancellation?["observedAt"] as? Int,
                     operationContinuesAfterCancellation: cancellation?["operationContinues"] as? Bool ?? false
+                )
+            }
+            let conversations = (root["conversations"] as? [[String: Any]] ?? []).compactMap { entry -> ConversationSummary? in
+                guard let label = entry["conversationLabel"] as? String else { return nil }
+                let activityHighlights = (entry["activityHighlights"] as? [[String: Any]] ?? []).compactMap { highlight -> ConversationActivityHighlight? in
+                    guard let kind = highlight["kind"] as? String,
+                          let state = highlight["state"] as? String,
+                          let startedAt = highlight["startedAt"] as? Int
+                    else { return nil }
+                    return ConversationActivityHighlight(
+                        kind: kind,
+                        state: state,
+                        startedAt: startedAt,
+                        finishedAt: highlight["finishedAt"] as? Int
+                    )
+                }
+                let operations = (entry["operations"] as? [[String: Any]] ?? []).compactMap { operation -> ConversationOperationSummary? in
+                    guard let operationId = operation["operationId"] as? String,
+                          let tool = operation["tool"] as? String,
+                          let startedAt = operation["startedAt"] as? Int
+                    else { return nil }
+                    return ConversationOperationSummary(
+                        operationId: operationId,
+                        tool: tool,
+                        state: operation["state"] as? String ?? "idle",
+                        startedAt: startedAt,
+                        finishedAt: operation["finishedAt"] as? Int,
+                        elapsedMs: operation["elapsedMs"] as? Int ?? 0,
+                        phase: operation["phase"] as? String,
+                        message: operation["message"] as? String,
+                        activityHint: operation["activityHint"] as? String,
+                        lastProgressAt: operation["lastProgressAt"] as? Int
+                    )
+                }
+                return ConversationSummary(
+                    label: label,
+                    taskLabel: entry["taskLabel"] as? String,
+                    displayTitle: entry["displayTitle"] as? String,
+                    firstSeenAt: entry["firstSeenAt"] as? Int ?? 0,
+                    lastActiveAt: entry["lastActiveAt"] as? Int ?? 0,
+                    state: entry["state"] as? String ?? "idle",
+                    dashboardVisibleUntil: entry["dashboardVisibleUntil"] as? Int,
+                    activityHighlights: activityHighlights,
+                    operations: operations
+                )
+            }
+            let project = (root["project"] as? [String: Any]).map { entry in
+                LocalControlSnapshot.ProjectSummary(
+                    projectId: entry["projectId"] as? String ?? "project",
+                    name: entry["name"] as? String ?? entry["projectId"] as? String ?? "Project"
+                )
+            }
+            let lease = (root["lease"] as? [String: Any]).map { entry in
+                LocalControlSnapshot.LeaseSummary(
+                    preset: entry["preset"] as? String ?? "read-only",
+                    expiresAt: TimeInterval(entry["expiresAt"] as? Int ?? 0) / 1000.0,
+                    active: entry["active"] as? Bool ?? false
                 )
             }
             let diagnostics = root["diagnostics"] as? [String: Any]
@@ -716,6 +1141,8 @@ private final class ServiceController {
                 pendingRequests: pendingRgRequests
             )
             completion(LocalControlSnapshot(
+                project: project,
+                lease: lease,
                 armed: control["armed"] as? Bool ?? false,
                 killed: control["killed"] as? Bool ?? false,
                 pendingActions: pending,
@@ -725,6 +1152,7 @@ private final class ServiceController {
                 autoRemainingMs: control["autoRemainingMs"] as? Int ?? 0,
                 allowlistedAppCount: control["allowlistedAppCount"] as? Int ?? 0,
                 sessions: sessions,
+                conversations: conversations,
                 clientCancellationRecovery: cancellationRecovery,
                 rg: rgSnapshot
             ))
@@ -741,14 +1169,34 @@ private final class ServiceController {
 
     private func runCli(_ arguments: [String], stdin: String? = nil) throws -> (status: Int32, stdout: String, stderr: String) {
         let activeRoot = effectiveRuntimeRoot
-        let bundledNode = activeRoot.appendingPathComponent("bin").appendingPathComponent("node")
-        let useBundledNode = FileManager.default.fileExists(atPath: bundledNode.path)
+        let nodeCandidates = [
+            activeRoot.appendingPathComponent("bin/node"),
+            activeRoot.appendingPathComponent("node/bin/node"),
+            runtimeRoot.appendingPathComponent("bin/node"),
+            runtimeRoot.appendingPathComponent("node/bin/node"),
+        ]
+        let bundledNode = nodeCandidates.first {
+            FileManager.default.isExecutableFile(atPath: $0.path)
+        }
         let process = Process()
-        process.executableURL = useBundledNode ? bundledNode : URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = useBundledNode ? [cliScript.path] + arguments : ["node", cliScript.path] + arguments
+        process.executableURL = bundledNode ?? URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = bundledNode == nil ? ["node", cliScript.path] + arguments : [cliScript.path] + arguments
 
         var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = "\(activeRoot.appendingPathComponent("bin").path):\(NSHomeDirectory())/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:\(environment["PATH"] ?? "")"
+        environment["PATH"] = [
+            activeRoot.appendingPathComponent("bin").path,
+            activeRoot.appendingPathComponent("node/bin").path,
+            runtimeRoot.appendingPathComponent("bin").path,
+            runtimeRoot.appendingPathComponent("node/bin").path,
+            "\(NSHomeDirectory())/.local/bin",
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+            environment["PATH"] ?? "",
+        ].joined(separator: ":")
         process.environment = environment
 
         let stdoutPipe = Pipe()
@@ -775,15 +1223,16 @@ private final class ServiceController {
         return (process.terminationStatus, stdout, stderr)
     }
 
-    func ownerTokenConfigured() -> Bool {
+    func ownerTokenStatus() -> OwnerTokenStatus {
         guard let result = try? runCli(["owner-token", "--status", "--workspace", workspace]),
               result.status == 0,
               let data = result.stdout.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let configured = json["configured"] as? Bool
         else {
-            return false
+            return .checkFailed
         }
-        return json["configured"] as? Bool == true
+        return configured ? .configured : .missing
     }
 
     func generateOwnerToken() throws -> String {
@@ -822,7 +1271,33 @@ private final class ServiceController {
     }
 
     var workspace: String {
-        selectedProjectFolder?.path ?? defaultWorkspace
+        defaultWorkspace
+    }
+
+    var additionalWorkspaceRoots: [String] {
+        let primary = URL(fileURLWithPath: defaultWorkspace).standardizedFileURL.path
+        let primaryPrefix = primary.hasSuffix("/") ? primary : primary + "/"
+        var candidates = defaults.stringArray(forKey: additionalWorkspaceRootsKey) ?? []
+        if let selectedProjectFolder {
+            candidates.append(selectedProjectFolder.standardizedFileURL.path)
+        }
+        var seen = Set<String>()
+        return candidates.compactMap { value in
+            let root = URL(fileURLWithPath: value).standardizedFileURL.path
+            guard root != primary, !root.hasPrefix(primaryPrefix), seen.insert(root).inserted else {
+                return nil
+            }
+            return root
+        }
+    }
+
+    var additionalWorkspaceRootsJSON: String? {
+        let roots = additionalWorkspaceRoots
+        guard !roots.isEmpty,
+              let data = try? JSONSerialization.data(withJSONObject: roots),
+              let value = String(data: data, encoding: .utf8)
+        else { return nil }
+        return value
     }
 
     var activeProjectRoot: String? {
@@ -837,7 +1312,16 @@ private final class ServiceController {
     }
 
     func setSelectedProjectFolder(_ url: URL) {
-        defaults.set(url.path, forKey: selectedProjectFolderKey)
+        let normalized = url.standardizedFileURL.path
+        defaults.set(normalized, forKey: selectedProjectFolderKey)
+        let primary = URL(fileURLWithPath: defaultWorkspace).standardizedFileURL.path
+        let primaryPrefix = primary.hasSuffix("/") ? primary : primary + "/"
+        guard normalized != primary, !normalized.hasPrefix(primaryPrefix) else { return }
+        var roots = defaults.stringArray(forKey: additionalWorkspaceRootsKey) ?? []
+        if !roots.contains(normalized) {
+            roots.append(normalized)
+            defaults.set(roots, forKey: additionalWorkspaceRootsKey)
+        }
     }
 
     func clearSelectedProjectFolder() {
@@ -845,7 +1329,18 @@ private final class ServiceController {
     }
 
     func setPublicHostname(_ value: String) {
-        defaults.set(value.trimmingCharacters(in: .whitespacesAndNewlines), forKey: publicHostnameKey)
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        defaults.set(normalized, forKey: publicHostnameKey)
+        if !enablePublicTunnel {
+            defaults.set("loopback", forKey: tunnelModeKey)
+        } else if normalized.isEmpty {
+            defaults.set("cloudflare-quick", forKey: tunnelModeKey)
+        } else {
+            let lower = normalized.lowercased()
+            let external = lower.hasPrefix("https://") ||
+                (lower.hasSuffix(".ts.net") && !lower.contains("/") && !lower.contains("@") && cloudflaredTunnelName == nil)
+            defaults.set(external ? "external" : "cloudflare-named", forKey: tunnelModeKey)
+        }
     }
 
     func setEnablePublicTunnel(_ enabled: Bool) {
@@ -858,6 +1353,23 @@ private final class ServiceController {
 
     func setStartMCPOnLaunch(_ enabled: Bool) {
         defaults.set(enabled, forKey: startMCPOnLaunchKey)
+    }
+
+    func setMultiProjectLanesEnabled(_ enabled: Bool) {
+        defaults.set(enabled, forKey: multiProjectLanesEnabledKey)
+    }
+
+    func setChatGptRemoteControlEnabledForSession(_ enabled: Bool) {
+        chatGptRemoteControlSessionOverride = enabled
+    }
+
+    func setShowIntermediateCommentary(_ enabled: Bool) {
+        defaults.set(enabled, forKey: showIntermediateCommentaryKey)
+        localControlRequest(
+            "/output-policy",
+            method: "POST",
+            jsonBody: ["showIntermediateCommentary": enabled]
+        ) { _, _ in }
     }
 
     func setAutoCheckUpdates(_ enabled: Bool) {
@@ -912,10 +1424,13 @@ private final class ServiceController {
 
     var publicBaseURL: URL? {
         guard enablePublicTunnel else { return nil }
-        if let publicHost {
+        if tunnelMode == "external" {
+            return externalPublicBaseURL
+        }
+        if tunnelMode == "cloudflare-named", let publicHost {
             return URL(string: "https://\(publicHost)")
         }
-        return discoverQuickTunnelBaseURL()
+        return tunnelMode == "cloudflare-quick" ? discoverQuickTunnelBaseURL() : nil
     }
 
     var connectorURL: URL? {
@@ -945,8 +1460,24 @@ private final class ServiceController {
         }.resume()
     }
 
+    private func checkHealthBeforeLaunch(remainingAttempts: Int, completion: @escaping (Bool) -> Void) {
+        checkHealth { [weak self] healthy in
+            guard let self else { return }
+            if healthy || remainingAttempts <= 1 {
+                completion(healthy)
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                self.checkHealthBeforeLaunch(remainingAttempts: remainingAttempts - 1, completion: completion)
+            }
+        }
+    }
+
     func start(completion: @escaping (Bool) -> Void) {
-        checkHealth { [weak self] alreadyRunning in
+        // A host/account hiccup or a short event-loop stall must not turn into
+        // a second launcher that reclaims a healthy runtime. Require multiple
+        // consecutive loopback failures before attempting a new launch.
+        checkHealthBeforeLaunch(remainingAttempts: 3) { [weak self] alreadyRunning in
             guard let self else { return }
             if alreadyRunning {
                 completion(true)
@@ -977,10 +1508,11 @@ private final class ServiceController {
         let startPattern = shellQuote("start-chatgpt.sh")
         let servePattern = shellQuote("dist/cli.js serve --http --port \(port)")
         let tunnelPattern = shellQuote("cloudflared.*127.0.0.1:\(port)|cloudflared.*localhost:\(port)")
+        let stopManagedTunnel = tunnelMode.hasPrefix("cloudflare-") ? "pkill -f \(tunnelPattern) 2>/dev/null || true" : ":"
         let command = """
         pkill -f \(startPattern) 2>/dev/null || true
         pkill -f \(servePattern) 2>/dev/null || true
-        pkill -f \(tunnelPattern) 2>/dev/null || true
+        \(stopManagedTunnel)
         """
         runDetachedShell(command)
     }
@@ -992,6 +1524,45 @@ private final class ServiceController {
         }
     }
 
+    private func waitForRuntimeToStop(remainingAttempts: Int, completion: @escaping (Bool) -> Void) {
+        checkHealth { [weak self] healthy in
+            guard let self else { return }
+            if !healthy {
+                completion(true)
+                return
+            }
+            if remainingAttempts <= 1 {
+                completion(false)
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                self.waitForRuntimeToStop(remainingAttempts: remainingAttempts - 1, completion: completion)
+            }
+        }
+    }
+
+    func recoverManagedRuntimeAfterHandoff(completion: @escaping (Bool) -> Void) {
+        // The fixed app-apply worker stops the exact previous runtime/supervisor
+        // before relaunching this app. Do not call stop() here: stop() uses a
+        // detached broad pkill, which can race this replacement launch and kill
+        // the new managed supervisor after loopback health has already gone down.
+        waitForRuntimeToStop(remainingAttempts: 24) { [weak self] stopped in
+            guard let self else { return }
+            guard stopped else {
+                self.appendLog("handoff recovery failed: previous runtime stayed healthy before managed launch\n")
+                completion(false)
+                return
+            }
+            do {
+                try self.launchServer()
+                completion(true)
+            } catch {
+                self.appendLog("handoff recovery launch failed: \(error.localizedDescription)\n")
+                completion(false)
+            }
+        }
+    }
+
     private func launchServer() throws {
         let script = runtimeRoot.appendingPathComponent("start-chatgpt.sh")
         guard FileManager.default.fileExists(atPath: script.path) else {
@@ -1000,13 +1571,24 @@ private final class ServiceController {
             ])
         }
 
+        let stateDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local")
+            .appendingPathComponent("share")
+            .appendingPathComponent("chatgpt2codex")
         let command = """
         cd \(shellQuote(runtimeRoot.path))
         export PATH=\(shellQuote(runtimeRoot.appendingPathComponent("bin").path))":$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
         export WORKSPACE=\(shellQuote(workspace))
+        export CHATGPT2CODEX_STATE_DIR=\(shellQuote(stateDir.path))
+        \(additionalWorkspaceRootsJSON.map { "export CHATGPT2CODEX_ADDITIONAL_WORKSPACE_ROOTS_JSON=\(shellQuote($0))" } ?? "unset CHATGPT2CODEX_ADDITIONAL_WORKSPACE_ROOTS_JSON")
         export PORT=\(port)
+        \(multiProjectLanesEnabled ? "export CHATGPT2CODEX_MULTI_PROJECT_LANES=1" : "export CHATGPT2CODEX_MULTI_PROJECT_LANES=0")
+        \(chatGptRemoteControlEnabled ? "export CHATGPT2CODEX_CONTROL_CHATGPT=1" : "unset CHATGPT2CODEX_CONTROL_CHATGPT")
+        \(showIntermediateCommentary ? "export CHATGPT2CODEX_SHOW_INTERMEDIATE_COMMENTARY=1" : "unset CHATGPT2CODEX_SHOW_INTERMEDIATE_COMMENTARY")
         \(enablePublicTunnel ? "export CHATGPT2CODEX_EXPOSE_WEB=1" : "unset CHATGPT2CODEX_EXPOSE_WEB")
-        \(publicHost.map { "export PUBLIC_HOSTNAME=\(shellQuote($0))" } ?? "unset PUBLIC_HOSTNAME")
+        export CHATGPT2CODEX_TUNNEL_MODE=\(shellQuote(tunnelMode))
+        \(tunnelMode == "external" ? externalPublicBaseURL.map { "export CHATGPT2CODEX_PUBLIC_URL=\(shellQuote($0.absoluteString))" } ?? "unset CHATGPT2CODEX_PUBLIC_URL" : "unset CHATGPT2CODEX_PUBLIC_URL")
+        \(tunnelMode == "cloudflare-named" ? publicHost.map { "export PUBLIC_HOSTNAME=\(shellQuote($0))" } ?? "unset PUBLIC_HOSTNAME" : "unset PUBLIC_HOSTNAME")
         \(cloudflaredTunnelName.map { "export CLOUDFLARED_TUNNEL_NAME=\(shellQuote($0))" } ?? "")
         \(activeProjectRoot.map { "export CHATGPT2CODEX_ACTIVE_PROJECT_ROOT=\(shellQuote($0))" } ?? "")
         exec /bin/bash \(shellQuote(script.path))
@@ -1184,15 +1766,21 @@ private final class ServiceController {
         environment["WORKSPACE"] = workspace
         environment["PORT"] = "\(port)"
         environment["CHATGPT2CODEX_DOCTOR_REPAIR"] = repair ? "1" : "0"
+        environment["CHATGPT2CODEX_TUNNEL_MODE"] = tunnelMode
         if enablePublicTunnel {
             environment["CHATGPT2CODEX_EXPOSE_WEB"] = "1"
         } else {
             environment.removeValue(forKey: "CHATGPT2CODEX_EXPOSE_WEB")
         }
-        if let publicHost {
+        if tunnelMode == "external", let externalPublicBaseURL {
+            environment["CHATGPT2CODEX_PUBLIC_URL"] = externalPublicBaseURL.absoluteString
+            environment.removeValue(forKey: "PUBLIC_HOSTNAME")
+        } else if tunnelMode == "cloudflare-named", let publicHost {
             environment["PUBLIC_HOSTNAME"] = publicHost
+            environment.removeValue(forKey: "CHATGPT2CODEX_PUBLIC_URL")
         } else {
             environment.removeValue(forKey: "PUBLIC_HOSTNAME")
+            environment.removeValue(forKey: "CHATGPT2CODEX_PUBLIC_URL")
         }
         process.environment = environment
 
@@ -1225,8 +1813,157 @@ private final class ServiceController {
     }
 }
 
-private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+private final class ControlOverlayCoordinator {
+    private let badgeSize = NSSize(width: 38, height: 38)
+    private let cursorSize = NSSize(width: 30, height: 30)
+    private var controlActive = false
+    private var lastAgentPoint: CGPoint?
+
+    private lazy var badgePanel: NSPanel = {
+        let panel = makeOverlayPanel(size: badgeSize)
+        let effect = NSView(frame: NSRect(origin: .zero, size: badgeSize))
+        effect.wantsLayer = true
+        effect.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.94).cgColor
+        effect.layer?.cornerRadius = 11
+        effect.layer?.borderColor = NSColor.systemBlue.withAlphaComponent(0.95).cgColor
+        effect.layer?.borderWidth = 2
+        effect.layer?.masksToBounds = true
+
+        let icon = NSImageView(frame: NSRect(x: 8, y: 8, width: 22, height: 22))
+        icon.image = NSImage(systemSymbolName: "cursorarrow.rays", accessibilityDescription: "Computer control active")
+            ?? NSImage(systemSymbolName: "cursorarrow", accessibilityDescription: "Computer control active")
+        icon.imageScaling = .scaleProportionallyDown
+        icon.contentTintColor = .systemBlue
+        effect.addSubview(icon)
+        panel.contentView = effect
+        return panel
+    }()
+
+    private lazy var cursorPanel: NSPanel = {
+        let panel = makeOverlayPanel(size: cursorSize)
+        let container = NSView(frame: NSRect(origin: .zero, size: cursorSize))
+        container.wantsLayer = true
+
+        let halo = NSView(frame: NSRect(x: 3, y: 3, width: 24, height: 24))
+        halo.wantsLayer = true
+        halo.layer?.backgroundColor = NSColor.systemBlue.withAlphaComponent(0.88).cgColor
+        halo.layer?.cornerRadius = 12
+        halo.layer?.borderColor = NSColor.white.withAlphaComponent(0.95).cgColor
+        halo.layer?.borderWidth = 1.5
+        container.addSubview(halo)
+
+        let icon = NSImageView(frame: NSRect(x: 5, y: 5, width: 20, height: 20))
+        icon.image = NSImage(systemSymbolName: "cursorarrow", accessibilityDescription: "Agent cursor")
+        icon.imageScaling = .scaleProportionallyDown
+        icon.contentTintColor = .white
+        container.addSubview(icon)
+        panel.contentView = container
+        return panel
+    }()
+
+    private func makeOverlayPanel(size: NSSize) -> NSPanel {
+        let panel = NSPanel(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = false
+        panel.ignoresMouseEvents = true
+        panel.hidesOnDeactivate = false
+        panel.canHide = false
+        panel.isReleasedWhenClosed = false
+        panel.isFloatingPanel = true
+        panel.becomesKeyOnlyIfNeeded = true
+        panel.isMovable = false
+        panel.isMovableByWindowBackground = false
+        panel.isExcludedFromWindowsMenu = true
+        panel.sharingType = .readOnly
+        // `statusBar` proved too easy for a background utility window to lose
+        // behind app/full-screen surfaces. The control affordance must remain
+        // visibly above normal UI while it is armed, without taking focus or
+        // receiving pointer events.
+        panel.level = .screenSaver
+        panel.animationBehavior = .none
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        return panel
+    }
+
+    private func showOverlayPanel(_ panel: NSPanel) {
+        panel.alphaValue = 1
+        panel.displayIfNeeded()
+        panel.orderFrontRegardless()
+        panel.setIsVisible(true)
+    }
+
+
+    private func positionBadge(on screen: NSScreen? = nil) {
+        guard let targetScreen = screen ?? NSScreen.main ?? NSScreen.screens.first else { return }
+        let visible = targetScreen.visibleFrame
+        badgePanel.setFrameOrigin(NSPoint(
+            x: visible.minX + 14,
+            y: visible.maxY - badgeSize.height - 14
+        ))
+    }
+
+    private func screenAndAppKitPoint(fromCoreGraphics point: CGPoint) -> (screen: NSScreen, point: CGPoint)? {
+        for screen in NSScreen.screens {
+            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else { continue }
+            let cgBounds = CGDisplayBounds(CGDirectDisplayID(number.uint32Value))
+            guard cgBounds.contains(point) else { continue }
+            return (
+                screen,
+                CGPoint(
+                    x: screen.frame.minX + (point.x - cgBounds.minX),
+                    y: screen.frame.maxY - (point.y - cgBounds.minY)
+                )
+            )
+        }
+        return nil
+    }
+
+    func setControlActive(_ active: Bool) {
+        controlActive = active
+        guard active else {
+            badgePanel.orderOut(nil)
+            cursorPanel.orderOut(nil)
+            return
+        }
+        positionBadge()
+        showOverlayPanel(badgePanel)
+        if lastAgentPoint != nil {
+            showOverlayPanel(cursorPanel)
+        }
+    }
+
+    func moveAgentCursor(to coreGraphicsPoint: CGPoint) {
+        lastAgentPoint = coreGraphicsPoint
+        if !controlActive {
+            setControlActive(true)
+        }
+        guard let mapped = screenAndAppKitPoint(fromCoreGraphics: coreGraphicsPoint) else { return }
+        positionBadge(on: mapped.screen)
+        showOverlayPanel(badgePanel)
+        let point = mapped.point
+        let origin = NSPoint(x: point.x - 4, y: point.y - cursorSize.height + 4)
+        if cursorPanel.isVisible {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.10
+                cursorPanel.animator().setFrameOrigin(origin)
+            }
+        } else {
+            cursorPanel.setFrameOrigin(origin)
+            showOverlayPanel(cursorPanel)
+        }
+    }
+}
+
+private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, WKNavigationDelegate, WKScriptMessageHandler {
     private let controller = ServiceController()
+    private let controlOverlay = ControlOverlayCoordinator()
+    private var agentCursorObserver: NSObjectProtocol?
     private var statusItem: NSStatusItem!
     private var statusMenuItem = NSMenuItem(title: "ChatGPT To Codex: checking...", action: nil, keyEquivalent: "")
     private var projectMenuItem = NSMenuItem()
@@ -1243,20 +1980,38 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     private var sessionStatusSubmenu: NSMenu?
     private var rgPermissionSubmenu: NSMenu?
     private var rgPermissionMenuItem = NSMenuItem()
+    private var chatGptRemoteControlMenuItem = NSMenuItem()
     private var armMenuItem = NSMenuItem()
+    private var armExplanationMenuItem = NSMenuItem()
+    private var armRemoteRequestExplanationMenuItem = NSMenuItem()
     private var screenPermissionItem = NSMenuItem()
     private var accessibilityPermissionItem = NSMenuItem()
     private var latestControlSnapshot: ServiceController.LocalControlSnapshot?
     private var timer: Timer?
+    private var statusRefreshInFlight = false
+    private var accessibilityBridgeTimer: Timer?
     private var killHotkeyGlobalMonitor: Any?
     private var killHotkeyLocalMonitor: Any?
     private var settingsHotKeyRef: EventHotKeyRef?
     private var settingsHotKeyEventHandler: EventHandlerRef?
+    private var statusMenuHotKeyRef: EventHotKeyRef?
+    private var statusMenuHotKeyEventHandler: EventHandlerRef?
     private var presentedArmRequestIDs = Set<String>()
     private var presentedOperationApprovalIDs = Set<String>()
     private var presentedRgRequestIDs = Set<String>()
     private var latestHealth = false
     private var settingsWindow: NSWindow?
+    private var activityWindow: NSWindow?
+    private weak var activityWebView: WKWebView?
+    private weak var activityFallbackView: NSView?
+    private let activityDashboardURL = URL(string: "http://127.0.0.1:7980/activity/?embedded=mac")!
+    private weak var commandStatusLabel: NSTextField?
+    private weak var commandProjectLabel: NSTextField?
+    private weak var commandMcpButton: NSButton?
+    private weak var commandRemoteControlButton: NSButton?
+    private weak var commandAgentArmButton: NSButton?
+    private weak var commandKillControlButton: NSButton?
+    private weak var commandOperationApprovalsButton: NSButton?
     private var logWindow: NSWindow?
     private var doctorWindow: NSWindow?
     private weak var settingsLanguagePopup: NSPopUpButton?
@@ -1264,6 +2019,8 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     private weak var settingsLaunchAtLogin: NSButton?
     private weak var settingsStartOnLaunch: NSButton?
     private weak var settingsAutoUpdate: NSButton?
+    private weak var settingsMultiProjectLanes: NSButton?
+    private weak var settingsShowIntermediateCommentary: NSButton?
     private weak var settingsPublicTunnel: NSButton?
     private weak var settingsOwnerTokenStatus: NSTextField?
     private weak var settingsOwnerTokenButton: NSButton?
@@ -1277,43 +2034,84 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
+        NSApp.setActivationPolicy(.regular)
+        agentCursorObserver = NotificationCenter.default.addObserver(
+            forName: Notification.Name("C2CTAgentCursorMove"),
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let x = notification.userInfo?["x"] as? Double,
+                  let y = notification.userInfo?["y"] as? Double
+            else { return }
+            self?.controlOverlay.moveAgentCursor(to: CGPoint(x: x, y: y))
+        }
         let isDevelopmentBuild = (Bundle.main.object(forInfoDictionaryKey: "ChatGPT2CodexDevelopmentBuild") as? Bool) == true
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // Keep the status item compact. A variable-length image + title item can
+        // be pushed into macOS menu-bar overflow even when the process and menu
+        // are otherwise healthy.
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        // Keep the legacy status-item command surface alive internally during
+        // the windowed-app migration, but never occupy menu-bar space.
+        statusItem.autosaveName = "ChatGPTToCodexStatusItem"
+        statusItem.isVisible = false
         if let button = statusItem.button {
-            if let image = NSImage(named: "AppIcon") ?? NSImage(named: "StatusIconTemplate") {
-                image.isTemplate = false
-                image.size = NSSize(width: 22, height: 22)
-                button.image = image
-                button.imagePosition = isDevelopmentBuild ? .imageLeading : .imageOnly
+            let iconURL = Bundle.main.url(forResource: "StatusIconTemplate", withExtension: "png")
+            let statusImage = NSImage(
+                systemSymbolName: "arrow.left.arrow.right.square.fill",
+                accessibilityDescription: isDevelopmentBuild ? "C2CT DEV" : "C2CT"
+            )
+                ?? iconURL.flatMap { NSImage(contentsOf: $0) }
+                ?? NSImage(named: "StatusIconTemplate")
+                ?? NSImage(named: "AppIcon")
+            if let image = statusImage {
+                image.isTemplate = true
+                button.image = image.withSymbolConfiguration(
+                    NSImage.SymbolConfiguration(pointSize: 16, weight: .semibold)
+                ) ?? image
+                button.imageScaling = .scaleProportionallyDown
+                button.imagePosition = .imageOnly
             }
-            if isDevelopmentBuild {
-                button.title = "DEV"
-                button.font = NSFont.systemFont(ofSize: 10, weight: .bold)
-            }
+            button.title = ""
+            button.setAccessibilityLabel(isDevelopmentBuild ? "C2CT DEV" : "C2CT")
             button.toolTip = isDevelopmentBuild ? "ChatGPT To Codex Dev" : "ChatGPT To Codex"
         }
         rebuildMenu()
         refreshStatus()
         registerGlobalKillHotkeyIfNeeded()
         registerSettingsHotKey()
+        registerStatusMenuHotKey()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
             self?.promptScreenRecordingPermissionIfNeeded(force: false)
         }
         timer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
-            self?.refreshStatus()
+            guard let self else { return }
+            self.refreshStatus()
         }
-        if controller.startMCPOnLaunch {
-            if !controller.ownerTokenConfigured() {
+        accessibilityBridgeTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            guard let self, self.latestHealth, self.controller.controlEnabled else { return }
+            self.controller.pollAccessibilityBridgeRequests()
+        }
+        let recoverRuntimeAfterHandoff = CommandLine.arguments.contains("--c2ct-recover-runtime")
+        if controller.startMCPOnLaunch || recoverRuntimeAfterHandoff {
+            if case .missing = controller.ownerTokenStatus() {
                 showSettings()
                 return
             }
-            controller.start { [weak self] ok in
+            let completion: (Bool) -> Void = { [weak self] ok in
                 guard let self else { return }
                 self.refreshStatus()
                 if !ok {
                     self.runDoctor()
                 }
+            }
+            if recoverRuntimeAfterHandoff {
+                // A one-shot handoff recovery must re-establish an app-owned
+                // supervisor even when an orphaned runtime is still healthy on
+                // the port. A normal start would adopt that health result and
+                // leave no supervisor to consume future runtime-reload markers.
+                controller.recoverManagedRuntimeAfterHandoff(completion: completion)
+            } else {
+                controller.start(completion: completion)
             }
         }
         if controller.autoCheckUpdates {
@@ -1321,13 +2119,29 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
                 self?.statusMenuItem.title = message
             }
         }
+        DispatchQueue.main.async { [weak self] in
+            self?.showActivityWindow()
+        }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            showActivityWindow()
+        }
+        return true
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate()
+        controlOverlay.setControlActive(false)
+        if let observer = agentCursorObserver {
+            NotificationCenter.default.removeObserver(observer)
+            agentCursorObserver = nil
+        }
         if let monitor = killHotkeyGlobalMonitor { NSEvent.removeMonitor(monitor) }
         if let monitor = killHotkeyLocalMonitor { NSEvent.removeMonitor(monitor) }
         unregisterSettingsHotKey()
+        unregisterStatusMenuHotKey()
         controller.stop(terminateExternalRuntime: false)
     }
 
@@ -1337,6 +2151,8 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         statusMenuItem.isEnabled = false
         statusMenuItem.image = symbol("circle.dashed")
         menu.addItem(statusMenuItem)
+
+        menu.addItem(menuItem(t("activityWindowMenu"), #selector(showActivityWindow), "waveform.path.ecg.rectangle"))
 
         let sessionsSubmenu = NSMenu()
         sessionsSubmenu.delegate = self
@@ -1380,9 +2196,34 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             pendingArmRequestMenuItem.isEnabled = false
             menu.addItem(pendingArmRequestMenuItem)
 
+            let remoteControlEnabled = controller.chatGptRemoteControlEnabled
+            chatGptRemoteControlMenuItem = menuItem(
+                "ChatGPT 원격 제어: \(remoteControlEnabled ? "켜짐" : "꺼짐") · 이번 앱 세션만",
+                #selector(toggleChatGptRemoteControl),
+                remoteControlEnabled ? "network.badge.shield.half.filled" : "network"
+            )
+            chatGptRemoteControlMenuItem.state = remoteControlEnabled ? .on : .off
+            chatGptRemoteControlMenuItem.toolTip = "원격 ChatGPT의 화면·클릭·입력 실행을 허용합니다. 앱을 종료하면 꺼지며, 작업별 승인·허용 목록·민감 앱 차단·강제 종료는 그대로 유지됩니다."
+            menu.addItem(chatGptRemoteControlMenuItem)
+
             armMenuItem = menuItem("\(t("agentArmOffMenu")) · 로컬 직접 제어", #selector(toggleAgentArm), "shield.lefthalf.filled")
             armMenuItem.toolTip = "\(t("agentArmStatusDetail")) · 원격 승인 요청과 별도"
             menu.addItem(armMenuItem)
+
+            armExplanationMenuItem = NSMenuItem(title: t("agentArmOffExplanation"), action: nil, keyEquivalent: "")
+            armExplanationMenuItem.image = symbol("info.circle")
+            armExplanationMenuItem.indentationLevel = 1
+            armExplanationMenuItem.isEnabled = false
+            menu.addItem(armExplanationMenuItem)
+
+            armRemoteRequestExplanationMenuItem = NSMenuItem(
+                title: t("agentArmRemoteRequestExplanation"),
+                action: nil,
+                keyEquivalent: ""
+            )
+            armRemoteRequestExplanationMenuItem.indentationLevel = 1
+            armRemoteRequestExplanationMenuItem.isEnabled = false
+            menu.addItem(armRemoteRequestExplanationMenuItem)
 
             let killItem = menuItem(t("killControlMenu"), #selector(killControlAction), "hand.raised.fill")
             menu.addItem(killItem)
@@ -1420,7 +2261,58 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         menu.addItem(.separator())
         menu.addItem(menuItem(t("quit"), #selector(quit), "power"))
         statusItem.menu = menu
+        configureMainMenu()
         updatePermissionMenuItems()
+    }
+
+    private func configureMainMenu() {
+        let mainMenu = NSMenu(title: "MainMenu")
+
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu(title: "ChatGPT To Codex")
+        appMenuItem.submenu = appMenu
+
+        let aboutItem = NSMenuItem(title: t("aboutTitle"), action: #selector(showAbout), keyEquivalent: "")
+        aboutItem.target = self
+        appMenu.addItem(aboutItem)
+        appMenu.addItem(.separator())
+
+        let settingsItem = NSMenuItem(title: t("settingsMenu"), action: #selector(showSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        settingsItem.keyEquivalentModifierMask = [.command]
+        appMenu.addItem(settingsItem)
+        appMenu.addItem(.separator())
+
+        let quitItem = NSMenuItem(title: t("quit"), action: #selector(quit), keyEquivalent: "q")
+        quitItem.target = self
+        quitItem.keyEquivalentModifierMask = [.command]
+        appMenu.addItem(quitItem)
+        mainMenu.addItem(appMenuItem)
+
+        let windowMenuItem = NSMenuItem()
+        let windowMenu = NSMenu(title: "Window")
+        windowMenuItem.submenu = windowMenu
+
+        let activityItem = NSMenuItem(title: t("activityWindowMenu"), action: #selector(showActivityWindow), keyEquivalent: "1")
+        activityItem.target = self
+        activityItem.keyEquivalentModifierMask = [.command]
+        windowMenu.addItem(activityItem)
+
+        let logsItem = NSMenuItem(title: t("showLogs"), action: #selector(showLogs), keyEquivalent: "")
+        logsItem.target = self
+        windowMenu.addItem(logsItem)
+
+        let diagnosticsItem = NSMenuItem(title: t("connectionDiagnosticsMenu"), action: #selector(showConnectionDiagnostics), keyEquivalent: "")
+        diagnosticsItem.target = self
+        windowMenu.addItem(diagnosticsItem)
+
+        let doctorItem = NSMenuItem(title: t("doctorTitle"), action: #selector(runDoctor), keyEquivalent: "")
+        doctorItem.target = self
+        windowMenu.addItem(doctorItem)
+        mainMenu.addItem(windowMenuItem)
+
+        NSApp.mainMenu = mainMenu
+        NSApp.windowsMenu = windowMenu
     }
 
     private func menuItem(_ title: String, _ action: Selector, _ symbolName: String) -> NSMenuItem {
@@ -1444,7 +2336,13 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         return image
     }
 
+    private func finishStatusRefresh() {
+        statusRefreshInFlight = false
+    }
+
     private func refreshStatus() {
+        guard !statusRefreshInFlight else { return }
+        statusRefreshInFlight = true
         controller.checkHealth { [weak self] ok in
             guard let self else { return }
             self.latestHealth = ok
@@ -1462,6 +2360,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             self.copyConnectorItem.isEnabled = hasPublicURL
             self.statusItem.button?.toolTip = String(format: self.t("tooltipState"), state)
             self.updatePermissionMenuItems()
+            self.refreshCommandCenter()
             if ok {
                 self.controller.fetchLocalControlStatus { [weak self] snapshot in
                     guard let self else { return }
@@ -1470,6 +2369,8 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
                     self.applyRgSnapshot()
                     self.applyOperationApprovalSnapshot()
                     self.refreshSessionSubmenu()
+                    self.refreshCommandCenter()
+                    self.finishStatusRefresh()
                 }
             } else {
                 self.latestControlSnapshot = nil
@@ -1477,6 +2378,8 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
                 self.applyRgSnapshot()
                 self.applyOperationApprovalSnapshot()
                 self.refreshSessionSubmenu()
+                self.refreshCommandCenter()
+                self.finishStatusRefresh()
             }
         }
     }
@@ -1484,6 +2387,412 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     private func refreshSessionSubmenu() {
         guard let menu = sessionStatusSubmenu else { return }
         menuNeedsUpdate(menu)
+    }
+
+    private func activityLabel(
+        _ text: String,
+        font: NSFont,
+        color: NSColor = .labelColor,
+        lines: Int = 1
+    ) -> NSTextField {
+        let label = lines == 1 ? NSTextField(labelWithString: text) : NSTextField(wrappingLabelWithString: text)
+        label.font = font
+        label.textColor = color
+        label.maximumNumberOfLines = lines
+        label.lineBreakMode = lines == 1 ? .byTruncatingTail : .byWordWrapping
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return label
+    }
+
+    private func commandSectionLabel(_ text: String) -> NSTextField {
+        let label = activityLabel(text, font: .systemFont(ofSize: 11, weight: .semibold), color: .secondaryLabelColor)
+        label.stringValue = text.uppercased()
+        return label
+    }
+
+    private func commandButton(_ title: String, action: Selector, symbolName: String) -> NSButton {
+        let button = NSButton(title: title, target: self, action: action)
+        button.bezelStyle = .rounded
+        button.image = symbol(symbolName)
+        button.imagePosition = .imageLeading
+        button.alignment = .left
+        button.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        button.widthAnchor.constraint(greaterThanOrEqualToConstant: 164).isActive = true
+        return button
+    }
+
+    @objc private func showUnifiedApprovalsCommandMenu(_ sender: NSButton) {
+        let menu = makeNativeApprovalMenu()
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+    }
+
+    @objc private func showDiagnosticsCommandMenu(_ sender: NSButton) {
+        let menu = NSMenu()
+        menu.addItem(menuItem(t("connectionDiagnosticsMenu"), #selector(showConnectionDiagnostics), "stethoscope"))
+        menu.addItem(menuItem(t("showLogs"), #selector(showLogs), "doc.text.magnifyingglass"))
+        menu.addItem(menuItem(t("runDoctor"), #selector(runDoctor), "cross.case"))
+        menu.addItem(.separator())
+        menu.addItem(menuItem(t("openLocalHealth"), #selector(openLocalHealth), "heart.text.square"))
+        let publicHealth = menuItem(t("openPublicHealth"), #selector(openPublicHealth), "globe")
+        publicHealth.isEnabled = controller.connectorURL != nil
+        menu.addItem(publicHealth)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+    }
+
+    private func makeCommandCenter() -> NSView {
+        let sidebar = NSVisualEffectView()
+        sidebar.material = .sidebar
+        sidebar.blendingMode = .withinWindow
+        sidebar.state = .active
+        sidebar.translatesAutoresizingMaskIntoConstraints = false
+
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.drawsBackground = false
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        let document = FlippedView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(stack)
+        scrollView.documentView = document
+        sidebar.addSubview(scrollView)
+
+        let status = activityLabel(t("statusChecking"), font: .systemFont(ofSize: 14, weight: .semibold))
+        commandStatusLabel = status
+        stack.addArrangedSubview(status)
+        let project = activityLabel(controller.projectDisplayName, font: .systemFont(ofSize: 11), color: .secondaryLabelColor, lines: 2)
+        commandProjectLabel = project
+        stack.addArrangedSubview(project)
+
+        stack.addArrangedSubview(commandSectionLabel(controller.effectiveLanguageCode == "ko" ? "서비스" : "Service"))
+        let mcp = commandButton(t("startMCP"), action: #selector(toggleServer), symbolName: "play.circle")
+        commandMcpButton = mcp
+        stack.addArrangedSubview(mcp)
+
+        if controller.controlEnabled {
+            let remote = commandButton("ChatGPT 원격 제어", action: #selector(toggleChatGptRemoteControl), symbolName: "network.badge.shield.half.filled")
+            commandRemoteControlButton = remote
+            stack.addArrangedSubview(remote)
+            let arm = commandButton(t("agentArmOffMenu"), action: #selector(toggleAgentArm), symbolName: "shield.lefthalf.filled")
+            commandAgentArmButton = arm
+            stack.addArrangedSubview(arm)
+            let kill = commandButton(t("killControlMenu"), action: #selector(killControlAction), symbolName: "hand.raised.fill")
+            kill.contentTintColor = .systemRed
+            kill.isHidden = true
+            commandKillControlButton = kill
+            stack.addArrangedSubview(kill)
+        }
+
+        stack.addArrangedSubview(commandSectionLabel(controller.effectiveLanguageCode == "ko" ? "작업" : "Work"))
+        let approvals = commandButton(controller.effectiveLanguageCode == "ko" ? "승인 대기" : "Approvals", action: #selector(showUnifiedApprovalsCommandMenu(_:)), symbolName: "exclamationmark.shield")
+        commandOperationApprovalsButton = approvals
+        stack.addArrangedSubview(approvals)
+        stack.addArrangedSubview(commandButton(controller.effectiveLanguageCode == "ko" ? "진단" : "Diagnostics", action: #selector(showDiagnosticsCommandMenu(_:)), symbolName: "stethoscope"))
+        stack.addArrangedSubview(commandButton(controller.effectiveLanguageCode == "ko" ? "권한 / 도구…" : "Permissions / Tools…", action: #selector(showPermissionsToolsCommandMenu(_:)), symbolName: "checkmark.shield"))
+        stack.addArrangedSubview(commandButton(t("settingsMenu"), action: #selector(showSettings), symbolName: "gearshape"))
+
+        NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 12),
+            scrollView.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 10),
+            scrollView.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -10),
+            scrollView.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -12),
+            document.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
+            document.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
+            document.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
+            document.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+            stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 4),
+            stack.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 4),
+            stack.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -4),
+            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -4),
+        ])
+        return sidebar
+    }
+
+    private func refreshCommandCenter() {
+        let running = latestHealth || controller.isManagedProcessRunning
+        commandStatusLabel?.stringValue = "ChatGPT To Codex: \(running ? t("statusOn") : t("statusOff"))"
+        commandStatusLabel?.textColor = running ? .systemGreen : .secondaryLabelColor
+        commandProjectLabel?.stringValue = "\(controller.projectDisplayName) · \(t("portPrefix")) \(controller.port)"
+        commandMcpButton?.title = running ? t("stopMCP") : t("startMCP")
+        commandMcpButton?.image = symbol(running ? "stop.circle" : "play.circle")
+
+        let remoteEnabled = controller.chatGptRemoteControlEnabled
+        commandRemoteControlButton?.title = "ChatGPT 원격 제어: \(remoteEnabled ? "켜짐" : "꺼짐")"
+        commandRemoteControlButton?.state = remoteEnabled ? .on : .off
+        let armed = latestControlSnapshot?.armed == true
+        commandAgentArmButton?.title = armed ? t("agentArmOnMenu") : t("agentArmOffMenu")
+        commandAgentArmButton?.state = armed ? .on : .off
+        let armCount = latestControlSnapshot?.pendingArmRequests.count ?? 0
+        let actionCount = latestControlSnapshot?.pendingActions.count ?? 0
+        let approvalCount = latestControlSnapshot?.operationApprovals.count ?? 0
+        let rgCount = latestControlSnapshot?.rg.pendingRequests.count ?? 0
+        let totalApprovalCount = armCount + actionCount + approvalCount + rgCount
+        commandOperationApprovalsButton?.title = controller.effectiveLanguageCode == "ko"
+            ? "승인 대기 (\(totalApprovalCount))"
+            : "Approvals (\(totalApprovalCount))"
+        commandOperationApprovalsButton?.contentTintColor = totalApprovalCount > 0 ? .systemOrange : nil
+        commandKillControlButton?.isHidden = !(armed || actionCount > 0)
+    }
+
+    private func appendNativeApprovalMenuSection(_ title: String, source: NSMenu?, to menu: NSMenu) {
+        guard let source else { return }
+        menuNeedsUpdate(source)
+        if !menu.items.isEmpty { menu.addItem(.separator()) }
+        let heading = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        heading.isEnabled = false
+        menu.addItem(heading)
+        for item in source.items {
+            if let clone = item.copy() as? NSMenuItem {
+                menu.addItem(clone)
+            }
+        }
+    }
+
+    private func makeNativeApprovalMenu() -> NSMenu {
+        let menu = NSMenu()
+        appendNativeApprovalMenuSection(
+            controller.effectiveLanguageCode == "ko" ? "작업 승인" : "Work approvals",
+            source: pendingOperationApprovalSubmenu,
+            to: menu
+        )
+        if controller.controlEnabled {
+            appendNativeApprovalMenuSection(
+                controller.effectiveLanguageCode == "ko" ? "제어 승인" : "Control approvals",
+                source: pendingArmRequestSubmenu,
+                to: menu
+            )
+            appendNativeApprovalMenuSection(
+                controller.effectiveLanguageCode == "ko" ? "제어 작업" : "Control actions",
+                source: pendingControlSubmenu,
+                to: menu
+            )
+        }
+        appendNativeApprovalMenuSection(
+            controller.effectiveLanguageCode == "ko" ? "외부 도구 승인" : "External tool approvals",
+            source: rgPermissionSubmenu,
+            to: menu
+        )
+        if menu.items.isEmpty {
+            let empty = NSMenuItem(
+                title: controller.effectiveLanguageCode == "ko" ? "대기 중인 승인이 없습니다" : "No approvals waiting",
+                action: nil,
+                keyEquivalent: ""
+            )
+            empty.isEnabled = false
+            menu.addItem(empty)
+        }
+        return menu
+    }
+
+    private func showNativeApprovalMenu(from view: NSView) {
+        NSApp.activate(ignoringOtherApps: true)
+        let menu = makeNativeApprovalMenu()
+        menu.popUp(
+            positioning: nil,
+            at: NSPoint(x: 20, y: max(24, view.bounds.height - 28)),
+            in: view
+        )
+    }
+
+    @objc private func showPermissionsToolsCommandMenu(_ sender: NSButton) {
+        let menu = NSMenu()
+        menu.addItem(menuItem(t("screenshotPermissionMenu"), #selector(showScreenRecordingPermission), "camera.viewfinder"))
+        if controller.controlEnabled {
+            menu.addItem(menuItem(t("accessibilityPermissionMenu"), #selector(showAccessibilityPermission), "figure.roll"))
+        }
+        appendNativeApprovalMenuSection(
+            controller.effectiveLanguageCode == "ko" ? "외부 도구" : "External tools",
+            source: rgPermissionSubmenu,
+            to: menu
+        )
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+    }
+
+    private func isTrustedActivityDashboardURL(_ url: URL?) -> Bool {
+        guard let url,
+              url.scheme?.lowercased() == "http",
+              url.host?.lowercased() == "127.0.0.1",
+              url.port == 7980,
+              url.path == "/activity" || url.path == "/activity/"
+        else { return false }
+        return true
+    }
+
+    private func makeActivityFallbackView() -> NSView {
+        let fallback = NSVisualEffectView()
+        fallback.material = .underWindowBackground
+        fallback.blendingMode = .withinWindow
+        fallback.state = .active
+        fallback.translatesAutoresizingMaskIntoConstraints = false
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let title = NSTextField(labelWithString: controller.effectiveLanguageCode == "ko"
+            ? "작업 현황 대시보드에 연결할 수 없습니다"
+            : "Unable to connect to the activity dashboard")
+        title.font = .systemFont(ofSize: 16, weight: .semibold)
+        title.alignment = .center
+        stack.addArrangedSubview(title)
+
+        let detail = NSTextField(wrappingLabelWithString: controller.effectiveLanguageCode == "ko"
+            ? "로컬 C2CT runtime이 실행 중인지 확인한 뒤 다시 시도하세요."
+            : "Check that the local C2CT runtime is running, then try again.")
+        detail.font = .systemFont(ofSize: 12)
+        detail.textColor = .secondaryLabelColor
+        detail.alignment = .center
+        detail.maximumNumberOfLines = 2
+        stack.addArrangedSubview(detail)
+
+        let retry = NSButton(
+            title: controller.effectiveLanguageCode == "ko" ? "다시 시도" : "Retry",
+            target: self,
+            action: #selector(retryActivityDashboard)
+        )
+        retry.bezelStyle = .rounded
+        retry.image = symbol("arrow.clockwise")
+        retry.imagePosition = .imageLeading
+        stack.addArrangedSubview(retry)
+
+        fallback.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: fallback.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: fallback.centerYAnchor),
+            stack.leadingAnchor.constraint(greaterThanOrEqualTo: fallback.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: fallback.trailingAnchor, constant: -24),
+        ])
+        return fallback
+    }
+
+    @objc private func retryActivityDashboard() {
+        loadActivityDashboard()
+    }
+
+    private func loadActivityDashboard() {
+        guard let webView = activityWebView else { return }
+        activityFallbackView?.isHidden = true
+        let request = URLRequest(
+            url: activityDashboardURL,
+            cachePolicy: .reloadIgnoringLocalCacheData,
+            timeoutInterval: 5
+        )
+        webView.load(request)
+    }
+
+    @objc private func showActivityWindow() {
+        if let window = activityWindow {
+            NSApp.activate(ignoringOtherApps: true)
+            if window.isMiniaturized { window.deminiaturize(nil) }
+            window.makeKeyAndOrderFront(nil)
+            if activityWebView?.url == nil || activityFallbackView?.isHidden == false {
+                loadActivityDashboard()
+            }
+            refreshStatus()
+            return
+        }
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1080, height: 700),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = t("activityWindowTitle")
+        window.isReleasedWhenClosed = false
+        window.minSize = NSSize(width: 980, height: 520)
+        window.setFrameAutosaveName("ChatGPTToCodexActivityWindow")
+        window.collectionBehavior = [.moveToActiveSpace]
+
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .nonPersistent()
+        let contentController = WKUserContentController()
+        contentController.add(self, name: "c2ctMacApp")
+        configuration.userContentController = contentController
+
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.translatesAutoresizingMaskIntoConstraints = false
+        webView.navigationDelegate = self
+
+        let root = NSView()
+        root.translatesAutoresizingMaskIntoConstraints = false
+        let commandCenter = makeCommandCenter()
+        let fallback = makeActivityFallbackView()
+        fallback.isHidden = true
+
+        root.addSubview(commandCenter)
+        root.addSubview(webView)
+        root.addSubview(fallback)
+        NSLayoutConstraint.activate([
+            commandCenter.topAnchor.constraint(equalTo: root.topAnchor),
+            commandCenter.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            commandCenter.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            commandCenter.widthAnchor.constraint(equalToConstant: 196),
+            webView.topAnchor.constraint(equalTo: root.topAnchor),
+            webView.leadingAnchor.constraint(equalTo: commandCenter.trailingAnchor),
+            webView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            webView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            fallback.topAnchor.constraint(equalTo: root.topAnchor),
+            fallback.leadingAnchor.constraint(equalTo: commandCenter.trailingAnchor),
+            fallback.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            fallback.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+        ])
+
+        window.contentView = root
+        activityWindow = window
+        activityWebView = webView
+        activityFallbackView = fallback
+
+        NSApp.activate(ignoringOtherApps: true)
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        loadActivityDashboard()
+        refreshStatus()
+    }
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == "c2ctMacApp",
+              message.webView === activityWebView,
+              isTrustedActivityDashboardURL(message.webView?.url),
+              let body = message.body as? [String: Any],
+              body["action"] as? String == "openApprovals",
+              let webView = activityWebView
+        else { return }
+        showNativeApprovalMenu(from: webView)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        decisionHandler(isTrustedActivityDashboardURL(navigationAction.request.url) ? .allow : .cancel)
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        activityFallbackView?.isHidden = true
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        if (error as NSError).code != NSURLErrorCancelled {
+            activityFallbackView?.isHidden = false
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        if (error as NSError).code != NSURLErrorCancelled {
+            activityFallbackView?.isHidden = false
+        }
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        activityFallbackView?.isHidden = false
     }
 
     private func updatePermissionMenuItems() {
@@ -1498,12 +2807,24 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     private func applyControlSnapshot() {
-        guard controller.controlEnabled else { return }
+        guard controller.controlEnabled else {
+            controlOverlay.setControlActive(false)
+            return
+        }
         let armed = latestControlSnapshot?.armed == true
+        // `armed` is authoritative for both the local default session and a
+        // remote scoped control lease. The top-level lease can intentionally
+        // describe a different local project while remote control is active.
+        if let snapshot = latestControlSnapshot {
+            controlOverlay.setControlActive(snapshot.armed && !snapshot.killed)
+        }
         armMenuItem.title = "\(t(armed ? "agentArmOnMenu" : "agentArmOffMenu")) · 로컬 직접 제어"
         armMenuItem.image = symbol(armed ? "shield.fill" : "shield.lefthalf.filled")
         armMenuItem.state = armed ? .on : .off
         armMenuItem.isEnabled = latestHealth
+        armExplanationMenuItem.title = t(armed ? "agentArmOnExplanation" : "agentArmOffExplanation")
+        armExplanationMenuItem.toolTip = t("agentArmStatusDetail")
+        armRemoteRequestExplanationMenuItem.title = t("agentArmRemoteRequestExplanation")
         let pendingArmRequests = latestControlSnapshot?.pendingArmRequests ?? []
         pendingArmRequestMenuItem.title = "제어 승인 요청 대기 (\(pendingArmRequests.count))"
         pendingArmRequestMenuItem.isEnabled = latestHealth && !pendingArmRequests.isEmpty
@@ -1540,7 +2861,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
                 self.refreshStatus()
             }
         } else {
-            if !controller.ownerTokenConfigured() {
+            if case .missing = controller.ownerTokenStatus() {
                 showSettings()
                 return
             }
@@ -1679,8 +3000,39 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         return formatter.string(from: Date(timeIntervalSince1970: request.expiresAt))
     }
 
+    private func runForegroundApprovalAlert(_ alert: NSAlert) -> NSApplication.ModalResponse {
+        let window = alert.window
+        window.level = .modalPanel
+        window.collectionBehavior.insert(.moveToActiveSpace)
+        window.hidesOnDeactivate = false
+        NSApp.activate(ignoringOtherApps: true)
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+        return alert.runModal()
+    }
+
+    private func makeUnifiedApprovalAlert(
+        category: String,
+        details: [String],
+        primaryTitle: String,
+        secondaryTitle: String = "거부",
+        tertiaryTitle: String = "나중에"
+    ) -> NSAlert {
+        let alert = NSAlert()
+        alert.messageText = "C2CT 승인 요청"
+        alert.informativeText = (["유형: \(category)"] + details).joined(separator: "\n")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: primaryTitle)
+        alert.addButton(withTitle: secondaryTitle)
+        alert.addButton(withTitle: tertiaryTitle)
+        return alert
+    }
+
     private func operationApprovalRiskText(_ risk: String) -> String {
-        risk == "network" ? "네트워크 접근" : "파괴적 변경 가능"
+        if risk == "network" { return "네트워크 접근" }
+        if risk == "local-file-mutation" { return "고정 로컬 파일 변경" }
+        return "파괴적 변경 가능"
     }
 
     private func presentFirstSeenOperationApproval(from requests: [ServiceController.PendingOperationApproval]) {
@@ -1690,9 +3042,8 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     private func presentOperationApproval(_ request: ServiceController.PendingOperationApproval) {
-        let alert = NSAlert()
-        alert.messageText = "작업 승인 요청"
-        alert.informativeText = [
+        let isRuntimeApply = request.tool == "runtime_apply_local"
+        var details = [
             "프로젝트: \(request.projectId)",
             "도구: \(request.tool)",
             "위험 유형: \(operationApprovalRiskText(request.risk))",
@@ -1700,22 +3051,28 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             "만료: \(operationApprovalExpiryText(request))",
             "",
             "승인은 현재 프로젝트·현재 lease·이 정확한 작업에만 묶이며 한 번 실행하면 즉시 소모됩니다."
-        ].joined(separator: "\n")
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "한 번 허용")
-        alert.addButton(withTitle: "거부")
-        alert.addButton(withTitle: "나중에")
-        NSApp.activate(ignoringOtherApps: true)
-        let response = alert.runModal()
+        ]
+        if isRuntimeApply {
+            details.append("메뉴바에서 이 버튼을 직접 누른 경우에만 런타임 교체가 허용됩니다. 앱·커넥터·터널은 교체 대상이 아닙니다.")
+        }
+        let alert = makeUnifiedApprovalAlert(
+            category: isRuntimeApply ? "런타임 교체" : "보호 작업",
+            details: details,
+            primaryTitle: isRuntimeApply ? t("installRuntimeUpdate") : "이번만 허용"
+        )
+        let response = runForegroundApprovalAlert(alert)
         if response == .alertFirstButtonReturn {
-            resolveOperationApproval(request.requestId, decision: "approve")
+            resolveOperationApproval(request, decision: "approve")
         } else if response == .alertSecondButtonReturn {
-            resolveOperationApproval(request.requestId, decision: "reject")
+            resolveOperationApproval(request, decision: "reject")
         }
     }
 
-    private func resolveOperationApproval(_ requestId: String, decision: String) {
-        controller.performLocalControl("/operation-approvals/\(requestId)/\(decision)") { [weak self] _ in
+    private func resolveOperationApproval(_ request: ServiceController.PendingOperationApproval, decision: String) {
+        let path = request.tool == "runtime_apply_local" && decision == "approve"
+            ? "/runtime-apply-approvals/\(request.requestId)/approve"
+            : "/operation-approvals/\(request.requestId)/\(decision)"
+        controller.performLocalControl(path) { [weak self] _ in
             self?.refreshStatus()
         }
     }
@@ -1735,9 +3092,9 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
 
     private func presentRgRequest(_ request: ServiceController.PendingRgRequest) {
         let shortHash = String(request.binarySha256.prefix(16))
-        let alert = NSAlert()
-        alert.messageText = t("rgApprovalTitle")
-        alert.informativeText = [
+        let alert = makeUnifiedApprovalAlert(
+            category: "외부 검색 도구 (rg)",
+            details: [
             "프로젝트: \(request.projectId)",
             "검색: \(request.queryPreview)",
             "방식: \(request.patternMode) · 대소문자 \(request.caseSensitive ? "구분" : "무시") · 최대 \(request.maxResults)개",
@@ -1747,20 +3104,38 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             "만료: \(rgRequestExpiryText(request))",
             "",
             "승인은 이 프로젝트와 현재 lease, 검증된 rg 실행 파일에만 적용됩니다."
-        ].joined(separator: "\n")
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: t("rgApproveOnce"))
-        alert.addButton(withTitle: t("rgApproveSession"))
-        alert.addButton(withTitle: t("rgApproveAlways"))
-        alert.addButton(withTitle: t("rgReject"))
-        NSApp.activate(ignoringOtherApps: true)
-        let response = alert.runModal()
-        let index = response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
-        switch index {
-        case 0: resolveRgRequest(request.requestId, decision: "once")
-        case 1: resolveRgRequest(request.requestId, decision: "session")
-        case 2: resolveRgRequest(request.requestId, decision: "always")
-        default: resolveRgRequest(request.requestId, decision: "reject")
+            ],
+            primaryTitle: t("rgApproveOnce"),
+            secondaryTitle: t("rgReject"),
+            tertiaryTitle: "추가 옵션…"
+        )
+        let response = runForegroundApprovalAlert(alert)
+        if response == .alertFirstButtonReturn {
+            resolveRgRequest(request.requestId, decision: "once")
+        } else if response == .alertSecondButtonReturn {
+            resolveRgRequest(request.requestId, decision: "reject")
+        } else if response == .alertThirdButtonReturn {
+            presentRgExtendedApprovalOptions(request)
+        }
+    }
+
+    private func presentRgExtendedApprovalOptions(_ request: ServiceController.PendingRgRequest) {
+        let alert = makeUnifiedApprovalAlert(
+            category: "외부 검색 도구 (rg) · 추가 옵션",
+            details: [
+                "프로젝트: \(request.projectId)",
+                "검색: \(request.queryPreview)",
+                "승인 범위를 넓히면 이후 같은 범위의 rg 요청에서는 승인 횟수가 줄어듭니다."
+            ],
+            primaryTitle: t("rgApproveSession"),
+            secondaryTitle: t("rgApproveAlways"),
+            tertiaryTitle: t("cancel")
+        )
+        let response = runForegroundApprovalAlert(alert)
+        if response == .alertFirstButtonReturn {
+            resolveRgRequest(request.requestId, decision: "session")
+        } else if response == .alertSecondButtonReturn {
+            resolveRgRequest(request.requestId, decision: "always")
         }
     }
 
@@ -1816,22 +3191,19 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     private func presentArmRequest(_ request: ServiceController.PendingArmRequest) {
-        let alert = NSAlert()
-        alert.messageText = "원격 제어 승인 요청"
-        alert.informativeText = [
+        let alert = makeUnifiedApprovalAlert(
+            category: "원격 제어",
+            details: [
             "프로젝트: \(request.projectName)",
             "클라이언트: \(request.clientLabel)",
             "사유: \(request.reason)",
             "만료: \(armRequestExpiryText(request))",
             "",
             "허용할 때만 로컬 control lease가 발급되고 KILL 상태가 해제됩니다."
-        ].joined(separator: "\n")
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "제어 허용")
-        alert.addButton(withTitle: "거부")
-        alert.addButton(withTitle: "나중에")
-        NSApp.activate(ignoringOtherApps: true)
-        let response = alert.runModal()
+            ],
+            primaryTitle: "제어 허용"
+        )
+        let response = runForegroundApprovalAlert(alert)
         if response == .alertFirstButtonReturn {
             controller.performLocalControl("/control/arm-requests/\(request.requestId)/approve") { [weak self] _ in
                 self?.refreshStatus()
@@ -2114,6 +3486,21 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         controller.performLocalControl(path) { [weak self] _ in self?.refreshStatus() }
     }
 
+    @objc private func toggleChatGptRemoteControl() {
+        let enabled = !controller.chatGptRemoteControlEnabled
+        controller.setChatGptRemoteControlEnabledForSession(enabled)
+        rebuildMenu()
+        let shouldRestart = latestHealth || controller.isManagedProcessRunning || controller.startMCPOnLaunch
+        guard shouldRestart else {
+            refreshStatus()
+            return
+        }
+        statusMenuItem.title = "ChatGPT To Codex: \(t("statusRestarting"))"
+        controller.restart { [weak self] _ in
+            self?.refreshStatus()
+        }
+    }
+
     private static let settingsHotKeySignature: OSType = 0x43324353 // C2CS
     private static let settingsHotKeyIdentifier: UInt32 = 1
     private static let settingsHotKeyHandler: EventHandlerUPP = { _, event, userData in
@@ -2187,6 +3574,82 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         showSettings()
     }
 
+    private static let statusMenuHotKeySignature: OSType = 0x4332434D // C2CM
+    private static let statusMenuHotKeyIdentifier: UInt32 = 2
+    private static let statusMenuHotKeyHandler: EventHandlerUPP = { _, event, userData in
+        guard let event, let userData else { return OSStatus(eventNotHandledErr) }
+        var hotKeyID = EventHotKeyID()
+        let readStatus = GetEventParameter(
+            event,
+            EventParamName(kEventParamDirectObject),
+            EventParamType(typeEventHotKeyID),
+            nil,
+            MemoryLayout<EventHotKeyID>.size,
+            nil,
+            &hotKeyID
+        )
+        guard readStatus == noErr,
+              hotKeyID.signature == statusMenuHotKeySignature,
+              hotKeyID.id == statusMenuHotKeyIdentifier
+        else { return OSStatus(eventNotHandledErr) }
+        let delegate = Unmanaged<StatusBarAppDelegate>.fromOpaque(userData).takeUnretainedValue()
+        DispatchQueue.main.async { delegate.showStatusMenuFromGlobalHotKey() }
+        return noErr
+    }
+
+    /// Opens the exact menu owned by the status item, so this temporary global
+    /// shortcut follows the same target/action path as a physical menu-bar click.
+    private func registerStatusMenuHotKey() {
+        guard statusMenuHotKeyRef == nil, statusMenuHotKeyEventHandler == nil else { return }
+        var eventType = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
+        )
+        var handler: EventHandlerRef?
+        let installStatus = InstallEventHandler(
+            GetApplicationEventTarget(),
+            Self.statusMenuHotKeyHandler,
+            1,
+            &eventType,
+            Unmanaged.passUnretained(self).toOpaque(),
+            &handler
+        )
+        guard installStatus == noErr, let handler else {
+            NSLog("ChatGPT To Codex: status-menu hotkey event handler registration failed: %d", installStatus)
+            return
+        }
+        var hotKey: EventHotKeyRef?
+        let hotKeyID = EventHotKeyID(signature: Self.statusMenuHotKeySignature, id: Self.statusMenuHotKeyIdentifier)
+        let modifiers = UInt32(controlKey) | UInt32(optionKey) | UInt32(cmdKey)
+        let registrationStatus = RegisterEventHotKey(
+            UInt32(kVK_ANSI_M),
+            modifiers,
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &hotKey
+        )
+        guard registrationStatus == noErr, let hotKey else {
+            RemoveEventHandler(handler)
+            NSLog("ChatGPT To Codex: status-menu hotkey registration failed: %d", registrationStatus)
+            return
+        }
+        statusMenuHotKeyEventHandler = handler
+        statusMenuHotKeyRef = hotKey
+    }
+
+    private func unregisterStatusMenuHotKey() {
+        if let hotKey = statusMenuHotKeyRef { UnregisterEventHotKey(hotKey) }
+        if let handler = statusMenuHotKeyEventHandler { RemoveEventHandler(handler) }
+        statusMenuHotKeyRef = nil
+        statusMenuHotKeyEventHandler = nil
+    }
+
+    private func showStatusMenuFromGlobalHotKey() {
+        showActivityWindow()
+        refreshStatus()
+    }
+
     /// Global emergency-stop hotkey (⌃⌥⌘.) for Option B desktop control:
     /// pressed anywhere on the system, it calls `chatgpt2codex control kill`
     /// immediately via the same runCli path as the menu item, with no
@@ -2257,7 +3720,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         }
         let width: CGFloat = 540
         let hintWidth: CGFloat = 322
-        let publicHintY: CGFloat = 398
+        let publicHintY: CGFloat = 450
         let hintFont = NSFont.systemFont(ofSize: 10)
         func measuredHintHeight(_ text: String, width: CGFloat) -> CGFloat {
             let rect = (text as NSString).boundingRect(
@@ -2267,7 +3730,9 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             )
             return max(58, ceil(rect.height) + 8)
         }
-        let publicHintText = t("publicHostnameHint")
+        let publicHintText = controller.effectiveLanguageCode == "ko"
+            ? "비워두면 Cloudflare Quick Tunnel을 사용합니다. 호스트명은 기존 Cloudflare named tunnel token/name이 함께 설정된 경우에만 고정 주소로 사용됩니다. https:// URL은 Tailscale Funnel 같은 외부 관리 터널로 사용하며 앱이 해당 터널을 시작하거나 종료하지 않습니다."
+            : "Blank uses a Cloudflare Quick Tunnel. A hostname is fixed only when an existing Cloudflare named-tunnel token/name is configured. An https:// URL is treated as an externally managed tunnel and is never started or stopped by this app."
         let publicHintHeight = measuredHintHeight(publicHintText, width: hintWidth)
         let localPortY = publicHintY + publicHintHeight + 18
         let portFieldY = localPortY - 4
@@ -2362,14 +3827,32 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         startOnLaunch.state = controller.startMCPOnLaunch ? .on : .off
         settingsStartOnLaunch = startOnLaunch
         content.addSubview(startOnLaunch)
-        let tokenConfigured = controller.ownerTokenConfigured()
+        let ownerTokenStatus = controller.ownerTokenStatus()
+        let tokenConfigured: Bool
+        let tokenStatusText: String
+        let tokenStatusColor: NSColor
+        switch ownerTokenStatus {
+        case .configured:
+            tokenConfigured = true
+            tokenStatusText = t("ownerTokenReady")
+            tokenStatusColor = .systemGreen
+        case .missing:
+            tokenConfigured = false
+            tokenStatusText = t("ownerTokenMissing")
+            tokenStatusColor = .systemOrange
+        case .checkFailed:
+            tokenConfigured = false
+            tokenStatusText = t("ownerTokenCheckFailed")
+            tokenStatusColor = .systemRed
+        }
         settingsOwnerTokenConfigured = tokenConfigured
         content.addSubview(label(t("ownerToken"), x: 28, y: 272, width: 170))
-        let tokenStatus = label(tokenConfigured ? t("ownerTokenReady") : t("ownerTokenMissing"), x: 190, y: 272, width: 170)
-        tokenStatus.textColor = tokenConfigured ? .systemGreen : .systemOrange
+        let tokenStatus = label(tokenStatusText, x: 190, y: 272, width: 170)
+        tokenStatus.textColor = tokenStatusColor
         settingsOwnerTokenStatus = tokenStatus
         content.addSubview(tokenStatus)
         let tokenButton = button(t("ownerTokenGenerateCopy"), x: 190, y: 296, width: 210, action: #selector(generateAndCopyOwnerToken))
+        tokenButton.isEnabled = ownerTokenStatus != .checkFailed
         settingsOwnerTokenButton = tokenButton
         content.addSubview(tokenButton)
         let tokenCopyButton = button(t("ownerTokenCopy"), x: 410, y: 296, width: 102, action: #selector(copyStoredOwnerToken))
@@ -2377,17 +3860,34 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         settingsOwnerTokenCopyButton = tokenCopyButton
         content.addSubview(tokenCopyButton)
 
+        let multiProjectLanes = NSButton(checkboxWithTitle: t("multiProjectLanesSetting"), target: nil, action: nil)
+        multiProjectLanes.frame = NSRect(x: 190, y: 334, width: 322, height: 22)
+        multiProjectLanes.state = controller.multiProjectLanesEnabled ? .on : .off
+        settingsMultiProjectLanes = multiProjectLanes
+        content.addSubview(multiProjectLanes)
+
+        let showIntermediateCommentary = NSButton(
+            checkboxWithTitle: t("showIntermediateCommentarySetting"),
+            target: self,
+            action: #selector(toggleIntermediateCommentarySetting(_:))
+        )
+        showIntermediateCommentary.frame = NSRect(x: 190, y: 360, width: 322, height: 22)
+        showIntermediateCommentary.state = controller.showIntermediateCommentary ? .on : .off
+        settingsShowIntermediateCommentary = showIntermediateCommentary
+        content.addSubview(showIntermediateCommentary)
+
         let publicTunnel = NSButton(checkboxWithTitle: t("publicTunnelSetting"), target: nil, action: nil)
-        publicTunnel.frame = NSRect(x: 190, y: 334, width: 322, height: 22)
+        publicTunnel.frame = NSRect(x: 190, y: 386, width: 322, height: 22)
         publicTunnel.state = controller.enablePublicTunnel ? .on : .off
         settingsPublicTunnel = publicTunnel
         content.addSubview(publicTunnel)
 
-        content.addSubview(label(t("publicHostname"), x: 28, y: 370, width: 170))
-        let hostField = field(controller.savedPublicHost ?? "", x: 190, y: 366, width: 230, placeholder: "chatgpt2codex.example.com")
+        let publicEndpointLabel = controller.effectiveLanguageCode == "ko" ? "공개 호스트 / 외부 HTTPS URL" : "Public host / external HTTPS URL"
+        content.addSubview(label(publicEndpointLabel, x: 28, y: 422, width: 170))
+        let hostField = field(controller.savedPublicHost ?? "", x: 190, y: 418, width: 230, placeholder: "host.example.com or https://...")
         settingsHostField = hostField
         content.addSubview(hostField)
-        content.addSubview(button(t("fixedDomainSetup"), x: 428, y: 365, width: 84, action: #selector(showFixedDomainSetup)))
+        content.addSubview(button(t("fixedDomainSetup"), x: 428, y: 417, width: 84, action: #selector(showFixedDomainSetup)))
         content.addSubview(hint(publicHintText, x: 190, y: publicHintY, width: hintWidth, height: publicHintHeight))
         content.addSubview(label(t("localPort"), x: 28, y: localPortY, width: 170))
         let portField = field("\(controller.port)", x: 190, y: portFieldY, width: 120)
@@ -2398,8 +3898,8 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         let actionCol2X: CGFloat = 277
         content.addSubview(button(t("copyConnector"), x: 28, y: actionRow1Y, width: actionColW, action: #selector(copyConnectorURL)))
         content.addSubview(button(t("openStatus"), x: actionCol2X, y: actionRow1Y, width: actionColW, action: #selector(openStatus)))
-        content.addSubview(button(t("showLogs"), x: 28, y: actionRow2Y, width: actionColW, action: #selector(showLogs)))
-        content.addSubview(button(t("runDoctor"), x: actionCol2X, y: actionRow2Y, width: actionColW, action: #selector(runDoctor)))
+        content.addSubview(button(controller.effectiveLanguageCode == "ko" ? "권한 / 도구…" : "Permissions / Tools…", x: 28, y: actionRow2Y, width: actionColW, action: #selector(showPermissionsToolsCommandMenu(_:))))
+        content.addSubview(button(t("checkUpdates"), x: actionCol2X, y: actionRow2Y, width: actionColW, action: #selector(checkForUpdates)))
         let copyright = label("v\(controller.appVersion) - Copyright 2026 ezBuilder. All rights reserved.", x: 28, y: footerY, width: 340, size: 11)
         content.addSubview(copyright)
         content.addSubview(button(t("cancel"), x: 338, y: footerButtonY, width: 78, action: #selector(cancelSettings)))
@@ -2427,6 +3927,10 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     @objc private func cancelSettings() {
         settingsWindow?.close()
         settingsWindow = nil
+    }
+
+    @objc private func toggleIntermediateCommentarySetting(_ sender: NSButton) {
+        controller.setShowIntermediateCommentary(sender.state == .on)
     }
 
     @objc private func showFixedDomainSetup() {
@@ -2462,11 +3966,21 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         guard let projectField = settingsProjectField,
               let launchAtLogin = settingsLaunchAtLogin,
               let startOnLaunch = settingsStartOnLaunch,
+              let multiProjectLanes = settingsMultiProjectLanes,
               let publicTunnel = settingsPublicTunnel,
               let hostField = settingsHostField,
               let portField = settingsPortField
         else { return }
         let projectPath = projectField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestedHost = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parsedPort = Int(portField.stringValue)
+        let requestedPort = (parsedPort ?? 0) > 0 ? parsedPort! : controller.port
+        let runtimeSettingsChanged =
+            projectPath != (controller.selectedProjectFolder?.path ?? "") ||
+            (multiProjectLanes.state == .on) != controller.multiProjectLanesEnabled ||
+            (publicTunnel.state == .on) != controller.enablePublicTunnel ||
+            requestedHost != (controller.savedPublicHost ?? "") ||
+            requestedPort != controller.port
         if projectPath.isEmpty {
             controller.clearSelectedProjectFolder()
         } else {
@@ -2483,12 +3997,11 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         }
         controller.setLaunchAtLogin(launchAtLogin.state == .on)
         controller.setStartMCPOnLaunch(startOnLaunch.state == .on)
+        controller.setMultiProjectLanesEnabled(multiProjectLanes.state == .on)
         controller.setEnablePublicTunnel(publicTunnel.state == .on)
-        controller.setPublicHostname(hostField.stringValue)
-        if let port = Int(portField.stringValue), port > 0 {
-            controller.setPort(port)
-        }
-        let shouldRestart = latestHealth || controller.isManagedProcessRunning
+        controller.setPublicHostname(requestedHost)
+        controller.setPort(requestedPort)
+        let shouldRestart = (latestHealth || controller.isManagedProcessRunning) && runtimeSettingsChanged
         settingsWindow?.close()
         settingsWindow = nil
         rebuildMenu()

@@ -178,9 +178,12 @@ export class JsonOAuthStore {
     this.cache = doc;
   }
 
-  private sweepExpired(doc: OAuthFile, nowSeconds: number): void {
+  private sweepExpired(doc: OAuthFile, nowSeconds: number): boolean {
+    const accessBefore = doc.accessTokens.length;
+    const refreshBefore = doc.refreshTokens.length;
     doc.accessTokens = doc.accessTokens.filter((t) => t.expiresAt >= nowSeconds);
     doc.refreshTokens = doc.refreshTokens.filter((t) => t.expiresAt >= nowSeconds);
+    return doc.accessTokens.length !== accessBefore || doc.refreshTokens.length !== refreshBefore;
   }
 
   private pruneClients(doc: OAuthFile, nowSeconds: number): void {
@@ -266,7 +269,8 @@ export class JsonOAuthStore {
     return this.locked(async () => {
       const doc = await this.load();
       const now = Math.floor(Date.now() / 1000);
-      this.sweepExpired(doc, now);
+      const pruned = this.sweepExpired(doc, now);
+      if (pruned) await this.persist(doc);
       const found = doc.accessTokens.find((t) => t.tokenHash === tokenHash);
       return found
         ? { clientId: found.clientId, scopes: found.scopes, expiresAt: found.expiresAt, resource: found.resource }
@@ -278,7 +282,8 @@ export class JsonOAuthStore {
     return this.locked(async () => {
       const doc = await this.load();
       const now = Math.floor(Date.now() / 1000);
-      this.sweepExpired(doc, now);
+      const pruned = this.sweepExpired(doc, now);
+      if (pruned) await this.persist(doc);
       const found = doc.refreshTokens.find((t) => t.tokenHash === tokenHash);
       return found
         ? { clientId: found.clientId, scopes: found.scopes, expiresAt: found.expiresAt, resource: found.resource }

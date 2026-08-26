@@ -12,10 +12,16 @@
     "node": ">=22"
   },
   "scripts": {
-    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
+    "audit:moderate": "npm audit --audit-level=moderate",
+    "audit:prod": "npm audit --omit=dev --audit-level=moderate",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json && node dist/runtime/runtime-manifest.js --seal",
+    "build:macos-app": "bash scripts/build-macos-app.sh",
     "chatgpt": "bash start-chatgpt.sh",
     "chatgpt:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File start-chatgpt.ps1",
+    "connector:assistant": "tsx src/cli.ts connector-assistant",
     "start": "node dist/cli.js",
+    "test": "vitest run",
+    "diff:check": "git diff --check",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -28,7 +34,7 @@
     "fast-uri": "3.1.5",
     "hono": "4.12.34",
     "ip-address": "10.3.1",
-    "nanoid": "3.3.17"
+    "nanoid": "3.3.18"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",

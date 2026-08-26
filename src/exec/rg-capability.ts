@@ -723,6 +723,20 @@ export async function getRgCapabilityStatus(input: {
   });
 }
 
+export async function listPendingRgApprovalRequests(
+  stateDir: string,
+  now = Date.now(),
+): Promise<RgApprovalRequest[]> {
+  return withStateLock(stateDir, async () => {
+    const state = await readState(stateDir);
+    const changed = cleanupState(state, now);
+    if (changed) await writeState(stateDir, state);
+    return state.requests
+      .filter((request) => request.status === "pending" && request.expiresAt > now)
+      .sort((left, right) => left.createdAt - right.createdAt);
+  });
+}
+
 interface RgJsonMatchData {
   path?: { text?: string };
   line_number?: number;

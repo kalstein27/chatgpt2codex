@@ -10,11 +10,12 @@ import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middlew
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { classifyMcpRequest } from "./mcp-request-classification.js";
-import { isModernMcpRequest, modernClientName } from "./mcp-discovery.js";
+import { isModernMcpRequest, modernClientName, modernRequestMeta } from "./mcp-discovery.js";
 import { dispatchModernMcpRequest } from "./mcp-modern.js";
 import { classifyModernMcpDiagnostic } from "./mcp-diagnostic-classification.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
 import type { ToolContext } from "../types.js";
+import { backgroundOperationManager } from "../exec/background-operations.js";
 import { createServer as createMcpServer } from "./mcp-server.js";
 import { SingleUserOAuthProvider, type OAuthConfig } from "../auth/oauth-provider.js";
 import { verifyOwnerToken } from "../auth/owner-token.js";
@@ -26,8 +27,14 @@ import {
   FileConnectionDiagnostics,
   type ConnectionDiagnosticSafeInputs,
 } from "../runtime/connection-diagnostics.js";
+import { getRuntimeManifest } from "../runtime/runtime-manifest.js";
+import { currentRuntimeExternalIdentity } from "../runtime/runtime-apply.js";
 import { toRemoteBoundaryError } from "./error-safety.js";
-import { remoteOwnerSessionScope } from "../state/session-scope.js";
+import {
+  remoteConversationSessionScope,
+  remoteTransientSessionScope,
+  remoteTransportSessionScope,
+} from "../state/session-scope.js";
 import {
   McpSessionLifecycleDiagnostics,
   type McpSessionCloseReason,
@@ -289,6 +296,7 @@ function isOAuthBrowserFlowPath(pathName: string): boolean {
 
 export interface RunningHttpServer {
   app: Express;
+  activityTracker: RuntimeActivityTracker;
   config: HttpServerConfig;
   close(): Promise<void>;
 }
@@ -493,6 +501,11 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
     if (loopbackClient && localHealthHosts.has(host)) {
       payload.startedAt = startedAt;
       payload.runtimeVersion = process.env.CHATGPT2CODEX_RUNTIME_VERSION ?? "development";
+      payload.runtimeManifest = getRuntimeManifest();
+      payload.runtimePid = process.pid;
+      const supervisorPid = Number(process.env.CHATGPT2CODEX_SUPERVISOR_PID ?? "");
+      if (Number.isSafeInteger(supervisorPid) && supervisorPid > 0) payload.supervisorPid = supervisorPid;
+      payload.runtimeExternalIdentity = currentRuntimeExternalIdentity();
       payload.platform = process.platform;
     }
     res.json(payload);
@@ -609,6 +622,16 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
     const sessionId = req.header("mcp-session-id");
     const initializeRequest = req.method === "POST" && isInitializeRequest(req.body);
     const requestClassification = classifyMcpRequest(req.body, Boolean(sessionId));
+    void diagnostics.record({
+      event: "mcp.http_request_received",
+      outcome: "info",
+      method: req.method,
+      jsonRpcMethod: requestClassification.jsonRpcMethod,
+      requestKind: requestClassification.requestKind,
+      hasSessionHeader: requestClassification.hasSessionHeader,
+      initializeRequest: requestClassification.initializeRequest,
+      notification: requestClassification.notification,
+    }).catch(() => undefined);
 
     await new Promise<void>((resolve, reject) => {
       bearerAuth(req, res, (error?: unknown) => {
@@ -626,6 +649,17 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
       return;
     }
 
+    void diagnostics.record({
+      event: "mcp.authenticated_request_received",
+      outcome: "info",
+      method: req.method,
+      jsonRpcMethod: requestClassification.jsonRpcMethod,
+      requestKind: requestClassification.requestKind,
+      hasSessionHeader: requestClassification.hasSessionHeader,
+      initializeRequest: requestClassification.initializeRequest,
+      notification: requestClassification.notification,
+    }).catch(() => undefined);
+
     if (
       isModernMcpRequest(
         req.method,
@@ -641,11 +675,14 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
       lastSessionActivityAtMs = now;
       activityTracker.touch(activitySession, now);
       try {
+        const sessionScope =
+          remoteConversationSessionScope(modernRequestMeta(req.body)) ?? remoteTransientSessionScope();
+        activityTracker.updateSession(activitySession, { capabilityScope: sessionScope, now });
         const result = await dispatchModernMcpRequest(
           {
             ...ctx,
             remote: true,
-            sessionScope: remoteOwnerSessionScope(),
+            sessionScope,
             activity: { tracker: activityTracker, session: activitySession },
           },
           req.body,
@@ -714,7 +751,8 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
         const activitySession = activityTracker.openSession({ transport: "http", clientName });
         res.locals.c2ctActivitySession = activitySession;
         const initializeStartedAtMs = Date.now();
-        const sessionScope = remoteOwnerSessionScope();
+        const sessionScope = remoteTransportSessionScope(randomUUID());
+        activityTracker.updateSession(activitySession, { capabilityScope: sessionScope, now: initializeStartedAtMs });
         let trackedSession: TrackedSession | undefined;
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
@@ -829,11 +867,13 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
   let closePromise: Promise<void> | undefined;
   return {
     app,
+    activityTracker,
     config,
     close: async () => {
       if (closePromise) return closePromise;
       closePromise = (async () => {
         clearInterval(sweepInterval);
+        await backgroundOperationManager(ctx.stateDir).shutdown();
         await Promise.all(
           [...sessions.values()].map((session) => closeTrackedSession(session, "shutdown").catch(() => undefined)),
         );

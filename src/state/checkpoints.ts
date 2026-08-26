@@ -34,6 +34,8 @@ export interface CheckpointRecord {
   diff: string;
   restorable?: boolean;
   restoreMode?: "file-snapshot" | "reverse-diff" | "delete-created-file" | "none";
+  restoreState?: "ready" | "restored";
+  restoredAt?: number;
   /** Private local rollback payload. Never expose this through checkpoint_show/list. */
   restoreFiles?: StoredCheckpointFile[];
   createdFile?: {
@@ -44,6 +46,7 @@ export interface CheckpointRecord {
 
 export type PublicCheckpointRecord = Omit<CheckpointRecord, "diff" | "restoreFiles" | "createdFile"> & {
   diff?: string;
+  affectedFiles?: string[];
   createdFile?: { path: string };
 };
 
@@ -140,6 +143,7 @@ export async function createMutationCheckpoint(
     diff: "",
     restorable: restoreFiles.length > 0,
     restoreMode: restoreFiles.length > 0 ? "file-snapshot" : "none",
+    ...(restoreFiles.length > 0 ? { restoreState: "ready" as const } : {}),
     ...(restoreFiles.length > 0 ? { restoreFiles } : {}),
   };
   await writeFile(checkpointPath(root, checkpointId), JSON.stringify(record, null, 2), { mode: 0o600 });
@@ -162,6 +166,7 @@ export async function createFileCheckpoint(
     diff: "",
     restorable: createdNew,
     restoreMode: createdNew ? "delete-created-file" : "none",
+    ...(createdNew ? { restoreState: "ready" as const } : {}),
   };
   if (createdNew) {
     const abs = await resolveInProject(root, rel, { allowSymlink: false, rejectRoot: true });
@@ -176,10 +181,12 @@ export async function createFileCheckpoint(
 }
 
 export function toPublicCheckpoint(record: CheckpointRecord): PublicCheckpointRecord {
-  const { diff, restoreFiles: _restoreFiles, createdFile, ...meta } = record;
+  const { diff, restoreFiles, createdFile, ...meta } = record;
+  const affectedFiles = restoreFiles?.map((file) => file.path) ?? (createdFile ? [createdFile.path] : []);
   return {
     ...meta,
     ...(diff.trim().length > 0 ? { diff: redact(diff) } : {}),
+    ...(affectedFiles.length > 0 ? { affectedFiles } : {}),
     ...(createdFile ? { createdFile: { path: createdFile.path } } : {}),
   };
 }
@@ -237,6 +244,45 @@ async function writeFileAtomically(abs: string, content: Buffer, mode: number | 
     await rm(temp, { force: true }).catch(() => undefined);
     throw error;
   }
+}
+
+async function persistCheckpointRecord(root: string, record: CheckpointRecord): Promise<void> {
+  await ensureCheckpointDir(root);
+  const destination = checkpointPath(root, record.checkpointId);
+  const temporary = `${destination}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporary, JSON.stringify(record, null, 2), { mode: 0o600, flag: "wx" });
+  try {
+    await rename(temporary, destination);
+    await chmod(destination, 0o600).catch(() => undefined);
+  } finally {
+    await rm(temporary, { force: true }).catch(() => undefined);
+  }
+}
+
+async function markCheckpointRestored(root: string, rec: CheckpointRecord): Promise<void> {
+  await persistCheckpointRecord(root, {
+    ...rec,
+    restorable: false,
+    restoreState: "restored",
+    restoredAt: rec.restoredAt ?? Date.now(),
+  });
+}
+
+async function fileSnapshotsMatchRestoredState(root: string, rec: CheckpointRecord): Promise<boolean> {
+  const restoreFiles = rec.restoreFiles;
+  if (!restoreFiles || restoreFiles.length === 0) return false;
+  for (const file of restoreFiles) {
+    const abs = await resolveInProject(root, file.path, { allowSymlink: false, rejectRoot: true });
+    const current = await readCurrentFile(abs);
+    if (file.beforeContentBase64 === undefined) {
+      if (current.content !== null) return false;
+      continue;
+    }
+    const beforeContent = Buffer.from(file.beforeContentBase64, "base64");
+    if (current.content === null || sha256(current.content) !== sha256(beforeContent)) return false;
+    if (file.beforeMode !== undefined && current.mode !== file.beforeMode) return false;
+  }
+  return true;
 }
 
 async function restoreFileSnapshots(root: string, rec: CheckpointRecord): Promise<void> {
@@ -315,22 +361,56 @@ async function restoreFileSnapshots(root: string, rec: CheckpointRecord): Promis
 export async function restoreCheckpoint(root: string, checkpointId: string): Promise<{
   checkpointId: string;
   restored: boolean;
+  status: "RESTORED" | "ALREADY_RESTORED" | "NOT_RESTORABLE";
   restoreMode: "file-snapshot" | "reverse-diff" | "delete-created-file" | "none";
   stdout: string;
   stderr: string;
 }> {
   const rec = await readCheckpoint(root, checkpointId);
   if (rec.restoreMode === "file-snapshot") {
+    if (rec.restoreState === "restored") {
+      return {
+        checkpointId,
+        restored: false,
+        status: "ALREADY_RESTORED",
+        restoreMode: "file-snapshot",
+        stdout: "Checkpoint was already restored.",
+        stderr: "",
+      };
+    }
+    if (await fileSnapshotsMatchRestoredState(root, rec)) {
+      await markCheckpointRestored(root, rec);
+      return {
+        checkpointId,
+        restored: false,
+        status: "ALREADY_RESTORED",
+        restoreMode: "file-snapshot",
+        stdout: "Checkpoint files already match the restored state.",
+        stderr: "",
+      };
+    }
     await restoreFileSnapshots(root, rec);
+    await markCheckpointRestored(root, rec);
     return {
       checkpointId,
       restored: true,
+      status: "RESTORED",
       restoreMode: "file-snapshot",
       stdout: "Restored scoped checkpoint files.",
       stderr: "",
     };
   }
   if (rec.restoreMode === "delete-created-file") {
+    if (rec.restoreState === "restored") {
+      return {
+        checkpointId,
+        restored: false,
+        status: "ALREADY_RESTORED",
+        restoreMode: "delete-created-file",
+        stdout: "Checkpoint was already restored.",
+        stderr: "",
+      };
+    }
     if (!rec.createdFile) {
       throw new DomainError(ErrorCode.CHECKPOINT_NOT_FOUND, "Create checkpoint is missing file metadata", { checkpointId });
     }
@@ -339,12 +419,14 @@ export async function restoreCheckpoint(root: string, checkpointId: string): Pro
     try {
       content = await readFile(abs);
     } catch {
+      await markCheckpointRestored(root, rec);
       return {
         checkpointId,
         restored: false,
+        status: "ALREADY_RESTORED",
         restoreMode: "delete-created-file",
-        stdout: "",
-        stderr: "Created file is already absent.",
+        stdout: "Created file is already absent; checkpoint marked restored.",
+        stderr: "",
       };
     }
     const currentHash = createHash("sha256").update(content).digest("hex");
@@ -355,9 +437,11 @@ export async function restoreCheckpoint(root: string, checkpointId: string): Pro
       });
     }
     await unlink(abs);
+    await markCheckpointRestored(root, rec);
     return {
       checkpointId,
       restored: true,
+      status: "RESTORED",
       restoreMode: "delete-created-file",
       stdout: `Deleted ${rec.createdFile.path}.`,
       stderr: "",
@@ -367,6 +451,7 @@ export async function restoreCheckpoint(root: string, checkpointId: string): Pro
     return {
       checkpointId,
       restored: false,
+      status: "NOT_RESTORABLE",
       restoreMode: "none",
       stdout: "",
       stderr: "Checkpoint is not restorable.",

@@ -2,10 +2,11 @@ import type { Express, Request, Response } from "express";
 import { promises as fs } from "node:fs";
 import { verifyOwnerToken } from "../auth/owner-token.js";
 import type { ToolContext } from "../types.js";
-import { remoteOwnerSessionScope } from "../state/session-scope.js";
+import { remoteConversationSessionScope, remoteTransientSessionScope } from "../state/session-scope.js";
 import { createE2eScreenshotShare, readE2eScreenshotShare } from "../e2e/screenshot-share.js";
 import { CONTROL_TOOL_NAMES, isControlChatGptExposed, isDesktopControlSupported } from "../control/policy.js";
 import { NATIVE_E2E_TOOL_NAMES, isNativeE2eSupported } from "../e2e/capabilities.js";
+import { currentOutputPolicy } from "../runtime/output-policy.js";
 import { createServer as createMcpServer } from "./mcp-server.js";
 import { toRemoteBoundaryError } from "./error-safety.js";
 import { TOOL_AVAILABILITY_GATE, toolCallProof } from "./tool-proof.js";
@@ -29,6 +30,15 @@ interface ActionRoute {
   summary: string;
   description: string;
   schema: string;
+}
+
+function actionRequestMeta(body: unknown): unknown {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  return (body as Record<string, unknown>)._meta;
+}
+
+function remoteActionSessionScope(body: unknown): string {
+  return remoteConversationSessionScope(actionRequestMeta(body)) ?? remoteTransientSessionScope();
 }
 
 const ACTION_ROUTES: ActionRoute[] = [
@@ -65,8 +75,48 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "project_select",
     summary: "Select the active local project",
     description:
-      "Selects and leases the project. GPT Actions default to preset=full-write when preset is omitted, so source edits can be applied directly through chatgpt2codex instead of returning copy/paste scripts. Use preset=image-only only for image-only saves.",
+      "Serial-only project lease acquisition for explicit legacy/admin workflows. Normal coding must use project_lane_open and retain its workLaneId. For legacy-admin calls, GPT Actions defaults to preset=full-write when preset is omitted.",
     schema: "ProjectSelectInput",
+  },
+  {
+    path: "/actions/project-lane-open",
+    tool: "project_lane_open",
+    operationId: "project_lane_open",
+    summary: "Open an isolated project work lane",
+    description: "Open the smallest suitable project work lane for normal coding and retain the exact returned workLaneId.",
+    schema: "ProjectLaneOpenInput",
+  },
+  {
+    path: "/actions/project-lane-status",
+    tool: "project_lane_status",
+    operationId: "project_lane_status",
+    summary: "Validate a project work lane",
+    description: "Validate the exact workLaneId/project binding before lane-aware work.",
+    schema: "ProjectLaneStatusInput",
+  },
+  {
+    path: "/actions/project-lane-renew",
+    tool: "project_lane_renew",
+    operationId: "project_lane_renew",
+    summary: "Renew a project work lane",
+    description: "Renew the exact current work lane without changing its project or preset.",
+    schema: "ProjectLaneLeaseInput",
+  },
+  {
+    path: "/actions/project-lane-release",
+    tool: "project_lane_release",
+    operationId: "project_lane_release",
+    summary: "Release a project work lane",
+    description: "Release only the exact current conversation work lane after work is complete.",
+    schema: "ProjectLaneLeaseInput",
+  },
+  {
+    path: "/actions/project-lane-recover",
+    tool: "project_lane_recover",
+    operationId: "project_lane_recover",
+    summary: "Recover project work-lane state",
+    description: "Run ownership-sensitive lane recovery; foreign abandoned lanes remain locally approval-gated.",
+    schema: "ProjectLaneRecoverInput",
   },
   {
     path: "/actions/project-release",
@@ -76,6 +126,14 @@ const ACTION_ROUTES: ActionRoute[] = [
     description:
       "Call this after mutation, test, image-save, or control work is complete and before the final response. It releases the privileged lease while keeping the project selected by default, and fails closed if another operation is still running.",
     schema: "ProjectReleaseInput",
+  },
+  {
+    path: "/actions/operation-status",
+    tool: "operation_status",
+    operationId: "operation_status",
+    summary: "Read background operation status",
+    description: "Read one exact background operation and carry the same workLaneId when the operation is lane-bound.",
+    schema: "OperationStatusInput",
   },
   {
     path: "/actions/connection-audit",
@@ -191,8 +249,18 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "command_run",
     operationId: "command_run",
     summary: "Run allowlisted project command",
-    description: "Run an allowlisted project command through chatgpt2codex.",
+    description:
+      "Run an allowlisted project command through chatgpt2codex. Foreground is the remote default for ordinary bounded checks. If executionMode is omitted and expectedDurationSec is above 20 seconds, or background is explicitly requested, the command is handed off. While turnContinuationRequired=true, immediately poll operation_status through generic call_tool and do not finalize the assistant turn.",
     schema: "CommandRunInput",
+  },
+  {
+    path: "/actions/verified-local-file-apply",
+    tool: "verified_local_file_apply",
+    operationId: "verified_local_file_apply",
+    summary: "Apply one verified fixed local file",
+    description:
+      "Apply one predeclared integrity-verified local artifact to one predeclared fixed local destination. This action cannot accept commands, argv, raw source paths, raw destination paths, network access, or process launch requests.",
+    schema: "VerifiedLocalFileApplyInput",
   },
   {
     path: "/actions/output-read",
@@ -350,9 +418,13 @@ const OPENAPI_ACTION_TOOL_NAMES = new Set([
   "agent_guide",
   "goal_intake",
   "goal_loop",
+  "project_lane_open",
+  "project_lane_status",
+  "project_lane_renew",
+  "project_lane_release",
+  "project_lane_recover",
   "project_select",
-  "project_release",
-  "connection_audit",
+  "operation_status",
   "workspace_list_projects",
   "project_status",
   "project_rules",
@@ -362,13 +434,9 @@ const OPENAPI_ACTION_TOOL_NAMES = new Set([
   "file_edit_lines",
   "file_create",
   "command_run",
+  "verified_local_file_apply",
   "output_read",
-  "e2e_start_server",
-  "e2e_open_target",
-  "e2e_run_command",
   "e2e_test_and_show_screenshot",
-  "e2e_screenshot",
-  "e2e_open_url_screenshot",
   "repo_status",
   "repo_diff_summary",
   "git_commit",
@@ -578,6 +646,7 @@ async function actionResponse(ctx: ToolContext, publicOrigin: string, tool: stri
     ok,
     tool,
     toolCall: toolCallProof(tool, ok),
+    outputPolicy: currentOutputPolicy(),
     text: inlineText,
     imageMarkdown: enriched.markdown[0],
     imageMarkdownList: enriched.markdown,
@@ -595,6 +664,7 @@ async function actionErrorResponse(ctx: ToolContext, tool: string, error: unknow
     ok: false,
     tool,
     toolCall: toolCallProof(tool, false),
+    outputPolicy: currentOutputPolicy(),
     text: boundary.message,
     structuredContent: {
       code: boundary.code,
@@ -605,7 +675,7 @@ async function actionErrorResponse(ctx: ToolContext, tool: string, error: unknow
   };
 }
 
-function openApiSpec(publicOrigin: string): Record<string, unknown> {
+export function openApiSpec(publicOrigin: string): Record<string, unknown> {
   const paths: Record<string, unknown> = {
     "/actions/health": {
       get: {
@@ -676,9 +746,9 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
       title: "chatgpt2codex Custom GPT Actions",
       version: "0.1.6",
       description:
-        "OpenAPI bridge for Custom GPTs. This does not call OpenAI Codex or spend Codex quota; ChatGPT drives local coding actions through chatgpt2codex. Hard gate: do not claim local project inspection, edits, tests, commits, or image saves unless a current-turn ActionToolResponse includes ok=true and toolCall.namespace=ChatGPT_To_Codex. If the active ChatGPT app was Image Generation/ImageGen, image_gen, python_user_visible, or a text-only answer, no chatgpt2codex local work happened; reselect/reconnect ChatGPT To Codex or refresh this Action schema. For /goal or broad implementation prompts, call goal_intake or goal_loop immediately before long reasoning. This compact schema stays under 30 operations including action_health and call_tool, and exposes exact tool names such as workspace_list_projects, project_select, code_search, file_read_slice, file_edit_lines, file_apply_patch, file_create, and command_run for source editing. It avoids broad context-pack actions that ChatGPT safety may block; inspect with code_search followed by narrow file_read_slice calls instead. " +
+        "OpenAPI bridge for Custom GPTs. This does not call OpenAI Codex or spend Codex quota; ChatGPT drives local coding actions through chatgpt2codex. Bootstrap lease-neutrally with connection_status -> agent_guide before acquiring project capability; this works even when zero projects are registered. The live agent_guide is the canonical C2CT contract. When multi-project lanes are enabled, normal coding uses the dedicated project_lane_open/status/renew/release/recover actions and carries the exact workLaneId through lane-aware dedicated actions. project_select remains a legacy/admin serial path, not a normal coding fallback. Platform-compatible tools omitted from the compact dedicated surface remain reachable through call_tool with their runtime schema validation and approval gates intact. Hard gate: do not claim local project inspection, edits, tests, commits, or image saves unless a current-turn ActionToolResponse includes ok=true and toolCall.namespace=ChatGPT_To_Codex. If the active ChatGPT app was Image Generation/ImageGen, image_gen, python_user_visible, or a text-only answer, no chatgpt2codex local work happened; reselect/reconnect ChatGPT To Codex or refresh this Action schema. For /goal or broad implementation prompts, call goal_intake or goal_loop immediately before long reasoning. This compact schema stays at or below 30 operations including action_health and call_tool. It avoids broad context-pack actions that ChatGPT safety may block; inspect with code_search followed by narrow file_read_slice calls instead. " +
         (isNativeE2eSupported()
-          ? "On macOS it also exposes e2e_test_and_show_screenshot plus E2E server/app launch and screenshot capture. "
+          ? "On macOS it directly exposes e2e_test_and_show_screenshot; lower-level E2E operations remain available through call_tool. "
           : `Native E2E screenshot actions are omitted on ${process.platform}; use command_run for verification. `) +
         "Registered platform-compatible tools without a dedicated route remain reachable through call_tool. ChatGPT's sandbox cannot write /Users/... directly; use these actions. For generated images, use a Share/Copy Link/content URL, copied image, download, or local path with save_chatgpt_image/save_chatgpt_image_from_url.",
       "x-chatgpt2codex-tool-proof": TOOL_AVAILABILITY_GATE,
@@ -725,6 +795,18 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
               description:
                 "The user's broad /goal, deep research, implementation, debugging, review, or planning request. Pass the full request text.",
             },
+            dashboardTitle: {
+              type: "string",
+              maxLength: 80,
+              description:
+                "Short human-readable C2CT dashboard name, typically 3-8 words. Provide it when the exact ChatGPT conversation title is unavailable.",
+            },
+            displayTitle: {
+              type: "string",
+              maxLength: 120,
+              description:
+                "Exact current ChatGPT conversation title only. Omit when unavailable; never substitute a task summary.",
+            },
             projectId: { type: "string", description: "Optional known project id/name." },
             mode: { type: "string", enum: ["implement", "research", "debug", "review", "plan"] },
             urgency: { type: "string", enum: ["normal", "fast"] },
@@ -739,11 +821,24 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
               description:
                 "The user's full coding goal. Required on the first loop call unless loopId is provided.",
             },
+            dashboardTitle: {
+              type: "string",
+              maxLength: 80,
+              description:
+                "Short human-readable C2CT dashboard name, typically 3-8 words. Provide it when the exact ChatGPT conversation title is unavailable.",
+            },
+            displayTitle: {
+              type: "string",
+              maxLength: 120,
+              description:
+                "Exact current ChatGPT conversation title only. Omit when unavailable; never substitute a task summary.",
+            },
             loopId: {
               type: "string",
               description: "Existing local loop id returned by a previous goal_loop call.",
             },
             projectId: { type: "string", description: "Optional known project id/name." },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             mode: { type: "string", enum: ["implement", "research", "debug", "review", "plan"] },
             maxTurns: { type: "integer", minimum: 1, maximum: 50, description: "Maximum ChatGPT action turns for this loop." },
             lastResult: {
@@ -782,7 +877,10 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           type: "object",
           additionalProperties: false,
           required: ["projectId"],
-          properties: { projectId: { type: "string" } },
+          properties: {
+            projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
+          },
         },
         CommandListInput: {
           type: "object",
@@ -790,6 +888,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId"],
           properties: {
             projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             query: { type: "string", minLength: 1, maxLength: 200 },
             commandIds: {
               type: "array",
@@ -804,16 +903,60 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
         ProjectSelectInput: {
           type: "object",
           additionalProperties: false,
-          required: ["projectId", "reason"],
+          required: ["projectId", "reason", "purpose"],
           properties: {
             projectId: { type: "string", description: "Project id or name, for example chatgpt2codex." },
             reason: { type: "string" },
+            purpose: {
+              type: "string",
+              enum: ["legacy-admin"],
+              description: "Explicit serial-only purpose. Normal coding must use a project work lane.",
+            },
             preset: {
               type: "string",
               enum: ["read-only", "tests-only", "full-write", "image-only"],
-              description: "Defaults to full-write on the GPT Actions bridge when omitted.",
+              description: "Legacy-admin serial preset. Defaults to full-write on the GPT Actions bridge when omitted; normal coding uses project_lane_open instead.",
             },
             confirmSwitch: { type: "boolean" },
+          },
+        },
+        ProjectLaneOpenInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["projectId", "preset", "reason"],
+          properties: {
+            projectId: { type: "string" },
+            preset: { type: "string", enum: ["read-only", "tests-only", "full-write", "image-only"] },
+            reason: { type: "string", minLength: 1 },
+          },
+        },
+        ProjectLaneStatusInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["projectId", "workLaneId"],
+          properties: {
+            projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
+          },
+        },
+        ProjectLaneLeaseInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["projectId", "workLaneId", "leaseId", "reason"],
+          properties: {
+            projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
+            leaseId: { type: "string", pattern: "^lease_[0-9a-fA-F-]{36}$" },
+            reason: { type: "string", minLength: 1 },
+          },
+        },
+        ProjectLaneRecoverInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["projectId", "reason"],
+          properties: {
+            projectId: { type: "string" },
+            reason: { type: "string", minLength: 1 },
           },
         },
         ProjectReleaseInput: {
@@ -829,6 +972,16 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
               default: true,
               description: "Keep the project selected in read mode after releasing its lease.",
             },
+          },
+        },
+        OperationStatusInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["projectId", "operationId"],
+          properties: {
+            projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
+            operationId: { type: "string", pattern: "^bg_[0-9a-f-]{36}$" },
           },
         },
         ConnectionAuditInput: {
@@ -860,6 +1013,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "query"],
           properties: {
             projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             query: { type: "string" },
             mode: { type: "string", enum: ["text", "symbol", "semantic"] },
             maxResults: { type: "integer", minimum: 1, maximum: 200 },
@@ -871,6 +1025,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "path"],
           properties: {
             projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             path: { type: "string" },
             start: { type: "integer", minimum: 1 },
             end: { type: "integer", minimum: 1 },
@@ -889,6 +1044,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "patch"],
           properties: {
             projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             patch: { type: "string", description: "Codex-style *** Begin Patch envelope." },
             preconditionHashes: { type: "object", additionalProperties: { type: "string" } },
           },
@@ -899,6 +1055,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "edits"],
           properties: {
             projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             edits: {
               type: "array",
               minItems: 1,
@@ -939,6 +1096,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "path", "content"],
           properties: {
             projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             path: { type: "string" },
             content: { type: "string" },
             overwrite: { type: "boolean" },
@@ -950,8 +1108,14 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "commandId"],
           properties: {
             projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             commandId: { type: "string" },
             args: { type: "array", items: { type: "string" } },
+            executionMode: {
+              type: "string",
+              enum: ["synchronous", "background"],
+              description: "Compatibility hint. Remote ChatGPT/Action calls are always promoted to background handoff; synchronous is honored only by local in-process callers.",
+            },
             intent: {
               type: "object",
               additionalProperties: false,
@@ -963,12 +1127,31 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
             },
           },
         },
+        VerifiedLocalFileApplyInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["projectId", "workLaneId", "operationSpecId"],
+          properties: {
+            projectId: { type: "string" },
+            workLaneId: {
+              type: "string",
+              pattern: "^lane_[0-9a-fA-F-]{36}$",
+              description: "Exact verified C2CT full-write work lane for this project.",
+            },
+            operationSpecId: {
+              type: "string",
+              pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$",
+              description: "ID of one project-predeclared fixedLocalFileOperations entry. It is not a command or path.",
+            },
+          },
+        },
         LocalShellRunInput: {
           type: "object",
           additionalProperties: false,
           required: ["projectId", "command"],
           properties: {
             projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             command: { type: "string" },
             cwd: { type: "string" },
             timeoutSec: { type: "integer", minimum: 1, maximum: 900 },
@@ -989,6 +1172,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           additionalProperties: false,
           required: ["outputRef"],
           properties: {
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             outputRef: { type: "string", pattern: "^out_[a-z0-9]+_[a-f0-9]{16}$" },
             offset: { type: "integer", minimum: 0 },
             maxBytes: { type: "integer", minimum: 1, maximum: 262144 },
@@ -1000,6 +1184,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "command"],
           properties: {
             projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             command: { type: "string", description: "Dev/server command to run in the project, e.g. npm run dev -- --host 127.0.0.1." },
             cwd: { type: "string", description: "Optional project-relative working directory." },
             label: { type: "string" },
@@ -1021,6 +1206,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           additionalProperties: false,
           properties: {
             projectId: { type: "string", description: "Required when appPath is project-relative or screenshot proof should be tied to a project." },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             url: { type: "string" },
             appName: { type: "string", description: "Installed macOS app name, e.g. Safari or ChatGPT." },
             appPath: { type: "string", description: "Absolute /Applications path or project-relative .app path." },
@@ -1033,6 +1219,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "command"],
           properties: {
             projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             command: { type: "string", description: "E2E/test command to run in the project, e.g. npm run test:e2e." },
             cwd: { type: "string", description: "Optional project-relative working directory." },
             timeoutSec: { type: "integer", minimum: 1, maximum: 900 },
@@ -1061,6 +1248,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           additionalProperties: false,
           properties: {
             projectId: { type: "string", description: "Optional. If omitted, use the currently selected project." },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             instruction: {
               type: "string",
               description: "The user's natural-language request, e.g. e2e 테스트하고 스크린샷 보여줘.",
@@ -1078,6 +1266,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId"],
           properties: {
             projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             label: { type: "string" },
             waitMs: { type: "integer", minimum: 0, maximum: 30000 },
             openAfterCapture: { type: "boolean", description: "Open the screenshot on the Mac immediately after capture." },
@@ -1089,6 +1278,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "url"],
           properties: {
             projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             url: { type: "string" },
             label: { type: "string" },
             waitMs: { type: "integer", minimum: 0, maximum: 30000 },
@@ -1101,6 +1291,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "checkpointId"],
           properties: {
             projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             checkpointId: { type: "string" },
           },
         },
@@ -1110,6 +1301,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "message"],
           properties: {
             projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             message: { type: "string" },
             paths: { type: "array", items: { type: "string" } },
           },
@@ -1120,6 +1312,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId"],
           properties: {
             projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             remote: { type: "string" },
             branch: { type: "string" },
           },
@@ -1129,6 +1322,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           additionalProperties: false,
           properties: {
             projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             destPath: { type: "string" },
             url: { type: "string" },
             sourcePath: { type: "string" },
@@ -1144,6 +1338,7 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           properties: {
             url: { type: "string" },
             projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             destPath: { type: "string" },
             metadata: { type: "object", additionalProperties: true },
           },
@@ -1152,7 +1347,10 @@ function openApiSpec(publicOrigin: string): Record<string, unknown> {
           type: "object",
           additionalProperties: false,
           required: ["projectId"],
-          properties: { projectId: { type: "string" } },
+          properties: {
+            projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
+          },
         },
         ActionToolResponse: {
           type: "object",
@@ -1261,7 +1459,7 @@ export function registerActionRoutes(app: Express, ctx: ToolContext, publicUrl: 
   app.post("/actions/call-tool", async (req, res) => {
     try {
       if (!(await requireOwnerBearer(ctx, req, res))) return;
-      const scopedCtx = { ...ctx, remote: true, sessionScope: remoteOwnerSessionScope() };
+      const scopedCtx = { ...ctx, remote: true, sessionScope: remoteActionSessionScope(req.body) };
       const { toolName, input } = genericToolInput(req.body);
       if (!toolName) {
         res.status(400).json({ ok: false, error: "Missing toolName" });
@@ -1278,7 +1476,7 @@ export function registerActionRoutes(app: Express, ctx: ToolContext, publicUrl: 
     app.post(route.path, async (req, res) => {
       try {
         if (!(await requireOwnerBearer(ctx, req, res))) return;
-        const scopedCtx = { ...ctx, remote: true, sessionScope: remoteOwnerSessionScope() };
+        const scopedCtx = { ...ctx, remote: true, sessionScope: remoteActionSessionScope(req.body) };
         const result = await callRegisteredTool(scopedCtx, route.tool, actionInputForRoute(route, req.body));
         res.json(await actionResponse(scopedCtx, publicOrigin, route.tool, result));
       } catch (error) {

@@ -9,8 +9,18 @@ const STATE_SCHEMA_VERSION = 1;
 const DEFAULT_TTL_MS = 10 * 60 * 1000;
 const MAX_RETAINED_REQUESTS = 100;
 
-export type OperationRisk = "network" | "destructive";
+export type OperationRisk = "network" | "destructive" | "local-file-mutation";
 export type OperationApprovalStatus = "pending" | "approved" | "rejected" | "expired" | "consumed";
+export type OperationApprovalVia = "local-control-api" | "menu-bar-ui" | "mobile-ntfy" | "mobile-web";
+
+const MOBILE_APPROVABLE_OPERATION_TOOLS = new Set([
+  "command_run",
+  "verified_local_file_apply",
+]);
+
+export function isMobileApprovableOperationTool(tool: string): boolean {
+  return MOBILE_APPROVABLE_OPERATION_TOOLS.has(tool);
+}
 
 export interface OperationApprovalRequest {
   requestId: string;
@@ -23,10 +33,12 @@ export interface OperationApprovalRequest {
   risk: OperationRisk;
   operationFingerprint: string;
   preview: string;
+  originOperationId?: string;
   createdAt: number;
   expiresAt: number;
   resolvedAt?: number;
   consumedAt?: number;
+  approvedVia?: OperationApprovalVia;
 }
 
 interface OperationApprovalState {
@@ -41,8 +53,16 @@ export interface EnsureOperationApprovalInput {
   risk: OperationRisk;
   operation: unknown;
   preview: string;
+  originOperationId?: string;
   ttlMs?: number;
   now?: number;
+  requiredApprovalVia?: OperationApprovalVia;
+}
+
+export interface WaitForOperationAuthorizationInput extends EnsureOperationApprovalInput {
+  requestId: string;
+  pollIntervalMs?: number;
+  shouldAbort?: () => boolean;
 }
 
 export interface OperationAuthorization {
@@ -103,11 +123,17 @@ function validRequest(value: unknown): value is OperationApprovalRequest {
     typeof request.leaseId === "string" &&
     typeof request.leaseExpiresAt === "number" &&
     typeof request.tool === "string" &&
-    (request.risk === "network" || request.risk === "destructive") &&
+    (request.risk === "network" || request.risk === "destructive" || request.risk === "local-file-mutation") &&
     typeof request.operationFingerprint === "string" &&
     typeof request.preview === "string" &&
+    (request.originOperationId === undefined || typeof request.originOperationId === "string") &&
     typeof request.createdAt === "number" &&
-    typeof request.expiresAt === "number"
+    typeof request.expiresAt === "number" &&
+    (request.approvedVia === undefined ||
+      request.approvedVia === "local-control-api" ||
+      request.approvedVia === "menu-bar-ui" ||
+      request.approvedVia === "mobile-ntfy" ||
+      request.approvedVia === "mobile-web")
   );
 }
 
@@ -183,6 +209,7 @@ function requestDetails(request: OperationApprovalRequest, created: boolean): Re
     tool: request.tool,
     risk: request.risk,
     preview: request.preview,
+    ...(request.originOperationId ? { originOperationId: request.originOperationId } : {}),
     expiresAt: request.expiresAt,
   };
 }
@@ -210,11 +237,25 @@ export async function ensureOperationAuthorized(
       request.operationFingerprint === fingerprint,
     );
 
-    if (matching?.status === "approved") {
+    if (matching?.status === "approved" &&
+        (!input.requiredApprovalVia || matching.approvedVia === input.requiredApprovalVia)) {
       matching.status = "consumed";
       matching.consumedAt = now;
       await writeState(input.stateDir, state);
       return { requestId: matching.requestId, scope: "once", operationFingerprint: fingerprint };
+    }
+
+    if (matching?.status === "approved") {
+      if (changed) await writeState(input.stateDir, state);
+      throw new DomainError(
+        ErrorCode.APPROVAL_REQUIRED,
+        `Approval for ${input.tool} did not come from the required local UI`,
+        {
+          ...requestDetails(matching, false),
+          requiredApprovalVia: input.requiredApprovalVia,
+          approvedVia: matching.approvedVia ?? null,
+        },
+      );
     }
 
     if (matching?.status === "pending") {
@@ -238,6 +279,9 @@ export async function ensureOperationAuthorized(
       risk: input.risk,
       operationFingerprint: fingerprint,
       preview: normalizeText(input.preview, "Protected operation", 320),
+      ...(input.originOperationId
+        ? { originOperationId: normalizeText(input.originOperationId, "operation", 120) }
+        : {}),
       createdAt: now,
       expiresAt: Math.min(now + ttlMs, input.lease.expiresAt),
     };
@@ -250,6 +294,150 @@ export async function ensureOperationAuthorized(
       requestDetails(request, true),
     );
   });
+}
+
+function approvalFingerprint(input: EnsureOperationApprovalInput): string {
+  return operationFingerprint({
+    projectId: input.lease.projectId,
+    projectRoot: input.lease.projectRoot,
+    leaseId: input.lease.leaseId,
+    tool: input.tool,
+    risk: input.risk,
+    operation: input.operation,
+  });
+}
+
+export async function waitForOperationAuthorization(
+  input: WaitForOperationAuthorizationInput,
+): Promise<OperationAuthorization> {
+  const pollIntervalMs = Math.min(1_000, Math.max(10, input.pollIntervalMs ?? 100));
+  const fingerprint = approvalFingerprint(input);
+
+  for (;;) {
+    if (input.shouldAbort?.()) {
+      await withStateLock(input.stateDir, async () => {
+        const now = Date.now();
+        const state = await readState(input.stateDir);
+        const changed = cleanupState(state, now);
+        const request = state.requests.find((entry) => entry.requestId === input.requestId);
+        const exactBinding = request &&
+          request.projectId === input.lease.projectId &&
+          request.projectRoot === input.lease.projectRoot &&
+          request.leaseId === input.lease.leaseId &&
+          request.tool === input.tool &&
+          request.risk === input.risk &&
+          request.operationFingerprint === fingerprint;
+        if (exactBinding && (request.status === "pending" || request.status === "approved")) {
+          request.status = "rejected";
+          request.resolvedAt = now;
+          await writeState(input.stateDir, state);
+        } else if (changed) {
+          await writeState(input.stateDir, state);
+        }
+      });
+      throw new DomainError(
+        ErrorCode.PERMISSION_DENIED,
+        `Client cancelled ${input.tool} while local approval was pending`,
+        {
+          requestId: input.requestId,
+          approvalStatus: "client-cancelled",
+          blockedAt: "c2ct-approval",
+          actionStarted: false,
+          subprocessStarted: false,
+        },
+      );
+    }
+
+    const outcome = await withStateLock(input.stateDir, async () => {
+      const now = Date.now();
+      const state = await readState(input.stateDir);
+      const changed = cleanupState(state, now);
+      const request = state.requests.find((entry) => entry.requestId === input.requestId);
+      if (!request) {
+        if (changed) await writeState(input.stateDir, state);
+        throw new DomainError(ErrorCode.OPERATION_NOT_FOUND, `Operation approval request not found: ${input.requestId}`, {
+          requestId: input.requestId,
+          blockedAt: "c2ct-approval",
+          actionStarted: false,
+          subprocessStarted: false,
+        });
+      }
+      if (
+        request.projectId !== input.lease.projectId ||
+        request.projectRoot !== input.lease.projectRoot ||
+        request.leaseId !== input.lease.leaseId ||
+        request.tool !== input.tool ||
+        request.risk !== input.risk ||
+        request.operationFingerprint !== fingerprint
+      ) {
+        if (changed) await writeState(input.stateDir, state);
+        throw new DomainError(ErrorCode.PERMISSION_DENIED, "Operation approval binding changed while waiting", {
+          requestId: input.requestId,
+          approvalStatus: request.status,
+          blockedAt: "c2ct-approval",
+          actionStarted: false,
+          subprocessStarted: false,
+        });
+      }
+      if (request.status === "approved") {
+        if (input.requiredApprovalVia && request.approvedVia !== input.requiredApprovalVia) {
+          if (changed) await writeState(input.stateDir, state);
+          throw new DomainError(
+            ErrorCode.APPROVAL_REQUIRED,
+            `Approval for ${input.tool} did not come from the required local UI`,
+            {
+              ...requestDetails(request, false),
+              requiredApprovalVia: input.requiredApprovalVia,
+              approvedVia: request.approvedVia ?? null,
+            },
+          );
+        }
+        request.status = "consumed";
+        request.consumedAt = now;
+        await writeState(input.stateDir, state);
+        return {
+          kind: "authorized" as const,
+          authorization: { requestId: request.requestId, scope: "once" as const, operationFingerprint: fingerprint },
+        };
+      }
+      if (request.status === "rejected") {
+        if (changed) await writeState(input.stateDir, state);
+        throw new DomainError(ErrorCode.PERMISSION_DENIED, `Local approval was rejected for ${input.tool}`, {
+          ...requestDetails(request, false),
+          approvalStatus: "rejected",
+          blockedAt: "c2ct-approval",
+          actionStarted: false,
+          subprocessStarted: false,
+        });
+      }
+      if (request.status === "expired") {
+        if (changed) await writeState(input.stateDir, state);
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `Local approval expired for ${input.tool}`, {
+          ...requestDetails(request, false),
+          approvalStatus: "expired",
+          blockedAt: "c2ct-approval",
+          actionStarted: false,
+          subprocessStarted: false,
+        });
+      }
+      if (request.status === "consumed") {
+        if (changed) await writeState(input.stateDir, state);
+        throw new DomainError(ErrorCode.PERMISSION_DENIED, `Local approval was already consumed for ${input.tool}`, {
+          ...requestDetails(request, false),
+          approvalStatus: "consumed",
+          blockedAt: "c2ct-approval",
+          actionStarted: false,
+          subprocessStarted: false,
+        });
+      }
+      if (changed) await writeState(input.stateDir, state);
+      return { kind: "pending" as const, expiresAt: request.expiresAt };
+    });
+
+    if (outcome.kind === "authorized") return outcome.authorization;
+    const delayMs = Math.max(1, Math.min(pollIntervalMs, outcome.expiresAt - Date.now()));
+    await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+  }
 }
 
 export async function listOperationApprovalRequests(
@@ -267,6 +455,7 @@ export async function resolveOperationApprovalRequest(input: {
   stateDir: string;
   requestId: string;
   decision: "approve" | "reject";
+  approvedVia?: OperationApprovalVia;
   now?: number;
 }): Promise<OperationApprovalRequest> {
   return withStateLock(input.stateDir, async () => {
@@ -281,7 +470,38 @@ export async function resolveOperationApprovalRequest(input: {
         status: request.status,
       });
     }
+    if ((input.approvedVia === "mobile-ntfy" || input.approvedVia === "mobile-web") &&
+        !isMobileApprovableOperationTool(request.tool)) {
+      throw new DomainError(
+        ErrorCode.PERMISSION_DENIED,
+        "Mobile approval is allowed only for explicitly mobile-approvable exact operations",
+        { requestId: input.requestId, tool: request.tool },
+      );
+    }
+    if (input.decision === "approve" &&
+        request.tool === "runtime_apply_local" &&
+        input.approvedVia !== "menu-bar-ui") {
+      throw new DomainError(
+        ErrorCode.APPROVAL_REQUIRED,
+        "Runtime apply must be approved from the ChatGPT To Codex menu-bar UI",
+        {
+          requestId: input.requestId,
+          tool: request.tool,
+          requiredApprovalVia: "menu-bar-ui",
+        },
+      );
+    }
+    if (input.decision === "approve" &&
+        input.approvedVia === "menu-bar-ui" &&
+        request.tool !== "runtime_apply_local") {
+      throw new DomainError(
+        ErrorCode.INVALID_ARGUMENT,
+        "The runtime-apply menu approval endpoint only accepts runtime_apply_local requests",
+        { requestId: input.requestId, tool: request.tool },
+      );
+    }
     request.status = input.decision === "approve" ? "approved" : "rejected";
+    if (input.decision === "approve") request.approvedVia = input.approvedVia ?? "local-control-api";
     request.resolvedAt = now;
     await writeState(input.stateDir, state);
     return request;
@@ -296,8 +516,10 @@ export function operationApprovalSummary(request: OperationApprovalRequest): Rec
     tool: request.tool,
     risk: request.risk,
     preview: request.preview,
+    ...(request.originOperationId ? { originOperationId: request.originOperationId } : {}),
     createdAt: request.createdAt,
     expiresAt: request.expiresAt,
     resolvedAt: request.resolvedAt,
+    approvedVia: request.approvedVia,
   };
 }

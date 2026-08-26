@@ -3,10 +3,10 @@ import ApplicationServices
 import CoreGraphics
 import Foundation
 
-// `chatgpt2codex-ax`: a small native CLI compiled into the signed app bundle
-// at Contents/MacOS/chatgpt2codex-ax (see scripts/build-macos-app.sh), used
-// by src/control/mac-input.ts as the preferred AX semantic-targeting engine
-// for Option B desktop control:
+// `chatgpt2codex-ax`: a legacy compatibility CLI compiled into the signed app
+// bundle at Contents/MacOS/chatgpt2codex-ax (see scripts/build-macos-app.sh).
+// The menu-bar-process Accessibility bridge is the primary engine so TCC is
+// evaluated against the app's stable identity; this helper is fallback only:
 //
 //   chatgpt2codex-ax resolve    <<< {"appName":"...","role":"...","title":"...","description":"..."}
 //   chatgpt2codex-ax press      <<< same shape
@@ -183,28 +183,119 @@ private func enableManualAccessibility(_ appElement: AXUIElement) {
 /// does. A short settle delay gives the app time to actually become key
 /// before events are posted; harmless (and skipped) when appName is absent
 /// or not currently running.
-private func activateIfNeeded(_ appName: String?) {
-    guard let appName, let app = findRunningApp(appName) else { return }
-    app.activate(options: [])
-    usleep(150_000)
+private func activateAndConfirmFrontmost(_ appName: String?) -> Bool {
+    guard let appName, let app = findRunningApp(appName) else { return false }
+    if NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier { return true }
+    guard app.activate(options: [.activateAllWindows]) else { return false }
+    for _ in 0..<12 {
+        if NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier { return true }
+        usleep(50_000)
+    }
+    return NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
+}
+
+private func pressAppElementAtPoint(appName: String?, x: Double, y: Double) -> Bool {
+    guard let appName, let app = findRunningApp(appName) else { return false }
+    let appElement = AXUIElementCreateApplication(app.processIdentifier)
+    enableManualAccessibility(appElement)
+    var hit: AXUIElement?
+    guard AXUIElementCopyElementAtPosition(appElement, Float(x), Float(y), &hit) == .success,
+          let hit
+    else { return false }
+    var rawActions: CFArray?
+    guard AXUIElementCopyActionNames(hit, &rawActions) == .success,
+          let actions = rawActions as? [String],
+          actions.contains(kAXPressAction as String)
+    else { return false }
+    return AXUIElementPerformAction(hit, kAXPressAction as CFString) == .success
 }
 
 /// Synthesizes a left-click at an absolute screen point via CGEvent. The
 /// point is always pre-resolved by the TypeScript caller (window-relative
 /// fraction -> absolute point via the app's current window bounds); this
 /// helper never picks a coordinate itself.
-private func synthesizeClick(x: Double, y: Double) -> Bool {
-    guard let source = CGEventSource(stateID: .hidSystemState) else { return false }
+private func mouseEventTypes(_ button: String) -> (CGEventType, CGEventType, CGEventType, CGMouseButton)? {
+    switch button.lowercased() {
+    case "left": return (.leftMouseDown, .leftMouseUp, .leftMouseDragged, .left)
+    case "right": return (.rightMouseDown, .rightMouseUp, .rightMouseDragged, .right)
+    case "middle": return (.otherMouseDown, .otherMouseUp, .otherMouseDragged, .center)
+    default: return nil
+    }
+}
+
+private func synthesizeClick(x: Double, y: Double, button: String = "left", clickCount: Int = 1) -> Bool {
+    guard let source = CGEventSource(stateID: .hidSystemState),
+          let types = mouseEventTypes(button),
+          (1...2).contains(clickCount)
+    else { return false }
+    let originalCursorPosition = CGEvent(source: nil)?.location
+    defer {
+        if let originalCursorPosition {
+            _ = CGWarpMouseCursorPosition(originalCursorPosition)
+        }
+    }
     let point = CGPoint(x: x, y: y)
-    guard
-        let down = CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left),
-        let up = CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)
-    else {
-        return false
+    for clickIndex in 1...clickCount {
+        guard let down = CGEvent(mouseEventSource: source, mouseType: types.0, mouseCursorPosition: point, mouseButton: types.3),
+              let up = CGEvent(mouseEventSource: source, mouseType: types.1, mouseCursorPosition: point, mouseButton: types.3)
+        else { return false }
+        down.setIntegerValueField(.mouseEventClickState, value: Int64(clickIndex))
+        up.setIntegerValueField(.mouseEventClickState, value: Int64(clickIndex))
+        down.post(tap: .cghidEventTap)
+        usleep(20_000)
+        up.post(tap: .cghidEventTap)
+        if clickIndex < clickCount { usleep(60_000) }
+    }
+    return true
+}
+
+private func synthesizeMove(x: Double, y: Double) -> Bool {
+    guard let source = CGEventSource(stateID: .hidSystemState),
+          let event = CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: CGPoint(x: x, y: y), mouseButton: .left)
+    else { return false }
+    event.post(tap: .cghidEventTap)
+    return true
+}
+
+private func synthesizeDrag(points: [CGPoint], button: String = "left") -> Bool {
+    guard points.count >= 2, points.count <= 32,
+          let source = CGEventSource(stateID: .hidSystemState),
+          let types = mouseEventTypes(button),
+          let first = points.first, let last = points.last,
+          let down = CGEvent(mouseEventSource: source, mouseType: types.0, mouseCursorPosition: first, mouseButton: types.3)
+    else { return false }
+    let originalCursorPosition = CGEvent(source: nil)?.location
+    defer {
+        if let originalCursorPosition {
+            _ = CGWarpMouseCursorPosition(originalCursorPosition)
+        }
     }
     down.post(tap: .cghidEventTap)
+    usleep(25_000)
+    for point in points.dropFirst().dropLast() {
+        guard let drag = CGEvent(mouseEventSource: source, mouseType: types.2, mouseCursorPosition: point, mouseButton: types.3) else { return false }
+        drag.post(tap: .cghidEventTap)
+        usleep(12_000)
+    }
+    guard let dragLast = CGEvent(mouseEventSource: source, mouseType: types.2, mouseCursorPosition: last, mouseButton: types.3),
+          let up = CGEvent(mouseEventSource: source, mouseType: types.1, mouseCursorPosition: last, mouseButton: types.3)
+    else { return false }
+    dragLast.post(tap: .cghidEventTap)
     usleep(20_000)
     up.post(tap: .cghidEventTap)
+    return true
+}
+
+private func synthesizeScroll(x: Double, y: Double, scrollX: Double, scrollY: Double) -> Bool {
+    guard let source = CGEventSource(stateID: .hidSystemState),
+          let event = CGEvent(
+            scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2,
+            wheel1: Int32(max(-4000, min(4000, -scrollY.rounded()))),
+            wheel2: Int32(max(-4000, min(4000, -scrollX.rounded()))), wheel3: 0
+          )
+    else { return false }
+    event.location = CGPoint(x: x, y: y)
+    event.post(tap: .cghidEventTap)
     return true
 }
 
@@ -410,7 +501,13 @@ case "click":
     guard let x = input["x"] as? Double, let y = input["y"] as? Double else {
         emitFail(["ok": false, "reason": "x and y are required for click"])
     }
-    activateIfNeeded(input["appName"] as? String)
+    let appName = input["appName"] as? String
+    if pressAppElementAtPoint(appName: appName, x: x, y: y) {
+        emitOk(["ok": true, "delivery": "ax-hit-test"])
+    }
+    guard activateAndConfirmFrontmost(appName) else {
+        emitFail(["ok": false, "reason": "target app is not frontmost"])
+    }
     guard synthesizeClick(x: x, y: y) else {
         emitFail(["ok": false, "reason": "failed to synthesize click event"])
     }
@@ -420,7 +517,9 @@ case "type":
     guard let text = input["text"] as? String else {
         emitFail(["ok": false, "reason": "text is required for type"])
     }
-    activateIfNeeded(input["appName"] as? String)
+    guard activateAndConfirmFrontmost(input["appName"] as? String) else {
+        emitFail(["ok": false, "reason": "target app is not frontmost"])
+    }
     guard synthesizeType(text) else {
         emitFail(["ok": false, "reason": "failed to synthesize keyboard event"])
     }
@@ -430,7 +529,9 @@ case "key":
     guard let keyCode = input["keyCode"] as? Int else {
         emitFail(["ok": false, "reason": "keyCode is required for key"])
     }
-    activateIfNeeded(input["appName"] as? String)
+    guard activateAndConfirmFrontmost(input["appName"] as? String) else {
+        emitFail(["ok": false, "reason": "target app is not frontmost"])
+    }
     guard synthesizeKey(keyCode) else {
         emitFail(["ok": false, "reason": "failed to synthesize key event"])
     }

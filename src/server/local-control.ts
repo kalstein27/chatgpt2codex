@@ -1,7 +1,9 @@
 import { timingSafeEqual } from "node:crypto";
 import type { Express, NextFunction, Request, Response } from "express";
 import { DomainError, ErrorCode, type Lease, type LeasePreset, type ToolContext } from "../types.js";
+import { backgroundOperationManager } from "../exec/background-operations.js";
 import { makeLease } from "../workspace/project-select.js";
+import { claimProjectPrivilege, inspectProjectPrivilegeLocks, releaseProjectPrivilege } from "../state/project-privilege-locks.js";
 import { redact } from "../policy/secrets.js";
 import { clearAuto, readAuto, setAuto } from "../control/auto.js";
 import {
@@ -29,20 +31,31 @@ import {
 } from "../control/policy.js";
 import type { RuntimeActivityTracker } from "../runtime/activity.js";
 import type { ConnectionDiagnosticsSink } from "../runtime/connection-diagnostics.js";
+import { currentOutputPolicy, setOutputPolicy } from "../runtime/output-policy.js";
 import {
   ensureRgAuthorized,
   executeRgSearch,
   getRgCapabilityStatus,
+  listPendingRgApprovalRequests,
   resolveRgApprovalRequest,
   setRgPreference,
   type RgApprovalDecision,
 } from "../exec/rg-capability.js";
 import { installManagedRipgrep } from "../exec/managed-rg-installer.js";
+import { inspectPersistedPrivilegeOwner } from "../state/store.js";
 import {
   listOperationApprovalRequests,
   operationApprovalSummary,
   resolveOperationApprovalRequest,
 } from "../exec/operation-approval.js";
+import {
+  completeScreenshotCapture,
+  listPendingScreenshotCaptures,
+} from "../e2e/screenshot-bridge.js";
+import {
+  completeAccessibilityBridgeRequest,
+  listPendingAccessibilityBridgeRequests,
+} from "../control/accessibility-bridge.js";
 
 export interface LocalControlRouteConfig {
   port: number;
@@ -56,6 +69,45 @@ export interface LocalControlRouteConfig {
     setKill?: typeof setKill;
   };
   rgBinary?: Awaited<ReturnType<typeof getRgCapabilityStatus>>["binary"];
+}
+
+const LOCAL_CONTROL_CONVERSATION_LIMIT = 8;
+const LOCAL_CONTROL_OPERATION_LIMIT = 10;
+
+async function activeLeaseForRgApproval(
+  stateDir: string,
+  request: {
+    projectId: string;
+    projectRoot: string;
+    leaseId: string;
+    leaseExpiresAt: number;
+    createdAt: number;
+  },
+  now: number,
+): Promise<Lease | null> {
+  const presets: LeasePreset[] = ["read-only", "tests-only", "full-write", "image-only", "control"];
+  for (const kind of ["lane", "serial"] as const) {
+    for (const preset of presets) {
+      const owner = await inspectPersistedPrivilegeOwner({
+        stateDir,
+        projectId: request.projectId,
+        leaseId: request.leaseId,
+        preset,
+        kind,
+        now,
+      });
+      if (!owner.active || owner.expiresAt === null) continue;
+      return {
+        projectId: request.projectId,
+        projectRoot: request.projectRoot,
+        leaseId: request.leaseId,
+        preset,
+        issuedAt: request.createdAt,
+        expiresAt: Math.min(owner.expiresAt, request.leaseExpiresAt),
+      };
+    }
+  }
+  return null;
 }
 
 function authorizedToken(candidate: string | undefined, expected: string): boolean {
@@ -196,42 +248,117 @@ export function registerLocalControlRoutes(
     `${base}/status`,
     asyncRoute(async (_req, res) => {
       const now = Date.now();
-      const persisted = (await ctx.store.getSession()) as {
-        activeProjectId?: string | null;
-        mode?: string;
-        lease?: {
-          projectId: string;
-          preset: string;
-          issuedAt: number;
-          expiresAt: number;
-        } | null;
-      };
-      const registry = ctx.registry.length > 0 ? ctx.registry : await ctx.store.loadProjects();
+      const [persisted, registry] = await Promise.all([
+        ctx.store.getSession() as Promise<{
+          activeProjectId?: string | null;
+          mode?: string;
+          lease?: {
+            projectId: string;
+            preset: string;
+            issuedAt: number;
+            expiresAt: number;
+          } | null;
+        }>,
+        ctx.registry.length > 0 ? Promise.resolve(ctx.registry) : ctx.store.loadProjects(),
+      ]);
       const project = registry.find((entry) => entry.projectId === persisted.activeProjectId);
       const leaseActive = Boolean(persisted.lease && persisted.lease.expiresAt > now);
-      const killed = await isKilled(ctx.stateDir);
-      const actions = await listActions(ctx.stateDir);
+      const seenControlGenerations = new Set<string>();
+      let remoteControlLeaseActive = false;
+      for (const candidate of registry) {
+        const locks = await inspectProjectPrivilegeLocks({
+          stateDir: ctx.stateDir,
+          project: candidate,
+          registry,
+          now,
+        }).catch(() => []);
+        for (const lock of locks) {
+          if (seenControlGenerations.has(lock.generation)) continue;
+          seenControlGenerations.add(lock.generation);
+          if (!lock.expired && lock.kind === "serial" && lock.preset === "control") {
+            remoteControlLeaseActive = true;
+          }
+        }
+        if (remoteControlLeaseActive) break;
+      }
+      const controlLeaseActive = Boolean(
+        (leaseActive && persisted.lease?.preset === "control") || remoteControlLeaseActive,
+      );
+      const [
+        killed,
+        actions,
+        armRequests,
+        auto,
+        diagnosticSummary,
+        rgStatus,
+        pendingRgRequests,
+        operationApprovalRequests,
+        backgroundOperations,
+      ] = await Promise.all([
+        isKilled(ctx.stateDir),
+        listActions(ctx.stateDir),
+        listArmRequests(ctx.stateDir, now),
+        readAuto(ctx.stateDir),
+        config.diagnostics?.summary(10),
+        getRgCapabilityStatus({
+          stateDir: ctx.stateDir,
+          projectId: project?.projectId ?? null,
+          binary: config.rgBinary,
+          now,
+        }),
+        listPendingRgApprovalRequests(ctx.stateDir, now),
+        listOperationApprovalRequests(ctx.stateDir, now),
+        backgroundOperationManager(ctx.stateDir).recentForLocalUi(now),
+      ]);
       const allPending = actions.filter((action) => action.status === "pending");
       const pending = allPending.slice(0, 50);
-      const armRequests = await listArmRequests(ctx.stateDir, now);
       await auditExpiredArmRequests(ctx, armRequests.expired);
       const allPendingArmRequests = armRequests.requests.filter((request) => request.status === "pending");
       const pendingArmRequests = allPendingArmRequests.slice(0, 50);
-      const auto = await readAuto(ctx.stateDir);
       const autoActive = Boolean(auto && auto.expiresAt > now);
-      const diagnosticSummary = await config.diagnostics?.summary(10);
-      const rgStatus = await getRgCapabilityStatus({
-        stateDir: ctx.stateDir,
-        projectId: project?.projectId ?? null,
-        binary: config.rgBinary,
-        now,
-      });
-      const operationApprovalRequests = await listOperationApprovalRequests(ctx.stateDir, now);
       const pendingOperationApprovals = operationApprovalRequests.filter((request) => request.status === "pending");
+      const pendingScreenshotCaptures = listPendingScreenshotCaptures(now);
+      const pendingAccessibilityBridgeRequests = listPendingAccessibilityBridgeRequests(now);
+      const backgroundSessions = backgroundOperations.map((operation) => ({
+        sessionLabel: "BACKGROUND",
+        transport: "http",
+        clientName: "C2CT background",
+        connectedAt: operation.createdAt,
+        lastActiveAt: operation.lastHeartbeatAt,
+        state:
+          operation.state === "completed"
+            ? "completed"
+            : operation.state === "failed" || operation.state === "timed-out" || operation.state === "cancelled" || operation.state === "interrupted-by-runtime-restart"
+              ? "failed"
+              : "running",
+        operation: {
+          operationId: operation.operationId,
+          tool: `command_run · ${operation.commandId}`,
+          state:
+            operation.state === "completed"
+              ? "completed"
+              : operation.state === "failed" || operation.state === "timed-out" || operation.state === "cancelled" || operation.state === "interrupted-by-runtime-restart"
+                ? "failed"
+                : "running",
+          startedAt: operation.startedAt ?? operation.createdAt,
+          ...(operation.finishedAt !== undefined ? { finishedAt: operation.finishedAt } : {}),
+          elapsedMs: operation.elapsedMs,
+          phase: operation.phase,
+          message: `${operation.state} · ${operation.recommendedAction}`,
+          lastProgressAt: operation.lastHeartbeatAt,
+        },
+      }));
+      const conversations = tracker.conversationSnapshot(now)
+        .slice(0, LOCAL_CONTROL_CONVERSATION_LIMIT)
+        .map((conversation) => ({
+          ...conversation,
+          operations: conversation.operations.slice(-LOCAL_CONTROL_OPERATION_LIMIT),
+        }));
 
       res.json({
-        schemaVersion: 3,
+        schemaVersion: 7,
         server: { ok: true, pid: process.pid, startedAt: config.startedAt },
+        outputPolicy: currentOutputPolicy(),
         project: project ? { projectId: project.projectId, name: project.name } : null,
         lease: persisted.lease
           ? {
@@ -244,7 +371,7 @@ export function registerLocalControlRoutes(
         control: {
           enabled: isControlEnabled(),
           platformSupported: desktopControlSupported,
-          armed: leaseActive && persisted.lease?.preset === "control" && !killed,
+          armed: controlLeaseActive && !killed,
           killed,
           pendingCount: allPending.length,
           pendingActions: pending.map(uiAction),
@@ -258,17 +385,26 @@ export function registerLocalControlRoutes(
           pendingRequestCount: pendingOperationApprovals.length,
           pendingRequests: pendingOperationApprovals.slice(0, 50).map(operationApprovalSummary),
         },
+        screenshotCapture: {
+          pendingRequestCount: pendingScreenshotCaptures.length,
+          pendingRequests: pendingScreenshotCaptures.slice(0, 10),
+        },
+        accessibilityBridge: {
+          pendingRequestCount: pendingAccessibilityBridgeRequests.length,
+          pendingRequests: pendingAccessibilityBridgeRequests.slice(0, 10),
+        },
         externalSearch: {
           rg: {
             preference: rgStatus.preference,
             binary: rgStatus.binary,
-            pendingRequestCount: rgStatus.pendingRequests.length,
-            pendingRequests: rgStatus.pendingRequests.slice(0, 50),
+            pendingRequestCount: pendingRgRequests.length,
+            pendingRequests: pendingRgRequests.slice(0, 50),
             grants: rgStatus.grants,
             fallbackTool: "code_search",
           },
         },
-        sessions: tracker.snapshot(now),
+        sessions: [...tracker.snapshot(now), ...backgroundSessions],
+        conversations,
         diagnostics: diagnosticSummary
           ? {
               logPath: diagnosticSummary.logPath,
@@ -280,6 +416,74 @@ export function registerLocalControlRoutes(
             }
           : null,
       });
+    }),
+  );
+
+  app.post(
+    `${base}/output-policy`,
+    asyncRoute(async (req, res) => {
+      const showIntermediateCommentary = req.body?.showIntermediateCommentary;
+      if (typeof showIntermediateCommentary !== "boolean") {
+        res.status(400).json({
+          error: "invalid_output_policy",
+          message: "showIntermediateCommentary must be boolean",
+        });
+        return;
+      }
+      const outputPolicy = setOutputPolicy(showIntermediateCommentary, "local-control");
+      res.json({ ok: true, outputPolicy });
+    }),
+  );
+
+  app.get(
+    `${base}/accessibility-bridge/pending`,
+    asyncRoute(async (_req, res) => {
+      const now = Date.now();
+      const pendingRequests = listPendingAccessibilityBridgeRequests(now);
+      res.json({
+        ok: true,
+        pendingRequestCount: pendingRequests.length,
+        pendingRequests: pendingRequests.slice(0, 10),
+      });
+    }),
+  );
+
+  app.post(
+    `${base}/screenshot-capture/:requestId/complete`,
+    asyncRoute(async (req, res) => {
+      const requestId = String(req.params.requestId ?? "");
+      const ok = req.body?.ok === true;
+      const error = typeof req.body?.error === "string" ? req.body.error.slice(0, 500) : undefined;
+      const result = await completeScreenshotCapture({ requestId, ok, ...(error ? { error } : {}) });
+      if (!result.accepted && !result.alreadyCompleted) {
+        res.status(404).json({ error: "screenshot_capture_request_not_found", requestId });
+        return;
+      }
+      res.json({ ok: true, requestId, ...result });
+    }),
+  );
+
+  app.post(
+    `${base}/accessibility-bridge/:requestId/complete`,
+    asyncRoute(async (req, res) => {
+      const requestId = String(req.params.requestId ?? "");
+      const ok = req.body?.ok === true;
+      const error = typeof req.body?.error === "string" ? req.body.error.slice(0, 500) : undefined;
+      const rawResult = req.body?.result;
+      const result = rawResult && typeof rawResult === "object" && !Array.isArray(rawResult)
+        ? rawResult as Record<string, unknown>
+        : undefined;
+      const completed = await completeAccessibilityBridgeRequest({
+        requestId,
+        ok,
+        ...(result ? { result } : {}),
+        ...(error ? { error } : {}),
+      });
+      if (!completed.accepted && !completed.alreadyCompleted) {
+        res.status(404).json({ error: "accessibility_bridge_request_not_found", requestId });
+        return;
+      }
+      res.json({ ok: true, requestId, ...completed });
     }),
   );
 
@@ -331,6 +535,7 @@ export function registerLocalControlRoutes(
             stateDir: ctx.stateDir,
             requestId,
             decision,
+            approvedVia: "local-control-api",
           });
           await ctx.ledger.append({
             type: decision === "approve" ? "operation.approval.approved" : "operation.approval.rejected",
@@ -355,6 +560,40 @@ export function registerLocalControlRoutes(
       }),
     );
   }
+
+  app.post(
+    `${base}/runtime-apply-approvals/:requestId/approve`,
+    asyncRoute(async (req, res) => {
+      const requestId = String(req.params.requestId ?? "");
+      try {
+        const request = await resolveOperationApprovalRequest({
+          stateDir: ctx.stateDir,
+          requestId,
+          decision: "approve",
+          approvedVia: "menu-bar-ui",
+        });
+        await ctx.ledger.append({
+          type: "runtime.apply.approval.approved.menu-ui",
+          requestId: request.requestId,
+          projectId: request.projectId,
+          tool: request.tool,
+          risk: request.risk,
+        }).catch(() => undefined);
+        res.json({ ok: true, request: operationApprovalSummary(request) });
+      } catch (error) {
+        if (error instanceof DomainError) {
+          res.status(error.code === ErrorCode.NOT_IMPLEMENTED ? 404 : 409).json({
+            error: "runtime_apply_approval_failed",
+            code: error.code,
+            message: redact(error.message),
+            details: error.details ?? {},
+          });
+          return;
+        }
+        throw error;
+      }
+    }),
+  );
 
   app.post(
     `${base}/external-search/rg/install`,
@@ -482,9 +721,11 @@ export function registerLocalControlRoutes(
         return;
       }
       const decision = rawDecision as RgApprovalDecision | "reject";
-      const persisted = (await ctx.store.getSession()) as { lease?: Lease | null };
-      const currentLease = persisted.lease && persisted.lease.expiresAt > Date.now()
-        ? persisted.lease
+      const now = Date.now();
+      const pendingRequest = (await listPendingRgApprovalRequests(ctx.stateDir, now))
+        .find((request) => request.requestId === requestId);
+      const currentLease = pendingRequest
+        ? await activeLeaseForRgApproval(ctx.stateDir, pendingRequest, now)
         : null;
       try {
         const request = await resolveRgApprovalRequest({
@@ -493,6 +734,7 @@ export function registerLocalControlRoutes(
           decision,
           currentLease,
           binary: config.rgBinary,
+          now,
         });
         await ctx.ledger.append({
           type: decision === "reject"
@@ -582,13 +824,17 @@ export function registerLocalControlRoutes(
                 [key: string]: unknown;
               })
             : persisted;
+          const localLease = persisted.lease as Lease | null | undefined;
           const localProjectMismatch = Boolean(
-            persisted.activeProjectId && persisted.activeProjectId !== request.projectId,
+            localLease &&
+              localLease.expiresAt > Date.now() &&
+              persisted.activeProjectId &&
+              persisted.activeProjectId !== request.projectId,
           );
           const requesterProjectMismatch = Boolean(
             requesterPersisted.activeProjectId && requesterPersisted.activeProjectId !== request.projectId,
           );
-          if (!project || localProjectMismatch || requesterProjectMismatch) {
+          if (!project || requesterProjectMismatch || (localProjectMismatch && !requesterScope)) {
             throw new DomainError(ErrorCode.PERMISSION_DENIED, "Arm request project mismatch", {
               reason: "arm_request_project_mismatch",
               requestProjectId: request.projectId,
@@ -597,12 +843,28 @@ export function registerLocalControlRoutes(
             });
           }
 
+          const preserveLocalSession = Boolean(requesterScope && localProjectMismatch);
           const previousSession = { ...persisted };
           const previousRequesterSession = { ...requesterPersisted };
+          const previousRequesterLease = requesterPersisted.lease as Lease | null | undefined;
           const wasKilled = await readApprovalKill(ctx.stateDir);
           const nextLease = makeLease(project, "control");
+          let requesterPrivilegeClaimed = false;
           try {
-            await ctx.store.setSession({ ...persisted, activeProjectId: project.projectId, mode: "read", lease: nextLease });
+            if (requesterScope && ctx.config.multiProjectLanesEnabled === true) {
+              await claimProjectPrivilege({
+                stateDir: ctx.stateDir,
+                project,
+                registry,
+                ownerScope: requesterScope,
+                lease: nextLease,
+                kind: "serial",
+              });
+              requesterPrivilegeClaimed = true;
+            }
+            if (!preserveLocalSession) {
+              await ctx.store.setSession({ ...persisted, activeProjectId: project.projectId, mode: "read", lease: nextLease });
+            }
             if (requesterScope) {
               await ctx.store.setSession(
                 { ...requesterPersisted, activeProjectId: project.projectId, mode: "read", lease: nextLease },
@@ -613,9 +875,36 @@ export function registerLocalControlRoutes(
             approved = await transition("approved");
             lease = nextLease;
           } catch (error) {
-            await ctx.store.setSession(previousSession).catch(() => undefined);
+            if (!preserveLocalSession) {
+              await ctx.store.setSession(previousSession).catch(() => undefined);
+            }
             if (requesterScope) {
               await ctx.store.setSession(previousRequesterSession, requesterScope).catch(() => undefined);
+            }
+            if (requesterPrivilegeClaimed && requesterScope) {
+              if (
+                previousRequesterLease &&
+                previousRequesterLease.projectId === project.projectId &&
+                previousRequesterLease.preset !== "read-only" &&
+                previousRequesterLease.expiresAt > Date.now()
+              ) {
+                await claimProjectPrivilege({
+                  stateDir: ctx.stateDir,
+                  project,
+                  registry,
+                  ownerScope: requesterScope,
+                  lease: previousRequesterLease,
+                  kind: "serial",
+                }).catch(() => undefined);
+              } else {
+                await releaseProjectPrivilege({
+                  stateDir: ctx.stateDir,
+                  project,
+                  ownerScope: requesterScope,
+                  leaseId: nextLease.leaseId,
+                  kind: "serial",
+                }).catch(() => undefined);
+              }
             }
             if (wasKilled) await setApprovalKill(ctx.stateDir).catch(() => undefined);
             else await clearApprovalKill(ctx.stateDir).catch(() => undefined);

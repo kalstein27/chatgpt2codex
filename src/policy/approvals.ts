@@ -4,11 +4,11 @@
  * (approval required) rather than silently allowed.
  */
 const NO_APPROVAL_TIERS = new Set(["observe", "read", "verify", "write"]);
-const APPROVAL_REQUIRED_TIERS = new Set(["destructive", "network", "danger"]);
+const APPROVAL_REQUIRED_TIERS = new Set(["destructive", "network", "local-file-mutation", "danger"]);
 
 /**
  * Whether a given risk tier (e.g. "read" | "verify" | "write" | "network" |
- * "destructive") requires an explicit human approval gate before executing
+ * "destructive" | "local-file-mutation") requires an explicit human approval gate before executing
  * (PRD §9.5 Two-key classification).
  *
  * Per PRD §9.5: `if tier in {destructive, network} and not

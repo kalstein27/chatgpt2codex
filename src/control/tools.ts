@@ -203,10 +203,59 @@ export async function handleComputerScreenshot(ctx: ToolContext, input: Computer
 export interface ComputerRequestActionInput {
   appName: string;
   kind: ControlActionKind;
-  target: ControlActionTarget;
+  target?: ControlActionTarget;
   text?: string;
   keyCode?: number;
+  keys?: string[];
+  button?: "left" | "right" | "middle";
+  path?: Array<{ xRel: number; yRel: number }>;
+  scrollX?: number;
+  scrollY?: number;
+  durationMs?: number;
   reason: string;
+}
+
+function validRelativePoint(point: { xRel: number; yRel: number } | undefined): boolean {
+  return Boolean(point && Number.isFinite(point.xRel) && Number.isFinite(point.yRel) && point.xRel >= 0 && point.xRel <= 1 && point.yRel >= 0 && point.yRel <= 1);
+}
+
+function validateComputerActionInput(input: ComputerRequestActionInput): ControlActionTarget {
+  const target = input.target ?? {};
+  if (input.button !== undefined && !["left", "right", "middle"].includes(input.button)) {
+    throw new DomainError(ErrorCode.NOT_IMPLEMENTED, `Unsupported mouse button: ${input.button}`);
+  }
+  switch (input.kind) {
+    case "click":
+      if (!target.ax && !validRelativePoint(target.windowPoint)) throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "click requires target.ax or target.windowPoint");
+      break;
+    case "double_click":
+    case "move":
+      if (!validRelativePoint(target.windowPoint)) throw new DomainError(ErrorCode.NOT_IMPLEMENTED, `${input.kind} requires target.windowPoint`);
+      break;
+    case "drag":
+      if (!input.path || input.path.length < 2 || input.path.length > 32 || !input.path.every(validRelativePoint)) {
+        throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "drag requires path with 2..32 valid window-relative points");
+      }
+      break;
+    case "scroll":
+      if (!validRelativePoint(target.windowPoint)) throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "scroll requires target.windowPoint");
+      if (!Number.isFinite(input.scrollX ?? NaN) || !Number.isFinite(input.scrollY ?? NaN)) throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "scroll requires finite scrollX and scrollY");
+      if (Math.abs(input.scrollX ?? 0) > 4000 || Math.abs(input.scrollY ?? 0) > 4000) throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "scroll deltas must be between -4000 and 4000");
+      break;
+    case "type":
+      if (typeof input.text !== "string") throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "type requires text");
+      break;
+    case "key":
+      if (!Number.isInteger(input.keyCode) || (input.keyCode ?? -1) < 0 || (input.keyCode ?? 128) > 127) throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "key requires keyCode in 0..127");
+      break;
+    case "keypress":
+      if (!input.keys || input.keys.length < 1 || input.keys.length > 8 || input.keys.some((key) => !key.trim() || key.length > 32)) throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "keypress requires 1..8 short key names");
+      break;
+    case "wait":
+      if (input.durationMs !== undefined && (!Number.isFinite(input.durationMs) || input.durationMs < 0 || input.durationMs > 10_000)) throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "wait durationMs must be between 0 and 10000");
+      break;
+  }
+  return target;
 }
 
 // Defense in depth for the ChatGPT-exposed immediate-execution branch below:
@@ -239,6 +288,7 @@ export async function handleComputerRequestAction(ctx: ToolContext, input: Compu
   const redactedInput = { ...input, text: input.text ? "[redacted]" : undefined };
   return withControlErrorMapping(ctx, "computer_request_action", redactedInput, async () => {
     const { projectId } = await requireControlLease(ctx);
+    const target = validateComputerActionInput(input);
 
     if (await isKilled(ctx.stateDir)) {
       throw new DomainError(ErrorCode.CONTROL_KILLED, "Control session is killed; grant a new control lease to resume");
@@ -265,8 +315,8 @@ export async function handleComputerRequestAction(ctx: ToolContext, input: Compu
     // resolved.found=false rather than an error, so the approver knows to
     // expect an executor-time windowPoint fallback.
     let resolved: ResolvedTargetPreview | undefined;
-    if (input.target.ax && process.platform === "darwin") {
-      resolved = await macInput.resolveAxElement(input.appName, input.target.ax).catch((err) => ({
+    if (target.ax && process.platform === "darwin") {
+      resolved = await macInput.resolveAxElement(input.appName, target.ax).catch((err) => ({
         found: false,
         reason: err instanceof Error ? err.message : String(err),
       }));
@@ -275,9 +325,15 @@ export async function handleComputerRequestAction(ctx: ToolContext, input: Compu
     const record = await enqueue(ctx.stateDir, {
       appName: input.appName,
       kind: input.kind,
-      target: input.target,
+      target,
       text: input.text,
       keyCode: input.keyCode,
+      keys: input.keys,
+      button: input.button,
+      path: input.path,
+      scrollX: input.scrollX,
+      scrollY: input.scrollY,
+      durationMs: input.durationMs,
       reason: input.reason,
       resolved,
     });
@@ -289,6 +345,11 @@ export async function handleComputerRequestAction(ctx: ToolContext, input: Compu
       appName: record.appName,
       kind: record.kind,
       target: summarizeControlTarget(record.target),
+      button: record.button,
+      pathPoints: record.path?.length,
+      scroll: record.scrollX !== undefined || record.scrollY !== undefined ? { x: record.scrollX ?? 0, y: record.scrollY ?? 0 } : undefined,
+      keys: record.keys,
+      durationMs: record.durationMs,
       reason: summarizePrivateText(record.reason),
       resolved: summarizeResolvedTarget(record.resolved),
     });

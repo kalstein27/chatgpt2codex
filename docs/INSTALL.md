@@ -49,15 +49,24 @@ ChatGPT To Codex는 내 Mac 또는 Windows PC에서 실행되는 로컬 코딩 �
 
 1. macOS는 메뉴 막대 아이콘, Windows는 시스템 트레이 아이콘을 누릅니다.
 2. **Settings...**를 엽니다.
-3. **Project folder**에서 ChatGPT가 도와줄 프로젝트 폴더를 고릅니다.
+3. **Project folder**는 선택 사항입니다. 아직 작업할 저장소가 없어도 기본 workspace로 MCP를 먼저 시작하고 ChatGPT 연결을 설정할 수 있습니다. 실제 프로젝트 작업을 시작할 때 폴더를 추가하거나 선택하면 됩니다.
 4. ChatGPT 웹에서 연결하려면 **ChatGPT web connector**를 켭니다.
-5. 고정 도메인이 없다면 도메인 칸은 비워둡니다. 그러면 임시 `trycloudflare.com` 주소가 만들어질 수 있습니다.
+5. 공개 주소 칸은 세 가지 방식으로 사용할 수 있습니다. 비워두면 Cloudflare Quick Tunnel, 일반 호스트명은 이미 구성된 Cloudflare named tunnel의 `CLOUDFLARED_TUNNEL_TOKEN` 또는 `CLOUDFLARED_TUNNEL_NAME`과 함께 사용할 때만 고정 Cloudflare 주소로 동작합니다. `https://...` 전체 URL은 Tailscale Funnel 같은 **외부 관리 HTTPS 터널**로 취급하며 앱이 해당 tunnel을 시작하거나 종료하지 않습니다.
 6. **Start MCP**를 누릅니다.
 7. 상태가 켜질 때까지 기다립니다.
 8. **Copy Connector URL**을 누릅니다. 주소는 `/mcp`로 끝나야 합니다.
 9. ChatGPT의 Apps, Apps & Connectors, 또는 Connectors 설정에서 새 앱/커넥터를 만듭니다.
 10. 복사한 `/mcp` 주소를 붙여넣습니다.
 11. 승인 화면이 나오면 ChatGPT To Codex 앱에서 Owner Token을 복사해 입력합니다.
+
+연결 직후에는 프로젝트가 0개여도 정상입니다. 새 ChatGPT 세션은 먼저
+`connection_status` -> `agent_guide`를 호출해 현재 설치본의 C2CT 공통 사용법을
+프로젝트/lease 없이 확인합니다. 프로젝트가 생긴 뒤에는
+`workspace_list_projects`/`workspace_get_project`로 대상을 찾고,
+`project_rules(projectId=...)`와 `project_status(projectId=...)`를 직접 읽습니다.
+이 지침 확인 단계만을 위해 `project_select`를 호출하거나 다른 세션의 lease/lane을
+변경하면 안 됩니다. 실제 수정·테스트처럼 권한이 필요한 작업을 시작할 때만 가장
+작은 work lane 또는 해당 runtime의 최소 serial capability를 획득합니다.
 
 ### E2E 스크린샷 사용
 
@@ -88,7 +97,8 @@ Windows 네이티브 데스크톱 캡처와 클릭·타이핑 제어는 아직 �
 
 - Owner Token은 비밀번호처럼 다루세요.
 - 임시 `trycloudflare.com` 주소는 앱이나 터널을 재시작하면 바뀔 수 있습니다.
-- 앱의 **업데이트 확인**으로 런타임 업데이트를 적용하면 cloudflared는 계속 실행되어 임시 주소와 커넥터 등록이 유지됩니다. 메뉴 막대 UI 변경은 다음 앱 실행 때 반영됩니다.
+- 외부 관리 HTTPS URL은 `https` origin만 허용하며 사용자정보, query, fragment, 경로, localhost/loopback 주소를 허용하지 않습니다. 기존 `*.ts.net` 호스트 설정은 Cloudflare 자격정보가 없을 때 호환 migration으로 외부 관리 모드로 인식됩니다. 새 설정은 명시적인 external 모드를 사용합니다.
+- 앱의 **업데이트 확인**으로 런타임을 hot reload해도 connector URL은 유지됩니다. Cloudflare 모드에서는 기존 cloudflared가 유지되고, 외부 관리 모드에서는 앱이 외부 tunnel을 시작·종료하지 않으므로 지정 URL이 그대로 유지됩니다. 메뉴 막대 UI 변경은 다음 앱 실행 때 반영됩니다.
 - 로컬 소스 수정과 supervisor 교체는 공개 설치 절차와 별개인 개발 작업입니다. 설치본에는 공식 Release artifact만 사용하세요.
 - Windows SmartScreen 경고는 아직 널리 알려지지 않은 새 설치파일에서 보일 수 있습니다. 공식 릴리스 파일인지 확인한 뒤 진행하세요.
 
@@ -108,7 +118,7 @@ The app bundle includes Node.js, cloudflared, the MCP runtime, and native helper
 2. Open the DMG and drag **ChatGPT To Codex** onto the **Applications** shortcut.
 3. If macOS blocks it because it is unsigned, Control-click the file, choose **Open**, then confirm. If needed, open **System Settings** -> **Privacy & Security** -> **Open Anyway**.
 4. Open **ChatGPT To Codex** from **Applications**.
-5. Click the menu bar icon to confirm it is running.
+5. Confirm the regular app window opens. The former menu-bar commands are available in the left command sidebar; no persistent menu-bar icon is required.
 
 ### Install on Windows
 
@@ -121,13 +131,22 @@ The app bundle includes Node.js, cloudflared, the MCP runtime, and native helper
 
 ### First setup
 
-1. Open **Settings...** from the macOS menu bar icon or Windows tray icon.
-2. Choose your **Project folder**.
-3. Enable **ChatGPT web connector** if ChatGPT in the browser needs to reach this computer.
+1. On macOS click **Settings...** in the app's left command sidebar. On Windows use the tray menu.
+2. **Project folder** is optional for first connection. You can start MCP with the default workspace even when it contains zero registered projects, then add or choose a project when you are ready to work on one.
+3. Enable **ChatGPT web connector** if ChatGPT in the browser needs to reach this computer. Leave the public address blank for a Cloudflare Quick Tunnel. A hostname is a fixed Cloudflare address only when an existing named tunnel is also configured with `CLOUDFLARED_TUNNEL_TOKEN` or `CLOUDFLARED_TUNNEL_NAME`; a hostname alone is rejected. A full `https://...` URL is an externally managed tunnel such as Tailscale Funnel, and externally managed mode never starts or stops `cloudflared`.
 4. Click **Start MCP**.
 5. Click **Copy Connector URL**. It should end with `/mcp`.
 6. Add that URL in ChatGPT under Apps, Apps & Connectors, or Connectors.
 7. Approve the connection with the Owner Token from the app.
+
+Zero registered projects is a valid first-connection state. A fresh ChatGPT
+session should call `connection_status` -> `agent_guide` first; these are global,
+lease-neutral bootstrap calls that describe the live C2CT contract without a
+project folder. Once a project exists, resolve it with workspace discovery and
+read `project_rules(projectId=...)` / `project_status(projectId=...)` directly.
+Do not use `project_select` or disturb another session's lease merely to inspect
+instructions. Acquire the smallest project capability only when actual project
+work begins.
 
 ### E2E screenshots
 
@@ -144,16 +163,17 @@ Native Windows desktop capture and click/type control are not implemented yet. `
 ### Connection diagnostics
 
 If tools are visible but a real call fails, open **Connection Diagnostics...**
-from the macOS menu bar or Windows tray. Match the failure time to its
-`HTTP_...` code and `diag_...` ID. No event at that time means the request did
-not reach this local runtime. See
+from the macOS app's left command sidebar or the Windows tray. Match the failure
+time to its `HTTP_...` code and `diag_...` ID. No event at that time means the
+request did not reach this local runtime. See
 [CONNECTION-DIAGNOSTICS.ko.md](CONNECTION-DIAGNOSTICS.ko.md).
 
 ### Notes
 
 - Keep the Owner Token private.
 - Temporary `trycloudflare.com` URLs can change after restart.
-- Applying a runtime update from **Check for Updates** keeps cloudflared running, so the temporary URL and connector registration remain in place. Native menu bar UI changes appear after the next app launch.
+- External public URLs must be HTTPS origins without userinfo, query, fragment, path, localhost, or loopback addresses. A legacy `*.ts.net` hostname with no Cloudflare tunnel credentials is migrated to externally managed mode; new configurations should use the explicit external mode.
+- Applying a runtime hot update from **Check for Updates** preserves the connector URL. Cloudflare mode keeps its existing cloudflared process; externally managed mode never starts or stops the external tunnel, so its configured URL remains unchanged. Native macOS app UI changes appear after the next app launch.
 - Applying a local TypeScript checkout to a running supervisor is a development-only workflow and is not part of the public installation procedure. Use an official Release artifact for installation.
 - Windows SmartScreen can warn on new unsigned installers. Continue only when the file came from the official GitHub release.
 

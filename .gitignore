@@ -8,6 +8,7 @@
 .vscode/
 *.code-workspace
 /AGENTS.md
+/CLAUDE.md
 
 # Dependencies, generated builds, and test output.
 node_modules/

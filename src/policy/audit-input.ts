@@ -8,12 +8,15 @@ const MAX_INLINE_STRING_CHARS = 1_024;
 
 const SECRET_KEY_PATTERN =
   /^(token|ownerToken|accessToken|refreshToken|apiKey|password|passphrase|secret|authorization|cookie|setCookie|stdin)$/i;
+const CAPABILITY_HANDLE_KEY_PATTERN = /^(workLaneId)$/i;
 const BINARY_KEY_PATTERN = /^(imageData|imageBytes|base64|dataUrl)$/i;
 const PATCH_KEY_PATTERN = /^(patch|patchText|diff)$/i;
-const PRIVATE_TEXT_KEY_PATTERN = /^(text|body|content|fileContent|reason|typedText|inputText|instruction|prompt|query|topic|label|message|title|description)$/i;
+const PRIVATE_TEXT_KEY_PATTERN = /^(text|body|content|fileContent|reason|typedText|inputText|instruction|prompt|query|topic|label|message|title|description|error|preview)$/i;
 const COMMAND_KEY_PATTERN = /^(command|script)$/i;
+const ARGUMENTS_KEY_PATTERN = /^(args|argv|arguments)$/i;
+const SECRET_CONTAINER_KEY_PATTERN = /^(env|environment|environmentvariables|headers|requestheaders|responseheaders)$/i;
 const PATH_KEY_PATTERN = /^(path|cwd|root|projectRoot|sourcePath|destPath)$/i;
-const URL_KEY_PATTERN = /^(url|waitUrl|screenshotUrl|sourceUrl)$/i;
+const URL_KEY_PATTERN = /(?:url|uri)$/i;
 
 function normalizedKey(key: string): string {
   return key.replace(/[-_\s]/g, "");
@@ -21,6 +24,46 @@ function normalizedKey(key: string): string {
 
 function stringSize(value: string): { chars: number; bytes: number } {
   return { chars: value.length, bytes: Buffer.byteLength(value, "utf8") };
+}
+
+function auditValueType(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) return "binary";
+  if (value instanceof Date) return "date";
+  return typeof value;
+}
+
+function summarizeSecretContainer(value: unknown): Record<string, unknown> {
+  if (Array.isArray(value)) {
+    return { kind: "secret-container", redacted: true, itemCount: value.length };
+  }
+  if (value && typeof value === "object") {
+    return {
+      kind: "secret-container",
+      redacted: true,
+      itemCount: Object.keys(value as Record<string, unknown>).length,
+    };
+  }
+  return { kind: "secret-container", redacted: true, valueType: auditValueType(value) };
+}
+
+function summarizeArguments(value: unknown): Record<string, unknown> {
+  if (Array.isArray(value)) {
+    let bytes: number | undefined;
+    try {
+      bytes = Buffer.byteLength(JSON.stringify(value), "utf8");
+    } catch {
+      // Count remains useful even when an unusual value cannot be serialized.
+    }
+    return {
+      kind: "arguments",
+      redacted: true,
+      count: value.length,
+      ...(bytes !== undefined ? { bytes } : {}),
+    };
+  }
+  return { kind: "arguments", redacted: true, valueType: auditValueType(value) };
 }
 
 function hashedSummary(kind: "binary" | "patch", value: string): Record<string, unknown> {
@@ -80,7 +123,6 @@ export function summarizeUrl(value: string): Record<string, unknown> {
     return {
       kind: "url",
       protocol: parsed.protocol,
-      host: parsed.host,
       hasUsername: Boolean(parsed.username),
       hasPassword: Boolean(parsed.password),
       hasQuery: parsed.search.length > 0,
@@ -138,6 +180,14 @@ export function summarizeResolvedTarget(value: unknown): Record<string, unknown>
 function summarizeString(value: string, key?: string): unknown {
   const normalized = key ? normalizedKey(key) : "";
 
+  if (CAPABILITY_HANDLE_KEY_PATTERN.test(normalized)) {
+    return {
+      kind: "capability-handle",
+      redacted: true,
+      ...stringSize(value),
+      sha256: createHash("sha256").update(value, "utf8").digest("hex"),
+    };
+  }
   if (SECRET_KEY_PATTERN.test(normalized)) {
     return { kind: "secret", redacted: true, ...stringSize(value) };
   }
@@ -163,7 +213,7 @@ function summarizeString(value: string, key?: string): unknown {
     return {
       kind: "string",
       ...stringSize(value),
-      preview: redact(value.slice(0, 256)),
+      sha256: createHash("sha256").update(value, "utf8").digest("hex"),
       truncated: true,
     };
   }
@@ -179,6 +229,18 @@ export function summarizeAuditInput(input: unknown): unknown {
   const seen = new WeakSet<object>();
 
   const visit = (value: unknown, depth: number, key?: string): unknown => {
+    const normalized = key ? normalizedKey(key) : "";
+    if (key && SECRET_CONTAINER_KEY_PATTERN.test(normalized)) {
+      return summarizeSecretContainer(value);
+    }
+    if (key && ARGUMENTS_KEY_PATTERN.test(normalized)) {
+      return summarizeArguments(value);
+    }
+    if (key && URL_KEY_PATTERN.test(normalized)) {
+      return typeof value === "string"
+        ? summarizeUrl(value)
+        : { kind: "url", redacted: true, valueType: auditValueType(value) };
+    }
     if (typeof value === "string") return summarizeString(value, key);
     if (value === null || typeof value === "number" || typeof value === "boolean") return value;
     if (typeof value === "bigint") return value.toString();

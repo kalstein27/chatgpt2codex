@@ -8,6 +8,7 @@ import { resolveInProject } from "../policy/paths.js";
 import { redact } from "../policy/secrets.js";
 import { buildSafeChildEnv } from "../exec/command-runner.js";
 import { guardShellCommand } from "../exec/local-shell.js";
+import { requestScreenshotCapture } from "./screenshot-bridge.js";
 
 export interface E2eScreenshotResult {
   path: string;
@@ -18,6 +19,8 @@ export interface E2eScreenshotResult {
   targetAppName?: string;
   shotLabel?: string;
 }
+const SCREEN_CAPTURE_PERMISSION_NAME = "Screen & System Audio Recording";
+
 
 /** Mirrors src/server/tools.ts's isLocalHttpUrl (duplicated rather than
  * imported to avoid a circular import: tools.ts already imports from this
@@ -98,12 +101,20 @@ async function captureRegionScreenshot(
   const dir = path.join(await e2eDir(root), "screenshots");
   await fs.mkdir(dir, { recursive: true });
   const file = path.join(dir, `${Date.now()}-${slug(input.label)}.png`);
-  await execFileAsync("/usr/sbin/screencapture", ["-x", "-R", input.region, file]);
+  try {
+    await requestScreenshotCapture({ outputPath: file, region: input.region });
+  } catch (error) {
+    throw new DomainError(
+      ErrorCode.PERMISSION_DENIED,
+      `The ChatGPT To Codex menu-bar app could not capture the E2E region using its macOS ${SCREEN_CAPTURE_PERMISSION_NAME} permission. Verify the packaged app is running and allowed in System Settings > Privacy & Security > ${SCREEN_CAPTURE_PERMISSION_NAME}.`,
+      { permission: "screen-recording", cause: summarizeE2eError(error) },
+    );
+  }
   const stat = await fs.stat(file);
   if (stat.size === 0) {
     throw new DomainError(
       ErrorCode.PERMISSION_DENIED,
-      "macOS Screen Recording permission is required for E2E screenshots. Open ChatGPT To Codex > Screenshot Permission, enable ChatGPT To Codex in System Settings > Privacy & Security > Screen Recording, then retry.",
+      `macOS ${SCREEN_CAPTURE_PERMISSION_NAME} permission is required for E2E screenshots. Open ChatGPT To Codex > Screenshot Permission, verify ChatGPT To Codex in System Settings > Privacy & Security > ${SCREEN_CAPTURE_PERMISSION_NAME}, then retry.`,
       { permission: "screen-recording" },
     );
   }
@@ -341,11 +352,11 @@ export async function captureE2eScreenshot(
   await fs.mkdir(dir, { recursive: true });
   const file = path.join(dir, `${Date.now()}-${slug(input.label ?? "screen")}.png`);
   try {
-    await execFileAsync("/usr/sbin/screencapture", ["-x", file]);
+    await requestScreenshotCapture({ outputPath: file });
   } catch (error) {
     throw new DomainError(
       ErrorCode.PERMISSION_DENIED,
-      "macOS Screen Recording permission is required for E2E screenshots. Open ChatGPT To Codex > Screenshot Permission, enable ChatGPT To Codex in System Settings > Privacy & Security > Screen Recording, then retry.",
+      `The ChatGPT To Codex menu-bar app could not capture the E2E screen using its macOS ${SCREEN_CAPTURE_PERMISSION_NAME} permission. Verify the packaged app is running and allowed in System Settings > Privacy & Security > ${SCREEN_CAPTURE_PERMISSION_NAME}.`,
       { permission: "screen-recording", cause: summarizeE2eError(error) },
     );
   }
@@ -353,7 +364,7 @@ export async function captureE2eScreenshot(
   if (stat.size === 0) {
     throw new DomainError(
       ErrorCode.PERMISSION_DENIED,
-      "macOS Screen Recording permission is required for E2E screenshots. Open ChatGPT To Codex > Screenshot Permission, enable ChatGPT To Codex in System Settings > Privacy & Security > Screen Recording, then retry.",
+      `macOS ${SCREEN_CAPTURE_PERMISSION_NAME} permission is required for E2E screenshots. Open ChatGPT To Codex > Screenshot Permission, verify ChatGPT To Codex in System Settings > Privacy & Security > ${SCREEN_CAPTURE_PERMISSION_NAME}, then retry.`,
       { permission: "screen-recording" },
     );
   }

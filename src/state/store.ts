@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
-import { DomainError, ErrorCode, type ProjectRegistryEntry } from "../types.js";
+import { DomainError, ErrorCode, type LeasePreset, type ProjectRegistryEntry } from "../types.js";
 
 /**
  * Central state store under `~/.local/share/chatgpt2codex/` (PRD §10):
@@ -38,11 +38,42 @@ const ProjectsFileSchema = z.object({
 
 type ProjectsFile = z.infer<typeof ProjectsFileSchema>;
 
-/** Session document shape (active project, mode, lease) — PRD §6, §7. */
+export const MAX_PROJECT_LANES = 8;
+
+const ProjectLaneRecordSchema = z.object({
+  laneDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  projectId: z.string().min(1),
+  projectRootDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  ownerScopeDigest: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  leaseId: z.string().min(1),
+  preset: z.enum(["read-only", "tests-only", "full-write", "image-only"]),
+  issuedAt: z.number().int().nonnegative(),
+  expiresAt: z.number().int().nonnegative(),
+  createdAt: z.number().int().nonnegative(),
+  lastUsedAt: z.number().int().nonnegative(),
+});
+
+export type ProjectLaneRecord = z.infer<typeof ProjectLaneRecordSchema>;
+
+const ReleasedProjectLaneRecordSchema = z.object({
+  laneDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  projectId: z.string().min(1),
+  leaseId: z.string().min(1),
+  releasedAt: z.number().int().nonnegative(),
+});
+
+export type ReleasedProjectLaneRecord = z.infer<typeof ReleasedProjectLaneRecordSchema>;
+
+/** Session document shape (active project, mode, lease) — PRD §6, §7.
+ * `lanes` is an optional version-2 extension. Keeping it optional preserves
+ * exact version-1 serial-session reads until the first lane is explicitly
+ * opened; the existing active project and lease never become an implicit
+ * lane during migration. */
 const SessionSchema = z.object({
   version: z.number().int().nonnegative(),
   updatedAt: z.number().int().nonnegative(),
   activeProjectId: z.string().nullable(),
+  boundProjectId: z.string().nullable().optional(),
   mode: z.enum(["observe", "read", "edit", "verify", "danger"]),
   lease: z
     .object({
@@ -54,6 +85,8 @@ const SessionSchema = z.object({
       expiresAt: z.number().int().nonnegative(),
     })
     .nullable(),
+  lanes: z.array(ProjectLaneRecordSchema).max(MAX_PROJECT_LANES).optional(),
+  releasedLanes: z.array(ReleasedProjectLaneRecordSchema).max(16).optional(),
 });
 
 export type SessionDocument = z.infer<typeof SessionSchema>;
@@ -88,6 +121,7 @@ function emptySession(): SessionDocument {
 
 export class Store {
   private readonly stateDir: string;
+  private readonly sessionLocks = new Map<string, Promise<void>>();
 
   constructor(stateDir: string) {
     this.stateDir = stateDir;
@@ -203,16 +237,136 @@ export class Store {
     return parsed.data;
   }
 
-  async setSession(s: unknown, scope?: string): Promise<void> {
+  private normalizeSession(s: unknown): SessionDocument {
     const merged = {
       ...emptySession(),
       ...(typeof s === "object" && s !== null ? s : {}),
     };
     // updatedAt is always server-recomputed, never trusted from caller input.
     merged.updatedAt = Date.now();
-    const validated = SessionSchema.parse(merged);
+    return SessionSchema.parse(merged);
+  }
+
+  private async writeSessionUnlocked(s: unknown, scope?: string): Promise<SessionDocument> {
+    const validated = this.normalizeSession(s);
     const filename = sessionFilename(scope);
     await this.atomicWriteJson(filename, validated);
     if (scope) await this.pruneScopedSessionFiles(filename);
+    return validated;
   }
+
+  private async withSessionLock<T>(scope: string | undefined, operation: () => Promise<T>): Promise<T> {
+    const filename = sessionFilename(scope);
+    const previous = this.sessionLocks.get(filename) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.catch(() => undefined).then(() => gate);
+    this.sessionLocks.set(filename, tail);
+    await previous.catch(() => undefined);
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.sessionLocks.get(filename) === tail) this.sessionLocks.delete(filename);
+    }
+  }
+
+  async setSession(s: unknown, scope?: string): Promise<void> {
+    await this.withSessionLock(scope, async () => {
+      await this.writeSessionUnlocked(s, scope);
+    });
+  }
+
+  /** Atomically update one scoped session without losing concurrent lane or
+   * serial-lease changes between a separate getSession/setSession pair. */
+  async updateSession(
+    scope: string | undefined,
+    updater: (current: SessionDocument) => unknown | Promise<unknown>,
+  ): Promise<SessionDocument> {
+    return this.withSessionLock(scope, async () => {
+      const current = await this.getSession(scope);
+      const next = await updater(current);
+      return this.writeSessionUnlocked(next, scope);
+    });
+  }
+}
+
+export interface PersistedProjectPrivilegeOwner {
+  found: boolean;
+  active: boolean;
+  expiresAt: number | null;
+  kind: "lane" | "serial";
+}
+
+/**
+ * Secret-safe persisted owner lookup used by privileged root-lock recovery.
+ *
+ * Root-lock owner digests intentionally cannot be inverted back to a scoped
+ * session filename. Lease IDs are random exact identities, so recovery scans
+ * the bounded session set and matches the lock's project/lease/preset tuple.
+ * No session filename, scope, or raw owner identifier leaves this helper.
+ */
+export async function inspectPersistedPrivilegeOwner(input: {
+  stateDir: string;
+  projectId: string;
+  leaseId: string;
+  preset: LeasePreset;
+  kind: "lane" | "serial";
+  projectRootDigest?: string;
+  now?: number;
+}): Promise<PersistedProjectPrivilegeOwner> {
+  const now = input.now ?? Date.now();
+  const entries = await readdir(input.stateDir, { withFileTypes: true }).catch(() => []);
+  const filenames = entries
+    .filter((entry) => entry.isFile() && (entry.name === SESSIONS_FILE || SCOPED_SESSION_FILE_RE.test(entry.name)))
+    .map((entry) => entry.name)
+    .slice(0, MAX_SCOPED_SESSION_FILES + 1);
+
+  let foundExpiry: number | null = null;
+  for (const filename of filenames) {
+    let parsed: SessionDocument | undefined;
+    try {
+      const raw = JSON.parse(await readFile(join(input.stateDir, filename), "utf8"));
+      const result = SessionSchema.safeParse(raw);
+      if (result.success) parsed = result.data;
+    } catch {
+      // Corrupt/unreadable session state must never become proof of a live
+      // privileged owner. The lock itself remains fail-closed until the
+      // caller also verifies that no active operation still exists.
+    }
+    if (!parsed) continue;
+
+    if (input.kind === "serial") {
+      const lease = parsed.lease;
+      if (
+        lease
+        && lease.projectId === input.projectId
+        && lease.leaseId === input.leaseId
+        && lease.preset === input.preset
+      ) {
+        foundExpiry = Math.max(foundExpiry ?? 0, lease.expiresAt);
+      }
+      continue;
+    }
+
+    for (const lane of parsed.lanes ?? []) {
+      if (
+        lane.projectId === input.projectId
+        && lane.leaseId === input.leaseId
+        && lane.preset === input.preset
+        && (input.projectRootDigest === undefined || lane.projectRootDigest === input.projectRootDigest)
+      ) {
+        foundExpiry = Math.max(foundExpiry ?? 0, lane.expiresAt);
+      }
+    }
+  }
+
+  return {
+    found: foundExpiry !== null,
+    active: foundExpiry !== null && foundExpiry >= now,
+    expiresAt: foundExpiry,
+    kind: input.kind,
+  };
 }

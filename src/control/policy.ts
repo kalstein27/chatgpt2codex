@@ -11,7 +11,7 @@ import { DomainError, ErrorCode } from "../types.js";
  *     (enforced separately by src/workspace/lease-guard.ts).
  * Neither gate alone is sufficient. Gate 1 only controls whether the tools
  * are registered/reachable at all — even with it on, gate 2 (and the
- * ChatGPT tools/list hide + generic call-tool bridge block, which apply
+ * ChatGPT remote-execution gate + generic call-tool bridge block, which apply
  * unconditionally) still stand between ChatGPT and any control action.
  */
 
@@ -31,7 +31,7 @@ export function isDesktopControlSupported(platform: NodeJS.Platform = process.pl
 }
 
 /** Names of the 4 desktop-control MCP tools. Shared denylist used by:
- *  - src/server/tools.ts installChatGptToolListHandler (hide from ChatGPT tools/list)
+ *  - src/server/tools.ts remote MCP tool handler guard (catalog stays visible)
  *  - src/server/actions.ts callRegisteredTool (block the generic call-tool/action bridge) */
 export const CONTROL_TOOL_NAMES: ReadonlySet<string> = new Set([
   "computer_screenshot",
@@ -55,8 +55,8 @@ export function isControlEnabled(env: NodeJS.ProcessEnv = process.env): boolean 
 }
 
 /**
- * Owner opt-in flag ("ChatGPT confirm" model): expose the 4 desktop-control
- * tools to ChatGPT's tools/list and the generic action bridge, and let a
+ * Owner opt-in flag ("ChatGPT confirm" model): authorize the 4 desktop-control
+ * tools for remote ChatGPT execution and the generic action bridge, and let a
  * confirmed `computer_request_action` call execute immediately through the
  * executor path (src/control/tools.ts handleComputerRequestAction) instead of
  * only ever queuing for local human approval. Disabled by default — this is
@@ -110,7 +110,7 @@ export function isSensitiveApp(appName: string | undefined): boolean {
  * operator opts an app in, on top of the two gates above. */
 export function controlAllowlist(env: NodeJS.ProcessEnv = process.env): string[] {
   const raw = env[CONTROL_ALLOWLIST_ENV_FLAG];
-  if (!raw) return [];
+  if (!raw) return ["Finder"];
   return raw
     .split(",")
     .map((entry) => entry.trim())

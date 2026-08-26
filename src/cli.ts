@@ -2,12 +2,13 @@
 /**
  * chatgpt2codex CLI entrypoint.
  *
- * Minimal hand-rolled argv parsing (no commander dependency) for the three
- * MVP subcommands defined in PRD §5:
+ * Minimal hand-rolled argv parsing (no commander dependency) for the MVP
+ * subcommands defined in PRD §5 plus local operator helpers:
  *
  *   chatgpt2codex serve  --workspace <path>
  *   chatgpt2codex init   --workspace <path>
  *   chatgpt2codex doctor
+ *   chatgpt2codex connector-assistant [--json]
  */
 
 import { execFile } from "node:child_process";
@@ -17,7 +18,8 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { Config, LeasePreset, ProjectRegistryEntry, ToolContext } from "./types.js";
-import { findProject, scanWorkspace } from "./workspace/registry.js";
+import { findProject, scanWorkspaces } from "./workspace/registry.js";
+import { addAuthorizedWorkspaceRoot, loadAuthorizedWorkspaceRoots, removeAuthorizedWorkspaceRoot } from "./workspace/authorized-roots.js";
 import { makeLease } from "./workspace/project-select.js";
 import { Store } from "./state/store.js";
 import { Ledger } from "./state/ledger.js";
@@ -32,6 +34,11 @@ import { startExecutor } from "./control/executor.js";
 import { approveAction, isKilled, listActions, rejectAction, setKill, toSummary } from "./control/queue.js";
 import { preflightPermissions } from "./control/mac-input.js";
 import { clampMinutes, clearAuto, readAuto, setAuto, type AutoActionKind } from "./control/auto.js";
+import {
+  formatConnectorRegistrationReport,
+  inspectConnectorRegistration,
+} from "./connector/registration-assistant.js";
+import { MobileApprovalBridge } from "./exec/mobile-approval.js";
 
 // execution-capability: cli-runtime-doctor
 const execFileAsync = promisify(execFile);
@@ -70,31 +77,56 @@ function defaultStateDir(): string {
   return path.join(os.homedir(), ".local", "share", "chatgpt2codex");
 }
 
-function defaultConfig(workspaceRoot: string, stateDir: string): Config {
+async function configuredWorkspaceRoots(workspaceRoot: string, stateDir: string): Promise<string[]> {
+  const roots = [path.resolve(workspaceRoot), ...(await loadAuthorizedWorkspaceRoots(stateDir))];
+  const raw = process.env.CHATGPT2CODEX_ADDITIONAL_WORKSPACE_ROOTS_JSON?.trim();
+  if (raw) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error("CHATGPT2CODEX_ADDITIONAL_WORKSPACE_ROOTS_JSON must be a JSON array of absolute paths");
+    }
+    if (
+      !Array.isArray(parsed)
+      || parsed.some((value) => typeof value !== "string" || value.trim().length === 0 || !path.isAbsolute(value))
+    ) {
+      throw new Error("CHATGPT2CODEX_ADDITIONAL_WORKSPACE_ROOTS_JSON must be a JSON array of non-empty absolute paths");
+    }
+    for (const value of parsed as string[]) roots.push(path.resolve(value));
+  }
+  return Array.from(new Set(roots));
+}
+
+function defaultConfig(workspaceRoot: string, workspaceRoots: string[], stateDir: string): Config {
   return {
     workspaceRoot,
+    workspaceRoots,
     stateDir,
     maxReadBytes: 10 * 1024 * 1024,
     maxPatchBytes: 10 * 1024 * 1024,
     defaultCommandTimeoutSec: 30,
     defaultLeaseTtlMs: 30 * 60 * 1000,
+    multiProjectLanesEnabled: process.env.CHATGPT2CODEX_MULTI_PROJECT_LANES !== "0",
   };
 }
 
 async function buildToolContext(workspace: string): Promise<ToolContext> {
   const workspaceRoot = path.resolve(workspace);
   const stateDir = defaultStateDir();
+  const workspaceRoots = await configuredWorkspaceRoots(workspaceRoot, stateDir);
 
   const store = new Store(stateDir);
   const ledger = new Ledger(stateDir);
 
-  const registry = await scanWorkspace(workspaceRoot);
+  const registry = await scanWorkspaces(workspaceRoots);
   await store.saveProjects(registry);
 
-  const config = defaultConfig(workspaceRoot, stateDir);
+  const config = defaultConfig(workspaceRoot, workspaceRoots, stateDir);
 
   return {
     workspaceRoot,
+    workspaceRoots,
     stateDir,
     registry,
     ledger: { append: (event) => ledger.append(event) },
@@ -103,6 +135,7 @@ async function buildToolContext(workspace: string): Promise<ToolContext> {
       saveProjects: (p) => store.saveProjects(p),
       getSession: (scope) => store.getSession(scope),
       setSession: (s, scope) => store.setSession(s, scope),
+      updateSession: (scope, updater) => store.updateSession(scope, updater),
     },
     config,
   };
@@ -198,15 +231,38 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
 
   let httpServer: ReturnType<ReturnType<typeof createHttpServer>["app"]["listen"]> | undefined;
   let closeHttpServer: () => Promise<void> = async () => undefined;
+  let mobileApprovalBridge: MobileApprovalBridge | undefined;
   let shuttingDown = false;
   const shutdown = (exitCode = 0) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    const finish = () => {
-      void closeHttpServer().finally(() => process.exit(exitCode));
-    };
-    if (httpServer) httpServer.close(finish);
-    else finish();
+    void (async () => {
+      const server = httpServer;
+      let resolveServerClosed: (() => void) | undefined;
+      const serverClosed = new Promise<void>((resolve) => {
+        resolveServerClosed = resolve;
+      });
+      if (server) {
+        // Stop accepting new requests immediately, but do not wait for the
+        // close callback before closing MCP transports below. Long-lived MCP
+        // connections otherwise keep server.close() pending indefinitely and
+        // block the supervisor's in-place runtime update.
+        server.close(() => resolveServerClosed?.());
+        server.closeIdleConnections();
+      } else {
+        resolveServerClosed?.();
+      }
+
+      await mobileApprovalBridge?.close().catch(() => undefined);
+      await closeHttpServer().catch(() => undefined);
+      if (server) {
+        const forceClose = setTimeout(() => server.closeAllConnections(), 2_000);
+        forceClose.unref();
+        await serverClosed;
+        clearTimeout(forceClose);
+      }
+      process.exit(exitCode);
+    })();
   };
 
   const httpConfig = defaultHttpServerConfig({
@@ -221,8 +277,14 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
     localControlToken: await ensureLocalControlToken(ctx.stateDir),
   });
   const running = createHttpServer(ctx, httpConfig);
-  const { app } = running;
+  const { app, activityTracker } = running;
   closeHttpServer = running.close;
+  mobileApprovalBridge = new MobileApprovalBridge({
+    stateDir: ctx.stateDir,
+    activityTracker,
+    ledgerAppend: (event) => ctx.ledger.append(event),
+  });
+  await mobileApprovalBridge.start();
 
   httpServer = app.listen(port, host, () => {
     console.error(`chatgpt2codex serve --http: listening on http://${host}:${port}/mcp`);
@@ -256,14 +318,15 @@ async function cmdInit(flags: Record<string, string | boolean>): Promise<void> {
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
   const workspaceRoot = path.resolve(workspace);
   const stateDir = defaultStateDir();
+  const workspaceRoots = await configuredWorkspaceRoots(workspaceRoot, stateDir);
 
   const store = new Store(stateDir);
   const ledger = new Ledger(stateDir);
 
-  const registry = await scanWorkspace(workspaceRoot);
+  const registry = await scanWorkspaces(workspaceRoots);
   await store.saveProjects(registry);
   await store.setSession({ activeProjectId: null, mode: "observe", lease: null });
-  await ledger.append({ type: "workspace.opened", workspaceRoot });
+  await ledger.append({ type: "workspace.opened", workspaceRoot, workspaceRootCount: workspaceRoots.length });
 
   console.error(
     `chatgpt2codex init: initialized state dir ${stateDir} with ${registry.length} project(s) from ${workspaceRoot}`,
@@ -570,6 +633,40 @@ async function cmdDoctor(): Promise<void> {
   );
 }
 
+async function cmdConnectorAssistant(flags: Record<string, string | boolean>): Promise<void> {
+  const port = typeof flags.port === "string" ? Number.parseInt(flags.port, 10) : 7979;
+  const timeoutMs = typeof flags.timeout === "string" ? Number.parseInt(flags.timeout, 10) : undefined;
+  const report = await inspectConnectorRegistration({
+    port,
+    timeoutMs,
+    publicOrigin: typeof flags["public-url"] === "string" ? flags["public-url"] : undefined,
+    currentConnectorName: typeof flags.name === "string" ? flags.name : undefined,
+    candidateConnectorName: typeof flags["candidate-name"] === "string" ? flags["candidate-name"] : undefined,
+  });
+  console.log(flags.json ? JSON.stringify(report, null, 2) : formatConnectorRegistrationReport(report));
+  if (report.state !== "READY") process.exitCode = 1;
+}
+
+async function cmdWorkspaceRoot(positional: string[]): Promise<void> {
+  const [action, requestedRoot] = positional;
+  const stateDir = defaultStateDir();
+  if (action === "list") {
+    console.log(JSON.stringify(await loadAuthorizedWorkspaceRoots(stateDir), null, 2));
+    return;
+  }
+  if (action === "add") {
+    if (!requestedRoot) throw new Error("usage: chatgpt2codex workspace-root add <absolute-path>");
+    console.log(JSON.stringify(await addAuthorizedWorkspaceRoot(stateDir, requestedRoot), null, 2));
+    return;
+  }
+  if (action === "remove") {
+    if (!requestedRoot) throw new Error("usage: chatgpt2codex workspace-root remove <absolute-path>");
+    console.log(JSON.stringify(await removeAuthorizedWorkspaceRoot(stateDir, requestedRoot), null, 2));
+    return;
+  }
+  throw new Error("usage: chatgpt2codex workspace-root <list|add|remove> [absolute-path]");
+}
+
 async function main(): Promise<void> {
   const { command, flags, positional } = parseArgs(process.argv.slice(2));
   switch (command) {
@@ -582,15 +679,21 @@ async function main(): Promise<void> {
     case "doctor":
       await cmdDoctor();
       break;
+    case "connector-assistant":
+      await cmdConnectorAssistant(flags);
+      break;
     case "owner-token":
       await cmdOwnerToken(flags);
       break;
     case "control":
       await cmdControl(positional, flags);
       break;
+    case "workspace-root":
+      await cmdWorkspaceRoot(positional);
+      break;
     default:
       console.error(
-        "usage: chatgpt2codex <serve|init|doctor|owner-token|control> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
+        "usage: chatgpt2codex <serve|init|doctor|connector-assistant|owner-token|control|workspace-root> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
       );
       process.exitCode = 1;
   }

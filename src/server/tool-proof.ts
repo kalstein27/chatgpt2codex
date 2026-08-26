@@ -1,3 +1,5 @@
+import { currentOutputPolicy, type OutputPolicySnapshot } from "../runtime/output-policy.js";
+
 export const CHATGPT2CODEX_APP_NAME = "ChatGPT To Codex";
 export const CHATGPT2CODEX_TOOL_NAMESPACE = "ChatGPT_To_Codex";
 
@@ -30,9 +32,10 @@ export function addToolCallProof<T extends Record<string, unknown>>(
   structured: T,
   tool: string,
   ok: boolean,
-): T & { chatgpt2codexToolCall: Record<string, unknown> } {
+): T & { chatgpt2codexToolCall: Record<string, unknown>; outputPolicy: OutputPolicySnapshot } {
   return {
     chatgpt2codexToolCall: toolCallProof(tool, ok),
     ...structured,
+    outputPolicy: currentOutputPolicy(),
   };
 }

@@ -5,6 +5,11 @@ import { fileURLToPath } from "node:url";
 import { DomainError, ErrorCode } from "../types.js";
 import { buildSafeChildEnv } from "../exec/command-runner.js";
 import type { ResolvedTargetPreview } from "./queue.js";
+import {
+  requestAccessibilityBridge,
+  type AccessibilityBridgeKind,
+  type AccessibilityBridgePayload,
+} from "./accessibility-bridge.js";
 
 /**
  * darwin-only synthetic-input primitives for Option B desktop control.
@@ -67,10 +72,26 @@ function assertDarwin(): void {
   }
 }
 
+const MENU_BAR_ACCESSIBILITY_TIMEOUT_MS = 5_000;
+
+function requestMenuBarAccessibility(
+  kind: AccessibilityBridgeKind,
+  payload?: AccessibilityBridgePayload,
+): Promise<Record<string, unknown>> {
+  return requestAccessibilityBridge({ kind, payload, timeoutMs: MENU_BAR_ACCESSIBILITY_TIMEOUT_MS });
+}
+
 /** Name of the frontmost (active) application, used as the 2nd sensitive-app
  * gate immediately before executing an approved action. */
 export async function resolveFrontmostApp(): Promise<string | undefined> {
   assertDarwin();
+  try {
+    const result = await requestMenuBarAccessibility("frontmost");
+    const name = typeof result.appName === "string" ? result.appName.trim() : "";
+    if (name.length > 0) return name;
+  } catch {
+    // Fall through to the legacy System Events lookup below.
+  }
   try {
     const { stdout } = await execFileAsync("/usr/bin/osascript", [
       "-e",
@@ -94,6 +115,18 @@ export interface AppWindowRegion {
  * approach as src/e2e/local-e2e.ts getAppWindowRegion). */
 export async function getAppWindowRegion(appName: string): Promise<AppWindowRegion> {
   assertDarwin();
+  try {
+    const result = await requestMenuBarAccessibility("windowregion", { appName });
+    const x = typeof result.x === "number" ? result.x : Number.NaN;
+    const y = typeof result.y === "number" ? result.y : Number.NaN;
+    const width = typeof result.width === "number" ? result.width : Number.NaN;
+    const height = typeof result.height === "number" ? result.height : Number.NaN;
+    if ([x, y, width, height].every(Number.isFinite) && width > 0 && height > 0) {
+      return { x, y, width, height };
+    }
+  } catch {
+    // Fall through to the legacy System Events lookup below.
+  }
   const { stdout } = await execFileAsync("/usr/bin/osascript", [
     "-e",
     `
@@ -135,30 +168,114 @@ export async function resolveWindowPoint(appName: string, xRel: number, yRel: nu
   };
 }
 
-/** Click an absolute screen point. Prefers the native `chatgpt2codex-ax`
- * helper's CGEvent-based synthesis (more reliable against Electron/Chromium
- * apps than AppleScript UI scripting) and falls back to the existing
- * osascript "click at" primitive when the helper is unavailable or fails. */
-export async function clickAtPoint(appName: string, x: number, y: number): Promise<void> {
+export type MouseButton = "left" | "right" | "middle";
+
+/** Click an absolute screen point. The signed menu-bar bridge is primary so
+ * macOS evaluates the app's Accessibility TCC identity. clickCount is bounded
+ * by callers to 1 or 2; non-left buttons intentionally have no System Events
+ * fallback because silently degrading them to a left click would be unsafe. */
+export async function clickAtPoint(
+  appName: string,
+  x: number,
+  y: number,
+  button: MouseButton = "left",
+  clickCount = 1,
+ ): Promise<void> {
   assertDarwin();
+  const kind: AccessibilityBridgeKind = clickCount >= 2 ? "doubleclick" : "click";
+  try {
+    await requestMenuBarAccessibility(kind, { appName, x, y, button });
+    return;
+  } catch {
+    // Fall through to the packaged helper and limited System Events fallback.
+  }
   const helper = resolveHelperPath();
   if (helper) {
     try {
-      await runHelper(helper, "click", { appName, x, y });
+      await runHelper(helper, kind, { appName, x, y, button });
       return;
     } catch {
-      // Fall through to the osascript fallback below.
+      // Fall through only for a left click.
     }
   }
+  if (button !== "left") {
+    throw new DomainError(ErrorCode.NOT_IMPLEMENTED, `${button} click requires the native accessibility bridge`);
+  }
+  const repeatCount = clickCount >= 2 ? 2 : 1;
   await execFileAsync("/usr/bin/osascript", [
     "-e",
     `
     tell application ${appleScriptString(appName)} to activate
     tell application "System Events"
-      click at {${Math.round(x)}, ${Math.round(y)}}
+      repeat ${repeatCount} times
+        click at {${Math.round(x)}, ${Math.round(y)}}
+        delay 0.05
+      end repeat
     end tell
     `,
   ]);
+}
+
+/** Move the pointer without clicking. */
+export async function moveMouseToPoint(appName: string, x: number, y: number): Promise<void> {
+  assertDarwin();
+  try {
+    await requestMenuBarAccessibility("move", { appName, x, y });
+    return;
+  } catch {
+    // Fall through to packaged helper.
+  }
+  const helper = resolveHelperPath();
+  if (helper) {
+    await runHelper(helper, "move", { appName, x, y });
+    return;
+  }
+  throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "Mouse move requires the native accessibility bridge");
+}
+
+/** Drag through an already-resolved absolute path. */
+export async function dragPoints(
+  appName: string,
+  points: Array<{ x: number; y: number }>,
+  button: MouseButton = "left",
+): Promise<void> {
+  assertDarwin();
+  try {
+    await requestMenuBarAccessibility("drag", { appName, points, button });
+    return;
+  } catch {
+    // Fall through to packaged helper.
+  }
+  const helper = resolveHelperPath();
+  if (helper) {
+    await runHelper(helper, "drag", { appName, points, button });
+    return;
+  }
+  throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "Drag requires the native accessibility bridge");
+}
+
+/** Scroll at an absolute point. Positive scrollY means down and positive
+ * scrollX means right, matching the model-facing computer-use convention. */
+export async function scrollAtPoint(
+  appName: string,
+  x: number,
+  y: number,
+  scrollX: number,
+  scrollY: number,
+): Promise<void> {
+  assertDarwin();
+  try {
+    await requestMenuBarAccessibility("scroll", { appName, x, y, scrollX, scrollY });
+    return;
+  } catch {
+    // Fall through to packaged helper.
+  }
+  const helper = resolveHelperPath();
+  if (helper) {
+    await runHelper(helper, "scroll", { appName, x, y, scrollX, scrollY });
+    return;
+  }
+  throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "Scroll requires the native accessibility bridge");
 }
 
 export interface AxClickTarget {
@@ -191,11 +308,15 @@ export async function clickAxElement(appName: string, target: AxClickTarget): Pr
 }
 
 /** Type literal text into the frontmost element of `appName`. Prefers the
- * native helper's CGEvent keyboard synthesis over AppleScript `keystroke`
- * and falls back to it when the helper is unavailable or fails. The raw
- * `text` is only ever passed over the helper's stdin pipe, never logged. */
+ * native helper's CGEvent keyboard synthesis over AppleScript `keystroke`. */
 export async function typeText(appName: string, text: string): Promise<void> {
   assertDarwin();
+  try {
+    await requestMenuBarAccessibility("type", { appName, text });
+    return;
+  } catch {
+    // Fall through to the packaged helper and System Events fallbacks below.
+  }
   const helper = resolveHelperPath();
   if (helper) {
     try {
@@ -205,13 +326,6 @@ export async function typeText(appName: string, text: string): Promise<void> {
       // Fall through to the osascript fallback below.
     }
   }
-  // The text is passed via an environment variable and read back with
-  // `system attribute`, never inlined into the script argv: node's execFile
-  // error.message includes the full "Command failed: <file> <args>" string
-  // on failure (e.g. AppleScript error -1728), so inlining the raw text here
-  // would leak it — including passwords typed into a form — into any caller
-  // that logs or returns that error message (ledger, tool result to
-  // ChatGPT). See src/control/executor.ts's catch handler.
   await execFileAsync(
     "/usr/bin/osascript",
     [
@@ -230,15 +344,20 @@ export async function typeText(appName: string, text: string): Promise<void> {
   );
 }
 
-/** Press a single virtual key code in `appName`. Prefers the native helper's
- * CGEvent keyboard synthesis over AppleScript `key code` and falls back to
- * it when the helper is unavailable or fails. */
+/** Press a single virtual key code in `appName`. */
 export async function pressKey(appName: string, keyCode: number): Promise<void> {
   assertDarwin();
+  const roundedKeyCode = Math.round(keyCode);
+  try {
+    await requestMenuBarAccessibility("key", { appName, keyCode: roundedKeyCode });
+    return;
+  } catch {
+    // Fall through to the packaged helper and System Events fallbacks below.
+  }
   const helper = resolveHelperPath();
   if (helper) {
     try {
-      await runHelper(helper, "key", { appName, keyCode: Math.round(keyCode) });
+      await runHelper(helper, "key", { appName, keyCode: roundedKeyCode });
       return;
     } catch {
       // Fall through to the osascript fallback below.
@@ -251,11 +370,70 @@ export async function pressKey(appName: string, keyCode: number): Promise<void> 
     tell application "System Events"
       tell process ${appleScriptString(appName)}
         set frontmost to true
-        key code ${Math.round(keyCode)}
+        key code ${roundedKeyCode}
       end tell
     end tell
     `,
   ]);
+}
+
+const KEY_NAME_TO_CODE: Record<string, number> = {
+  A: 0, S: 1, D: 2, F: 3, H: 4, G: 5, Z: 6, X: 7, C: 8, V: 9, B: 11,
+  Q: 12, W: 13, E: 14, R: 15, Y: 16, T: 17, "1": 18, "2": 19, "3": 20, "4": 21,
+  "6": 22, "5": 23, "=": 24, "9": 25, "7": 26, "-": 27, "8": 28, "0": 29, "]": 30, O: 31,
+  U: 32, "[": 33, I: 34, P: 35, ENTER: 36, RETURN: 36, L: 37, J: 38, "'": 39, K: 40, ";": 41,
+  "\\": 42, ",": 43, "/": 44, N: 45, M: 46, ".": 47, TAB: 48, SPACE: 49, BACKSPACE: 51,
+  DELETE: 51, ESC: 53, ESCAPE: 53, HOME: 115, END: 119, PAGEUP: 116, PAGEDOWN: 121,
+  LEFT: 123, RIGHT: 124, DOWN: 125, UP: 126, F1: 122, F2: 120, F3: 99, F4: 118,
+  F5: 96, F6: 97, F7: 98, F8: 100, F9: 101, F10: 109, F11: 103, F12: 111,
+};
+
+function keypressSpec(keys: string[]): { keyCodes: number[]; modifiers: string[] } {
+  const modifiers: string[] = [];
+  const keyCodes: number[] = [];
+  for (const raw of keys) {
+    const key = raw.trim().toUpperCase();
+    if (["CMD", "COMMAND", "META"].includes(key)) { modifiers.push("command"); continue; }
+    if (key === "SHIFT") { modifiers.push("shift"); continue; }
+    if (["ALT", "OPTION"].includes(key)) { modifiers.push("option"); continue; }
+    if (["CTRL", "CONTROL"].includes(key)) { modifiers.push("control"); continue; }
+    if (["FN", "FUNCTION"].includes(key)) { modifiers.push("function"); continue; }
+    const keyCode = KEY_NAME_TO_CODE[key];
+    if (keyCode === undefined) throw new DomainError(ErrorCode.NOT_IMPLEMENTED, `Unsupported key name: ${raw}`);
+    keyCodes.push(keyCode);
+  }
+  if (keyCodes.length === 0) throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "keypress requires at least one non-modifier key");
+  return { keyCodes, modifiers: [...new Set(modifiers)] };
+}
+
+/** Press a named key or key chord such as ["CMD", "L"] or ["SHIFT", "TAB"]. */
+export async function pressKeyNames(appName: string, keys: string[]): Promise<void> {
+  assertDarwin();
+  const spec = keypressSpec(keys);
+  try {
+    await requestMenuBarAccessibility("keypress", { appName, ...spec });
+    return;
+  } catch {
+    // Fall through to packaged helper, then a validated AppleScript fallback.
+  }
+  const helper = resolveHelperPath();
+  if (helper) {
+    try {
+      await runHelper(helper, "keypress", { appName, ...spec });
+      return;
+    } catch {
+      // Fall through.
+    }
+  }
+  const modifierMap: Record<string, string> = { command: "command down", shift: "shift down", option: "option down", control: "control down" };
+  const modifiers = spec.modifiers.map((name) => modifierMap[name]).filter((value): value is string => Boolean(value));
+  const usingClause = modifiers.length > 0 ? ` using {${modifiers.join(", ")}}` : "";
+  for (const keyCode of spec.keyCodes) {
+    await execFileAsync("/usr/bin/osascript", [
+      "-e",
+      `tell application ${appleScriptString(appName)} to activate\ntell application "System Events" to key code ${keyCode}${usingClause}`,
+    ]);
+  }
 }
 
 export interface AxResolveTarget {
@@ -265,30 +443,31 @@ export interface AxResolveTarget {
 }
 
 // ---------------------------------------------------------------------------
-// AX semantic targeting: native `chatgpt2codex-ax` helper (preferred, ships
-// inside the signed .app bundle at Contents/MacOS/chatgpt2codex-ax, built by
-// scripts/build-macos-app.sh from macos/ChatGPTToCodexStatusBar/ax-helper.swift)
-// with an osascript/System Events read-only fallback for source/dev runs
-// where the helper hasn't been built. Resolve is always side-effect free;
-// press/setvalue re-resolve the element at actuation time (never reuse a
-// stale reference from an earlier dry-run preview).
+// AX semantic targeting: the signed menu-bar app bridge is primary so native
+// AX/CGEvent work executes inside the process that owns the user's stable TCC
+// grant. The bundled `chatgpt2codex-ax` executable remains a compatibility
+// fallback, followed by System Events where applicable. Resolve is always
+// side-effect free; press/setvalue re-resolve at actuation time and never
+// reuse a stale reference from an earlier dry-run preview.
 // ---------------------------------------------------------------------------
 
 let cachedHelperPath: string | null | undefined;
 
-/** Locate the bundled `chatgpt2codex-ax` helper relative to this compiled
- * module (dist/control/mac-input.js -> Contents/Resources/chatgpt2codex/dist/control
- * -> up 4 -> Contents/MacOS/chatgpt2codex-ax). Returns null (cached) when not
- * running from inside the packaged app, e.g. source/dev/test runs. */
+/** Locate the signed `chatgpt2codex-ax` helper. Packaged runs resolve it
+ * relative to this compiled module. Immutable runtime snapshots live outside
+ * the .app bundle, so they also probe the fixed system install location.
+ * Never fall back to PATH or arbitrary environment-provided executables. */
 function resolveHelperPath(): string | null {
   if (cachedHelperPath !== undefined) return cachedHelperPath;
+  const candidates: string[] = [];
   try {
     const here = path.dirname(fileURLToPath(import.meta.url));
-    const candidate = path.join(here, "..", "..", "..", "..", "MacOS", "chatgpt2codex-ax");
-    cachedHelperPath = existsSync(candidate) ? candidate : null;
+    candidates.push(path.join(here, "..", "..", "..", "..", "MacOS", "chatgpt2codex-ax"));
   } catch {
-    cachedHelperPath = null;
+    // Runtime snapshots may not live inside the packaged app bundle.
   }
+  candidates.push("/Applications/ChatGPT To Codex.app/Contents/MacOS/chatgpt2codex-ax");
+  cachedHelperPath = candidates.find((candidate) => existsSync(candidate)) ?? null;
   return cachedHelperPath;
 }
 
@@ -392,6 +571,18 @@ async function resolveAxElementViaSystemEvents(appName: string, target: AxResolv
  * query when the helper isn't present (source/dev runs). */
 export async function resolveAxElement(appName: string, target: AxResolveTarget): Promise<ResolvedTargetPreview> {
   assertDarwin();
+  assertSafeAxRoleClass(target.role);
+  try {
+    const result = await requestMenuBarAccessibility("resolve", {
+      appName,
+      role: target.role,
+      title: target.title,
+      description: target.description,
+    });
+    return { source: "menu-bar", ...result } as ResolvedTargetPreview;
+  } catch {
+    // Fall through to the packaged helper and read-only System Events fallback.
+  }
   const helper = resolveHelperPath();
   if (helper) {
     try {
@@ -417,6 +608,18 @@ export async function resolveAxElement(appName: string, target: AxResolveTarget)
  * resolved center-point click, when the native helper is unavailable. */
 export async function pressAxElement(appName: string, target: AxResolveTarget): Promise<void> {
   assertDarwin();
+  assertSafeAxRoleClass(target.role);
+  try {
+    await requestMenuBarAccessibility("press", {
+      appName,
+      role: target.role,
+      title: target.title,
+      description: target.description,
+    });
+    return;
+  } catch {
+    // Fall through to the packaged helper and System Events fallbacks below.
+  }
   const helper = resolveHelperPath();
   if (helper) {
     try {
@@ -448,9 +651,22 @@ export async function pressAxElement(appName: string, target: AxResolveTarget): 
 /** Set the value of an accessibility text element (AXSetValue) by role +
  * title/description, re-resolving at actuation time like pressAxElement.
  * Falls back to focusing the element (pressAxElement) then the existing
- * keystroke-based typeText when the native helper is unavailable. */
+ * keystroke-based typeText when the menu-bar bridge and helper are unavailable. */
 export async function setAxValue(appName: string, target: AxResolveTarget, text: string): Promise<void> {
   assertDarwin();
+  assertSafeAxRoleClass(target.role);
+  try {
+    await requestMenuBarAccessibility("setvalue", {
+      appName,
+      role: target.role,
+      title: target.title,
+      description: target.description,
+      text,
+    });
+    return;
+  } catch {
+    // Fall through to the packaged helper and focus/type fallbacks below.
+  }
   const helper = resolveHelperPath();
   if (helper) {
     try {
@@ -474,21 +690,31 @@ export async function setAxValue(appName: string, target: AxResolveTarget, text:
 // Live permission preflight: surfaces the real Accessibility/Screen
 // Recording trust state so callers (executor.ts, `chatgpt2codex control
 // preflight`) can report a clear reason instead of a control action silently
-// failing partway through. Only the native helper (running inside the
-// signed .app, which is what actually needs/holds the TCC grants) can answer
-// this definitively; a source/dev run without the built helper reports
-// `source: "unavailable"` rather than guessing.
+// failing partway through. The signed menu-bar process is the primary
+// definitive source because it owns the stable TCC grant. The legacy helper
+// is used only when the menu-bar bridge is unavailable; a source/dev run with
+// neither native source reports `source: "unavailable"` rather than guessing.
 // ---------------------------------------------------------------------------
 
 export interface PermissionPreflightResult {
   accessibilityTrusted: boolean;
   screenRecordingAllowed: boolean;
-  source: "ax-helper" | "unavailable";
+  source: "menu-bar" | "ax-helper" | "unavailable";
   reason?: string;
 }
 
 export async function preflightPermissions(): Promise<PermissionPreflightResult> {
   assertDarwin();
+  try {
+    const result = await requestMenuBarAccessibility("preflight");
+    return {
+      accessibilityTrusted: result.accessibilityTrusted === true,
+      screenRecordingAllowed: result.screenRecordingAllowed === true,
+      source: "menu-bar",
+    };
+  } catch {
+    // Fall through to the legacy packaged helper when the menu-bar app bridge is unavailable.
+  }
   const helper = resolveHelperPath();
   if (helper) {
     try {
