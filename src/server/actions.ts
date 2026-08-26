@@ -695,7 +695,7 @@ export function openApiSpec(publicOrigin: string): Record<string, unknown> {
         operationId: "call_tool",
         summary: "Call any chatgpt2codex MCP tool",
         description:
-          "Full-power owner bridge for Custom GPTs. Use this when a dedicated action route is missing. It calls the named chatgpt2codex MCP tool on the local Mac; do not try to write /Users/... directly from ChatGPT's sandbox. For source edits: select project with preset=full-write, then call file_apply_patch or file_create through this route. The response toolCall object is the required proof that the local tool was actually callable.",
+          "Full-power owner bridge for Custom GPTs. Use this when a dedicated action route is missing. It calls the named chatgpt2codex MCP tool on the local Mac; do not try to write /Users/... directly from ChatGPT's sandbox. For source edits, follow the live agent_guide: when multi-project lanes are enabled, open and verify a full-write work lane and carry its exact workLaneId into file_apply_patch/file_create; use serial project_select only when the live contract explicitly requires that legacy mode. The response toolCall object is the required proof that the local tool was actually callable.",
         security: [{ ownerBearer: [] }],
         requestBody: {
           required: true,
