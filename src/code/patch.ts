@@ -271,6 +271,8 @@ interface StagedWrite {
   content: string | null; // null => delete
   /** Whole-file hash observed while the edit was staged. */
   baselineHash?: string;
+  /** Existing/source mode to preserve across temp-file replacement or moves. */
+  mode?: number;
   tempPath?: string;
 }
 
@@ -323,7 +325,8 @@ export async function applyPatch(
     if (op.action === "delete") {
       const abs = await resolveInProject(root, op.path, { allowSymlink: false, rejectRoot: true });
       const original = await readMutationSource(abs, op.path, preconditionHashes);
-      staged.push({ abs, content: null, baselineHash: rangeHash(original) });
+      const stat = await fs.lstat(abs);
+      staged.push({ abs, content: null, baselineHash: rangeHash(original), mode: stat.mode & 0o7777 });
       applied.push({ path: op.path, action: "delete", added: 0, removed: 0 });
       continue;
     }
@@ -332,7 +335,8 @@ export async function applyPatch(
       const abs = await resolveInProject(root, op.path, { allowSymlink: false, rejectRoot: true });
       const original = await readMutationSource(abs, op.path, preconditionHashes);
       const next = applyHunks(original, op.hunks);
-      staged.push({ abs, content: next, baselineHash: rangeHash(original) });
+      const stat = await fs.lstat(abs);
+      staged.push({ abs, content: next, baselineHash: rangeHash(original), mode: stat.mode & 0o7777 });
       const delta = countDelta(op.hunks);
       applied.push({ path: op.path, action: "update", added: delta.added, removed: delta.removed });
       continue;
@@ -343,8 +347,10 @@ export async function applyPatch(
       const newAbs = await resolveInProject(root, op.newPath, { allowSymlink: false, rejectRoot: true });
       const original = await readMutationSource(abs, op.path, preconditionHashes);
       const next = op.hunks.length > 0 ? applyHunks(original, op.hunks) : original;
-      staged.push({ abs, content: null, baselineHash: rangeHash(original) }); // remove old location
-      staged.push({ abs: newAbs, content: next }); // write new location
+      const stat = await fs.lstat(abs);
+      const mode = stat.mode & 0o7777;
+      staged.push({ abs, content: null, baselineHash: rangeHash(original), mode }); // remove old location
+      staged.push({ abs: newAbs, content: next, mode }); // write new location
       const delta = countDelta(op.hunks);
       applied.push({ path: op.path, action: "move", added: delta.added, removed: delta.removed });
       continue;
@@ -389,7 +395,7 @@ export async function applyPatch(
   // then rename into place. If any write fails, roll back everything that
   // already landed.
   await assertStagedSourcesUnchanged(staged);
-  const committed: { finalPath: string; hadPrevious: boolean; prevContent: Buffer | null }[] = [];
+  const committed: { finalPath: string; hadPrevious: boolean; prevContent: Buffer | null; prevMode?: number }[] = [];
   try {
     for (const write of staged) {
       if (write.content === null) {
@@ -401,7 +407,12 @@ export async function applyPatch(
           prevContent = null;
         }
         await fs.unlink(write.abs);
-        committed.push({ finalPath: write.abs, hadPrevious: prevContent !== null, prevContent });
+        committed.push({
+          finalPath: write.abs,
+          hadPrevious: prevContent !== null,
+          prevContent,
+          prevMode: checkpointBefore.get(write.abs)?.mode,
+        });
         continue;
       }
 
@@ -418,16 +429,26 @@ export async function applyPatch(
         hadPrevious = false;
       }
 
-      await fs.writeFile(tempPath, write.content, "utf8");
+      await fs.writeFile(tempPath, write.content, {
+        encoding: "utf8",
+        ...(write.mode !== undefined ? { mode: write.mode } : {}),
+      });
+      if (write.mode !== undefined) await fs.chmod(tempPath, write.mode);
       await fs.rename(tempPath, write.abs);
-      committed.push({ finalPath: write.abs, hadPrevious, prevContent });
+      committed.push({
+        finalPath: write.abs,
+        hadPrevious,
+        prevContent,
+        prevMode: checkpointBefore.get(write.abs)?.mode,
+      });
     }
   } catch (err) {
     // Roll back everything already committed, best-effort, in reverse order.
     for (const c of committed.reverse()) {
       try {
         if (c.hadPrevious && c.prevContent !== null) {
-          await fs.writeFile(c.finalPath, c.prevContent);
+          await fs.writeFile(c.finalPath, c.prevContent, c.prevMode !== undefined ? { mode: c.prevMode } : undefined);
+          if (c.prevMode !== undefined) await fs.chmod(c.finalPath, c.prevMode);
         } else {
           await fs.rm(c.finalPath, { force: true });
         }

@@ -1495,13 +1495,12 @@ private final class ServiceController {
 
     func stop(terminateExternalRuntime: Bool = true) {
         let managedProcess = process
-        let ownsRuntime = managedProcess != nil
         if let managedProcess, managedProcess.isRunning {
             managedProcess.terminate()
         }
         process = nil
 
-        if !terminateExternalRuntime && !ownsRuntime {
+        if !terminateExternalRuntime {
             return
         }
 
@@ -1518,9 +1517,26 @@ private final class ServiceController {
     }
 
     func restart(completion: @escaping (Bool) -> Void) {
-        stop()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            self.start(completion: completion)
+        let ownsManagedRuntime = process?.isRunning == true
+        // When this app owns the launcher, terminate only that exact Process.
+        // A detached broad pkill can outlive the old process and race the new
+        // launch after loopback health has already gone down. Fall back to the
+        // broad external cleanup only when there is no live managed handle.
+        stop(terminateExternalRuntime: !ownsManagedRuntime)
+        waitForRuntimeToStop(remainingAttempts: 24) { [weak self] stopped in
+            guard let self else { return }
+            guard stopped else {
+                self.appendLog("restart failed: previous runtime stayed healthy before managed launch\n")
+                completion(false)
+                return
+            }
+            do {
+                try self.launchServer()
+                completion(true)
+            } catch {
+                self.appendLog("restart launch failed: \(error.localizedDescription)\n")
+                completion(false)
+            }
         }
     }
 
