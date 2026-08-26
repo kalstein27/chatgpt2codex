@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import { redact } from "../policy/secrets.js";
 import type { RuntimeActivityTracker, RuntimeConversationSummary } from "../runtime/activity.js";
 
 const MAX_DASHBOARD_OPERATIONS = 12;
+const ACTIVITY_DASHBOARD_REVISION_TOKEN = "__C2CT_ACTIVITY_DASHBOARD_REVISION__";
 
 export interface ActivityDashboardApproval {
   id: string;
@@ -94,13 +96,14 @@ export function activityDashboardSnapshot(
 ) {
   return {
     schemaVersion: 2,
+    dashboardRevision: ACTIVITY_DASHBOARD_REVISION,
     generatedAt: now,
     approvals: approvals.map(dashboardApproval),
     conversations: tracker.conversationSnapshot(now).map(dashboardConversation),
   };
 }
 
-export const ACTIVITY_DASHBOARD_HTML = String.raw`<!doctype html>
+const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
 <html lang="ko">
 <head>
   <meta charset="utf-8">
@@ -248,6 +251,7 @@ export const ACTIVITY_DASHBOARD_HTML = String.raw`<!doctype html>
 </main>
 <script>
 (function () {
+  var pageDashboardRevision = "__C2CT_ACTIVITY_DASHBOARD_REVISION__";
   var selectedProject = "all";
   var latest = [];
   var latestApprovals = [];
@@ -539,6 +543,10 @@ export const ACTIVITY_DASHBOARD_HTML = String.raw`<!doctype html>
       var response = await fetch("/activity/api/activity", { cache: "no-store" });
       if (!response.ok) throw new Error("HTTP " + response.status);
       var payload = await response.json();
+      if (typeof payload.dashboardRevision === "string" && payload.dashboardRevision !== pageDashboardRevision) {
+        window.location.reload();
+        return;
+      }
       latest = Array.isArray(payload.conversations) ? payload.conversations : [];
       latestApprovals = Array.isArray(payload.approvals) ? payload.approvals : [];
       liveDot.classList.remove("offline");
@@ -555,3 +563,13 @@ export const ACTIVITY_DASHBOARD_HTML = String.raw`<!doctype html>
 </script>
 </body>
 </html>`;
+
+export const ACTIVITY_DASHBOARD_REVISION = createHash("sha256")
+  .update(ACTIVITY_DASHBOARD_TEMPLATE)
+  .digest("hex")
+  .slice(0, 16);
+
+export const ACTIVITY_DASHBOARD_HTML = ACTIVITY_DASHBOARD_TEMPLATE.replace(
+  ACTIVITY_DASHBOARD_REVISION_TOKEN,
+  ACTIVITY_DASHBOARD_REVISION,
+);

@@ -720,13 +720,13 @@ export class MobileApprovalBridge {
     }
   }
 
-  async start(): Promise<void> {
+  private async ensureCallbackServer(): Promise<void> {
     if (this.server) return;
-    this.server = createServer((req, res) => {
+    const server = createServer((req, res) => {
       void this.handleCallback(req, res).catch(() => sendJson(res, 500, { ok: false }));
     });
+    this.server = server;
     await new Promise<void>((resolve, reject) => {
-      const server = this.server!;
       const onError = (error: Error) => {
         server.off("listening", onListening);
         reject(error);
@@ -741,12 +741,16 @@ export class MobileApprovalBridge {
     }).then(() => {
       this.state().listening = true;
       this.state().error = null;
-      this.server?.unref();
+      server.unref();
     }).catch((error) => {
       this.state().listening = false;
       this.state().error = safeError(error);
-      this.server = undefined;
+      if (this.server === server) this.server = undefined;
     });
+  }
+
+  async start(): Promise<void> {
+    await this.ensureCallbackServer();
 
     this.timer = setInterval(() => {
       void this.poll();
@@ -773,9 +777,13 @@ export class MobileApprovalBridge {
   }
 
   async poll(now = Date.now()): Promise<void> {
-    if (this.polling || !this.state().listening) return;
+    if (this.polling) return;
     this.polling = true;
     try {
+      if (!this.state().listening) {
+        await this.ensureCallbackServer();
+        if (!this.state().listening) return;
+      }
       const config = await readMobileApprovalConfig(this.stateDir);
       const requests = await listOperationApprovalRequests(this.stateDir, now);
       let pending = new Map(
