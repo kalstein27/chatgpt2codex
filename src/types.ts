@@ -2,8 +2,8 @@
  * chatgpt2codex shared contract.
  *
  * This module is the single source of truth for cross-module types used by
- * every tool implementation. Per PRD (docs/UNIFIED-PRD.md §8, §10) and
- * docs/CHATGPT2CODEX-PRD.md §8.
+ * every tool implementation. It implements the repository's internal PRD
+ * contracts without requiring private/local design documents in the public tree.
  *
  * Public signatures frozen here MUST NOT change without updating every
  * dependent module. Implementers fill in *other* modules' bodies, not this

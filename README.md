@@ -18,8 +18,6 @@ edited.
 > [ezBuilder/chatgpt2codex](https://github.com/ezBuilder/chatgpt2codex), with
 > separate modifications applied here.
 
-[Installation guide](docs/INSTALL.md) ·
-[Build guide](docs/BUILDING.md) ·
 [Official releases](https://github.com/ezBuilder/chatgpt2codex/releases)
 
 > Help us get this in front of more builders: star the repo if you want
@@ -49,8 +47,8 @@ ChatGPT thinks. Your computer acts. You review the result.
 
 | Platform | Status | Package/build path |
 | --- | --- | --- |
-| macOS | Local/source workflow validated; publish only a signed and notarized release asset | See [the build guide](docs/BUILDING.md) |
-| Windows | Tray and installer source exist; real Windows CI/E2E acceptance is still required before publishing | See [the Windows quick start](docs/WINDOWS-QUICKSTART.ko.md) |
+| macOS | Local/source workflow validated; publish only a signed and notarized release asset | Public source build: `npm run build`; release packaging stays outside Git |
+| Windows | Tray and installer source exist; real Windows CI/E2E acceptance is still required before publishing | See [windows/README.md](windows/README.md) |
 | Linux | Developer path only | Not published |
 
 Installers are distributed as GitHub Release assets when the matching platform
@@ -124,7 +122,7 @@ local folders.
 
 ## Install In 5 Minutes
 
-Full beginner guide: [docs/INSTALL.md](docs/INSTALL.md)
+Public installation guidance lives in this README; machine-local operator notes stay outside Git.
 
 Use an installer only when the matching asset is attached to an official
 GitHub Release. Otherwise build from source and keep platform-specific steps
@@ -207,8 +205,8 @@ for English, Korean, Japanese, Simplified Chinese, Traditional Chinese, Spanish,
 French, German, Brazilian Portuguese, Italian, Dutch, Polish, Russian, Turkish,
 Vietnamese, Indonesian, Thai, Arabic, Hindi, and Ukrainian.
 
-The install guide currently includes Korean, English, Japanese, and Simplified
-Chinese. More documentation languages are welcome.
+Local installation and operator notes may contain additional languages without
+becoming public repository content.
 
 ## Windows status
 
@@ -218,9 +216,7 @@ session-status runtime is implemented, but a Windows release is not accepted
 until those paths run on a real Windows runner. Native Windows desktop
 screenshot/click/type control is not implemented, so the tray deliberately
 shows `Agent Arm: unavailable on Windows` instead of accepting a lease it
-cannot execute. See
-[docs/WINDOWS-QUICKSTART.ko.md](docs/WINDOWS-QUICKSTART.ko.md),
-[docs/INSTALL.md](docs/INSTALL.md), and [windows/README.md](windows/README.md).
+cannot execute. See [windows/README.md](windows/README.md).
 
 ## Command side-effect metadata
 
@@ -341,12 +337,10 @@ remains full-write and one-shot approval gated. While that local approval is
 pending, the command's remaining timeout budget is paused for at most two minutes
 so approval does not lose a race to the original deadline; a client
 Stop/disconnect still never implies cancel or safe automatic retry.
-See [docs/CONNECTION-DIAGNOSTICS.ko.md](docs/CONNECTION-DIAGNOSTICS.ko.md).
-
 ## Repository contents
 
-This public repository is intended to contain only the product source, public
-documentation, reviewed assets, and reproducible scripts. Release binaries are
+This public repository is intended to contain only the product source, the
+reviewed public READMEs, reviewed assets, and reproducible scripts. Release binaries are
 published as GitHub Release assets rather than committed. Local agent state,
 personal automation rules, generated memory, hooks, private MCP config, build
 output, installation backups, signing credentials, IDE state, E2E captures,
@@ -354,7 +348,7 @@ local databases, and machine-local logs are ignored.
 
 If you see local-only files in a clone, they came from your machine, not from
 the public repo. The public tree intentionally contains only product source,
-reviewed assets, and the small set of user-facing guides linked above.
+reviewed assets, and the intentionally public README files.
 
 ## Build From Source
 
@@ -373,8 +367,8 @@ npm start
 ```
 
 Platform packaging, signing, notarization, live connector reload, and Windows
-runner acceptance are intentionally kept outside the public source tree. See
-[docs/BUILDING.md](docs/BUILDING.md) for the reproducible source build boundary.
+runner acceptance are intentionally kept outside the public source tree. The
+commands above are the reproducible public source-build boundary.
 
 ## Star Pitch
 

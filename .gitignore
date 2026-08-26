@@ -9,6 +9,7 @@
 *.code-workspace
 /AGENTS.md
 /CLAUDE.md
+/AUTOPILOT.md
 
 # Dependencies, generated builds, and test output.
 node_modules/
@@ -32,10 +33,24 @@ dist/
 .mcp.json
 .env
 .env.*
+.envrc
+.direnv/
+.secrets/
 *.local
 *.token
+*.secret
+*.secrets
+.npmrc
+.pypirc
+.netrc
+credentials.json
+credentials.*.json
+id_rsa
+id_ed25519
 *.pem
 *.key
+*.jks
+*.keystore
 *.p12
 *.pfx
 *.cer
@@ -91,13 +106,9 @@ dist/
 !/assets/chatgpt2codex-icon.ico
 !/assets/readme-hero.png
 
-# Keep working notes and implementation reports local. Public documentation is
-# an explicit allowlist so new reports cannot be staged accidentally.
-/docs/*
-!/docs/INSTALL.md
-!/docs/BUILDING.md
-!/docs/CONNECTION-DIAGNOSTICS.ko.md
-!/docs/WINDOWS-QUICKSTART.ko.md
+# Documentation and working notes are local-only. Existing tracked files are
+# not untracked by .gitignore; handle any historical tracked docs separately.
+/docs/
 
 # Platform noise.
 .DS_Store

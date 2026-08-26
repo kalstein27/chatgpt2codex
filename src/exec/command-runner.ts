@@ -149,7 +149,8 @@ const SECRET_SCRIPT_PATTERN =
 const DESTRUCTIVE_SCRIPT_PATTERN =
   /\bsudo\b|\brm\s+-\w*r\w*f\w*\b|\brm\s+-\w*f\w*r\w*\b|\bfind\b[^\n]*-delete\b|\bgit\s+clean\b|\bdiskutil\s+erase|\bmkfs\b|\bshutdown\b|\breboot\b/i;
 const NETWORK_SCRIPT_PATTERN = /\b(npm|pnpm|yarn|bun)\s+(install|add|update)|\b(curl|wget)\b|\bgit\s+(pull|fetch|clone|push)\b/i;
-const WORKSPACE_METADATA_WRITE_SCRIPT_PATTERN = /\b(chmod|chown|chgrp)\b/i;
+const WORKSPACE_WRITE_SCRIPT_PATTERN =
+  /\b(chmod|chown|chgrp)\b|\bgit\s+(add|rm|mv|restore|reset|checkout|switch|commit|merge|rebase|cherry-pick|revert|stash|tag|branch)\b/i;
 
 function classifyByName(name: string): string {
   // Manifest command names are commonly composed with `:`, `-`, `_`, and
@@ -221,12 +222,12 @@ function baselineSideEffects(name: string, script: string): {
 } {
   const hardDestructive = SECRET_SCRIPT_PATTERN.test(script) || DESTRUCTIVE_SCRIPT_PATTERN.test(script);
   const hardNeedsNetwork = NETWORK_SCRIPT_PATTERN.test(script);
-  const writesWorkspaceMetadata = WORKSPACE_METADATA_WRITE_SCRIPT_PATTERN.test(script);
+  const writesWorkspace = WORKSPACE_WRITE_SCRIPT_PATTERN.test(script);
   const nameTier = classifyByName(name);
   const lowRiskTier = lowRiskTierForName(name);
   const sideEffects: CommandSideEffects = {
     needsNetwork: hardNeedsNetwork || nameTier === "network",
-    writesWorkspace: writesWorkspaceMetadata,
+    writesWorkspace,
     writesExternalLocalPath: false,
     launchesProcess: false,
     destructive: hardDestructive || nameTier === "destructive",

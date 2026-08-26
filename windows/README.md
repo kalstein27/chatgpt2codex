@@ -100,8 +100,7 @@ commands or claim native-control parity.
 - If SmartScreen appears, run the file only after verifying it came from the
   official release or from your own source build.
 
-See [the Korean Windows quick start](../docs/WINDOWS-QUICKSTART.ko.md),
-[the installation guide](../docs/INSTALL.md), and the
-[build guide](../docs/BUILDING.md).
+Keep machine-local installation, acceptance, and operator notes outside the
+public Git tree. Use this README and the root README as the public source guide.
 
 Copyright 2026 ezBuilder. All rights reserved.
