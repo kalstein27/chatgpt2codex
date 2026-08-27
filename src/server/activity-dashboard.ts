@@ -57,6 +57,9 @@ function dashboardConversation(conversation: RuntimeConversationSummary) {
     firstSeenAt: conversation.firstSeenAt,
     lastActiveAt: conversation.lastActiveAt,
     state: conversation.state,
+    ...(conversation.dashboardVisibleUntil !== undefined
+      ? { dashboardVisibleUntil: conversation.dashboardVisibleUntil }
+      : {}),
     operations: conversation.operations.slice(-MAX_DASHBOARD_OPERATIONS).map((operation) => ({
       operationId: operation.operationId,
       tool: operation.tool,
@@ -202,13 +205,12 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 13px 14px; box-shadow: var(--shadow); min-width: 0; transition: box-shadow var(--motion-fast) ease, border-color var(--motion-fast) ease; }
     .card.active-card { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--blue) 72%, transparent), var(--shadow); }
     .card.stale-card { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--orange) 82%, transparent), var(--shadow); }
-    .card-meta-row { display: flex; align-items: center; justify-content: space-between; gap: 8px 12px; margin-bottom: 8px; min-width: 0; }
-    .project-row { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
-    .project-badge { display: inline-flex; align-items: center; min-height: 22px; border-radius: 7px; padding: 3px 7px; background: color-mix(in srgb, var(--blue) 7%, var(--panel2)); color: color-mix(in srgb, var(--blue) 80%, var(--text)); font-size: 10px; font-weight: 760; letter-spacing: .01em; }
+    .card-primary { display: grid; grid-template-columns: auto minmax(0,1fr) auto auto; align-items: center; gap: 7px 10px; min-width: 0; }
+    .project-badge { display: inline-flex; align-items: center; min-width: 0; max-width: 132px; min-height: 22px; border-radius: 7px; padding: 3px 7px; background: color-mix(in srgb, var(--blue) 7%, var(--panel2)); color: color-mix(in srgb, var(--blue) 80%, var(--text)); font-size: 10px; font-weight: 760; letter-spacing: .01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .project-badge.none { border-color: var(--line); background: var(--panel2); color: var(--muted); }
-    .card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; min-width: 0; }
-    .title { font-size: 15px; font-weight: 730; line-height: 1.35; letter-spacing: -.01em; min-width: 0; overflow-wrap: anywhere; }
+    .title { font-size: 14px; font-weight: 730; line-height: 1.35; letter-spacing: -.01em; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .title.provisional { color: var(--muted); }
+    .start-time { color: var(--muted); font-size: 9.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
     .status { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; min-height: 23px; border-radius: 999px; padding: 3px 7px; background: var(--panel2); font-size: 10px; font-weight: 760; white-space: nowrap; transition: color var(--motion-fast) ease, background-color var(--motion-fast) ease; }
     .status::before { content: ""; width: 6px; height: 6px; border-radius: 999px; background: currentColor; opacity: .8; }
     .status.blue { color: var(--blue); }
@@ -216,18 +218,27 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     .status.orange { color: var(--orange); }
     .status.red { color: var(--red); }
     .status.gray { color: var(--gray); }
-    .meta { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 4px 8px; color: var(--muted); font-size: 9.5px; text-align: right; }
-    .current { margin-top: 9px; padding: 9px 10px; border: 1px solid color-mix(in srgb, var(--line) 72%, transparent); border-radius: 10px; background: var(--panel2); }
-    .current .summary-line { font-size: 11.5px; font-weight: 630; line-height: 1.45; overflow-wrap: anywhere; }
-    details { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; }
-    summary { cursor: pointer; color: var(--muted); font-size: 10.5px; user-select: none; }
-    .timeline { margin-top: 9px; display: grid; gap: 7px; }
-    details[open] .timeline { animation: disclosure-in var(--motion-fast) var(--motion-ease); }
-    .op { display: grid; grid-template-columns: 58px minmax(0,1fr); gap: 8px; font-size: 11px; line-height: 1.35; }
-    .op-time { color: var(--muted); font-variant-numeric: tabular-nums; }
-    .op-body { min-width: 0; overflow-wrap: anywhere; }
-    .op-body b { font-weight: 650; }
-    .op-hint { color: var(--muted); margin-left: 5px; }
+    .activity-disclosure { margin-top: 9px; border: 1px solid color-mix(in srgb, var(--line) 72%, transparent); border-radius: 10px; background: var(--panel2); overflow: hidden; }
+    .activity-disclosure > summary { position: relative; list-style: none; cursor: pointer; user-select: none; padding: 9px 31px 9px 10px; }
+    .activity-disclosure > summary::-webkit-details-marker { display: none; }
+    .activity-preview { display: grid; gap: 4px; min-width: 0; }
+    .activity-preview-line, .activity-line { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 11px; line-height: 1.4; white-space: nowrap; }
+    .activity-time { flex: 0 0 40px; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 9.5px; }
+    .activity-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 620; }
+    .activity-collapse-label { display: none; color: var(--muted); font-size: 10px; font-weight: 650; }
+    .disclosure-indicator { position: absolute; right: 10px; top: 50%; color: var(--muted); font-size: 13px; transform: translateY(-50%) rotate(0deg); transition: transform var(--motion-fast) var(--motion-ease); }
+    .activity-disclosure[open] > summary .activity-preview { display: none; }
+    .activity-disclosure[open] > summary .activity-collapse-label { display: inline; }
+    .activity-disclosure[open] > summary .disclosure-indicator { transform: translateY(-50%) rotate(180deg); }
+    .activity-timeline { display: grid; gap: 2px; border-top: 1px solid var(--line); margin: 0 10px 8px; padding-top: 7px; }
+    .activity-disclosure[open] .activity-timeline { animation: disclosure-in var(--motion-fast) var(--motion-ease); }
+    .activity-entry { min-width: 0; border-radius: 7px; }
+    .activity-line { cursor: pointer; padding: 4px 2px; outline: none; }
+    .activity-line:focus-visible { box-shadow: 0 0 0 1px color-mix(in srgb, var(--blue) 65%, transparent); }
+    .activity-detail { display: none; margin: 0 2px 7px 50px; color: var(--muted); font-size: 9.5px; line-height: 1.45; overflow-wrap: anywhere; }
+    .activity-entry.detail-open .activity-detail { display: block; }
+    .activity-detail-text { color: var(--text); margin-bottom: 2px; }
+    .activity-detail-meta { font-variant-numeric: tabular-nums; }
     .empty { grid-column: 1/-1; text-align: center; color: var(--muted); padding: 44px 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; }
     .footer { color: var(--muted); font-size: 9.5px; text-align: center; margin-top: 13px; opacity: .8; }
     @keyframes disclosure-in { from { opacity: .3; transform: translateY(-3px); } to { opacity: 1; transform: translateY(0); } }
@@ -246,8 +257,10 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       .metric span { font-size: 9px; }
       #cards { grid-template-columns: 1fr; }
       .card { border-radius: 13px; }
-      .card-meta-row { align-items: flex-start; }
-      .meta { max-width: 58%; }
+      .card-primary { grid-template-columns: auto minmax(0,1fr) auto auto; gap: 6px 7px; }
+      .project-badge { max-width: 104px; }
+      .title { font-size: 13px; }
+      .status { padding-left: 6px; padding-right: 6px; }
     }
   </style>
 </head>
@@ -289,7 +302,6 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   </section>
   <nav id="filters" class="toolbar"></nav>
   <section id="cards"></section>
-  <div class="footer">작업 현황은 읽기 전용 · 기존 모바일 승인 정책에서 허용된 항목만 이 화면에서 승인/거절 가능</div>
 </main>
 <script>
 (function () {
@@ -298,6 +310,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   var latest = [];
   var latestApprovals = [];
   var expandedToolRequestChats = new Set();
+  var expandedOperationDetails = new Set();
   var lastFilterSignature = "";
   var reducedMotion = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
   var embeddedHint = new URLSearchParams(window.location.search).get("embedded") === "mac";
@@ -339,6 +352,10 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   function fmtClock(ms) {
     if (!ms) return "-";
     return new Date(ms).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+  }
+  function fmtStartClock(ms) {
+    if (!ms) return "-";
+    return new Date(ms).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", hour12: false });
   }
   function age(ms, now) {
     var s = Math.max(0, Math.floor((now - ms) / 1000));
@@ -385,6 +402,21 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     for (var i = ops.length - 1; i >= 0; i--) if (isRunning(ops[i].state) || ops[i].state === "waiting-approval") return ops[i];
     return ops.length ? ops[ops.length - 1] : null;
   }
+  function targetProject(chat) {
+    var current = latestOperation(chat);
+    if (current && current.projectId) return current.projectId;
+    var projects = projectSet(chat);
+    return projects.length ? projects[0] : "";
+  }
+  var DASHBOARD_TERMINAL_TTL_MS = 5 * 60 * 1000;
+  function isDashboardVisible(chat, now) {
+    if (Number.isFinite(chat.dashboardVisibleUntil)) return now <= chat.dashboardVisibleUntil;
+    var state = String(chat.state || "idle").toLowerCase();
+    if (state !== "completed" && state !== "success" && state !== "failed") return true;
+    var latest = latestOperation(chat);
+    if (!latest || !Number.isFinite(latest.finishedAt)) return true;
+    return now <= latest.finishedAt + DASHBOARD_TERMINAL_TTL_MS;
+  }
   function semanticLabel(kind, running) {
     var map = {
       planning: ["작업 계획", "계획 완료"], inspecting: ["관련 내용 확인 중", "내용 확인 완료"], editing: ["변경 반영 중", "변경 반영 완료"],
@@ -416,6 +448,52 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     var action = humanToolLabel(op.tool);
     var detail = chat.taskLabel || op.message || "";
     return detail ? action + " · " + detail : action;
+  }
+  function makeActivityPreviewLine(chat, entry) {
+    var text = activitySummary(chat, entry);
+    var line = el("span", "activity-preview-line");
+    line.appendChild(el("span", "activity-time", fmtStartClock(entry.startedAt)));
+    var content = el("span", "activity-text", text);
+    content.title = text;
+    line.appendChild(content);
+    return line;
+  }
+  function makeActivityEntry(chat, entry) {
+    var text = activitySummary(chat, entry);
+    var detailKey = String(entry.operationId || (cardKey(chat) + ":" + entry.startedAt + ":" + entry.tool));
+    var wrapper = el("div", "activity-entry" + (expandedOperationDetails.has(detailKey) ? " detail-open" : ""));
+    var line = el("div", "activity-line");
+    line.setAttribute("role", "button");
+    line.tabIndex = 0;
+    line.setAttribute("aria-expanded", expandedOperationDetails.has(detailKey) ? "true" : "false");
+    line.appendChild(el("span", "activity-time", fmtStartClock(entry.startedAt)));
+    var content = el("span", "activity-text", text);
+    content.title = text;
+    line.appendChild(content);
+    var detail = el("div", "activity-detail");
+    detail.appendChild(el("div", "activity-detail-text", text));
+    var meta = ["도구 " + entry.tool, "시작 " + fmtClock(entry.startedAt)];
+    if (Number.isFinite(entry.finishedAt)) meta.push("완료 " + fmtClock(entry.finishedAt));
+    if (entry.state) meta.push("상태 " + entry.state);
+    detail.appendChild(el("div", "activity-detail-meta", meta.join(" · ")));
+    function toggleDetail(event) {
+      if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      var open = !wrapper.classList.contains("detail-open");
+      wrapper.classList.toggle("detail-open", open);
+      line.setAttribute("aria-expanded", open ? "true" : "false");
+      if (open) expandedOperationDetails.add(detailKey);
+      else expandedOperationDetails.delete(detailKey);
+    }
+    line.addEventListener("click", toggleDetail);
+    line.addEventListener("keydown", function (event) {
+      if (event.key === "Enter" || event.key === " ") toggleDetail(event);
+    });
+    wrapper.appendChild(line);
+    wrapper.appendChild(detail);
+    return wrapper;
   }
   function riskLabel(risk) {
     if (risk === "network") return "네트워크 접근";
@@ -522,38 +600,26 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     var card = el("article", "card" + (st.key === "active" || st.key === "quiet" ? " active-card" : "") + (st.key === "stale" ? " stale-card" : ""));
     card.dataset.chatKey = cardKey(chat);
     card.dataset.statusKey = st.key;
-    var projects = projectSet(chat);
-    var metaRow = el("div", "card-meta-row");
-    var projectRow = el("div", "project-row");
-    if (projects.length) {
-      projects.forEach(function (project) { projectRow.appendChild(el("span", "project-badge", project)); });
-    } else {
-      projectRow.appendChild(el("span", "project-badge none", "프로젝트 미확인"));
-    }
-    metaRow.appendChild(projectRow);
-    var meta = el("div", "meta");
-    meta.appendChild(el("span", "", age(chat.lastActiveAt, now)));
-    metaRow.appendChild(meta);
-    card.appendChild(metaRow);
-    var head = el("div", "card-head");
-    head.appendChild(el("div", "title" + (chat.titleSource === "missing" ? " provisional" : ""), chat.title || "채팅 이름 필요"));
-    head.appendChild(el("div", "status " + st.color, st.text));
-    card.appendChild(head);
-
-    var op = latestOperation(chat);
-    if (op) {
-      var current = el("div", "current");
-      var summaryText = activitySummary(chat, op);
-      card.dataset.summary = summaryText;
-      var summaryLine = el("div", "summary-line", summaryText);
-      summaryLine.title = summaryText;
-      current.appendChild(summaryLine);
-      card.appendChild(current);
-    }
+    var primary = el("div", "card-primary");
+    var project = targetProject(chat);
+    var projectBadge = el("span", "project-badge" + (project ? "" : " none"), project || "프로젝트 미확인");
+    projectBadge.title = project || "프로젝트 미확인";
+    primary.appendChild(projectBadge);
+    var title = el("div", "title" + (chat.titleSource === "missing" ? " provisional" : ""), chat.title || "채팅 이름 필요");
+    title.title = chat.title || "채팅 이름 필요";
+    primary.appendChild(title);
+    var started = el("div", "start-time", fmtStartClock(chat.firstSeenAt));
+    started.title = "작업 시작 " + fmtClock(chat.firstSeenAt);
+    primary.appendChild(started);
+    primary.appendChild(el("div", "status " + st.color, st.text));
+    card.appendChild(primary);
 
     var ops = (chat.operations || []).slice().reverse();
     if (ops.length) {
+      var previewOps = ops.slice(0, 3);
+      card.dataset.summary = previewOps.map(function (entry) { return activitySummary(chat, entry); }).join("\u001f");
       var details = document.createElement("details");
+      details.className = "activity-disclosure";
       var disclosureKey = String(chat.id || "");
       details.open = disclosureKey ? expandedToolRequestChats.has(disclosureKey) : false;
       details.addEventListener("toggle", function () {
@@ -562,19 +628,14 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
         else expandedToolRequestChats.delete(disclosureKey);
       });
       var summary = document.createElement("summary");
-      summary.textContent = "최근 도구 요청 " + ops.length + "개";
+      var preview = el("span", "activity-preview");
+      previewOps.forEach(function (entry) { preview.appendChild(makeActivityPreviewLine(chat, entry)); });
+      summary.appendChild(preview);
+      summary.appendChild(el("span", "activity-collapse-label", "접기"));
+      summary.appendChild(el("span", "disclosure-indicator", "⌄"));
       details.appendChild(summary);
-      var timeline = el("div", "timeline");
-      ops.forEach(function (entry) {
-        var row = el("div", "op");
-        row.appendChild(el("div", "op-time", fmtClock(entry.startedAt)));
-        var body = el("div", "op-body");
-        body.appendChild(el("b", "", entry.tool));
-        var hint = entry.activityHint || entry.message || entry.phase;
-        if (hint) body.appendChild(el("span", "op-hint", hint));
-        row.appendChild(body);
-        timeline.appendChild(row);
-      });
+      var timeline = el("div", "activity-timeline");
+      ops.forEach(function (entry) { timeline.appendChild(makeActivityEntry(chat, entry)); });
       details.appendChild(timeline);
       card.appendChild(details);
     }
@@ -618,7 +679,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
         ], 430);
       }
       if (before.summary !== (card.dataset.summary || "")) {
-        animateNode(card.querySelector(".summary-line"), [{ opacity: .7, transform: "translateY(1px)" }, { opacity: 1, transform: "translateY(0)" }], 320);
+        animateNode(card.querySelector(".activity-preview"), [{ opacity: .7 }, { opacity: 1 }], 240);
       }
       if (before.statusKey !== (card.dataset.statusKey || "")) {
         animateNode(card.querySelector(".status"), [{ opacity: .74, transform: "translateY(.5px)" }, { opacity: 1, transform: "translateY(0)" }], 280);
@@ -640,14 +701,14 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   }
   function render() {
     var now = Date.now();
-    updateMetrics(latest, latestApprovals, now);
+    var retained = latest.filter(function (chat) { return isDashboardVisible(chat, now); });
+    updateMetrics(retained, latestApprovals, now);
     renderApprovals(latestApprovals, now);
-    renderFilters(latest);
-    var visible = latest.filter(function (chat) {
+    renderFilters(retained);
+    var visible = retained.filter(function (chat) {
       return selectedProject === "all" || projectSet(chat).indexOf(selectedProject) >= 0;
     }).slice().sort(function (a, b) {
-      var sa = statusOf(a, now), sb = statusOf(b, now);
-      return sa.priority - sb.priority || b.lastActiveAt - a.lastActiveAt;
+      return (a.firstSeenAt || 0) - (b.firstSeenAt || 0) || cardKey(a).localeCompare(cardKey(b));
     });
     renderCards(visible, now);
   }
