@@ -5,12 +5,16 @@ export const MCP_PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVe
 export const MCP_CLIENT_INFO_META_KEY = "io.modelcontextprotocol/clientInfo";
 export const MCP_CLIENT_CAPABILITIES_META_KEY = "io.modelcontextprotocol/clientCapabilities";
 export const MCP_SERVER_INFO_META_KEY = "io.modelcontextprotocol/serverInfo";
-export const MCP_SCHEMA_CACHE_TTL_MS = 5 * 60 * 1000;
+// Remote ChatGPT may keep a mounted tool schema across a runtime replacement.
+// C2CT therefore never asks clients/proxies to persist schema discovery results:
+// every discovery/list read is a revalidation point for the live runtime.
+export const MCP_SCHEMA_CACHE_TTL_MS = 0;
 export const MCP_DISCOVERY_TTL_MS = MCP_SCHEMA_CACHE_TTL_MS;
 export const MCP_TOOL_LIST_TTL_MS = MCP_SCHEMA_CACHE_TTL_MS;
-export const MCP_SCHEMA_CONTRACT_VERSION = 2;
+export const MCP_SCHEMA_CONTRACT_VERSION = 3;
 export const MCP_SCHEMA_REVISION_META_KEY = "io.ezbuilder.chatgpt2codex/schemaRevision";
 export const MCP_SCHEMA_EXPIRED_META_KEY = "io.ezbuilder.chatgpt2codex/schemaExpired";
+export const MCP_SCHEMA_REVALIDATE_META_KEY = "io.ezbuilder.chatgpt2codex/schemaMustRevalidate";
 export const MCP_CORE_TOOLS_META_KEY = "io.ezbuilder.chatgpt2codex/coreToolNames";
 
 export const MCP_CORE_TOOL_NAMES = [
@@ -38,6 +42,7 @@ export const MCP_CORE_TOOL_NAMES = [
   "file_edit_lines",
   "file_apply_patch",
   "file_create",
+  "tool_schema_get",
   "mutation_status",
   "repo_status",
   "git_diff_summary",
@@ -103,19 +108,28 @@ export function modernServerMeta(serverInfo: McpServerIdentity): Record<string, 
   return { [MCP_SERVER_INFO_META_KEY]: serverInfo };
 }
 
-export function createMcpDiscoveryResult(serverInfo: McpServerIdentity): Record<string, unknown> {
+export function createMcpDiscoveryResult(
+  serverInfo: McpServerIdentity,
+  schemaRevision?: string,
+): Record<string, unknown> {
   return {
     resultType: "complete",
     supportedVersions: [MCP_MODERN_PROTOCOL_VERSION],
     capabilities: { tools: {} },
     instructions:
-      "Cache the advertised tool schemas for ttlMs. tools/list also supports exact-name query, explicit names, and coreOnly extensions for compact schema discovery.",
+      "Revalidate tools/list for the live runtime instead of persisting tool schemas across runtime replacement. tools/list supports exact-name query, explicit names, and coreOnly extensions. tool_schema_get plus c2ct_invoke is the stable fallback when a host-mounted named schema is stale.",
     ttlMs: MCP_DISCOVERY_TTL_MS,
     toolListTtlMs: MCP_TOOL_LIST_TTL_MS,
     cacheScope: "private",
     schemaContractVersion: MCP_SCHEMA_CONTRACT_VERSION,
     schemaExpired: false,
+    schemaMustRevalidate: true,
+    ...(schemaRevision ? { schemaRevision } : {}),
     coreToolNames: [...MCP_CORE_TOOL_NAMES],
-    _meta: modernServerMeta(serverInfo),
+    _meta: {
+      ...modernServerMeta(serverInfo),
+      [MCP_SCHEMA_REVALIDATE_META_KEY]: true,
+      ...(schemaRevision ? { [MCP_SCHEMA_REVISION_META_KEY]: schemaRevision } : {}),
+    },
   };
 }

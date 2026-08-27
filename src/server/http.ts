@@ -717,6 +717,19 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
             notification: requestClassification.notification,
           })
           .catch(() => undefined);
+        // Runtime replacement can change tool descriptions/input schemas while the
+        // public connector URL stays stable. Never let an HTTP intermediary cache
+        // modern discovery/list responses from an older runtime generation.
+        res.set("Cache-Control", "private, no-store, max-age=0, must-revalidate");
+        res.set("Pragma", "no-cache");
+        res.set("Expires", "0");
+        const modernResult = result.response?.result;
+        if (modernResult && typeof modernResult === "object" && !Array.isArray(modernResult)) {
+          const revision = (modernResult as Record<string, unknown>).schemaRevision;
+          if (typeof revision === "string" && /^sha256:[a-f0-9]{24}$/u.test(revision)) {
+            res.set("Mcp-Schema-Revision", revision);
+          }
+        }
         if (result.response) res.status(result.status).json(result.response);
         else res.status(result.status).end();
       } finally {

@@ -939,7 +939,9 @@ export async function runRuntimeApplyWorker(input: {
         next.rollbackSucceeded = null;
         next.previousRuntimeRestored = false;
         next.finalHealthy = true;
-        next.recommendedAction = "none";
+        next.recommendedAction = value.previousManifest.toolSchemaRevision !== value.targetManifest.toolSchemaRevision
+          ? "refresh-tool-schema-and-bootstrap"
+          : "none";
         return next;
       });
     }
@@ -1029,6 +1031,9 @@ export async function runRuntimeApplyWorker(input: {
 }
 
 export function runtimeApplyPublicReceipt(receipt: RuntimeApplyReceipt): Record<string, unknown> {
+  const schemaRefreshRequired =
+    (receipt.state === "APPLIED" || receipt.state === "ALREADY_APPLIED")
+    && receipt.previousManifest.toolSchemaRevision !== receipt.targetManifest.toolSchemaRevision;
   return {
     requestId: receipt.requestId,
     operationId: receipt.operationId,
@@ -1055,6 +1060,12 @@ export function runtimeApplyPublicReceipt(receipt: RuntimeApplyReceipt): Record<
     diagnosticId: receipt.diagnosticId,
     failurePhase: receipt.failurePhase,
     recommendedAction: receipt.recommendedAction,
+    schemaRefreshRequired,
+    previousToolSchemaRevision: receipt.previousManifest.toolSchemaRevision,
+    targetToolSchemaRevision: receipt.targetManifest.toolSchemaRevision,
+    schemaRefreshFallback: schemaRefreshRequired
+      ? "connection_status -> agent_guide -> tool_schema_get/c2ct_invoke until host catalog revalidates"
+      : "none",
     approvalRequestId: receipt.approvalRequestId ?? null,
     createdAt: receipt.createdAt,
     updatedAt: receipt.updatedAt,

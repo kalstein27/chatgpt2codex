@@ -109,63 +109,72 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
-  <title>C2CT 작업 및 승인</title>
+  <title>ChatGPT To Codex</title>
   <style>
     :root {
       font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Apple SD Gothic Neo", sans-serif;
       color-scheme: light dark;
-      --bg: #f4f5f7;
-      --panel: rgba(255,255,255,.92);
-      --panel2: rgba(246,247,249,.95);
-      --text: #161719;
-      --muted: #6d7178;
-      --line: rgba(0,0,0,.1);
+      --bg: #f6f7f8;
+      --panel: rgba(255,255,255,.96);
+      --panel2: #f7f8fa;
+      --text: #17181a;
+      --muted: #73777e;
+      --line: rgba(17,24,39,.08);
       --blue: #0a84ff;
       --green: #2a9d55;
       --orange: #d97706;
       --red: #dc3545;
       --gray: #8b9097;
-      --shadow: 0 8px 28px rgba(0,0,0,.07);
+      --shadow: 0 1px 2px rgba(0,0,0,.035), 0 8px 24px rgba(0,0,0,.035);
+      --motion-fast: 160ms;
+      --motion-layout: 220ms;
+      --motion-ease: cubic-bezier(.2,.8,.2,1);
     }
     @media (prefers-color-scheme: dark) {
       :root {
-        --bg: #101113;
-        --panel: rgba(29,30,33,.96);
-        --panel2: rgba(36,37,40,.96);
+        --bg: #111315;
+        --panel: rgba(28,30,33,.98);
+        --panel2: #222529;
         --text: #f5f5f7;
         --muted: #a2a5aa;
-        --line: rgba(255,255,255,.1);
+        --line: rgba(255,255,255,.085);
         --green: #43c46b;
         --orange: #ff9f0a;
         --red: #ff453a;
         --gray: #98989f;
-        --shadow: 0 12px 36px rgba(0,0,0,.2);
+        --shadow: 0 1px 2px rgba(0,0,0,.16), 0 10px 26px rgba(0,0,0,.12);
       }
     }
     * { box-sizing: border-box; }
     body { margin: 0; background: var(--bg); color: var(--text); }
-    main { width: min(1100px, 100%); margin: 0 auto; padding: max(18px, env(safe-area-inset-top)) 14px max(28px, env(safe-area-inset-bottom)); }
-    header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin: 4px 2px 14px; }
-    h1 { font-size: 24px; line-height: 1.15; margin: 0 0 6px; letter-spacing: -.02em; }
-    .subtitle { color: var(--muted); font-size: 13px; }
-    .live { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); white-space: nowrap; padding-top: 4px; }
-    .dot { width: 8px; height: 8px; border-radius: 999px; background: var(--green); box-shadow: 0 0 0 4px rgba(42,157,85,.12); }
-    .dot.offline { background: var(--red); box-shadow: 0 0 0 4px rgba(220,53,69,.12); }
-    .summary { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); gap: 8px; margin-bottom: 12px; }
-    .metric { background: var(--panel); border: 1px solid var(--line); border-radius: 13px; padding: 10px 11px; box-shadow: var(--shadow); }
-    .metric b { display: block; font-size: 20px; line-height: 1; margin-bottom: 5px; }
-    .metric span { font-size: 11px; color: var(--muted); }
-    .approval-box { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 13px; box-shadow: var(--shadow); margin-bottom: 12px; }
+    main { width: min(1120px, 100%); margin: 0 auto; padding: max(12px, env(safe-area-inset-top)) 14px max(28px, env(safe-area-inset-bottom)); }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 44px; margin: 0 2px 11px; }
+    .header-main { display: flex; align-items: center; gap: 11px; min-width: 0; }
+    .app-mark { width: 38px; height: 38px; flex: 0 0 auto; filter: drop-shadow(0 3px 9px rgba(0,0,0,.1)); }
+    .app-mark svg { display: block; width: 100%; height: 100%; }
+    .live { display: inline-flex; align-items: center; gap: 6px; font-size: 10px; color: var(--muted); white-space: nowrap; }
+    .dot { width: 7px; height: 7px; border-radius: 999px; background: var(--green); box-shadow: 0 0 0 3px rgba(42,157,85,.1); transition: background-color var(--motion-fast) ease, box-shadow var(--motion-fast) ease; }
+    .dot.offline { background: var(--red); box-shadow: 0 0 0 3px rgba(220,53,69,.1); }
+    .summary { display: inline-flex; align-items: center; gap: 0; min-width: 0; }
+    .metric { display: inline-flex; align-items: baseline; gap: 4px; min-height: 24px; padding: 3px 8px; color: var(--text); }
+    .metric + .metric { border-left: 1px solid var(--line); }
+    .metric b { display: inline-block; font-size: 12px; line-height: 1; font-weight: 760; font-variant-numeric: tabular-nums; }
+    .metric span { font-size: 10px; color: var(--muted); }
+    .metric.attention.has-value { color: var(--orange); }
+    .metric.approval.has-value { color: var(--blue); }
+    .metric.attention.has-value span, .metric.approval.has-value span { color: currentColor; opacity: .78; }
+    .approval-box { max-height: 1600px; overflow: hidden; background: color-mix(in srgb, var(--orange) 5%, var(--panel)); border: 1px solid color-mix(in srgb, var(--orange) 30%, var(--line)); border-radius: 13px; padding: 11px 12px; margin-bottom: 10px; opacity: 1; transform: translateY(0); transition: max-height var(--motion-layout) var(--motion-ease), opacity var(--motion-fast) ease, transform var(--motion-layout) var(--motion-ease), margin-bottom var(--motion-layout) var(--motion-ease), padding var(--motion-layout) var(--motion-ease), border-width var(--motion-layout) var(--motion-ease); }
+    .approval-box.hidden { max-height: 0; opacity: 0; transform: translateY(-4px); margin-bottom: 0; padding-top: 0; padding-bottom: 0; border-width: 0; pointer-events: none; }
     .section-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 9px; }
-    .section-head h2 { font-size: 15px; margin: 0; }
+    .section-head h2 { font-size: 14px; margin: 0; }
     .section-head span { color: var(--muted); font-size: 11px; }
     .approval-list { display: grid; gap: 8px; }
-    .approval-item { border: 1px solid var(--line); border-radius: 13px; background: var(--panel2); padding: 11px; }
+    .approval-item { border: 1px solid var(--line); border-radius: 11px; background: var(--panel); padding: 11px; }
     .approval-item.mobile { border-color: color-mix(in srgb, var(--blue) 45%, var(--line)); }
     .approval-item.mac { border-color: color-mix(in srgb, var(--orange) 55%, var(--line)); }
     .approval-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 9px; }
     .approval-category { font-size: 13px; font-weight: 700; line-height: 1.35; }
-    .approval-channel { flex: 0 0 auto; font-size: 10px; font-weight: 700; border-radius: 999px; padding: 4px 7px; background: var(--panel); }
+    .approval-channel { flex: 0 0 auto; font-size: 10px; font-weight: 700; border-radius: 999px; padding: 4px 7px; background: var(--panel2); }
     .approval-channel.mobile { color: var(--blue); }
     .approval-channel.mac { color: var(--orange); }
     .approval-summary { margin-top: 6px; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
@@ -176,50 +185,59 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     .approval-actions button.reject { color: var(--red); }
     .approval-actions button:disabled { opacity: .5; }
     .approval-actions button.native { border-color: color-mix(in srgb, var(--orange) 55%, var(--line)); color: var(--orange); }
-    .approval-empty { color: var(--muted); font-size: 12px; padding: 5px 2px 2px; }
-    .toolbar { display: flex; gap: 8px; overflow-x: auto; padding: 1px 1px 10px; scrollbar-width: none; }
+    .toolbar { display: flex; gap: 5px; overflow-x: auto; padding: 0 1px 9px; scrollbar-width: none; }
+    .toolbar.hidden { display: none; }
     .toolbar::-webkit-scrollbar { display: none; }
-    button.filter { appearance: none; border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 999px; padding: 7px 11px; font-size: 12px; white-space: nowrap; }
-    button.filter.active { border-color: var(--blue); color: var(--blue); background: color-mix(in srgb, var(--blue) 10%, var(--panel)); }
-    #cards { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 12px; }
-    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 14px; box-shadow: var(--shadow); min-width: 0; }
-    .card.active-card { border-color: color-mix(in srgb, var(--blue) 55%, var(--line)); }
-    .card.stale-card { border-color: color-mix(in srgb, var(--orange) 62%, var(--line)); }
-    .card-meta-row { display: flex; align-items: center; justify-content: space-between; gap: 8px 12px; margin-bottom: 9px; min-width: 0; }
+    button.filter { appearance: none; border: 1px solid transparent; background: var(--panel2); color: var(--muted); border-radius: 999px; padding: 5px 9px; font-size: 10px; font-weight: 650; white-space: nowrap; transition: color var(--motion-fast) ease, background-color var(--motion-fast) ease, border-color var(--motion-fast) ease; }
+    button.filter.active { color: var(--text); background: var(--panel); border-color: var(--line); }
+    #cards { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 10px; }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 13px 14px; box-shadow: var(--shadow); min-width: 0; transition: box-shadow var(--motion-fast) ease, border-color var(--motion-fast) ease; }
+    .card.active-card { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--blue) 72%, transparent), var(--shadow); }
+    .card.stale-card { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--orange) 82%, transparent), var(--shadow); }
+    .card-meta-row { display: flex; align-items: center; justify-content: space-between; gap: 8px 12px; margin-bottom: 8px; min-width: 0; }
     .project-row { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; }
-    .project-badge { display: inline-flex; align-items: center; min-height: 27px; border-radius: 9px; padding: 5px 9px; border: 1px solid color-mix(in srgb, var(--blue) 48%, var(--line)); background: color-mix(in srgb, var(--blue) 10%, var(--panel2)); color: var(--blue); font-size: 12px; font-weight: 800; letter-spacing: .01em; }
+    .project-badge { display: inline-flex; align-items: center; min-height: 22px; border-radius: 7px; padding: 3px 7px; background: color-mix(in srgb, var(--blue) 7%, var(--panel2)); color: color-mix(in srgb, var(--blue) 80%, var(--text)); font-size: 10px; font-weight: 760; letter-spacing: .01em; }
     .project-badge.none { border-color: var(--line); background: var(--panel2); color: var(--muted); }
     .card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; min-width: 0; }
-    .title { font-size: 16px; font-weight: 700; line-height: 1.35; min-width: 0; overflow-wrap: anywhere; }
+    .title { font-size: 15px; font-weight: 730; line-height: 1.35; letter-spacing: -.01em; min-width: 0; overflow-wrap: anywhere; }
     .title.provisional { color: var(--muted); }
-    .status { flex: 0 0 auto; display: inline-flex; align-items: center; min-height: 25px; border-radius: 999px; padding: 4px 8px; background: var(--panel2); font-size: 11px; font-weight: 800; white-space: nowrap; }
+    .status { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; min-height: 23px; border-radius: 999px; padding: 3px 7px; background: var(--panel2); font-size: 10px; font-weight: 760; white-space: nowrap; transition: color var(--motion-fast) ease, background-color var(--motion-fast) ease; }
+    .status::before { content: ""; width: 6px; height: 6px; border-radius: 999px; background: currentColor; opacity: .8; }
     .status.blue { color: var(--blue); }
     .status.green { color: var(--green); }
     .status.orange { color: var(--orange); }
     .status.red { color: var(--red); }
     .status.gray { color: var(--gray); }
-    .meta { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 4px 8px; color: var(--muted); font-size: 10px; text-align: right; }
-    .current { margin-top: 10px; padding: 10px 11px; border-radius: 12px; background: var(--panel2); }
-    .current .summary-line { font-size: 12px; font-weight: 650; line-height: 1.45; overflow-wrap: anywhere; }
-    details { border-top: 1px solid var(--line); margin-top: 11px; padding-top: 9px; }
-    summary { cursor: pointer; color: var(--muted); font-size: 12px; user-select: none; }
+    .meta { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 4px 8px; color: var(--muted); font-size: 9.5px; text-align: right; }
+    .current { margin-top: 9px; padding: 9px 10px; border: 1px solid color-mix(in srgb, var(--line) 72%, transparent); border-radius: 10px; background: var(--panel2); }
+    .current .summary-line { font-size: 11.5px; font-weight: 630; line-height: 1.45; overflow-wrap: anywhere; }
+    details { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 8px; }
+    summary { cursor: pointer; color: var(--muted); font-size: 10.5px; user-select: none; }
     .timeline { margin-top: 9px; display: grid; gap: 7px; }
+    details[open] .timeline { animation: disclosure-in var(--motion-fast) var(--motion-ease); }
     .op { display: grid; grid-template-columns: 58px minmax(0,1fr); gap: 8px; font-size: 11px; line-height: 1.35; }
     .op-time { color: var(--muted); font-variant-numeric: tabular-nums; }
     .op-body { min-width: 0; overflow-wrap: anywhere; }
     .op-body b { font-weight: 650; }
     .op-hint { color: var(--muted); margin-left: 5px; }
     .empty { grid-column: 1/-1; text-align: center; color: var(--muted); padding: 44px 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; }
-    .footer { color: var(--muted); font-size: 10px; text-align: center; margin-top: 14px; }
-    html.embedded-mac main { width: 100%; max-width: none; padding-top: 14px; }
+    .footer { color: var(--muted); font-size: 9.5px; text-align: center; margin-top: 13px; opacity: .8; }
+    @keyframes disclosure-in { from { opacity: .3; transform: translateY(-3px); } to { opacity: 1; transform: translateY(0); } }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
+    }
+    html.embedded-mac main { width: 100%; max-width: none; padding-top: 10px; }
     html.embedded-mac .footer { margin-bottom: 4px; }
     @media (max-width: 720px) {
       main { padding-left: 10px; padding-right: 10px; }
-      h1 { font-size: 21px; }
-      .summary { grid-template-columns: repeat(5, minmax(68px,1fr)); overflow-x: auto; padding-bottom: 2px; scrollbar-width: none; }
-      .metric { min-width: 72px; }
+      header { gap: 8px; }
+      .header-main { gap: 7px; }
+      .app-mark { width: 34px; height: 34px; }
+      .metric { padding-left: 6px; padding-right: 6px; }
+      .metric b { font-size: 11px; }
+      .metric span { font-size: 9px; }
       #cards { grid-template-columns: 1fr; }
-      .card { border-radius: 15px; }
+      .card { border-radius: 13px; }
       .card-meta-row { align-items: flex-start; }
       .meta { max-width: 58%; }
     }
@@ -228,21 +246,36 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
 <body>
 <main>
   <header>
-    <div>
-      <h1>C2CT 작업 및 승인</h1>
-      <div class="subtitle">ChatGPT 작업 현황과 승인 대기 항목을 한 화면에서 확인</div>
+    <div class="header-main">
+      <div class="app-mark" aria-label="ChatGPT To Codex">
+        <svg viewBox="0 0 1024 1024" role="img" aria-hidden="true">
+          <defs>
+            <linearGradient id="dash-bg" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#087E78"/><stop offset=".55" stop-color="#119B93"/><stop offset="1" stop-color="#20B6AD"/>
+            </linearGradient>
+            <linearGradient id="dash-shield" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#FF9C14"/><stop offset="1" stop-color="#FF7A00"/>
+            </linearGradient>
+          </defs>
+          <rect x="28" y="28" width="968" height="968" rx="210" fill="url(#dash-bg)"/>
+          <g fill="none" stroke="#fff" stroke-width="64" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M514 171 C321 171 176 308 176 491 C176 594 225 684 306 744 L286 842 L405 777 C440 786 476 791 514 791 C705 791 852 655 852 476 C852 299 706 171 514 171 Z"/>
+            <path d="M426 388 L334 480 L426 572"/><path d="M602 388 L694 480 L602 572"/><path d="M552 349 L476 611"/>
+          </g>
+          <path d="M720 596 C789 620 850 618 905 596 L919 610 V738 C919 833 858 895 812 919 C766 895 705 833 705 738 V610 Z" fill="url(#dash-shield)" stroke="#FFD13A" stroke-width="26" stroke-linejoin="round"/>
+          <path d="M755 758 L799 802 L873 718" fill="none" stroke="#fff" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <section class="summary" aria-label="작업 상태">
+        <div class="metric"><b id="m-active">0</b><span>진행</span></div>
+        <div id="metric-attention" class="metric attention"><b id="m-attention">0</b><span>주의</span></div>
+        <div id="metric-approval" class="metric approval"><b id="m-approval">0</b><span>승인</span></div>
+      </section>
     </div>
     <div class="live"><span id="live-dot" class="dot"></span><span id="live-text">연결 중</span></div>
   </header>
-  <section class="summary">
-    <div class="metric"><b id="m-active">0</b><span>활성</span></div>
-    <div class="metric"><b id="m-quiet">0</b><span>응답 대기</span></div>
-    <div class="metric"><b id="m-stale">0</b><span>정체</span></div>
-    <div class="metric"><b id="m-approval">0</b><span>승인 대기</span></div>
-    <div class="metric"><b id="m-done">0</b><span>완료</span></div>
-  </section>
-  <section class="approval-box">
-    <div class="section-head"><h2>승인함</h2><span id="approval-label">대기 0건</span></div>
+  <section id="approval-box" class="approval-box hidden">
+    <div class="section-head"><h2>승인 필요</h2><span id="approval-label">0건</span></div>
     <div id="approvals" class="approval-list"></div>
   </section>
   <nav id="filters" class="toolbar"></nav>
@@ -256,6 +289,8 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   var latest = [];
   var latestApprovals = [];
   var expandedToolRequestChats = new Set();
+  var lastFilterSignature = "";
+  var reducedMotion = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
   var embeddedHint = new URLSearchParams(window.location.search).get("embedded") === "mac";
   if (embeddedHint) document.documentElement.classList.add("embedded-mac");
   var macBridge = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.c2ctMacApp
@@ -264,6 +299,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   var cards = document.getElementById("cards");
   var filters = document.getElementById("filters");
   var approvals = document.getElementById("approvals");
+  var approvalBox = document.getElementById("approval-box");
   var approvalLabel = document.getElementById("approval-label");
   var liveDot = document.getElementById("live-dot");
   var liveText = document.getElementById("live-text");
@@ -273,6 +309,23 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     if (cls) node.className = cls;
     if (text !== undefined) node.textContent = text;
     return node;
+  }
+  function motionEnabled() {
+    return !(reducedMotion && reducedMotion.matches);
+  }
+  function cardKey(chat) {
+    return String(chat.id || chat.sessionId || chat.conversationId || ((chat.title || "chat") + ":" + (chat.firstSeenAt || 0)));
+  }
+  function animateNode(node, keyframes, duration) {
+    if (!motionEnabled() || !node || typeof node.animate !== "function") return;
+    node.animate(keyframes, { duration: duration, easing: "cubic-bezier(.2,.8,.2,1)" });
+  }
+  function setMetricValue(id, value) {
+    var node = document.getElementById(id);
+    var next = String(value);
+    if (!node || node.textContent === next) return;
+    node.textContent = next;
+    animateNode(node, [{ opacity: .35, transform: "translateY(2px)" }, { opacity: 1, transform: "translateY(0)" }], 150);
   }
   function fmtClock(ms) {
     if (!ms) return "-";
@@ -387,12 +440,16 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     }
   }
   function renderApprovals(items, now) {
-    approvalLabel.textContent = "대기 " + items.length + "건";
-    approvals.replaceChildren();
+    approvalLabel.textContent = items.length + "건";
     if (!items.length) {
-      approvals.appendChild(el("div", "approval-empty", "현재 대기 중인 승인이 없습니다."));
+      approvalBox.classList.add("hidden");
+      window.setTimeout(function () {
+        if (approvalBox.classList.contains("hidden")) approvals.replaceChildren();
+      }, 230);
       return;
     }
+    approvals.replaceChildren();
+    approvalBox.classList.remove("hidden");
     items.slice().sort(function (a, b) { return a.createdAt - b.createdAt; }).forEach(function (item) {
       var row = el("article", "approval-item " + (item.channel === "mobile" ? "mobile" : "mac"));
       var top = el("div", "approval-top");
@@ -439,7 +496,11 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     var projects = new Set();
     chats.forEach(function (chat) { projectSet(chat).forEach(function (p) { projects.add(p); }); });
     var values = ["all"].concat(Array.from(projects).sort());
+    var signature = values.join("\u001f") + "|" + selectedProject;
+    if (signature === lastFilterSignature) return;
+    lastFilterSignature = signature;
     filters.replaceChildren();
+    filters.classList.toggle("hidden", values.length <= 1);
     values.forEach(function (value) {
       var b = el("button", "filter" + (selectedProject === value ? " active" : ""), value === "all" ? "전체" : value);
       b.type = "button";
@@ -450,6 +511,8 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   function makeCard(chat, now) {
     var st = statusOf(chat, now);
     var card = el("article", "card" + (st.key === "active" || st.key === "quiet" ? " active-card" : "") + (st.key === "stale" ? " stale-card" : ""));
+    card.dataset.chatKey = cardKey(chat);
+    card.dataset.statusKey = st.key;
     var projects = projectSet(chat);
     var metaRow = el("div", "card-meta-row");
     var projectRow = el("div", "project-row");
@@ -460,8 +523,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     }
     metaRow.appendChild(projectRow);
     var meta = el("div", "meta");
-    meta.appendChild(el("span", "", "첫 요청 " + fmtClock(chat.firstSeenAt)));
-    meta.appendChild(el("span", "", "마지막 활동 " + age(chat.lastActiveAt, now)));
+    meta.appendChild(el("span", "", age(chat.lastActiveAt, now)));
     metaRow.appendChild(meta);
     card.appendChild(metaRow);
     var head = el("div", "card-head");
@@ -472,8 +534,10 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     var op = latestOperation(chat);
     if (op) {
       var current = el("div", "current");
-      var summaryLine = el("div", "summary-line", activitySummary(chat, op));
-      summaryLine.title = activitySummary(chat, op);
+      var summaryText = activitySummary(chat, op);
+      card.dataset.summary = summaryText;
+      var summaryLine = el("div", "summary-line", summaryText);
+      summaryLine.title = summaryText;
       current.appendChild(summaryLine);
       card.appendChild(current);
     }
@@ -507,18 +571,63 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     }
     return card;
   }
+  function renderCards(visible, now) {
+    var previous = new Map();
+    Array.from(cards.children).forEach(function (card) {
+      var key = card.dataset && card.dataset.chatKey;
+      if (!key) return;
+      previous.set(key, {
+        rect: card.getBoundingClientRect(),
+        summary: card.dataset.summary || "",
+        statusKey: card.dataset.statusKey || ""
+      });
+    });
+    if (!visible.length) {
+      cards.replaceChildren(el("div", "empty", "표시할 채팅 작업이 없습니다."));
+      return;
+    }
+    var nextCards = visible.map(function (chat) { return makeCard(chat, now); });
+    var fragment = document.createDocumentFragment();
+    nextCards.forEach(function (card) { fragment.appendChild(card); });
+    cards.replaceChildren(fragment);
+    if (!motionEnabled() || !previous.size) return;
+    nextCards.forEach(function (card) {
+      var before = previous.get(card.dataset.chatKey || "");
+      if (!before) {
+        animateNode(card, [{ opacity: 0, transform: "translateY(4px)" }, { opacity: 1, transform: "translateY(0)" }], 180);
+        return;
+      }
+      var after = card.getBoundingClientRect();
+      var dx = before.rect.left - after.left;
+      var dy = before.rect.top - after.top;
+      var sx = after.width ? before.rect.width / after.width : 1;
+      var sy = after.height ? before.rect.height / after.height : 1;
+      if (Math.abs(dx) > .5 || Math.abs(dy) > .5 || Math.abs(sx - 1) > .01 || Math.abs(sy - 1) > .01) {
+        animateNode(card, [
+          { transformOrigin: "top left", transform: "translate(" + dx + "px," + dy + "px) scale(" + sx + "," + sy + ")" },
+          { transformOrigin: "top left", transform: "none" }
+        ], 220);
+      }
+      if (before.summary !== (card.dataset.summary || "")) {
+        animateNode(card.querySelector(".summary-line"), [{ opacity: .25, transform: "translateY(3px)" }, { opacity: 1, transform: "translateY(0)" }], 180);
+      }
+      if (before.statusKey !== (card.dataset.statusKey || "")) {
+        animateNode(card.querySelector(".status"), [{ opacity: .45, transform: "translateY(2px)" }, { opacity: 1, transform: "translateY(0)" }], 160);
+      }
+    });
+  }
   function updateMetrics(chats, approvalItems, now) {
-    var counts = { active: 0, quiet: 0, stale: 0, approval: 0, done: 0 };
+    var counts = { active: 0, attention: 0 };
     chats.forEach(function (chat) {
       var key = statusOf(chat, now).key;
-      if (counts[key] !== undefined) counts[key] += 1;
-      if (key === "failed" || key === "idle") counts.done += 1;
+      if (key === "active" || key === "quiet" || key === "detached") counts.active += 1;
+      if (key === "stale" || key === "failed") counts.attention += 1;
     });
-    document.getElementById("m-active").textContent = counts.active;
-    document.getElementById("m-quiet").textContent = counts.quiet;
-    document.getElementById("m-stale").textContent = counts.stale;
-    document.getElementById("m-approval").textContent = approvalItems.length;
-    document.getElementById("m-done").textContent = counts.done;
+    setMetricValue("m-active", counts.active);
+    setMetricValue("m-attention", counts.attention);
+    setMetricValue("m-approval", approvalItems.length);
+    document.getElementById("metric-attention").classList.toggle("has-value", counts.attention > 0);
+    document.getElementById("metric-approval").classList.toggle("has-value", approvalItems.length > 0);
   }
   function render() {
     var now = Date.now();
@@ -531,12 +640,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       var sa = statusOf(a, now), sb = statusOf(b, now);
       return sa.priority - sb.priority || b.lastActiveAt - a.lastActiveAt;
     });
-    cards.replaceChildren();
-    if (!visible.length) {
-      cards.appendChild(el("div", "empty", "표시할 채팅 작업이 없습니다."));
-      return;
-    }
-    visible.forEach(function (chat) { cards.appendChild(makeCard(chat, now)); });
+    renderCards(visible, now);
   }
   async function refresh() {
     try {

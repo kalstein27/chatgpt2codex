@@ -229,6 +229,7 @@ import {
   MCP_CORE_TOOL_NAMES,
   MCP_CORE_TOOLS_META_KEY,
   MCP_SCHEMA_EXPIRED_META_KEY,
+  MCP_SCHEMA_REVALIDATE_META_KEY,
   MCP_SCHEMA_REVISION_META_KEY,
   MCP_TOOL_LIST_TTL_MS,
 } from "./mcp-discovery.js";
@@ -1044,6 +1045,39 @@ function isChatGptVisibleRegisteredTool(
   );
 }
 
+function chatGptToolDefinition(name: string, tool: RegisteredToolLike): Record<string, unknown> {
+  const definition: Record<string, unknown> = {
+    name,
+    title: tool.title,
+    description: tool.description,
+    inputSchema: schemaToJsonSchema(tool.inputSchema, "input"),
+    securitySchemes: CHATGPT2CODEX_SECURITY_SCHEMES,
+    annotations: tool.annotations,
+    execution: tool.execution,
+    _meta: {
+      securitySchemes: CHATGPT2CODEX_SECURITY_SCHEMES,
+      ui: { visibility: ["model"] },
+      "openai/visibility": "public",
+      ...(tool._meta ?? {}),
+    },
+  };
+  if (tool.outputSchema) definition.outputSchema = schemaToJsonSchema(tool.outputSchema, "output");
+  return definition;
+}
+
+function chatGptVisibleToolDefinitions(
+  registeredTools: Record<string, RegisteredToolLike>,
+  desktopControlSupported: boolean,
+  exposeNativeE2e: boolean,
+  nativeFirstClient: boolean,
+): Record<string, unknown>[] {
+  return Object.entries(registeredTools)
+    .filter(([name, tool]) =>
+      isChatGptVisibleRegisteredTool(name, tool, desktopControlSupported, exposeNativeE2e, nativeFirstClient),
+    )
+    .map(([name, tool]) => chatGptToolDefinition(name, tool));
+}
+
 function installChatGptToolListHandler(s: McpServer, ctx: ToolContext): void {
   const registeredTools = (s as unknown as { _registeredTools: Record<string, RegisteredToolLike> })._registeredTools;
   s.server.setRequestHandler(ChatGptListToolsRequestSchema, (request) => {
@@ -1054,29 +1088,12 @@ function installChatGptToolListHandler(s: McpServer, ctx: ToolContext): void {
     const desktopControlSupported = isDesktopControlSupported();
     const exposeNativeE2e = isNativeE2eSupported();
     const nativeFirstClient = isNativeFirstClient(ctx);
-    const allTools = Object.entries(registeredTools)
-        .filter(([name, tool]) =>
-          isChatGptVisibleRegisteredTool(name, tool, desktopControlSupported, exposeNativeE2e, nativeFirstClient),
-        )
-        .map(([name, tool]) => {
-          const definition: Record<string, unknown> = {
-            name,
-            title: tool.title,
-            description: tool.description,
-            inputSchema: schemaToJsonSchema(tool.inputSchema, "input"),
-            securitySchemes: CHATGPT2CODEX_SECURITY_SCHEMES,
-            annotations: tool.annotations,
-            execution: tool.execution,
-            _meta: {
-              securitySchemes: CHATGPT2CODEX_SECURITY_SCHEMES,
-              ui: { visibility: ["model"] },
-              "openai/visibility": "public",
-              ...(tool._meta ?? {}),
-            },
-          };
-          if (tool.outputSchema) definition.outputSchema = schemaToJsonSchema(tool.outputSchema, "output");
-          return definition;
-        });
+    const allTools = chatGptVisibleToolDefinitions(
+      registeredTools,
+      desktopControlSupported,
+      exposeNativeE2e,
+      nativeFirstClient,
+    );
     const selection = selectToolDefinitions(allTools, toolListExtensionParams(request));
     const schemaRevision = toolSchemaRevision(allTools);
     const visibleCoreToolNames = MCP_CORE_TOOL_NAMES.filter(
@@ -1087,11 +1104,13 @@ function installChatGptToolListHandler(s: McpServer, ctx: ToolContext): void {
       matchMode: selection.matchMode,
       schemaRevision,
       schemaExpired: false,
+      schemaMustRevalidate: true,
       schemaTtlMs: MCP_TOOL_LIST_TTL_MS,
       coreToolNames: visibleCoreToolNames,
       _meta: {
         [MCP_SCHEMA_REVISION_META_KEY]: schemaRevision,
         [MCP_SCHEMA_EXPIRED_META_KEY]: false,
+        [MCP_SCHEMA_REVALIDATE_META_KEY]: true,
         [MCP_CORE_TOOLS_META_KEY]: visibleCoreToolNames,
       },
     };
@@ -2379,6 +2398,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                   "file_edit_lines for redaction-safe line-addressed edits; file_apply_patch/file_create for ordinary controlled edits",
                   "For a predeclared integrity-verified fixed local artifact install, use verified_local_file_apply with only operationSpecId; do not express that operation as command_run, argv, or caller-supplied source/destination paths.",
                   "Remote response-latency rule: never keep one MCP request open while a subprocess, human approval, live session, or readiness condition may run long. Remote command_run and e2e_run_command are forced into persisted background handoff even if synchronous execution is requested. Protected remote approvals return promptly; after the user approves, replay the exact same input so the approved fingerprint is consumed, then poll operation_status with short calls. If a screenshot was requested, capture it only after the background operation is terminal. After any client timeout/cancellation, inspect the exact operation/receipt before deciding whether to retry.",
+                  "Runtime schema freshness rule: after runtime replacement, re-run connection_status -> agent_guide and revalidate tools/list. If the host still exposes a stale named-tool schema, fetch the live schema with tool_schema_get (or c2ct_invoke targeting tool_schema_get when that named tool is itself missing) and execute the operation through stable c2ct_invoke until the host refreshes its mounted catalog.",
                   ...(canRunLocalShell ? ["local_shell_run for local-only Codex-style commands inside the selected project"] : []),
                   ...e2eWorkflow,
                   "repo_status/repo_diff_summary, then git_commit and git_push when explicitly requested",
@@ -2439,6 +2459,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                 "Apply redaction-safe changes with file_edit_lines when displayed context contains [REDACTED]; otherwise use file_apply_patch or file_create. Never hand the user a script to paste when the action bridge is reachable.",
                 "Use verified_local_file_apply for predeclared integrity-verified fixed local artifact installs; its dedicated schema intentionally has no command, argv, raw source path, or raw destination path fields.",
                 `Use command_run${canRunLocalShell ? " or local-only local_shell_run" : ""} for verification. On remote ChatGPT/MCP, never wait inside one tool request for subprocess completion or human approval: command_run and e2e_run_command are code-forced to persisted background execution even when synchronous is requested. A protected remote approval returns immediately; after approval, replay the exact same input, then poll operation_status with short calls until terminal. Do not use foreground sleep/wait commands to keep a request alive. If visual proof is needed, capture it after the background command is terminal. After timeout/cancellation, inspect the exact operation/receipt and never blind-retry.`,
+                "After runtime replacement, treat a host-mounted named tool schema as potentially stale until revalidated. Use tool_schema_get for the live definition and stable c2ct_invoke for execution; if tool_schema_get is absent from the mounted catalog, invoke tool_schema_get through c2ct_invoke itself.",
                 "Use repo status/diff/show changes and then commit/push only when requested.",
               ],
               imageSaveFlow: [
@@ -8628,11 +8649,60 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
   }
 
   registerTool(
+    "tool_schema_get",
+    {
+      title: "Get one live C2CT tool schema",
+      description:
+        "Return the live runtime definition for one public C2CT tool plus the exact current tools/list schema revision and runtime schema identity. Use after runtime replacement when the host may still have a stale named-tool schema. If this named tool is missing from a stale host catalog, call it through stable c2ct_invoke.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: chatGptToolMeta("Reading live tool schema...", "Live tool schema loaded"),
+      inputSchema: {
+        toolName: z.string().min(1).max(128),
+      },
+    },
+    async ({ toolName }) => {
+      return withErrorMapping(ctx, "tool_schema_get", { toolName }, async () => {
+        const registeredTools = (s as unknown as { _registeredTools: Record<string, RegisteredToolLike> })._registeredTools;
+        const target = registeredTools[toolName];
+        if (!target || !isChatGptVisibleRegisteredTool(
+          toolName,
+          target,
+          isDesktopControlSupported(),
+          isNativeE2eSupported(),
+          false,
+        )) {
+          throw new DomainError(ErrorCode.NOT_A_FILE, `Public C2CT tool schema not found: ${toolName}`, { toolName });
+        }
+        const allTools = chatGptVisibleToolDefinitions(
+          registeredTools,
+          isDesktopControlSupported(),
+          isNativeE2eSupported(),
+          false,
+        );
+        const schemaRevision = toolSchemaRevision(allTools);
+        const runtimeManifest = getRuntimeManifest();
+        return makeResult(
+          {
+            tool: chatGptToolDefinition(toolName, target),
+            schemaRevision,
+            schemaMustRevalidate: true,
+            runtimeToolSchemaRevision: runtimeManifest.toolSchemaRevision,
+            runtimeFingerprint: runtimeManifest.runtimeFingerprint,
+            runtimeRoot: runtimeManifest.runtimeRoot,
+            recommendedExecution: toolName === "c2ct_invoke" ? "direct" : "c2ct_invoke",
+          },
+          `Live schema loaded for ${toolName} at ${schemaRevision}.`,
+        );
+      });
+    },
+  );
+
+  registerTool(
     "c2ct_invoke",
     {
       title: "Invoke one public C2CT operation",
       description:
-        "Dispatch one already-public C2CT operation through a stable generic schema. The target operation keeps its original input validation, lease checks, approval gates, audit trail, and result shape. Hidden operations, desktop control, recursive dispatch, and unsupported platform operations are refused.",
+        "Dispatch one already-public C2CT operation through a stable generic schema. Use with tool_schema_get as the runtime-replacement fallback when a host-mounted named schema is stale. The target operation keeps its original input validation, lease checks, approval gates, audit trail, and result shape. Hidden operations, desktop control, recursive dispatch, and unsupported platform operations are refused.",
       annotations: COMMAND_RUN_ANNOTATIONS,
       inputSchema: {
         toolName: z.string().min(1).max(128),
