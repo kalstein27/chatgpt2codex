@@ -608,6 +608,7 @@ function currentActivityScope(ctx: ToolContext) {
 }
 
 const MAX_CANCEL_APPROVAL_TIMEOUT_HOLD_MS = 2 * 60 * 1000;
+const REMOTE_FOREGROUND_WAIT_BUDGET_SEC = 15;
 
 async function runtimeApplyGateSnapshot(
   ctx: ToolContext,
@@ -2377,7 +2378,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                   "file_read_slice before editing one existing file; use file_read_batch when several exact slices are already known so ChatGPT can reduce host invocations without using broad context packs",
                   "file_edit_lines for redaction-safe line-addressed edits; file_apply_patch/file_create for ordinary controlled edits",
                   "For a predeclared integrity-verified fixed local artifact install, use verified_local_file_apply with only operationSpecId; do not express that operation as command_run, argv, or caller-supplied source/destination paths.",
-                  "Remote command_run never keeps the MCP request open for subprocess completion: it is host-safe background handoff by default (and even explicit synchronous requests are promoted). Poll operation_status and read outputRef when terminal.",
+                  "Remote response-latency rule: never keep one MCP request open while a subprocess, human approval, live session, or readiness condition may run long. Remote command_run and e2e_run_command are forced into persisted background handoff even if synchronous execution is requested. Protected remote approvals return promptly; after the user approves, replay the exact same input so the approved fingerprint is consumed, then poll operation_status with short calls. If a screenshot was requested, capture it only after the background operation is terminal. After any client timeout/cancellation, inspect the exact operation/receipt before deciding whether to retry.",
                   ...(canRunLocalShell ? ["local_shell_run for local-only Codex-style commands inside the selected project"] : []),
                   ...e2eWorkflow,
                   "repo_status/repo_diff_summary, then git_commit and git_push when explicitly requested",
@@ -2437,7 +2438,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                 "Use code_search first, then narrow file_read_slice calls; when several exact slices are already known, prefer file_read_batch to reduce host invocations. Avoid broad context-pack calls in ChatGPT because OpenAI safety may block them before they reach chatgpt2codex.",
                 "Apply redaction-safe changes with file_edit_lines when displayed context contains [REDACTED]; otherwise use file_apply_patch or file_create. Never hand the user a script to paste when the action bridge is reachable.",
                 "Use verified_local_file_apply for predeclared integrity-verified fixed local artifact installs; its dedicated schema intentionally has no command, argv, raw source path, or raw destination path fields.",
-                `Use command_run${canRunLocalShell ? " or local-only local_shell_run" : ""} for verification. Prefer foreground/synchronous execution for ordinary bounded checks so the ChatGPT turn stays visibly alive. Only long calls with an expected duration above 20 seconds are auto-handed off when executionMode is omitted; explicit background still hands off. Any active background result requires immediate operation_status polling in the same assistant turn, and the assistant must not finalize while turnContinuationRequired=true. Protected commands remain exact-operation approval-gated before execution or handoff.`,
+                `Use command_run${canRunLocalShell ? " or local-only local_shell_run" : ""} for verification. On remote ChatGPT/MCP, never wait inside one tool request for subprocess completion or human approval: command_run and e2e_run_command are code-forced to persisted background execution even when synchronous is requested. A protected remote approval returns immediately; after approval, replay the exact same input, then poll operation_status with short calls until terminal. Do not use foreground sleep/wait commands to keep a request alive. If visual proof is needed, capture it after the background command is terminal. After timeout/cancellation, inspect the exact operation/receipt and never blind-retry.`,
                 "Use repo status/diff/show changes and then commit/push only when requested.",
               ],
               imageSaveFlow: [
@@ -6346,6 +6347,16 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               ? error.details.requestId
               : undefined;
             if (!requestId) throw error;
+            if (ctx.remote === true) {
+              await progress?.update("approval", "Approval requested; returning promptly for host-safe handoff");
+              throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Remote verified file approval is pending; approve it, then replay the exact same verified_local_file_apply input", {
+                ...(error instanceof DomainError ? error.details ?? {} : {}),
+                requestId,
+                hostSafeApprovalHandoff: true,
+                replayExactInputAfterApproval: true,
+                actionStarted: false,
+              });
+            }
             await progress?.update("approval", "Waiting for approval; this same operation will resume automatically");
             const clientCancelled = (): boolean => {
               if (!operationId || !ctx.activity) return false;
@@ -6436,7 +6447,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Run project command",
       description:
-        "Run an allowlisted discovered command (never arbitrary shell). Foreground/synchronous is the default, including remote ChatGPT/MCP, so ordinary bounded checks keep the current assistant turn visibly alive. When executionMode is omitted, remote calls are auto-handed off only if expectedDurationSec is greater than 20 seconds; explicit background always hands off. If a background result says turnContinuationRequired=true, immediately poll operation_status in the same assistant turn and do not finalize until it becomes terminal.",
+        "Run an allowlisted discovered command (never arbitrary shell). Remote ChatGPT/MCP execution is always handed off to a persisted background operation, even if synchronous is requested, so an MCP request never waits for subprocess completion. Protected remote approvals also return promptly; after approval, replay the exact same command_run input. Poll operation_status until terminal. Native/local callers may still use bounded synchronous execution.",
       annotations: COMMAND_RUN_ANNOTATIONS,
       _meta: chatGptToolMeta("Running project command...", "Project command finished"),
       inputSchema: {
@@ -6526,6 +6537,17 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               ? error.details.requestId
               : undefined;
             if (!requestId) throw error;
+            if (ctx.remote === true) {
+              await progress?.update("approval", "Approval requested; returning promptly for host-safe handoff");
+              throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Remote command approval is pending; approve it, then replay the exact same command_run input", {
+                ...(error instanceof DomainError ? error.details ?? {} : {}),
+                requestId,
+                hostSafeApprovalHandoff: true,
+                replayExactInputAfterApproval: true,
+                actionStarted: false,
+                subprocessStarted: false,
+              });
+            }
             await progress?.update("approval", "Waiting for local approval; this operation will resume automatically");
             const clientCancelled = (): boolean => {
               if (!operationId || !ctx.activity) return false;
@@ -6559,11 +6581,9 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         }
         await assertRuntimeUpdateNotDraining(ctx.stateDir);
         const requestedExecutionMode = input.executionMode ?? "synchronous";
-        const remoteAutoBackground = ctx.remote === true
-          && input.executionMode === undefined
-          && (input.intent?.expectedDurationSec ?? 0) > 20;
-        const effectiveExecutionMode = input.executionMode ?? (remoteAutoBackground ? "background" : "synchronous");
-        const autoBackgrounded = remoteAutoBackground;
+        const remoteForcedBackground = ctx.remote === true;
+        const effectiveExecutionMode = remoteForcedBackground ? "background" : requestedExecutionMode;
+        const autoBackgrounded = remoteForcedBackground && input.executionMode !== "background";
         if (effectiveExecutionMode === "background") {
           const manager = backgroundOperationManager(ctx.stateDir);
           const operationFingerprint = approvedOperationFingerprint ?? backgroundCommandFingerprint({
@@ -6698,7 +6718,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               assistantMayFinalize: false,
               turnContinuationAction: "poll-operation-status-until-terminal",
             },
-            `${autoBackgrounded ? "Long remote command automatically handed off" : "Background command accepted"} as ${snapshot.operationId}; keep this assistant turn active and poll operation_status until terminal before finalizing.`,
+            `${remoteForcedBackground ? "Remote command handed off for host-safe execution" : "Background command accepted"} as ${snapshot.operationId}; keep this assistant turn active and poll operation_status until terminal before finalizing.`,
           );
         }
         await progress?.update("spawn", "Starting approved project command");
@@ -7075,7 +7095,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Start E2E dev server",
       description:
-        "Start a long-running local dev/server command in the selected project, optionally wait for a localhost URL, and return pid/log path. Use before E2E browser/app screenshots.",
+        "Start a long-running local dev/server command in the selected project and return pid/log path. An optional localhost readiness wait is hard-capped for remote ChatGPT/MCP so the request cannot sit open until the host timeout. Use later short status/screenshot calls instead of waiting in one request.",
       annotations: COMMAND_RUN_ANNOTATIONS,
       _meta: chatGptToolMeta("Starting E2E server...", "E2E server started"),
       inputSchema: {
@@ -7127,12 +7147,15 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         }
         await assertRuntimeUpdateNotDraining(ctx.stateDir);
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const effectiveWaitTimeoutSec = ctx.remote === true && input.waitUrl
+          ? Math.min(input.waitTimeoutSec ?? 30, REMOTE_FOREGROUND_WAIT_BUDGET_SEC)
+          : input.waitTimeoutSec;
         const result = await startE2eServer(entry.root, {
           command: input.command,
           cwd: input.cwd,
           label: input.label,
           waitUrl: input.waitUrl,
-          waitTimeoutSec: input.waitTimeoutSec,
+          waitTimeoutSec: effectiveWaitTimeoutSec,
         });
         await ctx.ledger.append({
           type: "e2e.server.started",
@@ -7145,6 +7168,12 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           {
             ...result,
             logPath: result.logPath,
+            ...(ctx.remote === true && input.waitUrl
+              ? {
+                  remoteForegroundBudgetSec: REMOTE_FOREGROUND_WAIT_BUDGET_SEC,
+                  waitTimeoutCappedForRemote: (input.waitTimeoutSec ?? 30) > REMOTE_FOREGROUND_WAIT_BUDGET_SEC,
+                }
+              : {}),
           },
           `E2E server ${result.runId} started as pid ${result.pid}${result.wait ? `; wait ok=${result.wait.ok}` : ""}.`,
         );
@@ -7214,7 +7243,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Run E2E command",
       description:
-        "Run a guarded project E2E/test command. A tests-only or full-write lease is required even when captureScreenshot=false because nonvisual execution still requires the verify capability. For visual proof, use e2e_screenshot, e2e_open_url_screenshot, or e2e_test_and_show_screenshot.",
+        "Run a guarded project E2E/test command. Remote ChatGPT/MCP execution is always handed off to a persisted background operation so the MCP request never waits for subprocess completion; poll operation_status until terminal. If captureScreenshot=true remotely, screenshot capture is deferred until the command is terminal, then use e2e_screenshot or e2e_open_url_screenshot. Native/local callers retain bounded synchronous execution.",
       annotations: COMMAND_RUN_ANNOTATIONS,
       _meta: chatGptToolMeta("Running E2E command...", "E2E command finished"),
       inputSchema: {
@@ -7248,7 +7277,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         : input.intent?.writesWorkspace
           ? "write"
           : "verify";
-      return withErrorMapping(ctx, "e2e_run_command", { ...input, command: redact(input.command) }, async (progress) => {
+      return withErrorMapping<Record<string, unknown>>(ctx, "e2e_run_command", { ...input, command: redact(input.command) }, async (progress) => {
         requireNativeE2eSupport();
         const lease = await requireProjectLease(
           ctx,
@@ -7275,6 +7304,132 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         }
         await assertRuntimeUpdateNotDraining(ctx.stateDir);
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        if (ctx.remote === true) {
+          const manager = backgroundOperationManager(ctx.stateDir);
+          const operationFingerprint = backgroundCommandFingerprint({
+            projectId: entry.projectId,
+            projectRoot: entry.root,
+            leaseId: lease.leaseId,
+            commandId: "e2e_run_command",
+            args: [
+              input.command,
+              input.cwd ?? "",
+              String(input.timeoutSec ?? 60),
+              input.label ?? "",
+              input.screenshotUrl ?? "",
+              String(input.captureScreenshot === true),
+            ],
+          });
+          const snapshot = await manager.start({
+            ownerScope: backgroundOwnerScope(ctx),
+            projectId: entry.projectId,
+            projectRoot: entry.root,
+            ...(input.workLaneId ? { laneDigest: projectLaneDigest(input.workLaneId) } : {}),
+            leaseId: lease.leaseId,
+            leasePreset: lease.preset,
+            commandId: "e2e_run_command",
+            operationFingerprint,
+            execute: async (_backgroundOperationId, signal, update) => {
+              await ctx.ledger.append({
+                type: "e2e.command.started",
+                projectId: input.projectId,
+                command: summarizeCommandAudit(input.command),
+                executionMode: "background",
+              });
+              await update({
+                state: "running",
+                phase: "running",
+                subprocessStarted: true,
+                subprocessStillRunning: true,
+              });
+              const result = await runLocalShell(
+                entry.root,
+                input.command,
+                input.cwd,
+                input.timeoutSec,
+                approvedRisk,
+                { signal, captureOutput: true },
+              );
+              await update({
+                phase: "serialize",
+                subprocessStarted: true,
+                subprocessStillRunning: false,
+                cleanupStarted: result.cleanupStatus !== "NOT_REQUIRED",
+                cleanupCompleted: result.cleanupStatus === "COMPLETED",
+              });
+              let outputArtifact: Awaited<ReturnType<typeof createOutputArtifact>> | undefined;
+              let artifactError: string | undefined;
+              if (result.capturedOutput) {
+                try {
+                  outputArtifact = await createOutputArtifact({
+                    stateDir: ctx.stateDir,
+                    projectId: input.projectId,
+                    ...(input.workLaneId ? { laneDigest: projectLaneDigest(input.workLaneId) } : {}),
+                    tool: "e2e_run_command",
+                    stdout: result.capturedOutput.stdout,
+                    stderr: result.capturedOutput.stderr,
+                    sourceTruncated: result.outputTruncated,
+                    artifactTruncated: result.capturedOutput.artifactTruncated,
+                    stdoutBytes: result.capturedOutput.stdoutBytes,
+                    stderrBytes: result.capturedOutput.stderrBytes,
+                  });
+                } catch (error) {
+                  artifactError = toArtifactError(error, true);
+                }
+              }
+              const artifactStatus = artifactError
+                ? "FAILED" as const
+                : outputArtifact?.artifactTruncated
+                  ? "TRUNCATED" as const
+                  : outputArtifact
+                    ? "CREATED" as const
+                    : "FAILED" as const;
+              await ctx.ledger.append({
+                type: "e2e.command.finished",
+                projectId: input.projectId,
+                command: summarizeCommandAudit(input.command),
+                exitCode: result.exitCode,
+                executionMode: "background",
+              });
+              return {
+                state: backgroundTerminalState(result.commandStatus),
+                commandStatus: result.commandStatus,
+                exitCode: result.exitCode,
+                terminationSignal: result.terminationSignal,
+                cleanupStatus: result.cleanupStatus,
+                artifactStatus,
+                domainStatus: null,
+                domainStatusSource: "not-provided" as const,
+                durationMs: result.durationMs,
+                ...(outputArtifact
+                  ? {
+                      outputRef: outputArtifact.outputRef,
+                      resourceUri: outputArtifact.resourceUri,
+                      outputBytes: outputArtifact.stdoutBytes + outputArtifact.stderrBytes,
+                      artifactTruncated: outputArtifact.artifactTruncated,
+                    }
+                  : {}),
+                ...(artifactError ? { errorCode: "OUTPUT_ARTIFACT_FAILED" } : {}),
+              };
+            },
+          });
+          await progress?.update("running", "Remote E2E command handed off; poll operation_status");
+          return makeResult(
+            {
+              ...snapshot,
+              effectiveExecutionMode: "background",
+              hostSafeHandoff: true,
+              screenshotDeferred: input.captureScreenshot === true,
+              pollAfterMs: 3_000,
+              turnContinuationRequired: true,
+              assistantMayFinalize: false,
+              turnContinuationAction: input.captureScreenshot === true
+                ? "poll-operation-status-until-terminal-then-capture-screenshot"
+                : "poll-operation-status-until-terminal",
+            },
+            `Remote E2E command handed off as ${snapshot.operationId}; poll operation_status until terminal${input.captureScreenshot === true ? ", then capture the requested screenshot" : ""}.`,
+          );
+        }
         await ctx.ledger.append({
           type: "e2e.command.started",
           projectId: input.projectId,
@@ -7346,7 +7501,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "E2E test and show screenshot",
       description:
-        "One-shot local E2E proof tool. Call immediately when the user says 'e2e 테스트하고 스크린샷 보여줘' or 'run e2e and show me the screenshot'. Uses the active project by default, detects web vs desktop-app projects such as Tauri, runs only discovered local package scripts, opens the built desktop app for Tauri projects, captures multiple top/middle/bottom app-window screenshots for desktop apps or browser-region screenshots for web apps, renders the screenshot set inline in ChatGPT through the E2E screenshot widget, and returns inline image markdown through GPT Actions. If the discovered local check fails, the assistant must inspect logs, make normal code fixes with separate coding tools, rerun E2E, and only then show the final passing screenshot set.",
+        "One-shot local E2E proof tool for short checks plus screenshots. Remote ChatGPT/MCP command and dev-server readiness phases are hard-capped so this request cannot wait on long subprocess work. For long tests/builds/live waits, use e2e_run_command, poll operation_status until terminal, then capture screenshots separately.",
       annotations: E2E_ONE_SHOT_ANNOTATIONS,
       _meta: chatGptToolMeta("Running E2E and capturing screenshot...", "E2E screenshot ready", E2E_WIDGET_TOOL_META),
       inputSchema: {
@@ -7407,12 +7562,17 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                 cwd: input.cwd,
                 label: "one-shot-e2e",
                 waitUrl: autoWaitUrl,
-                waitTimeoutSec: 45,
+                waitTimeoutSec: ctx.remote === true ? REMOTE_FOREGROUND_WAIT_BUDGET_SEC : 45,
               });
             }
 
             const command = discovered.command;
-            const commandResult = command ? await runLocalShell(project.root, command, input.cwd, input.timeoutSec) : undefined;
+            const effectiveCommandTimeoutSec = ctx.remote === true
+              ? Math.min(input.timeoutSec ?? 60, REMOTE_FOREGROUND_WAIT_BUDGET_SEC)
+              : input.timeoutSec;
+            const commandResult = command
+              ? await runLocalShell(project.root, command, input.cwd, effectiveCommandTimeoutSec)
+              : undefined;
             const screenshotUrl = input.url ?? autoWaitUrl;
             const screenshots =
               discovered.targetKind === "desktop-app" && discovered.targetAppName && !input.url

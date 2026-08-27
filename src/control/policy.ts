@@ -106,11 +106,13 @@ export function isSensitiveApp(appName: string | undefined): boolean {
 }
 
 /** Explicit allowlist of app names control may target, configured via env
- * (comma-separated). Empty by default: no app is reachable until the
- * operator opts an app in, on top of the two gates above. */
+ * (comma-separated). Finder is the compatibility default only when the env
+ * value is absent. An explicitly configured empty value means no app is
+ * reachable, which lets the native settings UI fail closed. */
 export function controlAllowlist(env: NodeJS.ProcessEnv = process.env): string[] {
   const raw = env[CONTROL_ALLOWLIST_ENV_FLAG];
-  if (!raw) return ["Finder"];
+  if (raw === undefined) return ["Finder"];
+  if (!raw.trim()) return [];
   return raw
     .split(",")
     .map((entry) => entry.trim())

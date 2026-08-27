@@ -374,7 +374,7 @@ const definitions = [
     allowedArgvGrammar: "fixed compiled runtime-apply-worker.js plus stateDir, operationId, and numeric loopback port",
     allowedCwdRoot: "runtime bundle",
     allowedReadRoots: "private runtime update receipts and verified managed runtime roots",
-    allowedWriteRoots: "private runtime update receipts, active-runtime pointer, and runtime-reload-request marker only",
+    allowedWriteRoots: "private runtime update receipts, active-runtime pointer, runtime-reload-request marker, and bounded runtime-apply-maintenance marker only",
     networkPolicy: "none",
     environmentProfile: "inherits current runtime identity solely for supervisor/tunnel preservation comparison",
     approvalPolicy: "project-lease",

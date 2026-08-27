@@ -427,6 +427,40 @@ export async function requestRuntimeReload(stateDir: string, operationId: string
   }
 }
 
+export async function writeRuntimeApplyMaintenanceMarker(
+  stateDir: string,
+  operationId: string,
+  supervisorPid: number,
+): Promise<void> {
+  if (!/^rt_[0-9a-f-]{36}$/u.test(operationId) || !Number.isSafeInteger(supervisorPid) || supervisorPid <= 0) {
+    throw new Error("INVALID_RUNTIME_MAINTENANCE_IDENTITY");
+  }
+  await ensurePrivateDirectory(stateDir);
+  const marker = path.join(stateDir, "runtime-apply-maintenance");
+  const temporary = `${marker}.${process.pid}.${randomUUID()}.tmp`;
+  await fs.writeFile(temporary, `${supervisorPid} ${operationId}\n`, { mode: FILE_MODE, flag: "wx" });
+  try {
+    await fs.rename(temporary, marker);
+    await fs.chmod(marker, FILE_MODE).catch(() => undefined);
+  } finally {
+    await fs.unlink(temporary).catch(() => undefined);
+  }
+}
+
+export async function clearRuntimeApplyMaintenanceMarker(stateDir: string, operationId: string): Promise<void> {
+  const marker = path.join(stateDir, "runtime-apply-maintenance");
+  const raw = await fs.readFile(marker, "utf8").catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  });
+  if (raw === null) return;
+  const currentOperationId = raw.trim().split(/\s+/u)[1] ?? "";
+  if (currentOperationId !== operationId) return;
+  await fs.unlink(marker).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  });
+}
+
 function newReceipt(input: {
   projectId: string;
   requestId: string;
@@ -872,6 +906,7 @@ export async function runRuntimeApplyWorker(input: {
     });
   }
 
+  await writeRuntimeApplyMaintenanceMarker(input.stateDir, input.operationId, expectedSupervisorPid);
   await writeActiveRuntimePointer(input.stateDir, receipt.targetManifest.runtimeRoot);
   receipt = await updateRuntimeApplyReceipt(input.stateDir, input.operationId, (value) => ({
     ...transition(value, "ACTIVATION_REQUESTED", "activation", now()),

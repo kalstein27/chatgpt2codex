@@ -74,6 +74,8 @@ function parseArgs(argv: string[]): ParsedArgs {
 
 /** Default state dir per PRD §10: `~/.local/share/chatgpt2codex/`. */
 function defaultStateDir(): string {
+  const configured = process.env.CHATGPT2CODEX_STATE_DIR?.trim();
+  if (configured) return path.resolve(configured);
   return path.join(os.homedir(), ".local", "share", "chatgpt2codex");
 }
 

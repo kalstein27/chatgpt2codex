@@ -250,7 +250,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "command_run",
     summary: "Run allowlisted project command",
     description:
-      "Run an allowlisted project command through chatgpt2codex. Foreground is the remote default for ordinary bounded checks. If executionMode is omitted and expectedDurationSec is above 20 seconds, or background is explicitly requested, the command is handed off. While turnContinuationRequired=true, immediately poll operation_status through generic call_tool and do not finalize the assistant turn.",
+      "Run an allowlisted project command through chatgpt2codex. Remote execution is always handed off to a persisted background operation, even if synchronous is requested, so one Action/MCP request never waits for subprocess completion. Protected approvals return promptly; after approval replay the exact same input, then poll operation_status until terminal.",
     schema: "CommandRunInput",
   },
   {
@@ -293,7 +293,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "e2e_run_command",
     summary: "Run a guarded E2E command",
     description:
-      "Run a guarded project E2E/test command. A tests-only or full-write lease is required even when captureScreenshot=false because nonvisual execution still requires verify capability. Capture visual proof only when captureScreenshot=true is explicitly requested.",
+      "Run a guarded project E2E/test command. Remote execution is always persisted as a background operation; poll operation_status until terminal. If visual proof is requested, capture it afterward with the screenshot action instead of holding this request open for both the long command and screenshot.",
     schema: "E2eRunCommandInput",
   },
   {

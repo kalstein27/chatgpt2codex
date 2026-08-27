@@ -152,7 +152,11 @@ private let desktopLocalizationRows: [String: [String]] = [
     "autoApproveOnMenu": ["Turn on auto-approve (10 min)", "자동 승인 켜기 (10분)"],
     "autoApproveOffMenu": ["Turn off auto-approve", "자동 승인 끄기"],
     "autoApproveStatusMenu": ["Auto-approve: on", "자동 승인: 켜짐"],
-    "autoApproveUnavailableMenu": ["Auto-approve needs an allowlisted app (CHATGPT2CODEX_CONTROL_ALLOWLIST)", "자동 승인을 사용하려면 허용 목록(CHATGPT2CODEX_CONTROL_ALLOWLIST) 앱이 필요합니다"],
+    "autoApproveUnavailableMenu": ["Auto-approve needs at least one allowed app", "자동 승인을 사용하려면 허용 앱이 하나 이상 필요합니다"],
+    "controlAllowlistMenu": ["Computer Use allowed apps...", "Computer Use 허용 앱..."],
+    "controlAllowlistTitle": ["Computer Use allowed apps", "Computer Use 허용 앱"],
+    "controlAllowlistInfo": ["Enter exact macOS app names separated by commas or new lines. An empty list blocks every Computer Use target. Sensitive apps remain blocked even if listed. Saving restarts MCP so the new list is applied.", "정확한 macOS 앱 이름을 쉼표 또는 줄바꿈으로 구분해 입력하세요. 목록을 비우면 모든 Computer Use 대상이 차단됩니다. 민감 앱은 목록에 넣어도 계속 차단됩니다. 저장하면 새 목록 적용을 위해 MCP가 재시작됩니다."],
+    "controlAllowlistEmpty": ["No apps allowed", "허용된 앱 없음"],
     "autoUpdatesMenu": ["Auto Check for Updates", "업데이트 자동 확인", "更新を自動確認", "自动检查更新", "自動檢查更新", "Buscar actualizaciones automáticamente", "Recherche auto des mises à jour", "Automatisch nach Updates suchen", "Verificar atualizações automaticamente", "Controlla aggiornamenti automaticamente", "Automatisch updates zoeken", "Automatycznie sprawdzaj aktualizacje", "Автопроверка обновлений", "Güncellemeleri otomatik denetle", "Tự động kiểm tra cập nhật", "Periksa pembaruan otomatis", "ตรวจอัปเดตอัตโนมัติ", "التحقق التلقائي من التحديثات", "अपडेट अपने-आप जांचें", "Автоматично перевіряти оновлення"],
     "openLocalHealth": ["Open Local Health", "로컬 상태 열기", "ローカルヘルスを開く", "打开本地健康检查", "開啟本機健康檢查", "Abrir estado local", "Ouvrir l'état local", "Lokalen Status öffnen", "Abrir saúde local", "Apri stato locale", "Lokale status openen", "Otwórz status lokalny", "Открыть локальный статус", "Yerel durumu aç", "Mở trạng thái cục bộ", "Buka kesehatan lokal", "เปิดสถานะภายใน", "فتح حالة الجهاز", "स्थानीय हेल्थ खोलें", "Відкрити локальний стан"],
     "openPublicHealth": ["Open Public Health", "공개 상태 열기", "公開ヘルスを開く", "打开公开健康检查", "開啟公開健康檢查", "Abrir estado público", "Ouvrir l'état public", "Öffentlichen Status öffnen", "Abrir saúde pública", "Apri stato pubblico", "Publieke status openen", "Otwórz status publiczny", "Открыть публичный статус", "Genel durumu aç", "Mở trạng thái công khai", "Buka kesehatan publik", "เปิดสถานะสาธารณะ", "فتح الحالة العامة", "सार्वजनिक हेल्थ खोलें", "Відкрити публічний стан"],
@@ -279,6 +283,7 @@ private final class ServiceController {
     private let startMCPOnLaunchKey = "startMCPOnLaunch"
     private let multiProjectLanesEnabledKey = "multiProjectLanesEnabled"
     private let showIntermediateCommentaryKey = "showIntermediateCommentary"
+    private let controlAllowlistKey = "controlAllowlist"
     private let autoCheckUpdatesKey = "autoCheckUpdates"
     private let appliedRuntimeVersionKey = "appliedRuntimeVersion"
     private(set) var process: Process?
@@ -462,6 +467,25 @@ private final class ServiceController {
             return configured == "1"
         }
         return false
+    }
+
+    var controlAllowlist: [String] {
+        let source: [String]
+        if let stored = defaults.array(forKey: controlAllowlistKey) as? [String] {
+            source = stored
+        } else if let configured = environment["CHATGPT2CODEX_CONTROL_ALLOWLIST"] {
+            source = configured.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+        } else {
+            source = ["Finder"]
+        }
+        var seen = Set<String>()
+        return source.compactMap { value in
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            let key = trimmed.lowercased()
+            guard seen.insert(key).inserted else { return nil }
+            return trimmed
+        }
     }
 
     var showIntermediateCommentary: Bool {
@@ -1359,6 +1383,18 @@ private final class ServiceController {
         defaults.set(enabled, forKey: multiProjectLanesEnabledKey)
     }
 
+    func setControlAllowlist(_ apps: [String]) {
+        var seen = Set<String>()
+        let normalized = apps.compactMap { value -> String? in
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            let key = trimmed.lowercased()
+            guard seen.insert(key).inserted else { return nil }
+            return trimmed
+        }
+        defaults.set(normalized, forKey: controlAllowlistKey)
+    }
+
     func setChatGptRemoteControlEnabledForSession(_ enabled: Bool) {
         chatGptRemoteControlSessionOverride = enabled
     }
@@ -1473,7 +1509,38 @@ private final class ServiceController {
         }
     }
 
-    func start(completion: @escaping (Bool) -> Void) {
+    private var operatorStopFile: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local")
+            .appendingPathComponent("share")
+            .appendingPathComponent("chatgpt2codex")
+            .appendingPathComponent("operator-stop")
+    }
+
+    private func setOperatorStopRequested(_ requested: Bool) {
+        let marker = operatorStopFile
+        if requested {
+            let directory = marker.deletingLastPathComponent()
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+                try Data("operator-stop\n".utf8).write(to: marker, options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: marker.path)
+            } catch {
+                appendLog("operator stop marker update failed: \(error.localizedDescription)\n")
+            }
+        } else if FileManager.default.fileExists(atPath: marker.path) {
+            do {
+                try FileManager.default.removeItem(at: marker)
+            } catch {
+                appendLog("operator stop marker clear failed: \(error.localizedDescription)\n")
+            }
+        }
+    }
+
+    func start(clearOperatorStop: Bool = true, completion: @escaping (Bool) -> Void) {
+        if clearOperatorStop {
+            setOperatorStopRequested(false)
+        }
         // A host/account hiccup or a short event-loop stall must not turn into
         // a second launcher that reclaims a healthy runtime. Require multiple
         // consecutive loopback failures before attempting a new launch.
@@ -1493,7 +1560,13 @@ private final class ServiceController {
         }
     }
 
-    func stop(terminateExternalRuntime: Bool = true) {
+    func stop(terminateExternalRuntime: Bool = true, markOperatorStop: Bool = true) {
+        if terminateExternalRuntime && markOperatorStop {
+            // Persist intent before terminating anything. External watchdogs or
+            // launch agents may race the stop, but every launcher observes this
+            // marker and must leave MCP down until an explicit Start/Restart.
+            setOperatorStopRequested(true)
+        }
         let managedProcess = process
         if let managedProcess, managedProcess.isRunning {
             managedProcess.terminate()
@@ -1517,12 +1590,13 @@ private final class ServiceController {
     }
 
     func restart(completion: @escaping (Bool) -> Void) {
+        setOperatorStopRequested(false)
         let ownsManagedRuntime = process?.isRunning == true
         // When this app owns the launcher, terminate only that exact Process.
         // A detached broad pkill can outlive the old process and race the new
         // launch after loopback health has already gone down. Fall back to the
         // broad external cleanup only when there is no live managed handle.
-        stop(terminateExternalRuntime: !ownsManagedRuntime)
+        stop(terminateExternalRuntime: !ownsManagedRuntime, markOperatorStop: false)
         waitForRuntimeToStop(remainingAttempts: 24) { [weak self] stopped in
             guard let self else { return }
             guard stopped else {
@@ -1570,7 +1644,7 @@ private final class ServiceController {
                 return
             }
             do {
-                try self.launchServer()
+                try self.launchServer(handoffRecovery: true)
                 completion(true)
             } catch {
                 self.appendLog("handoff recovery launch failed: \(error.localizedDescription)\n")
@@ -1579,7 +1653,7 @@ private final class ServiceController {
         }
     }
 
-    private func launchServer() throws {
+    private func launchServer(handoffRecovery: Bool = false) throws {
         let script = runtimeRoot.appendingPathComponent("start-chatgpt.sh")
         guard FileManager.default.fileExists(atPath: script.path) else {
             throw NSError(domain: "ChatGPTToCodex", code: 1, userInfo: [
@@ -1598,8 +1672,10 @@ private final class ServiceController {
         export CHATGPT2CODEX_STATE_DIR=\(shellQuote(stateDir.path))
         \(additionalWorkspaceRootsJSON.map { "export CHATGPT2CODEX_ADDITIONAL_WORKSPACE_ROOTS_JSON=\(shellQuote($0))" } ?? "unset CHATGPT2CODEX_ADDITIONAL_WORKSPACE_ROOTS_JSON")
         export PORT=\(port)
+        \(handoffRecovery ? "export CHATGPT2CODEX_HANDOFF_RECOVERY=1" : "unset CHATGPT2CODEX_HANDOFF_RECOVERY")
         \(multiProjectLanesEnabled ? "export CHATGPT2CODEX_MULTI_PROJECT_LANES=1" : "export CHATGPT2CODEX_MULTI_PROJECT_LANES=0")
         \(chatGptRemoteControlEnabled ? "export CHATGPT2CODEX_CONTROL_CHATGPT=1" : "unset CHATGPT2CODEX_CONTROL_CHATGPT")
+        export CHATGPT2CODEX_CONTROL_ALLOWLIST=\(shellQuote(controlAllowlist.joined(separator: ",")))
         \(showIntermediateCommentary ? "export CHATGPT2CODEX_SHOW_INTERMEDIATE_COMMENTARY=1" : "unset CHATGPT2CODEX_SHOW_INTERMEDIATE_COMMENTARY")
         \(enablePublicTunnel ? "export CHATGPT2CODEX_EXPOSE_WEB=1" : "unset CHATGPT2CODEX_EXPOSE_WEB")
         export CHATGPT2CODEX_TUNNEL_MODE=\(shellQuote(tunnelMode))
@@ -2127,7 +2203,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
                 // leave no supervisor to consume future runtime-reload markers.
                 controller.recoverManagedRuntimeAfterHandoff(completion: completion)
             } else {
-                controller.start(completion: completion)
+                controller.start(clearOperatorStop: false, completion: completion)
             }
         }
         if controller.autoCheckUpdates {
@@ -2221,6 +2297,11 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             chatGptRemoteControlMenuItem.state = remoteControlEnabled ? .on : .off
             chatGptRemoteControlMenuItem.toolTip = "원격 ChatGPT의 화면·클릭·입력 실행을 허용합니다. 앱을 종료하면 꺼지며, 작업별 승인·허용 목록·민감 앱 차단·강제 종료는 그대로 유지됩니다."
             menu.addItem(chatGptRemoteControlMenuItem)
+
+            let allowedApps = controller.controlAllowlist
+            let allowlistItem = menuItem("\(t("controlAllowlistMenu")) (\(allowedApps.count))", #selector(editControlAllowlist), "checklist")
+            allowlistItem.toolTip = allowedApps.isEmpty ? t("controlAllowlistEmpty") : allowedApps.joined(separator: ", ")
+            menu.addItem(allowlistItem)
 
             armMenuItem = menuItem("\(t("agentArmOffMenu")) · 로컬 직접 제어", #selector(toggleAgentArm), "shield.lefthalf.filled")
             armMenuItem.toolTip = "\(t("agentArmStatusDetail")) · 원격 승인 요청과 별도"
@@ -3495,6 +3576,41 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     @objc private func toggleAutoApprove() {
         let path = latestControlSnapshot?.autoEnabled == true ? "/control/auto/off" : "/control/auto/on"
         controller.performLocalControl(path) { [weak self] _ in self?.refreshStatus() }
+    }
+
+    @objc private func editControlAllowlist() {
+        let alert = NSAlert()
+        alert.messageText = t("controlAllowlistTitle")
+        alert.informativeText = t("controlAllowlistInfo")
+        alert.alertStyle = .informational
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 460, height: 24))
+        field.stringValue = controller.controlAllowlist.joined(separator: ", ")
+        field.placeholderString = "Finder, Codex, Safari"
+        alert.accessoryView = field
+        alert.addButton(withTitle: t("save"))
+        alert.addButton(withTitle: t("cancel"))
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        var seen = Set<String>()
+        let apps = field.stringValue
+            .split(whereSeparator: { $0 == "," || $0 == "\n" })
+            .compactMap { raw -> String? in
+                let value = String(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !value.isEmpty else { return nil }
+                let key = value.lowercased()
+                guard seen.insert(key).inserted else { return nil }
+                return value
+            }
+        controller.setControlAllowlist(apps)
+        rebuildMenu()
+
+        let shouldRestart = latestHealth || controller.isManagedProcessRunning || controller.startMCPOnLaunch
+        guard shouldRestart else {
+            refreshStatus()
+            return
+        }
+        statusMenuItem.title = "ChatGPT To Codex: \(t("statusRestarting"))"
+        controller.restart { [weak self] _ in self?.refreshStatus() }
     }
 
     @objc private func toggleAgentArm() {
