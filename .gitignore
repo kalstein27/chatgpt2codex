@@ -94,6 +94,7 @@ id_ed25519
 /benchmarks/
 /script/
 /scripts/*
+!/scripts/apply-activity-dashboard.ts
 !/scripts/macos-dependency-doctor.sh
 /linux/
 /windows/Build-ChatGPTToCodexExe.ps1

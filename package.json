@@ -14,6 +14,7 @@
   "scripts": {
     "audit:moderate": "npm audit --audit-level=moderate",
     "audit:prod": "npm audit --omit=dev --audit-level=moderate",
+    "activity-dashboard:apply": "tsx scripts/apply-activity-dashboard.ts",
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json && node dist/runtime/runtime-manifest.js --seal",
     "build:macos-app": "bash scripts/build-macos-app.sh",
     "chatgpt": "bash start-chatgpt.sh",

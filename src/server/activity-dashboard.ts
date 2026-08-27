@@ -1,9 +1,15 @@
 import { createHash } from "node:crypto";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import { redact } from "../policy/secrets.js";
 import type { RuntimeActivityTracker, RuntimeConversationSummary } from "../runtime/activity.js";
 
 const MAX_DASHBOARD_OPERATIONS = 12;
 const ACTIVITY_DASHBOARD_REVISION_TOKEN = "__C2CT_ACTIVITY_DASHBOARD_REVISION__";
+export const ACTIVITY_DASHBOARD_OVERRIDE_FILE = "activity-dashboard.html";
+export const ACTIVITY_DASHBOARD_CONTRACT_VERSION = 1;
+const ACTIVITY_DASHBOARD_MAX_OVERRIDE_BYTES = 512 * 1024;
+const ACTIVITY_DASHBOARD_CONTRACT_MARKER = `<meta name="c2ct-activity-dashboard-contract" content="${ACTIVITY_DASHBOARD_CONTRACT_VERSION}">`;
 
 export interface ActivityDashboardApproval {
   id: string;
@@ -93,10 +99,11 @@ export function activityDashboardSnapshot(
   tracker: RuntimeActivityTracker,
   approvals: ActivityDashboardApproval[] = [],
   now = Date.now(),
+  dashboardRevision = ACTIVITY_DASHBOARD_REVISION,
 ) {
   return {
     schemaVersion: 2,
-    dashboardRevision: ACTIVITY_DASHBOARD_REVISION,
+    dashboardRevision,
     generatedAt: now,
     approvals: approvals.map(dashboardApproval),
     conversations: tracker.conversationSnapshot(now).map(dashboardConversation),
@@ -109,6 +116,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
+  <meta name="c2ct-activity-dashboard-contract" content="1">
   <title>ChatGPT To Codex</title>
   <style>
     :root {
@@ -126,9 +134,9 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       --red: #dc3545;
       --gray: #8b9097;
       --shadow: 0 1px 2px rgba(0,0,0,.035), 0 8px 24px rgba(0,0,0,.035);
-      --motion-fast: 160ms;
-      --motion-layout: 220ms;
-      --motion-ease: cubic-bezier(.2,.8,.2,1);
+      --motion-fast: 270ms;
+      --motion-layout: 430ms;
+      --motion-ease: cubic-bezier(.2,.72,.2,1);
     }
     @media (prefers-color-scheme: dark) {
       :root {
@@ -244,6 +252,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   </style>
 </head>
 <body>
+<!-- activity-dashboard-hot-override-enabled -->
 <main>
   <header>
     <div class="header-main">
@@ -318,14 +327,14 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   }
   function animateNode(node, keyframes, duration) {
     if (!motionEnabled() || !node || typeof node.animate !== "function") return;
-    node.animate(keyframes, { duration: duration, easing: "cubic-bezier(.2,.8,.2,1)" });
+    node.animate(keyframes, { duration: duration, easing: "cubic-bezier(.2,.72,.2,1)", fill: "both" });
   }
   function setMetricValue(id, value) {
     var node = document.getElementById(id);
     var next = String(value);
     if (!node || node.textContent === next) return;
     node.textContent = next;
-    animateNode(node, [{ opacity: .35, transform: "translateY(2px)" }, { opacity: 1, transform: "translateY(0)" }], 150);
+    animateNode(node, [{ opacity: .72, transform: "translateY(.5px)" }, { opacity: 1, transform: "translateY(0)" }], 260);
   }
   function fmtClock(ms) {
     if (!ms) return "-";
@@ -594,7 +603,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     nextCards.forEach(function (card) {
       var before = previous.get(card.dataset.chatKey || "");
       if (!before) {
-        animateNode(card, [{ opacity: 0, transform: "translateY(4px)" }, { opacity: 1, transform: "translateY(0)" }], 180);
+        animateNode(card, [{ opacity: .68, transform: "translateY(2px)" }, { opacity: 1, transform: "translateY(0)" }], 340);
         return;
       }
       var after = card.getBoundingClientRect();
@@ -606,13 +615,13 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
         animateNode(card, [
           { transformOrigin: "top left", transform: "translate(" + dx + "px," + dy + "px) scale(" + sx + "," + sy + ")" },
           { transformOrigin: "top left", transform: "none" }
-        ], 220);
+        ], 430);
       }
       if (before.summary !== (card.dataset.summary || "")) {
-        animateNode(card.querySelector(".summary-line"), [{ opacity: .25, transform: "translateY(3px)" }, { opacity: 1, transform: "translateY(0)" }], 180);
+        animateNode(card.querySelector(".summary-line"), [{ opacity: .7, transform: "translateY(1px)" }, { opacity: 1, transform: "translateY(0)" }], 320);
       }
       if (before.statusKey !== (card.dataset.statusKey || "")) {
-        animateNode(card.querySelector(".status"), [{ opacity: .45, transform: "translateY(2px)" }, { opacity: 1, transform: "translateY(0)" }], 160);
+        animateNode(card.querySelector(".status"), [{ opacity: .74, transform: "translateY(.5px)" }, { opacity: 1, transform: "translateY(0)" }], 280);
       }
     });
   }
@@ -677,3 +686,56 @@ export const ACTIVITY_DASHBOARD_HTML = ACTIVITY_DASHBOARD_TEMPLATE.replace(
   ACTIVITY_DASHBOARD_REVISION_TOKEN,
   ACTIVITY_DASHBOARD_REVISION,
 );
+
+export interface ActivityDashboardDocument {
+  html: string;
+  revision: string;
+  source: "bundled" | "override";
+}
+
+interface CachedActivityDashboardDocument {
+  mtimeMs: number;
+  size: number;
+  document: ActivityDashboardDocument;
+}
+
+const activityDashboardDocumentCache = new Map<string, CachedActivityDashboardDocument>();
+const bundledActivityDashboardDocument: ActivityDashboardDocument = {
+  html: ACTIVITY_DASHBOARD_HTML,
+  revision: ACTIVITY_DASHBOARD_REVISION,
+  source: "bundled",
+};
+
+function activityDashboardRevisionFromHtml(html: string): string | undefined {
+  if (!html.includes(ACTIVITY_DASHBOARD_CONTRACT_MARKER)) return undefined;
+  return /var pageDashboardRevision = "([a-f0-9]{16})";/u.exec(html)?.[1];
+}
+
+export async function activityDashboardDocument(stateDir: string): Promise<ActivityDashboardDocument> {
+  const resolvedStateDir = path.resolve(stateDir);
+  const overridePath = path.join(resolvedStateDir, ACTIVITY_DASHBOARD_OVERRIDE_FILE);
+  try {
+    const stat = await fs.stat(overridePath);
+    if (!stat.isFile() || stat.size <= 0 || stat.size > ACTIVITY_DASHBOARD_MAX_OVERRIDE_BYTES) {
+      activityDashboardDocumentCache.delete(resolvedStateDir);
+      return bundledActivityDashboardDocument;
+    }
+    const cached = activityDashboardDocumentCache.get(resolvedStateDir);
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.document;
+
+    const html = await fs.readFile(overridePath, "utf8");
+    const revision = activityDashboardRevisionFromHtml(html);
+    const document = revision
+      ? { html, revision, source: "override" as const }
+      : bundledActivityDashboardDocument;
+    activityDashboardDocumentCache.set(resolvedStateDir, {
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+      document,
+    });
+    return document;
+  } catch {
+    activityDashboardDocumentCache.delete(resolvedStateDir);
+    return bundledActivityDashboardDocument;
+  }
+}

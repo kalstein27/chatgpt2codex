@@ -15,7 +15,7 @@ import {
 import { listPendingRgApprovalRequests, type RgApprovalRequest } from "./rg-capability.js";
 import type { RuntimeActivityTracker } from "../runtime/activity.js";
 import {
-  ACTIVITY_DASHBOARD_HTML,
+  activityDashboardDocument,
   activityDashboardSnapshot,
   type ActivityDashboardApproval,
 } from "../server/activity-dashboard.js";
@@ -877,13 +877,14 @@ export class MobileApprovalBridge {
       setDashboardHeaders(res);
       if (requestPath === "/activity/api/activity") {
         const now = Date.now();
+        const dashboard = await activityDashboardDocument(this.stateDir);
         const config = await readMobileApprovalConfig(this.stateDir);
         const approvalItems = await dashboardApprovalItems(
           this.stateDir,
           Boolean(config?.enabled && tailscaleIdentity(req)),
           now,
         );
-        sendJson(res, 200, activityDashboardSnapshot(this.activityTracker, approvalItems, now));
+        sendJson(res, 200, activityDashboardSnapshot(this.activityTracker, approvalItems, now, dashboard.revision));
         return;
       }
       if (requestPath === "/activity/api/health") {
@@ -891,9 +892,10 @@ export class MobileApprovalBridge {
         return;
       }
       if (requestPath === "/activity" || requestPath === "/activity/") {
+        const dashboard = await activityDashboardDocument(this.stateDir);
         res.statusCode = 200;
         res.setHeader("content-type", "text/html; charset=utf-8");
-        res.end(ACTIVITY_DASHBOARD_HTML);
+        res.end(dashboard.html);
         return;
       }
       sendJson(res, 404, { ok: false });
