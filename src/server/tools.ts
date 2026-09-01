@@ -113,7 +113,6 @@ import {
   CHATGPT_CONSENT_WIDGET_HTML,
   CHATGPT_CONSENT_WIDGET_LAB_URI,
   CHATGPT_CONSENT_WIDGET_LAB_VERSION,
-  CHATGPT_CONSENT_WIDGET_LEGACY_URIS,
   CHATGPT_CONSENT_WIDGET_MIME,
   CHATGPT_CONSENT_WIDGET_RESOURCE_META,
   CHATGPT_CONSENT_WIDGET_URI,
@@ -839,6 +838,30 @@ const PROJECT_WRITE_ANNOTATIONS = {
 const LOCAL_WRITE_ANNOTATIONS = {
   readOnlyHint: false,
   destructiveHint: true,
+  openWorldHint: false,
+} as const;
+
+// Bounded runtime housekeeping may remove only inactive immutable snapshots
+// selected by the hard-coded retention policy. It never changes the active
+// runtime, process, connector, or tunnel and is intentionally automatic so
+// runtime preparation cannot recreate the ENOSPC failure mode.
+const BOUNDED_RUNTIME_MAINTENANCE_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  openWorldHint: false,
+} as const;
+
+// These tools already enforce a C2CT-owned exact-operation human approval
+// before the consequential effect can occur. Advertising the outer MCP call as
+// destructive makes hosts add a generic confirmation that cannot currently be
+// consumed as that C2CT approval, producing two clicks for one operation.
+// Keep the internal approval gate authoritative and avoid the redundant host
+// confirmation. Tools without their own exact approval must keep using
+// LOCAL_WRITE_ANNOTATIONS when a host confirmation is part of their safety
+// boundary.
+const EXACT_APPROVAL_GATED_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: false,
   openWorldHint: false,
 } as const;
 
@@ -2306,7 +2329,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
   const scheduledGoalAnnotations = LOCAL_STATE_ANNOTATIONS;
   const scheduledGoalDescription = "Run one bounded scheduled GPT→Luna supervisor cycle. Fixed gpt-5.6-luna only; no blind retry, commit/push/install/runtime/tunnel changes. Initial local approval and a full-write work lane are required for mutation.";
   registerTool("scheduled_goal_create", {
-    title: "Create scheduled Luna goal", description: scheduledGoalDescription, annotations: LOCAL_WRITE_ANNOTATIONS,
+    title: "Create scheduled Luna goal", description: scheduledGoalDescription, annotations: EXACT_APPROVAL_GATED_ANNOTATIONS,
     inputSchema: { requestId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/u), projectId: z.string().min(1).max(120), workLaneId: WORK_LANE_ID_SCHEMA.optional(), objective: z.string().min(1).max(2000), stopConditions: z.array(z.string().min(1).max(512)).min(1).max(32), constraints: z.array(z.string().max(512)).max(32).optional(), milestone: z.string().max(512).optional(), expiresInMinutes: z.number().int().min(10).max(10080).default(1440), maxCycles: z.number().int().min(1).max(50).default(12), maxNoProgress: z.number().int().min(1).max(10).default(3) },
   }, async (input) => withErrorMapping(ctx, "scheduled_goal_create", {
     requestId: input.requestId,
@@ -2434,9 +2457,6 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
   registerConsentWidgetResource("c2ct-consent-widget", CHATGPT_CONSENT_WIDGET_URI);
   registerConsentWidgetResource("c2ct-consent-widget-lab-cache-bust", CHATGPT_CONSENT_WIDGET_LAB_URI);
   registerConsentWidgetResource(CHATGPT_OPERATION_APPROVAL_WIDGET_RESOURCE_NAME, CHATGPT_OPERATION_APPROVAL_WIDGET_URI);
-  CHATGPT_CONSENT_WIDGET_LEGACY_URIS.forEach((uri, index) => {
-    registerConsentWidgetResource(`c2ct-consent-widget-legacy-${index + 1}`, uri);
-  });
 
   registerTool(
     CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL,
@@ -2793,7 +2813,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     "chatgpt_consent_probe",
     {
       title: "Show C2CT in-chat confirmation",
-      description: "Render the current pending C2CT operation approval for this ChatGPT conversation when one exists; otherwise render a harmless allow/deny probe.",
+      description: "Render the shared C2CT Widget Shell presenter when one is pending; otherwise render a harmless allow/deny probe. Protected operation approvals always use the dedicated versioned operation presenter.",
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
         ...chatGptToolMeta("Opening C2CT confirmation...", "C2CT confirmation opened"),
@@ -2853,54 +2873,6 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           "openai/outputTemplate": CHATGPT_CONSENT_WIDGET_LAB_URI,
         };
         return result;
-      }
-      const remembered = ctx.sessionScope
-        ? chatGptPendingOperationBySession.get(ctx.sessionScope)
-        : undefined;
-      if (remembered) {
-        const approvalRequest = (await listOperationApprovalRequests(ctx.stateDir))
-          .find((candidate) => candidate.requestId === remembered.requestId);
-        if (approvalRequest &&
-            approvalRequest.status === "pending" &&
-            approvalRequest.tool === remembered.tool &&
-            approvalRequest.approvalSurface === "chatgpt-widget") {
-          const token = mintChatGptWidgetApprovalToken({
-            requestId: approvalRequest.requestId,
-            sessionScope: ctx.sessionScope,
-            expiresAt: approvalRequest.expiresAt,
-          });
-          const result = makeResult<Record<string, unknown>>(
-            {
-              requestId: approvalRequest.requestId,
-              status: "pending",
-              approvalKind: "operation",
-              approvalChannel: "chatgpt-widget",
-              decisionTool: "chatgpt_operation_approval_decide",
-              operationTool: remembered.tool,
-              preview: approvalRequest.preview,
-              summary: approvalRequest.summary ?? approvalRequest.preview,
-              impact: approvalRequest.impact,
-              details: approvalRequest.details,
-              expiresAt: approvalRequest.expiresAt,
-              replayExactInputAfterApproval: true,
-              actionStarted: false,
-              subprocessStarted: false,
-              sideEffects: "approval-state-only",
-              allowFollowUpPrompt: remembered.allowFollowUpPrompt,
-              denyFollowUpPrompt: remembered.denyFollowUpPrompt,
-              ...(remembered.extra ?? {}),
-            },
-            `${remembered.tool} approval opened in the C2CT in-chat confirmation card.`,
-          );
-          result._meta = {
-            ...(result._meta ?? {}),
-            ui: { resourceUri: CHATGPT_CONSENT_WIDGET_URI },
-            "openai/outputTemplate": CHATGPT_CONSENT_WIDGET_URI,
-            [CHATGPT_CONSENT_META_KEY]: { token },
-          };
-          return result;
-        }
-        forgetChatGptPendingOperation(ctx, remembered.requestId);
       }
       const probe = createChatGptConsentProbe({ sessionScope: ctx.sessionScope });
       const token = mintChatGptWidgetApprovalToken({
@@ -3309,7 +3281,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                   "For a predeclared integrity-verified fixed local artifact install, use verified_local_file_apply with only operationSpecId; do not express that operation as command_run, argv, or caller-supplied source/destination paths.",
                   "Remote response-latency rule: never keep one MCP request open while a subprocess, human approval, live session, or readiness condition may run long. Remote command_run and e2e_run_command are forced into persisted background handoff even if synchronous execution is requested. Protected remote approvals return promptly; after the user approves, replay the exact same input so the approved fingerprint is consumed, then poll operation_status with short calls. If a screenshot was requested, capture it only after the background operation is terminal. After any client timeout/cancellation, inspect the exact operation/receipt before deciding whether to retry.",
                   schemaRecovery.mode === "stable-dispatcher-preferred"
-                    ? "Automatic schema routing: connection_status/agent_guide reports stable-dispatcher-preferred because a schema-changing runtime apply has not yet been followed by an observed current tools/list fetch. After bootstrap, route public operations through stable c2ct_invoke by default. Keep named bootstrap reads only when their mounted schema accepts the input. Do not re-register the bare /mcp connector."
+                    ? "Automatic schema routing: connection_status/agent_guide reports stable-dispatcher-preferred because a schema-changing runtime apply has not yet been followed by an observed current tools/list fetch. After bootstrap, route public operations through stable c2ct_invoke by default. If the dispatcher refuses a target because its named surface carries the host confirmation boundary, do not bypass that boundary; use the named tool once the host catalog supports it. Keep named bootstrap reads only when their mounted schema accepts the input. Do not re-register the bare /mcp connector."
                     : "Automatic schema routing: connection_status/agent_guide reports named-tools-preferred, so use named tools normally. If a named call is rejected before runtime dispatch, immediately fall back to tool_schema_get + c2ct_invoke without connector re-registration.",
                   ...(canRunLocalShell ? ["local_shell_run for local-only Codex-style commands inside the selected project"] : []),
                   ...e2eWorkflow,
@@ -3500,8 +3472,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Prepare immutable local runtime update",
       description:
-        "Validate the selected project's sealed runtime build and materialize an immutable local runtime snapshot. This does not change active-runtime, restart the runtime, or touch connector/tunnel state.",
-      annotations: LOCAL_WRITE_ANNOTATIONS,
+        "Validate the selected project's sealed runtime build, enforce bounded automatic snapshot retention, and materialize an immutable local runtime snapshot. This does not change active-runtime, restart the runtime, or touch connector/tunnel state.",
+      annotations: BOUNDED_RUNTIME_MAINTENANCE_ANNOTATIONS,
       _meta: chatGptToolMeta("Preparing immutable runtime snapshot...", "Runtime snapshot prepared"),
       inputSchema: {
         projectId: z.string().min(1).max(120),
@@ -3632,7 +3604,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       title: "Request safe local runtime apply",
       description:
         "Validate and request an idempotent runtime-only replacement. Approval is routed through the C2CT Approval Broker. Host-native ChatGPT approval is preferred when a trusted host authorization event is actually available; until then the broker fails closed to the installed ChatGPT To Codex menu-bar approval provider. Conversational answers, generic local-control approval, and Computer Use confirmations cannot authorize this operation. After approval is granted, call runtime_apply_local again with the exact same requestId and unchanged target parameters to resume the same transaction; runtime_apply_status exposes provider/fallback metadata and reports approvalReadyToResume when replay is required. The fixed worker preserves the supervisor, app, connector, cloudflared/Tailscale topology, and rolls back on failed health checks.",
-      annotations: LOCAL_WRITE_ANNOTATIONS,
+      annotations: EXACT_APPROVAL_GATED_ANNOTATIONS,
       _meta: chatGptToolMeta("Preparing safe runtime replacement...", "Runtime replacement request recorded"),
       inputSchema: {
         projectId: z.string().min(1).max(120),
@@ -3872,7 +3844,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       title: "Install verified macOS menu-bar app",
       description:
         "Request an idempotent out-of-process install of the project's verified build/macos/ChatGPT To Codex.app into the fixed /Applications destination. Requires stable signing, a full-write lease, and local destructive approval. The fixed worker gracefully hands off an app-owned supervisor/runtime, preserves external topology, verifies health, persists a receipt, and rolls back on failure.",
-      annotations: LOCAL_WRITE_ANNOTATIONS,
+      annotations: EXACT_APPROVAL_GATED_ANNOTATIONS,
       _meta: chatGptToolMeta("Preparing verified macOS app install...", "macOS app install checked"),
       inputSchema: {
         projectId: z.string().min(1).max(120),
@@ -4024,7 +3996,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Get local runtime snapshot retention status",
       description:
-        "Inventory immutable local runtime snapshots under the fixed private release root. Reports active/current/recent-rollback protection and age eligibility without deleting files or changing the live runtime.",
+        "Inventory immutable local runtime snapshots under the fixed private release root. Reports active/current/recent-rollback/newest/running-process protection plus age and hard-cap eligibility without deleting files or changing the live runtime.",
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: chatGptToolMeta("Checking runtime snapshots...", "Runtime snapshot status loaded"),
       inputSchema: {
@@ -4051,8 +4023,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Prune eligible local runtime snapshots",
       description:
-        "Delete only old immutable runtime snapshots that are outside the fixed active/current/recent-rollback/newest/minimum-age protection set. Requires full-write plus separate local destructive approval; never changes active-runtime, restarts processes, or touches connector/tunnel state.",
-      annotations: LOCAL_WRITE_ANNOTATIONS,
+        "Delete only immutable runtime snapshots eligible by age or hard-cap overflow while preserving active/current/recent-rollback/newest/running-process roots. Requires full-write plus separate local destructive approval; never changes active-runtime, restarts processes, or touches connector/tunnel state.",
+      annotations: EXACT_APPROVAL_GATED_ANNOTATIONS,
       _meta: chatGptToolMeta("Preparing runtime snapshot cleanup...", "Runtime snapshot cleanup recorded"),
       inputSchema: {
         projectId: z.string().min(1).max(120),
@@ -4079,7 +4051,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             },
             after: before,
           },
-          `No runtime snapshot is eligible under keepNewest=${before.policy.keepNewest}, minAgeDays=${before.policy.minAgeDays}.`,
+          `No runtime snapshot is eligible under keepNewest=${before.policy.keepNewest}, minAgeDays=${before.policy.minAgeDays}, maxSnapshots=${before.policy.maxSnapshots}.`,
         );
       }
       const preApprovalGate = await runtimeApplyGateSnapshot(ctx, entry);
@@ -4599,7 +4571,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       title: "Configure mobile exact-operation approval",
       description:
         "Enable or disable the ntfy + tailnet-only Tailscale Serve bridge for explicitly mobile-approvable exact operations, including protected command_run and verified_local_file_apply. Requires full-write capability plus a Mac-local one-shot approval. Mobile approval itself can never authorize this setup tool.",
-      annotations: LOCAL_WRITE_ANNOTATIONS,
+      annotations: EXACT_APPROVAL_GATED_ANNOTATIONS,
       _meta: chatGptToolMeta("Configuring mobile approval...", "Mobile approval configured"),
       inputSchema: {
         projectId: z.string(),
@@ -5793,7 +5765,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         title: "Recover or clean up a project work lane",
         description:
           "Ownership-sensitive work-lane cleanup. If this session owns the active lane but lost its raw handle, or only a stale same-session lane record remains, the tool safely de-escalates that state without local approval. A genuinely foreign abandoned lane still requires explicit local approval, refuses while the project has active foreground/background work, retires only the exact foreign root-lock generation, and never grants a replacement lane automatically.",
-        annotations: LOCAL_WRITE_ANNOTATIONS,
+        annotations: EXACT_APPROVAL_GATED_ANNOTATIONS,
         _meta: chatGptToolMeta("Checking project lane recovery...", "Project lane recovery processed"),
         inputSchema: {
           projectId: z.string(),
@@ -7905,7 +7877,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       title: "Cancel background operation",
       description:
         "Request process-tree cleanup for one active background command. Requires full-write plus a separate one-shot human approval; remote ChatGPT uses the C2CT inline approval card, while native/local callers keep the local approval surface. While approval is pending, the existing command timeout budget is paused. Cancellation is never automatically retried.",
-      annotations: LOCAL_WRITE_ANNOTATIONS,
+      annotations: EXACT_APPROVAL_GATED_ANNOTATIONS,
       _meta: chatGptToolMeta("Requesting background cancellation...", "Background cancellation checked"),
       inputSchema: {
         projectId: z.string(),
@@ -9805,7 +9777,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Invoke one public C2CT operation",
       description:
-        "Dispatch one already-public C2CT operation through a stable generic schema. Use with tool_schema_get as the runtime-replacement fallback when a host-mounted named schema is stale. The target operation keeps its original input validation, lease checks, approval gates, audit trail, and result shape. Hidden operations, desktop control, recursive dispatch, and unsupported platform operations are refused.",
+        "Dispatch one already-public C2CT operation through a stable generic schema. Use with tool_schema_get as the runtime-replacement fallback when a host-mounted named schema is stale. The target operation keeps its original input validation, lease checks, C2CT-owned approval gates, audit trail, and result shape. Targets whose safety boundary depends on host confirmation are refused and must use their dedicated named surface. Hidden operations, desktop control, recursive dispatch, and unsupported platform operations are also refused.",
       annotations: COMMAND_RUN_ANNOTATIONS,
       inputSchema: {
         toolName: z.string().min(1).max(128),
@@ -9838,6 +9810,15 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       }
       if (!isChatGptVisibleRegisteredTool(toolName, target, false, isNativeE2eSupported(), false)) {
         return reject("TOOL_NOT_FOUND", `Public C2CT operation not found: ${toolName}`);
+      }
+      const targetAnnotations = target.annotations && typeof target.annotations === "object"
+        ? target.annotations as { destructiveHint?: boolean }
+        : undefined;
+      if (targetAnnotations?.destructiveHint === true) {
+        return reject(
+          "PERMISSION_DENIED",
+          `${toolName} requires its dedicated named tool surface so the host confirmation boundary cannot be bypassed.`,
+        );
       }
 
       let validatedInput = input;

@@ -219,7 +219,7 @@ export function toolSchemaRecoveryPlan(input: {
     reason: "runtime-schema-changed-awaiting-tools-list",
     toolListRefreshObserved: false,
     preferredExecution: "c2ct_invoke",
-    instruction: "The runtime schema changed and no current post-apply tools/list fetch has been observed. After bootstrap, route public operations through stable c2ct_invoke by default until connection_status reports named-tools-preferred. Do not re-register the bare /mcp connector.",
+    instruction: "The runtime schema changed and no current post-apply tools/list fetch has been observed. After bootstrap, route public operations through stable c2ct_invoke by default until connection_status reports named-tools-preferred. If c2ct_invoke refuses a target because that named tool requires host confirmation, do not bypass the boundary; use the dedicated named surface once the host catalog supports it. Do not re-register the bare /mcp connector.",
   };
 }
 

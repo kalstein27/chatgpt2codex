@@ -17,17 +17,10 @@ export const CHATGPT_CONSENT_WIDGET_URI = "ui://widget/c2ct-consent-v6.html";
 // consent/Widget Shell host bindings do not churn when only Lab JS changes.
 export const CHATGPT_CONSENT_WIDGET_LAB_VERSION = 8;
 export const CHATGPT_CONSENT_WIDGET_LAB_URI = `ui://widget/c2ct-consent-v${CHATGPT_CONSENT_WIDGET_LAB_VERSION}.html`;
-export const CHATGPT_CONSENT_WIDGET_LEGACY_URIS = [
-  "ui://widget/c2ct-consent.html",
-  "ui://widget/c2ct-consent-v3.html",
-  "ui://widget/c2ct-consent-v4.html",
-  "ui://widget/c2ct-consent-v5.html",
-  "ui://widget/c2ct-consent-v7.html",
-] as const;
 export const CHATGPT_CONSENT_WIDGET_MIME = "text/html;profile=mcp-app";
 export const CHATGPT_CONSENT_META_KEY = "chatgpt2codex/consent";
 export const CHATGPT_CONSENT_WIDGET_RESOURCE_META = {
-  "openai/widgetDescription": "Inline C2CT single-operation approval card with exact one-shot allow/deny handling.",
+  "openai/widgetDescription": "Shared C2CT harmless confirmation and widget interaction surface.",
   "openai/widgetPrefersBorder": true,
   "openai/widgetCSP": { connect_domains: [], resource_domains: [] },
   ui: {

@@ -382,6 +382,23 @@ const definitions = [
     maxRuntimeMs: 120_000,
     outputPolicy: "no inherited stdio; progress and terminal result are persisted in a 0600 receipt",
   },
+  {
+    capabilityId: "runtime-snapshot-process-inventory",
+    purpose: "Read the local process command table so automatic runtime retention never removes a snapshot still referenced by a running process.",
+    platforms: ["darwin", "linux", "win32"],
+    callSites: ["src/runtime/runtime-snapshot-retention.ts"],
+    binaryPolicy: "fixed /bin/ps on macOS, fixed /bin/ps or /usr/bin/ps on Linux, or validated SystemRoot PowerShell on Windows",
+    allowedArgvGrammar: "fixed process command-line listing arguments only",
+    allowedCwdRoot: "none",
+    allowedReadRoots: "local process command table only",
+    allowedWriteRoots: "none",
+    networkPolicy: "none",
+    environmentProfile: "fixed locale plus SystemRoot/temp allowlist with no PATH lookup or shell",
+    approvalPolicy: "none",
+    leasePreset: "none during bounded local runtime retention",
+    maxRuntimeMs: 5_000,
+    outputPolicy: "command lines remain internal; only matching runtime snapshot roots affect protection metadata",
+  },
 ] as const satisfies readonly ExecutionCapabilityDefinition[];
 
 export const EXECUTION_CAPABILITIES: readonly ExecutionCapabilityDefinition[] = definitions;

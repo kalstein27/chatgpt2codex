@@ -1,16 +1,54 @@
+import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
+import { promisify } from "node:util";
 import { readActiveRuntimePointer } from "./runtime-apply.js";
 import { getRuntimeManifest } from "./runtime-manifest.js";
 
 const SNAPSHOT_NAME = /^runtime-([a-f0-9]{64})$/u;
 const APPLY_RECEIPT_NAME = /^rt_[0-9a-f-]{36}\.json$/u;
 const ACTIVE_APPLY_STATES = new Set(["APPROVAL_REQUIRED", "ACTIVATION_REQUESTED", "HEALTH_CHECK_FAILED"]);
+// execution-capability: runtime-snapshot-process-inventory
+const execFileAsync = promisify(execFile);
+
+function processInventoryEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { LANG: "C", LC_ALL: "C" };
+  for (const key of ["SystemRoot", "WINDIR", "TEMP", "TMP", "TMPDIR"]) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
+}
+
+async function processInventoryExecutable(): Promise<string> {
+  if (process.platform === "darwin") return "/bin/ps";
+  if (process.platform === "linux") {
+    for (const candidate of ["/bin/ps", "/usr/bin/ps"]) {
+      if (await fs.access(candidate).then(() => true).catch(() => false)) return candidate;
+    }
+    throw new Error("No approved ps executable is available");
+  }
+  if (process.platform === "win32") {
+    const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
+    const normalizedRoot = path.win32.normalize(systemRoot);
+    if (!path.win32.isAbsolute(normalizedRoot) || path.win32.basename(normalizedRoot).toLowerCase() !== "windows") {
+      throw new Error("Invalid Windows system root for process inventory");
+    }
+    return path.win32.join(normalizedRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  }
+  throw new Error(`Unsupported process inventory platform: ${process.platform}`);
+}
 
 export interface RuntimeSnapshotRetentionPolicy {
   keepNewest: number;
   minAgeDays: number;
   keepRecentApplyReceipts: number;
+  maxSnapshots: number;
+}
+
+export interface RuntimeSnapshotInventoryOptions {
+  runningProcessCommands?: string | null;
+  protectedSnapshotRoots?: string[];
 }
 
 export interface RuntimeSnapshotInventoryEntry {
@@ -21,6 +59,7 @@ export interface RuntimeSnapshotInventoryEntry {
   protected: boolean;
   protectedReasons: string[];
   eligibleForPrune: boolean;
+  eligibilityReason: "minimum-age-expired" | "snapshot-cap-overflow" | null;
 }
 
 export interface RuntimeSnapshotInventory {
@@ -49,10 +88,12 @@ async function canonicalPrivateReleaseRoot(stateDir: string): Promise<string | n
 }
 
 function normalizedPolicy(policy: Partial<RuntimeSnapshotRetentionPolicy> = {}): RuntimeSnapshotRetentionPolicy {
+  const keepNewest = Math.min(20, Math.max(2, Math.floor(policy.keepNewest ?? 3)));
   return {
-    keepNewest: Math.min(20, Math.max(2, Math.floor(policy.keepNewest ?? 3))),
+    keepNewest,
     minAgeDays: Math.min(365, Math.max(1, Math.floor(policy.minAgeDays ?? 7))),
     keepRecentApplyReceipts: Math.min(20, Math.max(1, Math.floor(policy.keepRecentApplyReceipts ?? 2))),
+    maxSnapshots: Math.min(100, Math.max(keepNewest, Math.floor(policy.maxSnapshots ?? 10))),
   };
 }
 
@@ -100,10 +141,35 @@ async function receiptProtectedRoots(stateDir: string, keepRecent: number): Prom
   return protectedRoots;
 }
 
+async function runningProcessCommands(options: RuntimeSnapshotInventoryOptions): Promise<string | null> {
+  if (options.runningProcessCommands !== undefined) return options.runningProcessCommands;
+  try {
+    const executable = await processInventoryExecutable();
+    const env = processInventoryEnv();
+    if (process.platform === "win32") {
+      const result = await execFileAsync(executable, [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Get-CimInstance Win32_Process | Select-Object -ExpandProperty CommandLine",
+      ], { env, maxBuffer: 4 * 1024 * 1024, timeout: 5_000, windowsHide: true });
+      return result.stdout;
+    }
+    const result = await execFileAsync(executable, [
+      "-axo",
+      "command=",
+    ], { env, maxBuffer: 4 * 1024 * 1024, timeout: 5_000 });
+    return result.stdout;
+  } catch {
+    return null;
+  }
+}
+
 export async function runtimeSnapshotInventory(
   stateDir: string,
   policyInput: Partial<RuntimeSnapshotRetentionPolicy> = {},
   now = Date.now(),
+  options: RuntimeSnapshotInventoryOptions = {},
 ): Promise<RuntimeSnapshotInventory> {
   const policy = normalizedPolicy(policyInput);
   const root = releaseRoot(stateDir);
@@ -123,6 +189,13 @@ export async function runtimeSnapshotInventory(
     const canonicalCurrent = await fs.realpath(currentRoot).catch(() => path.resolve(currentRoot));
     protect(protectedRoots, canonicalCurrent, "current-runtime-process");
   }
+  for (const protectedRoot of options.protectedSnapshotRoots ?? []) {
+    if (!path.isAbsolute(protectedRoot)) continue;
+    const canonicalProtected = await fs.realpath(protectedRoot).catch(() => null);
+    if (canonicalProtected && inside(canonicalRoot, canonicalProtected)) {
+      protect(protectedRoots, canonicalProtected, "retention-operation-target");
+    }
+  }
 
   const candidates: Array<{ name: string; root: string; mtimeMs: number }> = [];
   for (const name of names.filter((entry) => SNAPSHOT_NAME.test(entry))) {
@@ -138,13 +211,32 @@ export async function runtimeSnapshotInventory(
   }
   candidates.sort((left, right) => right.mtimeMs - left.mtimeMs || left.name.localeCompare(right.name));
   const newest = new Set(candidates.slice(0, policy.keepNewest).map((entry) => entry.root));
+  for (const root of newest) protect(protectedRoots, root, "newest-retention");
+
+  const commands = await runningProcessCommands(options);
+  if (commands === null) {
+    for (const entry of candidates) protect(protectedRoots, entry.root, "running-process-scan-unavailable");
+  } else {
+    for (const entry of candidates) {
+      if (commands.includes(entry.root)) protect(protectedRoots, entry.root, "running-process");
+    }
+  }
+
+  const capOverflow = new Set<string>();
+  let retainedCount = candidates.length;
+  for (const entry of [...candidates].reverse()) {
+    if (retainedCount <= policy.maxSnapshots) break;
+    if ((protectedRoots.get(entry.root)?.length ?? 0) > 0) continue;
+    capOverflow.add(entry.root);
+    retainedCount -= 1;
+  }
   const minimumAgeMs = policy.minAgeDays * 24 * 60 * 60 * 1000;
   const snapshots = candidates.map((entry): RuntimeSnapshotInventoryEntry => {
     const reasons = [...(protectedRoots.get(entry.root) ?? [])];
-    if (newest.has(entry.root)) reasons.push("newest-retention");
     const ageMs = Math.max(0, now - entry.mtimeMs);
-    if (ageMs < minimumAgeMs) reasons.push("minimum-age");
+    if (ageMs < minimumAgeMs && !capOverflow.has(entry.root)) reasons.push("minimum-age");
     const protectedReasons = [...new Set(reasons)].sort();
+    const eligibleForPrune = protectedReasons.length === 0;
     return {
       snapshotName: entry.name,
       snapshotId: `sha256:${SNAPSHOT_NAME.exec(entry.name)?.[1] ?? ""}`,
@@ -152,7 +244,10 @@ export async function runtimeSnapshotInventory(
       ageDays: Math.floor(ageMs / (24 * 60 * 60 * 1000)),
       protected: protectedReasons.length > 0,
       protectedReasons,
-      eligibleForPrune: protectedReasons.length === 0,
+      eligibleForPrune,
+      eligibilityReason: !eligibleForPrune
+        ? null
+        : capOverflow.has(entry.root) ? "snapshot-cap-overflow" : "minimum-age-expired",
     };
   });
   return {
@@ -167,14 +262,15 @@ export async function runtimeSnapshotInventory(
 export async function pruneRuntimeSnapshots(
   stateDir: string,
   policyInput: Partial<RuntimeSnapshotRetentionPolicy> = {},
+  options: RuntimeSnapshotInventoryOptions = {},
 ): Promise<{ before: RuntimeSnapshotInventory; removed: string[]; after: RuntimeSnapshotInventory }> {
-  const before = await runtimeSnapshotInventory(stateDir, policyInput);
+  const before = await runtimeSnapshotInventory(stateDir, policyInput, Date.now(), options);
   const root = releaseRoot(stateDir);
   const canonicalRoot = await canonicalPrivateReleaseRoot(stateDir);
   if (!canonicalRoot) return { before, removed: [], after: before };
   const removed: string[] = [];
   for (const entry of before.snapshots.filter((candidate) => candidate.eligibleForPrune)) {
-    const fresh = await runtimeSnapshotInventory(stateDir, policyInput);
+    const fresh = await runtimeSnapshotInventory(stateDir, policyInput, Date.now(), options);
     if (!fresh.snapshots.some((candidate) =>
       candidate.snapshotName === entry.snapshotName && candidate.eligibleForPrune,
     )) continue;
@@ -184,8 +280,13 @@ export async function pruneRuntimeSnapshots(
       ? await fs.realpath(candidate).catch(() => null)
       : null;
     if (!canonical || !inside(canonicalRoot, canonical) || path.basename(canonical) !== entry.snapshotName) continue;
-    await fs.rm(canonical, { recursive: true, force: false });
+    try {
+      await fs.rm(canonical, { recursive: true, force: false });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw error;
+    }
     removed.push(entry.snapshotName);
   }
-  return { before, removed, after: await runtimeSnapshotInventory(stateDir, policyInput) };
+  return { before, removed, after: await runtimeSnapshotInventory(stateDir, policyInput, Date.now(), options) };
 }
