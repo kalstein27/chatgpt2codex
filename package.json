@@ -23,7 +23,26 @@
     "start": "node dist/cli.js",
     "test": "vitest run",
     "diff:check": "git diff --check",
+    "publication:check": "tsx scripts/check-publication-boundary.ts",
     "typecheck": "tsc --noEmit"
+  },
+  "c2ct": {
+    "fixedLocalFileOperations": {
+      "approval-widget-e2e-20260830": {
+        "source": {
+          "projectRelativePath": "README.md",
+          "sha256": "c702119269e317216b950b8f8499b7201946d3e2512ef4c4999b6b258eda1643"
+        },
+        "destination": {
+          "class": "user-application-support-measurement",
+          "fixedRelativePath": "ChatGPT To Codex/Measurement/approval-widget-e2e-20260830.txt"
+        },
+        "replaceMode": "atomic",
+        "approval": "once",
+        "network": false,
+        "launchProcess": false
+      }
+    }
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

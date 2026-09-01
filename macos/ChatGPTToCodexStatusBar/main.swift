@@ -664,6 +664,18 @@ private final class ServiceController {
         let tool: String
         let risk: String
         let preview: String
+        let impact: String
+        let details: String
+        let createdAt: TimeInterval
+        let expiresAt: TimeInterval
+    }
+
+    struct PendingOAuthApproval {
+        let requestId: String
+        let clientName: String
+        let scopes: [String]
+        let resource: String
+        let redirectHost: String
         let createdAt: TimeInterval
         let expiresAt: TimeInterval
     }
@@ -711,6 +723,7 @@ private final class ServiceController {
         let pendingActions: [PendingControlAction]
         let pendingArmRequests: [PendingArmRequest]
         let operationApprovals: [PendingOperationApproval]
+        let oauthApprovals: [PendingOAuthApproval]
         let autoEnabled: Bool
         let autoRemainingMs: Int
         let allowlistedAppCount: Int
@@ -1041,7 +1054,24 @@ private final class ServiceController {
                     projectId: entry["projectId"] as? String ?? "Project",
                     tool: entry["tool"] as? String ?? "operation",
                     risk: entry["risk"] as? String ?? "destructive",
-                    preview: entry["preview"] as? String ?? "Protected operation",
+                    preview: entry["summary"] as? String ?? entry["preview"] as? String ?? "Protected operation",
+                    impact: entry["impact"] as? String ?? "승인된 범위에서 시스템 상태가 변경될 수 있습니다.",
+                    details: entry["details"] as? String ?? entry["preview"] as? String ?? "상세 정보 없음",
+                    createdAt: TimeInterval(entry["createdAt"] as? Int ?? 0) / 1000.0,
+                    expiresAt: TimeInterval(entry["expiresAt"] as? Int ?? 0) / 1000.0
+                )
+            }
+            let oauthApprovalsRoot = root["oauthApprovals"] as? [String: Any] ?? [:]
+            let pendingOAuthApprovals = (oauthApprovalsRoot["pendingRequests"] as? [[String: Any]] ?? []).compactMap { entry -> PendingOAuthApproval? in
+                guard entry["status"] as? String == "pending",
+                      let requestId = entry["requestId"] as? String
+                else { return nil }
+                return PendingOAuthApproval(
+                    requestId: requestId,
+                    clientName: entry["clientName"] as? String ?? "ChatGPT",
+                    scopes: entry["scopes"] as? [String] ?? [],
+                    resource: entry["resource"] as? String ?? "C2CT",
+                    redirectHost: entry["redirectHost"] as? String ?? "chatgpt.com",
                     createdAt: TimeInterval(entry["createdAt"] as? Int ?? 0) / 1000.0,
                     expiresAt: TimeInterval(entry["expiresAt"] as? Int ?? 0) / 1000.0
                 )
@@ -1173,6 +1203,7 @@ private final class ServiceController {
                 pendingActions: pending,
                 pendingArmRequests: pendingArmRequests,
                 operationApprovals: pendingOperationApprovals,
+                oauthApprovals: pendingOAuthApprovals,
                 autoEnabled: control["autoEnabled"] as? Bool ?? false,
                 autoRemainingMs: control["autoRemainingMs"] as? Int ?? 0,
                 allowlistedAppCount: control["allowlistedAppCount"] as? Int ?? 0,
@@ -2053,6 +2084,52 @@ private final class ControlOverlayCoordinator {
     }
 }
 
+private final class ApprovalDetailsAccessory: NSView {
+    private let disclosureButton = NSButton(title: "상세 명령 및 파라미터 보기", target: nil, action: nil)
+    private let scrollView = NSScrollView()
+    private var expanded = false
+
+    init(details: String) {
+        super.init(frame: NSRect(x: 0, y: 0, width: 430, height: 30))
+        disclosureButton.target = self
+        disclosureButton.action = #selector(toggleDetails)
+        disclosureButton.bezelStyle = .inline
+        disclosureButton.alignment = .left
+        disclosureButton.frame = NSRect(x: 0, y: 4, width: 430, height: 24)
+        addSubview(disclosureButton)
+
+        let textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 410, height: 150))
+        textView.string = details
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        textView.textContainerInset = NSSize(width: 6, height: 6)
+        scrollView.documentView = textView
+        scrollView.hasVerticalScroller = true
+        scrollView.borderType = .bezelBorder
+        scrollView.frame = NSRect(x: 0, y: 34, width: 430, height: 150)
+        scrollView.isHidden = true
+        addSubview(scrollView)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    @objc private func toggleDetails() {
+        expanded.toggle()
+        scrollView.isHidden = !expanded
+        disclosureButton.title = expanded ? "상세 명령 및 파라미터 접기" : "상세 명령 및 파라미터 보기"
+        frame.size.height = expanded ? 188 : 30
+        invalidateIntrinsicContentSize()
+        superview?.layoutSubtreeIfNeeded()
+        window?.layoutIfNeeded()
+    }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: 430, height: expanded ? 188 : 30)
+    }
+}
+
 private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate, WKNavigationDelegate, WKScriptMessageHandler {
     private let controller = ServiceController()
     private let controlOverlay = ControlOverlayCoordinator()
@@ -2070,6 +2147,8 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     private var pendingArmRequestMenuItem = NSMenuItem()
     private var pendingOperationApprovalSubmenu: NSMenu?
     private var pendingOperationApprovalMenuItem = NSMenuItem()
+    private var pendingOAuthApprovalSubmenu: NSMenu?
+    private var pendingOAuthApprovalMenuItem = NSMenuItem()
     private var sessionStatusSubmenu: NSMenu?
     private var rgPermissionSubmenu: NSMenu?
     private var rgPermissionMenuItem = NSMenuItem()
@@ -2079,6 +2158,8 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     private var armRemoteRequestExplanationMenuItem = NSMenuItem()
     private var screenPermissionItem = NSMenuItem()
     private var accessibilityPermissionItem = NSMenuItem()
+    private var lastScreenPermissionState: Bool?
+    private var lastAccessibilityPermissionState: Bool?
     private var latestControlSnapshot: ServiceController.LocalControlSnapshot?
     private var timer: Timer?
     private var statusRefreshInFlight = false
@@ -2091,6 +2172,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     private var statusMenuHotKeyEventHandler: EventHandlerRef?
     private var presentedArmRequestIDs = Set<String>()
     private var presentedOperationApprovalIDs = Set<String>()
+    private var presentedOAuthApprovalIDs = Set<String>()
     private var presentedRgRequestIDs = Set<String>()
     private var latestHealth = false
     private var activityWindow: NSWindow?
@@ -2267,6 +2349,15 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         rgPermissionMenuItem.image = symbol("text.magnifyingglass")
         rgPermissionMenuItem.submenu = rgSubmenu
         menu.addItem(rgPermissionMenuItem)
+
+        let oauthApprovalSubmenu = NSMenu()
+        oauthApprovalSubmenu.delegate = self
+        pendingOAuthApprovalSubmenu = oauthApprovalSubmenu
+        pendingOAuthApprovalMenuItem = NSMenuItem(title: "ChatGPT 연결 승인 대기 (0)", action: nil, keyEquivalent: "")
+        pendingOAuthApprovalMenuItem.image = symbol("link.badge.plus")
+        pendingOAuthApprovalMenuItem.submenu = oauthApprovalSubmenu
+        pendingOAuthApprovalMenuItem.isEnabled = false
+        menu.addItem(pendingOAuthApprovalMenuItem)
 
         let operationApprovalSubmenu = NSMenu()
         operationApprovalSubmenu.delegate = self
@@ -2471,6 +2562,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
                     self.applyControlSnapshot()
                     self.applyRgSnapshot()
                     self.applyOperationApprovalSnapshot()
+                    self.applyOAuthApprovalSnapshot()
                     self.refreshSessionSubmenu()
                     self.refreshCommandCenter()
                     self.finishStatusRefresh()
@@ -2480,6 +2572,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
                 self.applyControlSnapshot()
                 self.applyRgSnapshot()
                 self.applyOperationApprovalSnapshot()
+                self.applyOAuthApprovalSnapshot()
                 self.refreshSessionSubmenu()
                 self.refreshCommandCenter()
                 self.finishStatusRefresh()
@@ -2594,7 +2687,6 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         commandOperationApprovalsButton = approvals
         stack.addArrangedSubview(approvals)
         stack.addArrangedSubview(commandButton(controller.effectiveLanguageCode == "ko" ? "진단" : "Diagnostics", action: #selector(showDiagnosticsCommandMenu(_:)), symbolName: "stethoscope"))
-        stack.addArrangedSubview(commandButton(controller.effectiveLanguageCode == "ko" ? "권한 / 도구…" : "Permissions / Tools…", action: #selector(showPermissionsToolsCommandMenu(_:)), symbolName: "checkmark.shield"))
         stack.addArrangedSubview(commandButton(t("settingsMenu"), action: #selector(showSettings), symbolName: "gearshape"))
 
         NSLayoutConstraint.activate([
@@ -2631,8 +2723,9 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         let armCount = latestControlSnapshot?.pendingArmRequests.count ?? 0
         let actionCount = latestControlSnapshot?.pendingActions.count ?? 0
         let approvalCount = latestControlSnapshot?.operationApprovals.count ?? 0
+        let oauthCount = latestControlSnapshot?.oauthApprovals.count ?? 0
         let rgCount = latestControlSnapshot?.rg.pendingRequests.count ?? 0
-        let totalApprovalCount = armCount + actionCount + approvalCount + rgCount
+        let totalApprovalCount = armCount + actionCount + approvalCount + oauthCount + rgCount
         commandOperationApprovalsButton?.title = controller.effectiveLanguageCode == "ko"
             ? "승인 대기 (\(totalApprovalCount))"
             : "Approvals (\(totalApprovalCount))"
@@ -2655,9 +2748,23 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
 
     private func makePermissionsToolsMenu() -> NSMenu {
         let menu = NSMenu()
-        menu.addItem(menuItem(t("screenshotPermissionMenu"), #selector(showScreenRecordingPermission), "camera.viewfinder"))
+        let screenAllowed = controller.screenRecordingAllowed
+        let screenPermission = menuItem(
+            "\(t("screenshotPermissionTitle")) · \(t(screenAllowed ? "permissionAllowed" : "permissionRequired"))",
+            #selector(showScreenRecordingPermission),
+            screenAllowed ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+        )
+        screenPermission.state = screenAllowed ? .on : .off
+        menu.addItem(screenPermission)
         if controller.controlEnabled {
-            menu.addItem(menuItem(t("accessibilityPermissionMenu"), #selector(showAccessibilityPermission), "figure.roll"))
+            let accessibilityAllowed = controller.accessibilityTrusted
+            let accessibilityPermission = menuItem(
+                "\(t("accessibilityPermissionTitle")) · \(t(accessibilityAllowed ? "permissionAllowed" : "permissionRequired"))",
+                #selector(showAccessibilityPermission),
+                accessibilityAllowed ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+            )
+            accessibilityPermission.state = accessibilityAllowed ? .on : .off
+            menu.addItem(accessibilityPermission)
         }
         appendNativeApprovalMenuSection(
             controller.effectiveLanguageCode == "ko" ? "외부 도구" : "External tools",
@@ -2858,6 +2965,11 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
 
     private func makeNativeApprovalMenu() -> NSMenu {
         let menu = NSMenu()
+        appendNativeApprovalMenuSection(
+            controller.effectiveLanguageCode == "ko" ? "ChatGPT 연결" : "ChatGPT connection",
+            source: pendingOAuthApprovalSubmenu,
+            to: menu
+        )
         appendNativeApprovalMenuSection(
             controller.effectiveLanguageCode == "ko" ? "작업 승인" : "Work approvals",
             source: pendingOperationApprovalSubmenu,
@@ -3095,12 +3207,22 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
 
     private func updatePermissionMenuItems() {
         let screenAllowed = controller.screenRecordingAllowed
+        let accessibilityAllowed = controller.controlEnabled ? controller.accessibilityTrusted : false
+        let permissionStateChanged = lastScreenPermissionState != screenAllowed
+            || lastAccessibilityPermissionState != accessibilityAllowed
+        lastScreenPermissionState = screenAllowed
+        lastAccessibilityPermissionState = accessibilityAllowed
         screenPermissionItem.title = "\(t("screenshotPermissionTitle")): \(t(screenAllowed ? "permissionAllowed" : "permissionRequired"))"
         screenPermissionItem.state = screenAllowed ? .on : .off
         if controller.controlEnabled {
-            let accessibilityAllowed = controller.accessibilityTrusted
             accessibilityPermissionItem.title = "\(t("accessibilityPermissionTitle")): \(t(accessibilityAllowed ? "permissionAllowed" : "permissionRequired"))"
             accessibilityPermissionItem.state = accessibilityAllowed ? .on : .off
+        }
+        if activeAppSection == "permissions", permissionStateChanged {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.activeAppSection == "permissions" else { return }
+                self.refreshIntegratedSection()
+            }
         }
     }
 
@@ -3134,6 +3256,15 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         pendingOperationApprovalMenuItem.title = "작업 승인 요청 대기 (\(requests.count))"
         pendingOperationApprovalMenuItem.isEnabled = latestHealth && !requests.isEmpty
         presentFirstSeenOperationApproval(from: requests)
+    }
+
+    private func applyOAuthApprovalSnapshot() {
+        let requests = latestControlSnapshot?.oauthApprovals ?? []
+        pendingOAuthApprovalMenuItem.title = controller.effectiveLanguageCode == "ko"
+            ? "ChatGPT 연결 승인 대기 (\(requests.count))"
+            : "ChatGPT connection approvals (\(requests.count))"
+        pendingOAuthApprovalMenuItem.isEnabled = latestHealth && !requests.isEmpty
+        presentFirstSeenOAuthApproval(from: requests)
     }
 
     private func applyRgSnapshot() {
@@ -3298,6 +3429,14 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         return formatter.string(from: Date(timeIntervalSince1970: request.expiresAt))
     }
 
+    private func oauthApprovalExpiryText(_ request: ServiceController.PendingOAuthApproval) -> String {
+        guard request.expiresAt > 0 else { return "알 수 없음" }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .none
+        formatter.timeStyle = .medium
+        return formatter.string(from: Date(timeIntervalSince1970: request.expiresAt))
+    }
+
     private func runForegroundApprovalAlert(_ alert: NSAlert) -> NSApplication.ModalResponse {
         let window = alert.window
         window.level = .modalPanel
@@ -3333,6 +3472,48 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         return "파괴적 변경 가능"
     }
 
+    private func presentFirstSeenOAuthApproval(from requests: [ServiceController.PendingOAuthApproval]) {
+        guard let request = requests.first(where: { !presentedOAuthApprovalIDs.contains($0.requestId) }) else { return }
+        presentedOAuthApprovalIDs.insert(request.requestId)
+        presentOAuthApproval(request)
+    }
+
+    private func presentOAuthApproval(_ request: ServiceController.PendingOAuthApproval) {
+        let scopeText = request.scopes.isEmpty ? "chatgpt2codex" : request.scopes.joined(separator: ", ")
+        let alert = makeUnifiedApprovalAlert(
+            category: "ChatGPT OAuth 연결",
+            details: [
+                "클라이언트: \(request.clientName)",
+                "권한: \(scopeText)",
+                "커넥터: \(request.resource)",
+                "돌아갈 호스트: \(request.redirectHost)",
+                "만료: \(oauthApprovalExpiryText(request))",
+                "",
+                "승인은 이 OAuth 연결 요청 한 건에만 적용됩니다. Owner Token과 OAuth access/refresh token은 이 앱, CLI, 에이전트 화면에 표시되지 않습니다."
+            ],
+            primaryTitle: "연결 승인"
+        )
+        let response = runForegroundApprovalAlert(alert)
+        if response == .alertFirstButtonReturn {
+            resolveOAuthApproval(request, decision: "approve")
+        } else if response == .alertSecondButtonReturn {
+            resolveOAuthApproval(request, decision: "reject")
+        }
+    }
+
+    private func resolveOAuthApproval(_ request: ServiceController.PendingOAuthApproval, decision: String) {
+        controller.performLocalControl("/oauth-approvals/\(request.requestId)/\(decision)") { [weak self] _ in
+            self?.refreshStatus()
+        }
+    }
+
+    @objc private func reviewPendingOAuthApproval(_ sender: NSMenuItem) {
+        guard let requestId = sender.representedObject as? String,
+              let request = latestControlSnapshot?.oauthApprovals.first(where: { $0.requestId == requestId })
+        else { return }
+        presentOAuthApproval(request)
+    }
+
     private func presentFirstSeenOperationApproval(from requests: [ServiceController.PendingOperationApproval]) {
         guard let request = requests.first(where: { !presentedOperationApprovalIDs.contains($0.requestId) }) else { return }
         presentedOperationApprovalIDs.insert(request.requestId)
@@ -3342,10 +3523,12 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     private func presentOperationApproval(_ request: ServiceController.PendingOperationApproval) {
         let isRuntimeApply = request.tool == "runtime_apply_local"
         var details = [
+            "작업: \(request.preview)",
+            "영향: \(request.impact)",
+            "",
             "프로젝트: \(request.projectId)",
             "도구: \(request.tool)",
             "위험 유형: \(operationApprovalRiskText(request.risk))",
-            "작업: \(request.preview)",
             "만료: \(operationApprovalExpiryText(request))",
             "",
             "승인은 현재 프로젝트·현재 lease·이 정확한 작업에만 묶이며 한 번 실행하면 즉시 소모됩니다."
@@ -3358,6 +3541,9 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             details: details,
             primaryTitle: isRuntimeApply ? t("installRuntimeUpdate") : "이번만 허용"
         )
+        if request.details != request.preview {
+            alert.accessoryView = ApprovalDetailsAccessory(details: request.details)
+        }
         let response = runForegroundApprovalAlert(alert)
         if response == .alertFirstButtonReturn {
             resolveOperationApproval(request, decision: "approve")
@@ -3526,6 +3712,29 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     /// live queue state each time the user opens it, rather than on a timer,
     /// so approve/reject always act on current data.
     func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === pendingOAuthApprovalSubmenu {
+            menu.removeAllItems()
+            let requests = latestControlSnapshot?.oauthApprovals ?? []
+            if requests.isEmpty {
+                let empty = NSMenuItem(title: "대기 중인 ChatGPT 연결 승인 없음", action: nil, keyEquivalent: "")
+                empty.isEnabled = false
+                menu.addItem(empty)
+                return
+            }
+            for request in requests {
+                let scopeText = request.scopes.isEmpty ? "chatgpt2codex" : request.scopes.joined(separator: ", ")
+                let item = NSMenuItem(
+                    title: "\(request.clientName) · \(scopeText) · \(oauthApprovalExpiryText(request))",
+                    action: #selector(reviewPendingOAuthApproval(_:)),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                item.representedObject = request.requestId
+                item.toolTip = "\(request.resource) → \(request.redirectHost)"
+                menu.addItem(item)
+            }
+            return
+        }
         if menu === pendingOperationApprovalSubmenu {
             menu.removeAllItems()
             let requests = latestControlSnapshot?.operationApprovals ?? []
@@ -4053,7 +4262,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     private func runUISmokeStep(_ index: Int) {
-        let sections = ["activity", "settings", "activity", "approvals", "diagnostics", "permissions", "settings", "activity"]
+        let sections = ["activity", "settings", "activity", "approvals", "diagnostics", "settings", "activity"]
         guard index < sections.count else {
             uiSmokeLog("PASS all-sections")
             Darwin.exit(0)
@@ -4077,12 +4286,6 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
                 id: "diagnostics",
                 title: controller.effectiveLanguageCode == "ko" ? "진단" : "Diagnostics",
                 menu: makeDiagnosticsMenu()
-            )
-        case "permissions":
-            showIntegratedMenuSection(
-                id: "permissions",
-                title: controller.effectiveLanguageCode == "ko" ? "권한 / 도구" : "Permissions / Tools",
-                menu: makePermissionsToolsMenu()
             )
         default:
             failUISmokeTest("unknown-section-\(expected)")
@@ -4276,6 +4479,50 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         intermediate.state = controller.showIntermediateCommentary ? .on : .off
         addRow("", intermediate)
 
+        stack.addArrangedSubview(sectionTitle(controller.effectiveLanguageCode == "ko" ? "권한" : "Permissions"))
+        let screenAllowed = controller.screenRecordingAllowed
+        let screenPermissionRow = NSStackView()
+        screenPermissionRow.orientation = .horizontal
+        screenPermissionRow.alignment = .centerY
+        screenPermissionRow.spacing = 8
+        let screenPermissionStatus = activityLabel(
+            t(screenAllowed ? "permissionAllowed" : "permissionRequired"),
+            font: .systemFont(ofSize: 12, weight: .medium),
+            color: screenAllowed ? .systemGreen : .systemOrange
+        )
+        screenPermissionRow.addArrangedSubview(screenPermissionStatus)
+        screenPermissionRow.addArrangedSubview(button(
+            screenAllowed
+                ? (controller.effectiveLanguageCode == "ko" ? "확인" : "Review")
+                : (controller.effectiveLanguageCode == "ko" ? "허용하기" : "Allow…"),
+            action: #selector(showScreenRecordingPermission),
+            symbolName: screenAllowed ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+        ))
+        addRow(t("screenshotPermissionTitle"), screenPermissionRow)
+
+        if controller.controlEnabled {
+            let accessibilityAllowed = controller.accessibilityTrusted
+            let accessibilityPermissionRow = NSStackView()
+            accessibilityPermissionRow.orientation = .horizontal
+            accessibilityPermissionRow.alignment = .centerY
+            accessibilityPermissionRow.spacing = 8
+            let accessibilityPermissionStatus = activityLabel(
+                t(accessibilityAllowed ? "permissionAllowed" : "permissionRequired"),
+                font: .systemFont(ofSize: 12, weight: .medium),
+                color: accessibilityAllowed ? .systemGreen : .systemOrange
+            )
+            accessibilityPermissionRow.addArrangedSubview(accessibilityPermissionStatus)
+            accessibilityPermissionRow.addArrangedSubview(button(
+                accessibilityAllowed
+                    ? (controller.effectiveLanguageCode == "ko" ? "확인" : "Review")
+                    : (controller.effectiveLanguageCode == "ko" ? "허용하기" : "Allow…"),
+                action: #selector(showAccessibilityPermission),
+                symbolName: accessibilityAllowed ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+            ))
+            addRow(t("accessibilityPermissionTitle"), accessibilityPermissionRow)
+        }
+
+
         stack.addArrangedSubview(sectionTitle(controller.effectiveLanguageCode == "ko" ? "연결" : "Connectivity"))
         let publicTunnel = NSButton(checkboxWithTitle: t("publicTunnelSetting"), target: nil, action: nil)
         publicTunnel.state = controller.enablePublicTunnel ? .on : .off
@@ -4310,7 +4557,6 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         toolRow.spacing = 8
         toolRow.addArrangedSubview(button(t("copyConnector"), action: #selector(copyConnectorURL), symbolName: "doc.on.doc"))
         toolRow.addArrangedSubview(button(t("openStatus"), action: #selector(openStatus), symbolName: "heart.text.square"))
-        toolRow.addArrangedSubview(button(controller.effectiveLanguageCode == "ko" ? "권한 / 도구" : "Permissions / Tools", action: #selector(showPermissionsToolsCommandMenu(_:)), symbolName: "checkmark.shield"))
         toolRow.addArrangedSubview(button(t("checkUpdates"), action: #selector(checkForUpdates), symbolName: "arrow.clockwise"))
         addRow("", toolRow)
 

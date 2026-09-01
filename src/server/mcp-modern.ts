@@ -1,4 +1,5 @@
 import type { ToolContext } from "../types.js";
+import { recordToolSchemaRevalidation } from "../runtime/tool-schema-revalidation.js";
 import { toRemoteBoundaryError } from "./error-safety.js";
 import { createServer as createMcpServer } from "./mcp-server.js";
 import {
@@ -198,7 +199,12 @@ export async function dispatchModernMcpRequest(
       response: jsonRpcResult(request.id, createMcpDiscoveryResult(serverInfo, schemaRevision)),
     };
   }
-  if (method !== "tools/list" && method !== "tools/call") {
+  if (
+    method !== "tools/list"
+    && method !== "tools/call"
+    && method !== "resources/list"
+    && method !== "resources/read"
+  ) {
     return { status: 200, response: jsonRpcError(request.id, -32601, "Method not found") };
   }
 
@@ -219,6 +225,13 @@ export async function dispatchModernMcpRequest(
         [MCP_SCHEMA_EXPIRED_META_KEY]: staleClientRevision,
         [MCP_SCHEMA_REVALIDATE_META_KEY]: true,
       };
+      if (currentRevision) {
+        await recordToolSchemaRevalidation(ctx.stateDir, {
+          schemaRevision: currentRevision,
+          clientSchemaRevision: typeof clientRevision === "string" ? clientRevision : null,
+          staleClientRevision,
+        }).catch(() => null);
+      }
     }
     return { status: 200, response: jsonRpcResult(request.id, decorateModernResult(method, result, serverInfo)) };
   } catch (error) {

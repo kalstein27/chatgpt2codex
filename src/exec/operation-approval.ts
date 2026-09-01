@@ -11,7 +11,8 @@ const MAX_RETAINED_REQUESTS = 100;
 
 export type OperationRisk = "network" | "destructive" | "local-file-mutation";
 export type OperationApprovalStatus = "pending" | "approved" | "rejected" | "expired" | "consumed";
-export type OperationApprovalVia = "local-control-api" | "menu-bar-ui" | "mobile-ntfy" | "mobile-web";
+export type OperationApprovalVia = "local-control-api" | "menu-bar-ui" | "mobile-ntfy" | "mobile-web" | "chatgpt-widget";
+export type OperationApprovalSurface = "local" | "chatgpt-widget";
 
 const MOBILE_APPROVABLE_OPERATION_TOOLS = new Set([
   "command_run",
@@ -33,7 +34,11 @@ export interface OperationApprovalRequest {
   risk: OperationRisk;
   operationFingerprint: string;
   preview: string;
+  summary?: string;
+  impact?: string;
+  details?: string;
   originOperationId?: string;
+  approvalSurface?: OperationApprovalSurface;
   createdAt: number;
   expiresAt: number;
   resolvedAt?: number;
@@ -54,6 +59,7 @@ export interface EnsureOperationApprovalInput {
   operation: unknown;
   preview: string;
   originOperationId?: string;
+  approvalSurface?: OperationApprovalSurface;
   ttlMs?: number;
   now?: number;
   requiredApprovalVia?: OperationApprovalVia;
@@ -88,6 +94,64 @@ function normalizeText(value: string, fallback: string, max: number): string {
     .replace(/\s+/gu, " ")
     .trim();
   return (normalized || fallback).slice(0, max);
+}
+
+function normalizeDetails(value: string, fallback: string, max: number): string {
+  const normalized = value
+    .normalize("NFKC")
+    .replace(/\r\n?/gu, "\n")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/gu, " ")
+    .trim();
+  return (normalized || fallback).slice(0, max);
+}
+
+function operationSummary(tool: string, projectId: string, operation?: unknown): string {
+  const record = operation && typeof operation === "object" && !Array.isArray(operation)
+    ? operation as Record<string, unknown>
+    : undefined;
+  const commandId = typeof record?.commandId === "string"
+    ? normalizeText(record.commandId, "command", 80)
+    : undefined;
+  switch (tool) {
+    case "command_run":
+      return commandId
+        ? `프로젝트 ${projectId}에서 허용된 명령 “${commandId}”을 1회 실행합니다.`
+        : `프로젝트 ${projectId}에서 허용된 명령을 1회 실행합니다.`;
+    case "e2e_run_command":
+      return `프로젝트 ${projectId}에서 E2E 검증 명령을 1회 실행합니다.`;
+    case "e2e_start_server":
+      return `프로젝트 ${projectId}의 로컬 E2E 서버를 시작합니다.`;
+    case "operation_cancel":
+      return `프로젝트 ${projectId}에서 실행 중인 작업을 취소합니다.`;
+    case "verified_local_file_apply":
+      return `프로젝트 ${projectId}의 검증된 로컬 파일을 고정된 대상 위치에 적용합니다.`;
+    case "runtime_apply_local":
+      return `프로젝트 ${projectId}의 검증된 C2CT 런타임으로 교체합니다.`;
+    case "macos_app_apply_local":
+      return `프로젝트 ${projectId}에서 검증된 ChatGPT To Codex 앱을 설치합니다.`;
+    case "runtime_snapshot_prune_local":
+      return `프로젝트 ${projectId}의 보호 대상이 아닌 오래된 런타임 스냅샷을 정리합니다.`;
+    case "project_lane_recover":
+      return `프로젝트 ${projectId}의 비활성 작업 lane 잠금을 안전하게 정리합니다.`;
+    case "mobile_approval_setup":
+      return `프로젝트 ${projectId}의 모바일 승인 연결 설정을 변경합니다.`;
+    default:
+      return `프로젝트 ${projectId}에서 보호 작업 “${normalizeText(tool, "operation", 80)}”을 1회 수행합니다.`;
+  }
+}
+
+function operationImpact(risk: OperationRisk): string {
+  if (risk === "network") return "외부 네트워크 통신이 발생할 수 있습니다.";
+  if (risk === "local-file-mutation") return "검증된 범위의 로컬 파일이 변경됩니다.";
+  return "파일 교체·삭제·작업 취소 등 되돌리기 어려운 변경이 발생할 수 있습니다.";
+}
+
+function approvalDisplay(request: OperationApprovalRequest): { summary: string; impact: string; details: string } {
+  return {
+    summary: request.summary ?? operationSummary(request.tool, request.projectId),
+    impact: request.impact ?? operationImpact(request.risk),
+    details: request.details ?? request.preview,
+  };
 }
 
 function stableValue(value: unknown): unknown {
@@ -126,14 +190,19 @@ function validRequest(value: unknown): value is OperationApprovalRequest {
     (request.risk === "network" || request.risk === "destructive" || request.risk === "local-file-mutation") &&
     typeof request.operationFingerprint === "string" &&
     typeof request.preview === "string" &&
+    (request.summary === undefined || typeof request.summary === "string") &&
+    (request.impact === undefined || typeof request.impact === "string") &&
+    (request.details === undefined || typeof request.details === "string") &&
     (request.originOperationId === undefined || typeof request.originOperationId === "string") &&
+    (request.approvalSurface === undefined || request.approvalSurface === "local" || request.approvalSurface === "chatgpt-widget") &&
     typeof request.createdAt === "number" &&
     typeof request.expiresAt === "number" &&
     (request.approvedVia === undefined ||
       request.approvedVia === "local-control-api" ||
       request.approvedVia === "menu-bar-ui" ||
       request.approvedVia === "mobile-ntfy" ||
-      request.approvedVia === "mobile-web")
+      request.approvedVia === "mobile-web" ||
+      request.approvedVia === "chatgpt-widget")
   );
 }
 
@@ -201,14 +270,20 @@ function cleanupState(state: OperationApprovalState, now: number): boolean {
 }
 
 function requestDetails(request: OperationApprovalRequest, created: boolean): Record<string, unknown> {
+  const approvalSurface = request.approvalSurface ?? "local";
+  const display = approvalDisplay(request);
   return {
     requestId: request.requestId,
     created,
-    localApprovalRequired: true,
+    localApprovalRequired: approvalSurface === "local",
+    approvalSurface,
     projectId: request.projectId,
     tool: request.tool,
     risk: request.risk,
-    preview: request.preview,
+    preview: display.summary,
+    summary: display.summary,
+    impact: display.impact,
+    details: display.details,
     ...(request.originOperationId ? { originOperationId: request.originOperationId } : {}),
     expiresAt: request.expiresAt,
   };
@@ -221,6 +296,7 @@ export async function ensureOperationAuthorized(
     const now = input.now ?? Date.now();
     const state = await readState(input.stateDir);
     const changed = cleanupState(state, now);
+    const approvalSurface = input.approvalSurface ?? "local";
     const fingerprint = operationFingerprint({
       projectId: input.lease.projectId,
       projectRoot: input.lease.projectRoot,
@@ -234,6 +310,7 @@ export async function ensureOperationAuthorized(
       request.projectId === input.lease.projectId &&
       request.projectRoot === input.lease.projectRoot &&
       request.leaseId === input.lease.leaseId &&
+      (request.approvalSurface ?? "local") === approvalSurface &&
       request.operationFingerprint === fingerprint,
     );
 
@@ -262,12 +339,19 @@ export async function ensureOperationAuthorized(
       if (changed) await writeState(input.stateDir, state);
       throw new DomainError(
         ErrorCode.APPROVAL_REQUIRED,
-        `Local approval is pending for ${input.tool}`,
+        `Approval is pending for ${input.tool}`,
         requestDetails(matching, false),
       );
     }
 
     const ttlMs = Math.min(DEFAULT_TTL_MS, Math.max(30_000, input.ttlMs ?? DEFAULT_TTL_MS));
+    const summary = normalizeText(
+      operationSummary(input.tool, input.lease.projectId, input.operation),
+      "보호 작업을 1회 수행합니다.",
+      200,
+    );
+    const impact = normalizeText(operationImpact(input.risk), "승인된 범위에서 시스템 상태가 변경될 수 있습니다.", 200);
+    const details = normalizeDetails(input.preview, "상세 정보 없음", 4096);
     const request: OperationApprovalRequest = {
       requestId: `op_${randomUUID()}`,
       status: "pending",
@@ -278,10 +362,14 @@ export async function ensureOperationAuthorized(
       tool: normalizeText(input.tool, "operation", 80),
       risk: input.risk,
       operationFingerprint: fingerprint,
-      preview: normalizeText(input.preview, "Protected operation", 320),
+      preview: summary,
+      summary,
+      impact,
+      details,
       ...(input.originOperationId
         ? { originOperationId: normalizeText(input.originOperationId, "operation", 120) }
         : {}),
+      approvalSurface,
       createdAt: now,
       expiresAt: Math.min(now + ttlMs, input.lease.expiresAt),
     };
@@ -290,7 +378,7 @@ export async function ensureOperationAuthorized(
     await writeState(input.stateDir, state);
     throw new DomainError(
       ErrorCode.APPROVAL_REQUIRED,
-      `Local approval request created for ${input.tool}`,
+      `Approval request created for ${input.tool}`,
       requestDetails(request, true),
     );
   });
@@ -470,7 +558,21 @@ export async function resolveOperationApprovalRequest(input: {
         status: request.status,
       });
     }
-    if ((input.approvedVia === "mobile-ntfy" || input.approvedVia === "mobile-web") &&
+    const approvalVia = input.approvedVia ?? "local-control-api";
+    const approvalSurface = request.approvalSurface ?? "local";
+    if (approvalSurface === "chatgpt-widget" && approvalVia !== "chatgpt-widget") {
+      throw new DomainError(
+        ErrorCode.APPROVAL_REQUIRED,
+        "ChatGPT widget approval requests can only be resolved from the ChatGPT widget",
+        {
+          requestId: input.requestId,
+          tool: request.tool,
+          approvalSurface,
+          approvedVia: approvalVia,
+        },
+      );
+    }
+    if ((approvalVia === "mobile-ntfy" || approvalVia === "mobile-web") &&
         !isMobileApprovableOperationTool(request.tool)) {
       throw new DomainError(
         ErrorCode.PERMISSION_DENIED,
@@ -480,7 +582,7 @@ export async function resolveOperationApprovalRequest(input: {
     }
     if (input.decision === "approve" &&
         request.tool === "runtime_apply_local" &&
-        input.approvedVia !== "menu-bar-ui") {
+        approvalVia !== "menu-bar-ui") {
       throw new DomainError(
         ErrorCode.APPROVAL_REQUIRED,
         "Runtime apply must be approved from the ChatGPT To Codex menu-bar UI",
@@ -492,7 +594,7 @@ export async function resolveOperationApprovalRequest(input: {
       );
     }
     if (input.decision === "approve" &&
-        input.approvedVia === "menu-bar-ui" &&
+        approvalVia === "menu-bar-ui" &&
         request.tool !== "runtime_apply_local") {
       throw new DomainError(
         ErrorCode.INVALID_ARGUMENT,
@@ -501,7 +603,7 @@ export async function resolveOperationApprovalRequest(input: {
       );
     }
     request.status = input.decision === "approve" ? "approved" : "rejected";
-    if (input.decision === "approve") request.approvedVia = input.approvedVia ?? "local-control-api";
+    if (input.decision === "approve") request.approvedVia = approvalVia;
     request.resolvedAt = now;
     await writeState(input.stateDir, state);
     return request;
@@ -509,13 +611,18 @@ export async function resolveOperationApprovalRequest(input: {
 }
 
 export function operationApprovalSummary(request: OperationApprovalRequest): Record<string, unknown> {
+  const display = approvalDisplay(request);
   return {
     requestId: request.requestId,
     status: request.status,
     projectId: request.projectId,
     tool: request.tool,
     risk: request.risk,
-    preview: request.preview,
+    preview: display.summary,
+    summary: display.summary,
+    impact: display.impact,
+    details: display.details,
+    approvalSurface: request.approvalSurface ?? "local",
     ...(request.originOperationId ? { originOperationId: request.originOperationId } : {}),
     createdAt: request.createdAt,
     expiresAt: request.expiresAt,

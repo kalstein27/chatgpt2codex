@@ -16,6 +16,7 @@ export interface RuntimeManifest {
   buildTimestamp: string | null;
   cliSha256: string | null;
   toolSchemaRevision: string | null;
+  uiResourceRevision: string | null;
   nodeVersion: string;
   runtimeSnapshotId: string | null;
   runtimeRoot: string;
@@ -38,6 +39,7 @@ interface SealedRuntimeBuildIdentity {
   buildTimestamp: string;
   cliSha256: string;
   toolSchemaRevision: string;
+  uiResourceRevision?: string;
   nodeVersion: string;
   runtimeSnapshotId: string;
   platform: NodeJS.Platform;
@@ -150,6 +152,20 @@ function toolSchemaRevision(root: string): string | null {
   return fingerprint ? `sha256:${fingerprint.slice(0, 24)}` : null;
 }
 
+function uiResourceRevision(root: string): string | null {
+  const compiled = [
+    "dist/server/chatgpt-consent-widget.js",
+    "dist/server/chatgpt-widget-capability-lab.js",
+  ];
+  const source = [
+    "src/server/chatgpt-consent-widget.ts",
+    "src/server/chatgpt-widget-capability-lab.ts",
+  ];
+  const selected = compiled.every((entry) => existsSync(path.join(root, entry))) ? compiled : source;
+  const fingerprint = fingerprintRuntimeFiles(root, selected);
+  return fingerprint ? `sha256:${fingerprint.slice(0, 24)}` : null;
+}
+
 function packageVersion(root: string): string {
   try {
     const pkg = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")) as { version?: unknown };
@@ -239,6 +255,8 @@ function isSealedRuntimeBuildIdentity(value: unknown): value is SealedRuntimeBui
     typeof candidate.buildTimestamp === "string" && Number.isFinite(Date.parse(candidate.buildTimestamp)) &&
     typeof candidate.cliSha256 === "string" && SHA256_PATTERN.test(candidate.cliSha256) &&
     typeof candidate.toolSchemaRevision === "string" && TOOL_SCHEMA_REVISION_PATTERN.test(candidate.toolSchemaRevision) &&
+    (candidate.uiResourceRevision === undefined ||
+      (typeof candidate.uiResourceRevision === "string" && TOOL_SCHEMA_REVISION_PATTERN.test(candidate.uiResourceRevision))) &&
     typeof candidate.nodeVersion === "string" && /^v\d+\.\d+\.\d+/u.test(candidate.nodeVersion) &&
     typeof candidate.runtimeSnapshotId === "string" && SNAPSHOT_ID_PATTERN.test(candidate.runtimeSnapshotId) &&
     typeof candidate.platform === "string" &&
@@ -250,6 +268,7 @@ function readSealedRuntimeBuildIdentity(root: string, observed: {
   buildFingerprint: string | null;
   cliSha256: string | null;
   toolSchemaRevision: string | null;
+  uiResourceRevision: string | null;
 }): SealedRuntimeBuildIdentity | null {
   try {
     const candidate = JSON.parse(readFileSync(path.join(root, SEALED_MANIFEST_RELATIVE_PATH), "utf8")) as unknown;
@@ -259,6 +278,7 @@ function readSealedRuntimeBuildIdentity(root: string, observed: {
         candidate.runtimeFingerprint !== observed.buildFingerprint ||
         candidate.cliSha256 !== observed.cliSha256 ||
         candidate.toolSchemaRevision !== observed.toolSchemaRevision ||
+        (candidate.uiResourceRevision !== undefined && candidate.uiResourceRevision !== observed.uiResourceRevision) ||
         candidate.platform !== process.platform ||
         candidate.architecture !== process.arch) return null;
     const expectedSnapshot = runtimeSnapshotId(candidate);
@@ -275,6 +295,7 @@ function freshRuntimeManifestForRoot(runtimeRoot: string, timestamp: string | nu
   const buildFingerprintValue = buildFingerprint(runtimeRoot);
   const cliSha256Value = cliSha256(runtimeRoot);
   const toolSchemaRevisionValue = toolSchemaRevision(runtimeRoot);
+  const uiResourceRevisionValue = uiResourceRevision(runtimeRoot);
   const nodeVersion = process.version;
   const runtimeFingerprint = buildFingerprintValue;
   return {
@@ -287,6 +308,7 @@ function freshRuntimeManifestForRoot(runtimeRoot: string, timestamp: string | nu
     buildTimestamp: timestamp,
     cliSha256: cliSha256Value,
     toolSchemaRevision: toolSchemaRevisionValue,
+    uiResourceRevision: uiResourceRevisionValue,
     nodeVersion,
     runtimeSnapshotId: runtimeSnapshotId({
       packageVersion: packageVersionValue,
@@ -322,6 +344,7 @@ export function sealRuntimeBuildManifest(runtimeRootValue = inferredRuntimeRoot(
     buildTimestamp: manifest.buildTimestamp!,
     cliSha256: manifest.cliSha256,
     toolSchemaRevision: manifest.toolSchemaRevision,
+    ...(manifest.uiResourceRevision ? { uiResourceRevision: manifest.uiResourceRevision } : {}),
     nodeVersion: manifest.nodeVersion,
     runtimeSnapshotId: manifest.runtimeSnapshotId,
     platform: manifest.platform,
@@ -356,14 +379,16 @@ export function getRuntimeManifestForRoot(runtimeRootValue: string): RuntimeMani
   const buildFingerprintValue = buildFingerprint(runtimeRoot);
   const cliSha256Value = cliSha256(runtimeRoot);
   const toolSchemaRevisionValue = toolSchemaRevision(runtimeRoot);
+  const uiResourceRevisionValue = uiResourceRevision(runtimeRoot);
   const sealed = readSealedRuntimeBuildIdentity(runtimeRoot, {
     packageVersion: packageVersionValue,
     buildFingerprint: buildFingerprintValue,
     cliSha256: cliSha256Value,
     toolSchemaRevision: toolSchemaRevisionValue,
+    uiResourceRevision: uiResourceRevisionValue,
   });
   const manifest = sealed
-    ? { ...sealed, runtimeRoot }
+    ? { ...sealed, uiResourceRevision: sealed.uiResourceRevision ?? uiResourceRevisionValue, runtimeRoot }
     : freshRuntimeManifestForRoot(runtimeRoot, configuredBuildTimestamp());
   return manifest;
 }

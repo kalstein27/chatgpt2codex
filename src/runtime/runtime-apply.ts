@@ -135,6 +135,14 @@ export interface RuntimeApplyWorkerDependencies {
   now?: () => Date;
 }
 
+function runtimeSchemaRefreshRequired(previous: RuntimeManifest, target: RuntimeManifest): boolean {
+  const uiResourceChanged =
+    typeof previous.uiResourceRevision === "string"
+    && typeof target.uiResourceRevision === "string"
+    && previous.uiResourceRevision !== target.uiResourceRevision;
+  return previous.toolSchemaRevision !== target.toolSchemaRevision || uiResourceChanged;
+}
+
 function receiptRoot(stateDir: string): string {
   return path.join(stateDir, "runtime-updates");
 }
@@ -712,6 +720,19 @@ export async function markRuntimeApplyApprovalRequired(
   });
 }
 
+export async function attachRuntimeApplyApprovalRequest(
+  stateDir: string,
+  operationId: string,
+  approvalRequestId: string,
+): Promise<RuntimeApplyReceipt> {
+  return updateRuntimeApplyReceipt(stateDir, operationId, (receipt) => {
+    const next = transition(receipt, "APPROVAL_REQUIRED", "approval");
+    next.approvalRequestId = approvalRequestId;
+    next.recommendedAction = "approve-runtime-apply-locally";
+    return next;
+  });
+}
+
 export async function markRuntimeApplyActivationRequested(
   stateDir: string,
   operationId: string,
@@ -939,7 +960,7 @@ export async function runRuntimeApplyWorker(input: {
         next.rollbackSucceeded = null;
         next.previousRuntimeRestored = false;
         next.finalHealthy = true;
-        next.recommendedAction = value.previousManifest.toolSchemaRevision !== value.targetManifest.toolSchemaRevision
+        next.recommendedAction = runtimeSchemaRefreshRequired(value.previousManifest, value.targetManifest)
           ? "refresh-tool-schema-and-bootstrap"
           : "none";
         return next;
@@ -1033,7 +1054,7 @@ export async function runRuntimeApplyWorker(input: {
 export function runtimeApplyPublicReceipt(receipt: RuntimeApplyReceipt): Record<string, unknown> {
   const schemaRefreshRequired =
     (receipt.state === "APPLIED" || receipt.state === "ALREADY_APPLIED")
-    && receipt.previousManifest.toolSchemaRevision !== receipt.targetManifest.toolSchemaRevision;
+    && runtimeSchemaRefreshRequired(receipt.previousManifest, receipt.targetManifest);
   return {
     requestId: receipt.requestId,
     operationId: receipt.operationId,
@@ -1063,8 +1084,12 @@ export function runtimeApplyPublicReceipt(receipt: RuntimeApplyReceipt): Record<
     schemaRefreshRequired,
     previousToolSchemaRevision: receipt.previousManifest.toolSchemaRevision,
     targetToolSchemaRevision: receipt.targetManifest.toolSchemaRevision,
+    previousUiResourceRevision: receipt.previousManifest.uiResourceRevision ?? null,
+    targetUiResourceRevision: receipt.targetManifest.uiResourceRevision ?? null,
+    connectorReregistrationRequired: false,
+    connectorEndpointPolicy: "stable-bare-mcp",
     schemaRefreshFallback: schemaRefreshRequired
-      ? "connection_status -> agent_guide -> tool_schema_get/c2ct_invoke until host catalog revalidates"
+      ? "keep the registered bare /mcp endpoint; bootstrap the live runtime, then use tool_schema_get plus stable c2ct_invoke whenever a host-mounted named tool is stale; host catalog refresh is optional and never a correctness dependency"
       : "none",
     approvalRequestId: receipt.approvalRequestId ?? null,
     createdAt: receipt.createdAt,

@@ -56,7 +56,7 @@ export function isControlEnabled(env: NodeJS.ProcessEnv = process.env): boolean 
 
 /**
  * Owner opt-in flag ("ChatGPT confirm" model): authorize the 4 desktop-control
- * tools for remote ChatGPT execution and the generic action bridge, and let a
+ * tools for remote ChatGPT execution on their dedicated MCP surface, and let a
  * confirmed `computer_request_action` call execute immediately through the
  * executor path (src/control/tools.ts handleComputerRequestAction) instead of
  * only ever queuing for local human approval. Disabled by default — this is
@@ -72,6 +72,14 @@ export function isControlChatGptExposed(env: NodeJS.ProcessEnv = process.env): b
   if (raw === undefined) return false;
   const normalized = raw.trim().toLowerCase();
   return normalized === "1" || normalized === "true" || normalized === "on";
+}
+
+/** ChatGPT-only execution semantics must never leak into local/native stdio clients. */
+export function isRemoteChatGptControlExposed(
+  remote: boolean | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return remote === true && isControlChatGptExposed(env);
 }
 
 /**

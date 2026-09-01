@@ -281,12 +281,18 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
   const running = createHttpServer(ctx, httpConfig);
   const { app, activityTracker } = running;
   closeHttpServer = running.close;
-  mobileApprovalBridge = new MobileApprovalBridge({
-    stateDir: ctx.stateDir,
-    activityTracker,
-    ledgerAppend: (event) => ctx.ledger.append(event),
-  });
-  await mobileApprovalBridge.start();
+  // E2E candidate servers are deliberately isolated from the operator's
+  // fixed mobile/activity callback port. They still expose their own MCP/health
+  // endpoint, but cannot steal :7980 from the live runtime if they outlive a
+  // diagnostic run or overlap a runtime handoff.
+  if (process.env.CHATGPT2CODEX_E2E_CHILD !== "1") {
+    mobileApprovalBridge = new MobileApprovalBridge({
+      stateDir: ctx.stateDir,
+      activityTracker,
+      ledgerAppend: (event) => ctx.ledger.append(event),
+    });
+    await mobileApprovalBridge.start();
+  }
 
   httpServer = app.listen(port, host, () => {
     console.error(`chatgpt2codex serve --http: listening on http://${host}:${port}/mcp`);

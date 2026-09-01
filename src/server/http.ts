@@ -236,6 +236,53 @@ const OWNER_TOKEN_TOGGLE_SCRIPT = `
 })();
 `.trimStart();
 
+const OAUTH_LOCAL_APPROVAL_SCRIPT = `
+(() => {
+  const root = document.getElementById("oauth_local_approval");
+  const status = document.getElementById("oauth_local_approval_status");
+  if (!(root instanceof HTMLElement) || !(status instanceof HTMLElement)) return;
+
+  const requestId = root.dataset.requestId || "";
+  const browserToken = root.dataset.browserToken || "";
+  delete root.dataset.browserToken;
+  if (!requestId || !browserToken) return;
+
+  const update = (message) => { status.textContent = message; };
+  const poll = async () => {
+    try {
+      const response = await fetch("/oauth/local-approval/" + encodeURIComponent(requestId) + "/status", {
+        method: "POST",
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: { "X-C2CT-Approval-Session": browserToken },
+      });
+      if (response.status === 404) {
+        update("This local approval request is unavailable or expired. Use the Owner Token fallback below.");
+        return;
+      }
+      if (!response.ok) throw new Error("status request failed");
+      const result = await response.json();
+      if (result.status === "approved" && typeof result.redirectUrl === "string") {
+        window.location.assign(result.redirectUrl);
+        return;
+      }
+      if (result.status === "rejected") {
+        update("The local app rejected this connection. Use the Owner Token fallback below to try again.");
+        return;
+      }
+      if (result.status === "expired") {
+        update("This local approval request expired. Start the connection again or use the Owner Token fallback.");
+        return;
+      }
+      window.setTimeout(poll, 1000);
+    } catch {
+      window.setTimeout(poll, 1500);
+    }
+  };
+  void poll();
+})();
+`.trimStart();
+
 /** SR-12: strict security headers applied to every response. The OAuth HTML
  * form is intentionally frameable by ChatGPT because connector authorization
  * may be shown inside ChatGPT's web UI. */
@@ -246,6 +293,7 @@ function securityHeaders(_req: Request, res: Response, next: () => void): void {
       "default-src 'none'",
       "base-uri 'none'",
       "script-src 'self'",
+      "connect-src 'self'",
       `form-action 'self' ${TRUSTED_CHATGPT_ORIGINS.join(" ")}`,
       `frame-ancestors 'self' ${TRUSTED_CHATGPT_ORIGINS.join(" ")}`,
       "style-src 'unsafe-inline'",
@@ -469,6 +517,23 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
     res.type("application/javascript").send(OWNER_TOKEN_TOGGLE_SCRIPT);
   });
 
+  app.get("/assets/oauth-local-approval.js", (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.type("application/javascript").send(OAUTH_LOCAL_APPROVAL_SCRIPT);
+  });
+
+  app.post("/oauth/local-approval/:requestId/status", (req, res) => {
+    const requestId = String(req.params.requestId ?? "");
+    const browserToken = String(req.header("x-c2ct-approval-session") ?? "");
+    const status = oauthProvider.localApprovalBrowserStatus(requestId, browserToken);
+    res.setHeader("Cache-Control", "no-store");
+    if (!status) {
+      res.status(404).json({ error: "approval_not_found" });
+      return;
+    }
+    res.json(status);
+  });
+
   app.get("/.well-known/openid-configuration", (_req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Cache-Control", "no-store");
@@ -517,6 +582,7 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
     startedAt,
     desktopControlSupported: config.desktopControlSupported,
     diagnostics,
+    oauthLocalApproval: oauthProvider,
     approvalState: config.localControlApprovalState,
     rgBinary: config.localControlRgBinary,
   });

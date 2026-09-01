@@ -1,5 +1,9 @@
 import { isIP } from "node:net";
 import { MCP_CORE_TOOL_NAMES } from "../server/mcp-discovery.js";
+import {
+  CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL,
+  CHATGPT_OPERATION_APPROVAL_WIDGET_URI,
+} from "../server/chatgpt-consent-widget.js";
 
 const DEFAULT_TIMEOUT_MS = 4_000;
 const CONNECTOR_NAME_PATTERN = /^[^\u0000-\u001f\u007f]{1,64}$/u;
@@ -191,6 +195,7 @@ function acceptancePrompt(candidateName: string, revision: string | null): strin
     "ok=true, currentTurnProof=true, transportErrors=0을 확인하고 named catalog와 live runtime catalog를 분리해 검증해.",
     revision ? `기대 runtime tool schema revision은 ${revision}이야.` : "runtime tool schema revision을 실제 응답에서 기록해.",
     "runtime_apply_status, macos_app_apply_status, runtime_snapshot_status, runtime_snapshot_prune_local을 exact-name으로 확인하고 각 outputSchema가 비어 있지 않은지 봐줘.",
+    `${CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL}을 exact-name으로 확인하고 openai/outputTemplate과 ui.resourceUri가 ${CHATGPT_OPERATION_APPROVAL_WIDGET_URI}인지 확인해. generic c2ct_invoke 결과만으로 presenter mount를 PASS 처리하지 마.`,
     "기존 연결은 변경하지 말고, 검증 후 lease가 있다면 명시적으로 release해.",
   ].join("\n");
 }
@@ -252,10 +257,14 @@ export async function inspectConnectorRegistration(
   if (publicOrigin && !oauthMetadata.ok) blockers.push(`OAuth metadata probe failed (${oauthMetadata.category})`);
   if (!schemaRevision) blockers.push("live runtime did not expose a valid tool schema revision");
 
+  // Keep connector registration permanently bound to the stable bare /mcp endpoint.
+  // Tool-schema revisions are runtime metadata, not connector-address identity:
+  // schema-qualified query URLs can become host cache keys and strand individual
+  // named-tool mounts on an obsolete endpoint after a runtime replacement.
   const mcpUrl = publicOrigin ? new URL("/mcp", publicOrigin).toString() : null;
   const steps = [
     `Keep ${currentConnectorName} installed and open ${"https://chatgpt.com/plugins"}.`,
-    `Add a new connector named ${candidateConnectorName}${mcpUrl ? ` with ${mcpUrl}` : " after resolving the blockers"}.`,
+    `Add a new connector named ${candidateConnectorName}${mcpUrl ? ` with the stable endpoint ${mcpUrl}` : " after resolving the blockers"}. Do not append a schema hash or other schema-version query parameter.`,
     "Complete OAuth interactively; do not paste the Owner Token into scripts, logs, or chat messages.",
     `Run the generated acceptance prompt in a fresh chat using ${candidateConnectorName}.`,
     `Only after PASS, rename ${currentConnectorName} to ${currentConnectorName}_old and ${candidateConnectorName} to ${currentConnectorName}.`,

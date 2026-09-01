@@ -428,7 +428,11 @@ async function dashboardApprovalItems(
     listArmRequests(stateDir, now),
   ]);
   const operationItems: ActivityDashboardApproval[] = operationRequests
-    .filter((request) => request.status === "pending" && request.expiresAt > now)
+    .filter((request) =>
+      request.status === "pending" &&
+      request.expiresAt > now &&
+      (request.approvalSurface ?? "local") !== "chatgpt-widget",
+    )
     .map((request) => {
       const mobile = isMobileApprovableOperationTool(request.tool);
       return {
@@ -641,7 +645,11 @@ export class MobileApprovalBridge {
 
     const requests = await listOperationApprovalRequests(this.stateDir, now);
     const request = requests.find((entry) => entry.requestId === challenge.requestId);
-    if (!request || request.status !== "pending" || !isMobileApprovableOperationTool(request.tool) || request.expiresAt <= now) {
+    if (!request ||
+        request.status !== "pending" ||
+        (request.approvalSurface ?? "local") === "chatgpt-widget" ||
+        !isMobileApprovableOperationTool(request.tool) ||
+        request.expiresAt <= now) {
       this.byToken.delete(token);
       this.tokenByRequest.delete(challenge.requestId);
       this.syncChallengeCount();
@@ -788,7 +796,12 @@ export class MobileApprovalBridge {
       const requests = await listOperationApprovalRequests(this.stateDir, now);
       let pending = new Map(
         requests
-          .filter((request) => request.status === "pending" && isMobileApprovableOperationTool(request.tool) && request.expiresAt > now)
+          .filter((request) =>
+            request.status === "pending" &&
+            (request.approvalSurface ?? "local") !== "chatgpt-widget" &&
+            isMobileApprovableOperationTool(request.tool) &&
+            request.expiresAt > now,
+          )
           .map((request) => [request.requestId, request]),
       );
 
@@ -808,12 +821,18 @@ export class MobileApprovalBridge {
         .filter((request) => request.status === "pending" && request.expiresAt > now);
       pending = new Map(
         pendingOperations
-          .filter((request) => isMobileApprovableOperationTool(request.tool))
+          .filter((request) =>
+            (request.approvalSurface ?? "local") !== "chatgpt-widget" &&
+            isMobileApprovableOperationTool(request.tool),
+          )
           .map((request) => [request.requestId, request]),
       );
 
       const localOnlyOperationNotices = pendingOperations
-        .filter((request) => !isMobileApprovableOperationTool(request.tool))
+        .filter((request) =>
+          (request.approvalSurface ?? "local") !== "chatgpt-widget" &&
+          !isMobileApprovableOperationTool(request.tool),
+        )
         .map(operationLocalOnlyNotice);
       const rgNotices = (await listPendingRgApprovalRequests(this.stateDir, now)).map(rgLocalOnlyNotice);
       const armNotices = (await listArmRequests(this.stateDir, now)).requests
@@ -931,7 +950,8 @@ export class MobileApprovalBridge {
         sendJson(res, 410, { ok: false });
         return;
       }
-      if (!isMobileApprovableOperationTool(request.tool)) {
+      if ((request.approvalSurface ?? "local") === "chatgpt-widget" ||
+          !isMobileApprovableOperationTool(request.tool)) {
         sendJson(res, 403, { ok: false });
         return;
       }

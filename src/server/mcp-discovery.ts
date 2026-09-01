@@ -1,4 +1,5 @@
 import type { McpRequestClassification } from "./mcp-request-classification.js";
+import { CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL } from "./chatgpt-consent-widget.js";
 
 export const MCP_MODERN_PROTOCOL_VERSION = "2026-07-28";
 export const MCP_PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion";
@@ -11,14 +12,23 @@ export const MCP_SERVER_INFO_META_KEY = "io.modelcontextprotocol/serverInfo";
 export const MCP_SCHEMA_CACHE_TTL_MS = 0;
 export const MCP_DISCOVERY_TTL_MS = MCP_SCHEMA_CACHE_TTL_MS;
 export const MCP_TOOL_LIST_TTL_MS = MCP_SCHEMA_CACHE_TTL_MS;
-export const MCP_SCHEMA_CONTRACT_VERSION = 3;
+export const MCP_SCHEMA_CONTRACT_VERSION = 4;
 export const MCP_SCHEMA_REVISION_META_KEY = "io.ezbuilder.chatgpt2codex/schemaRevision";
 export const MCP_SCHEMA_EXPIRED_META_KEY = "io.ezbuilder.chatgpt2codex/schemaExpired";
 export const MCP_SCHEMA_REVALIDATE_META_KEY = "io.ezbuilder.chatgpt2codex/schemaMustRevalidate";
 export const MCP_CORE_TOOLS_META_KEY = "io.ezbuilder.chatgpt2codex/coreToolNames";
 
+// Keep stateful SDK initialize responses and the stateless ChatGPT discovery
+// adapter on the same capability contract. Hosts that support MCP list-change
+// notifications can invalidate their mounted catalog, while reconnect/refresh
+// still revalidates against the live tools/list response with a zero TTL.
+export const MCP_TOOL_CAPABILITIES = {
+  listChanged: true,
+} as const;
+
 export const MCP_CORE_TOOL_NAMES = [
   "c2ct_invoke",
+  CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL,
   "connection_status",
   "connection_audit",
   "session_context_update",
@@ -115,7 +125,7 @@ export function createMcpDiscoveryResult(
   return {
     resultType: "complete",
     supportedVersions: [MCP_MODERN_PROTOCOL_VERSION],
-    capabilities: { tools: {} },
+    capabilities: { tools: { ...MCP_TOOL_CAPABILITIES } },
     instructions:
       "Revalidate tools/list for the live runtime instead of persisting tool schemas across runtime replacement. tools/list supports exact-name query, explicit names, and coreOnly extensions. tool_schema_get plus c2ct_invoke is the stable fallback when a host-mounted named schema is stale.",
     ttlMs: MCP_DISCOVERY_TTL_MS,

@@ -34,7 +34,7 @@ ChatGPT To Codex fills that gap:
 - allowlisted local commands for tests and checks
 - macOS app/window screenshot capture for visual E2E proof (Windows native capture planned)
 - temporary or fixed HTTPS connector URL for ChatGPT web
-- OAuth-style owner-token approval so random clients cannot just attach
+- OAuth 2.1 + PKCE approval, with one-click local macOS approval and an Owner Token fallback
 - multilingual macOS app window and Windows tray UI for non-English users
 
 The mental model is simple:
@@ -139,7 +139,7 @@ macOS short version:
 7. Enable **ChatGPT web connector** if you want ChatGPT in the browser to connect.
 8. Click **Start MCP** in the app sidebar.
 9. Click **Copy Connector URL** in the app sidebar.
-10. Register that `/mcp` URL in ChatGPT Apps / Connectors and approve with the Owner Token shown by the app.
+10. Register that `/mcp` URL in ChatGPT Apps / Connectors. On macOS, approve the exact OAuth request once in the ChatGPT To Codex app; use the Owner Token form only as a fallback.
 
 The legacy macOS status item remains hidden; its command model is retained internally for compatibility, while user-facing controls live in the regular app window.
 
@@ -156,6 +156,10 @@ Windows short version:
 6. Copy the `/mcp` Connector URL and approve it in ChatGPT with the Owner Token.
 
 Keep the Owner Token private. Treat it like a password.
+
+The native macOS approval path never copies the Owner Token or OAuth
+access/refresh tokens into the CLI, agent context, clipboard, or logs. ChatGPT
+and C2CT complete the standard authorization-code + PKCE exchange directly.
 
 ## First Prompt To Try
 

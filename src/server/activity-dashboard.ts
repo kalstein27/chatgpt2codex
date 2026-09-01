@@ -202,9 +202,12 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     button.filter { appearance: none; border: 1px solid transparent; background: var(--panel2); color: var(--muted); border-radius: 999px; padding: 5px 9px; font-size: 10px; font-weight: 650; white-space: nowrap; transition: color var(--motion-fast) ease, background-color var(--motion-fast) ease, border-color var(--motion-fast) ease; }
     button.filter.active { color: var(--text); background: var(--panel); border-color: var(--line); }
     #cards { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 10px; }
-    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 13px 14px; box-shadow: var(--shadow); min-width: 0; transition: box-shadow var(--motion-fast) ease, border-color var(--motion-fast) ease; }
-    .card.active-card { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--blue) 72%, transparent), var(--shadow); }
-    .card.stale-card { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--orange) 82%, transparent), var(--shadow); }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 13px 14px; box-shadow: var(--shadow); min-width: 0; transition: border-color 180ms ease, box-shadow 180ms ease; }
+    .card.status-blue { border-color: color-mix(in srgb, var(--blue) 72%, var(--line)); box-shadow: 0 0 0 1px color-mix(in srgb, var(--blue) 22%, transparent), var(--shadow); }
+    .card.status-green { border-color: color-mix(in srgb, var(--green) 66%, var(--line)); box-shadow: 0 0 0 1px color-mix(in srgb, var(--green) 18%, transparent), var(--shadow); }
+    .card.status-orange { border-color: color-mix(in srgb, var(--orange) 72%, var(--line)); box-shadow: 0 0 0 1px color-mix(in srgb, var(--orange) 20%, transparent), var(--shadow); }
+    .card.status-red { border-color: color-mix(in srgb, var(--red) 70%, var(--line)); box-shadow: 0 0 0 1px color-mix(in srgb, var(--red) 20%, transparent), var(--shadow); }
+    .card.status-gray { border-color: color-mix(in srgb, var(--gray) 42%, var(--line)); }
     .card-primary { display: grid; grid-template-columns: auto minmax(0,1fr) auto auto; align-items: center; gap: 7px 10px; min-width: 0; }
     .project-badge { display: inline-flex; align-items: center; min-width: 0; max-width: 132px; min-height: 22px; border-radius: 7px; padding: 3px 7px; background: color-mix(in srgb, var(--blue) 7%, var(--panel2)); color: color-mix(in srgb, var(--blue) 80%, var(--text)); font-size: 10px; font-weight: 760; letter-spacing: .01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .project-badge.none { border-color: var(--line); background: var(--panel2); color: var(--muted); }
@@ -223,6 +226,10 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     .activity-disclosure > summary::-webkit-details-marker { display: none; }
     .activity-preview { display: grid; gap: 4px; min-width: 0; }
     .activity-preview-line, .activity-line { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 11px; line-height: 1.4; white-space: nowrap; }
+    .activity-preview-line[role="button"] { cursor: pointer; border-radius: 6px; outline: none; }
+    .activity-preview-line[role="button"]:focus-visible { box-shadow: 0 0 0 1px color-mix(in srgb, var(--blue) 65%, transparent); }
+    .activity-preview-line.failed, .activity-entry.failed .activity-line { color: var(--red); }
+    .activity-preview-line.failed .activity-time, .activity-entry.failed .activity-time { color: color-mix(in srgb, var(--red) 72%, var(--muted)); }
     .activity-time { flex: 0 0 40px; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 9.5px; }
     .activity-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 620; }
     .activity-collapse-label { display: none; color: var(--muted); font-size: 10px; font-weight: 650; }
@@ -233,11 +240,13 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     .activity-timeline { display: grid; gap: 2px; border-top: 1px solid var(--line); margin: 0 10px 8px; padding-top: 7px; }
     .activity-disclosure[open] .activity-timeline { animation: disclosure-in var(--motion-fast) var(--motion-ease); }
     .activity-entry { min-width: 0; border-radius: 7px; }
+    .activity-entry.failed { background: color-mix(in srgb, var(--red) 6%, transparent); }
     .activity-line { cursor: pointer; padding: 4px 2px; outline: none; }
     .activity-line:focus-visible { box-shadow: 0 0 0 1px color-mix(in srgb, var(--blue) 65%, transparent); }
     .activity-detail { display: none; margin: 0 2px 7px 50px; color: var(--muted); font-size: 9.5px; line-height: 1.45; overflow-wrap: anywhere; }
     .activity-entry.detail-open .activity-detail { display: block; }
     .activity-detail-text { color: var(--text); margin-bottom: 2px; }
+    .activity-detail-message { margin-bottom: 2px; }
     .activity-detail-meta { font-variant-numeric: tabular-nums; }
     .empty { grid-column: 1/-1; text-align: center; color: var(--muted); padding: 44px 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; }
     .footer { color: var(--muted); font-size: 9.5px; text-align: center; margin-top: 13px; opacity: .8; }
@@ -357,6 +366,14 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     if (!ms) return "-";
     return new Date(ms).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", hour12: false });
   }
+  function fmtDuration(ms) {
+    if (!Number.isFinite(ms)) return "-";
+    if (ms < 1000) return Math.max(0, Math.round(ms)) + "ms";
+    if (ms < 60000) return (ms / 1000).toFixed(ms < 10000 ? 1 : 0) + "초";
+    var minutes = Math.floor(ms / 60000);
+    var seconds = Math.floor((ms % 60000) / 1000);
+    return minutes + "분 " + seconds + "초";
+  }
   function age(ms, now) {
     var s = Math.max(0, Math.floor((now - ms) / 1000));
     if (s < 5) return "방금";
@@ -444,24 +461,47 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       var detachedBase = op.activityHint || humanToolLabel(op.tool);
       return "ChatGPT 응답 연결 끊김 · 로컬 작업 계속 중 · " + detachedBase;
     }
-    if (op.activityHint) return op.activityHint;
-    var action = humanToolLabel(op.tool);
-    var detail = chat.taskLabel || op.message || "";
-    return detail ? action + " · " + detail : action;
+    var base;
+    if (op.activityHint) {
+      base = op.activityHint;
+    } else {
+      var action = humanToolLabel(op.tool);
+      var detail = chat.taskLabel || op.message || "";
+      base = detail ? action + " · " + detail : action;
+    }
+    return op.state === "failed" ? "실패 · " + base : base;
   }
-  function makeActivityPreviewLine(chat, entry) {
+  function activityDetailKey(chat, entry) {
+    return String(entry.operationId || (cardKey(chat) + ":" + entry.startedAt + ":" + entry.tool));
+  }
+  function makeActivityPreviewLine(chat, entry, openDetail) {
     var text = activitySummary(chat, entry);
-    var line = el("span", "activity-preview-line");
+    var line = el("span", "activity-preview-line" + (entry.state === "failed" ? " failed" : ""));
+    line.setAttribute("role", "button");
+    line.tabIndex = 0;
+    line.setAttribute("aria-label", "상세 보기 · " + text);
+    line.title = "눌러서 상세 보기";
     line.appendChild(el("span", "activity-time", fmtStartClock(entry.startedAt)));
     var content = el("span", "activity-text", text);
     content.title = text;
     line.appendChild(content);
+    function activate(event) {
+      if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      openDetail();
+    }
+    line.addEventListener("click", activate);
+    line.addEventListener("keydown", function (event) {
+      if (event.key === "Enter" || event.key === " ") activate(event);
+    });
     return line;
   }
   function makeActivityEntry(chat, entry) {
     var text = activitySummary(chat, entry);
-    var detailKey = String(entry.operationId || (cardKey(chat) + ":" + entry.startedAt + ":" + entry.tool));
-    var wrapper = el("div", "activity-entry" + (expandedOperationDetails.has(detailKey) ? " detail-open" : ""));
+    var detailKey = activityDetailKey(chat, entry);
+    var wrapper = el("div", "activity-entry" + (entry.state === "failed" ? " failed" : "") + (expandedOperationDetails.has(detailKey) ? " detail-open" : ""));
     var line = el("div", "activity-line");
     line.setAttribute("role", "button");
     line.tabIndex = 0;
@@ -472,9 +512,13 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     line.appendChild(content);
     var detail = el("div", "activity-detail");
     detail.appendChild(el("div", "activity-detail-text", text));
+    if (entry.message && entry.message !== text) detail.appendChild(el("div", "activity-detail-message", entry.message));
     var meta = ["도구 " + entry.tool, "시작 " + fmtClock(entry.startedAt)];
     if (Number.isFinite(entry.finishedAt)) meta.push("완료 " + fmtClock(entry.finishedAt));
+    if (Number.isFinite(entry.elapsedMs)) meta.push("소요 " + fmtDuration(entry.elapsedMs));
     if (entry.state) meta.push("상태 " + entry.state);
+    if (entry.phase) meta.push("단계 " + entry.phase);
+    if (entry.errorCode) meta.push("오류 " + entry.errorCode);
     detail.appendChild(el("div", "activity-detail-meta", meta.join(" · ")));
     function toggleDetail(event) {
       if (event) {
@@ -597,9 +641,10 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   }
   function makeCard(chat, now) {
     var st = statusOf(chat, now);
-    var card = el("article", "card" + (st.key === "active" || st.key === "quiet" ? " active-card" : "") + (st.key === "stale" ? " stale-card" : ""));
+    var card = el("article", "card status-" + st.color);
     card.dataset.chatKey = cardKey(chat);
     card.dataset.statusKey = st.key;
+    card.dataset.statusColor = st.color;
     var primary = el("div", "card-primary");
     var project = targetProject(chat);
     var projectBadge = el("span", "project-badge" + (project ? "" : " none"), project || "프로젝트 미확인");
@@ -629,7 +674,13 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       });
       var summary = document.createElement("summary");
       var preview = el("span", "activity-preview");
-      previewOps.forEach(function (entry) { preview.appendChild(makeActivityPreviewLine(chat, entry)); });
+      previewOps.forEach(function (entry) {
+        preview.appendChild(makeActivityPreviewLine(chat, entry, function () {
+          if (disclosureKey) expandedToolRequestChats.add(disclosureKey);
+          expandedOperationDetails.add(activityDetailKey(chat, entry));
+          render();
+        }));
+      });
       summary.appendChild(preview);
       summary.appendChild(el("span", "activity-collapse-label", "접기"));
       summary.appendChild(el("span", "disclosure-indicator", "⌄"));
@@ -646,10 +697,14 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     Array.from(cards.children).forEach(function (card) {
       var key = card.dataset && card.dataset.chatKey;
       if (!key) return;
+      var cardStyle = window.getComputedStyle(card);
       previous.set(key, {
         rect: card.getBoundingClientRect(),
         summary: card.dataset.summary || "",
-        statusKey: card.dataset.statusKey || ""
+        statusKey: card.dataset.statusKey || "",
+        statusColor: card.dataset.statusColor || "",
+        borderColor: cardStyle.borderTopColor,
+        boxShadow: cardStyle.boxShadow
       });
     });
     if (!visible.length) {
@@ -683,6 +738,13 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       }
       if (before.statusKey !== (card.dataset.statusKey || "")) {
         animateNode(card.querySelector(".status"), [{ opacity: .74, transform: "translateY(.5px)" }, { opacity: 1, transform: "translateY(0)" }], 280);
+      }
+      if (before.statusColor !== (card.dataset.statusColor || "")) {
+        var targetStyle = window.getComputedStyle(card);
+        animateNode(card, [
+          { borderColor: before.borderColor, boxShadow: before.boxShadow },
+          { borderColor: targetStyle.borderTopColor, boxShadow: targetStyle.boxShadow }
+        ], 180);
       }
     });
   }

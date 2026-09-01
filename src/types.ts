@@ -125,6 +125,16 @@ export interface ToolContext {
    * desktop-control tools are exposed to ChatGPT
    * (src/control/policy.ts isControlChatGptExposed). */
   remote?: boolean;
+  /** Server-injected provenance for one dedicated GPT Action route. This is
+   * never populated from caller input. Consequential=true means the route is
+   * published with x-openai-isConsequential=true so ChatGPT must confirm the
+   * exact action before issuing the request. */
+  actionInvocation?: {
+    surface: "gpt-action";
+    operationId: string;
+    dedicatedRoute: true;
+    consequential: boolean;
+  };
   /** Optional per-transport activity sink used only for bounded local
    * operational status. Tool inputs and outputs are never passed to it. */
   activity?: RuntimeActivityContext;

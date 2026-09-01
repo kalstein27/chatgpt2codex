@@ -92,8 +92,49 @@ import {
   ensureOperationAuthorized,
   listOperationApprovalRequests,
   waitForOperationAuthorization,
+  type OperationApprovalSurface,
   type OperationRisk,
 } from "../exec/operation-approval.js";
+import { resolveOperationApprovalRequest } from "../exec/operation-approval.js";
+import { RUNTIME_APPLY_PROVIDER_ORDER, approvalBrokerPlan, ensureBrokeredOperationAuthorized } from "../exec/approval-broker.js";
+import { authorizeDedicatedConsequentialAction } from "../exec/consequential-action-authorization.js";
+import {
+  consumeChatGptWidgetApprovalToken,
+  mintChatGptWidgetApprovalToken,
+} from "../exec/chatgpt-widget-approval.js";
+import { isChatGptWidgetApprovableOperationTool } from "../exec/chatgpt-widget-approval.js";
+import {
+  createChatGptConsentProbe,
+  getChatGptConsentProbe,
+  resolveChatGptConsentProbe,
+} from "../exec/chatgpt-consent-probe.js";
+import {
+  CHATGPT_CONSENT_META_KEY,
+  CHATGPT_CONSENT_WIDGET_HTML,
+  CHATGPT_CONSENT_WIDGET_LAB_URI,
+  CHATGPT_CONSENT_WIDGET_LAB_VERSION,
+  CHATGPT_CONSENT_WIDGET_LEGACY_URIS,
+  CHATGPT_CONSENT_WIDGET_MIME,
+  CHATGPT_CONSENT_WIDGET_RESOURCE_META,
+  CHATGPT_CONSENT_WIDGET_URI,
+  CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL,
+  CHATGPT_OPERATION_APPROVAL_WIDGET_RESOURCE_NAME,
+  CHATGPT_OPERATION_APPROVAL_WIDGET_URI,
+} from "./chatgpt-consent-widget.js";
+import {
+  CHATGPT_WIDGET_CAPABILITY_LAB_HTML,
+  CHATGPT_WIDGET_CAPABILITY_LAB_MIME,
+  CHATGPT_WIDGET_CAPABILITY_LAB_RESOURCE_META,
+  CHATGPT_WIDGET_CAPABILITY_LAB_URI,
+  summarizeWidgetLabSyntheticSecret,
+} from "./chatgpt-widget-capability-lab.js";
+import {
+  createChatGptWidgetChoiceCard,
+  getChatGptWidgetChoiceResult,
+  decodeChatGptWidgetChoiceTransport,
+  getCurrentChatGptWidgetChoiceCard,
+  resolveChatGptWidgetChoice,
+} from "../exec/chatgpt-widget-shell.js";
 import { disableMobileApproval, enableMobileApproval, mobileApprovalStatus } from "../exec/mobile-approval.js";
 import { installManagedRipgrep } from "../exec/managed-rg-installer.js";
 import { getScheduledGoalRuntime } from "../exec/scheduled-goal-runtime.js";
@@ -125,6 +166,7 @@ import type {
 import { chatGptConversationDisplayTitleFromMeta } from "../runtime/activity.js";
 import { conversationLabelFromRequestMeta } from "../runtime/activity.js";
 import { getRuntimeManifest } from "../runtime/runtime-manifest.js";
+import { readToolSchemaRecoveryState } from "../runtime/tool-schema-revalidation.js";
 import {
   readExternalWatchdogProbeWindow,
   readExternalWatchdogStatus,
@@ -135,7 +177,6 @@ import {
 } from "../runtime/runtime-snapshot-retention.js";
 import {
   currentRuntimeExternalIdentity,
-  getLatestRuntimeApplyReceipt,
   getRuntimeApplyReceipt,
   launchRuntimeApplyWorker,
   markRuntimeApplyActivationRequested,
@@ -148,6 +189,7 @@ import {
   runtimeApplyPublicReceipt,
 } from "../runtime/runtime-apply.js";
 import { reconcileRuntimeApplyApprovalReceipts } from "../runtime/runtime-apply.js";
+import { attachRuntimeApplyApprovalRequest } from "../runtime/runtime-apply.js";
 import {
   checkRuntimeUpdate,
   getRuntimeUpdatePrepareReceipt,
@@ -783,6 +825,17 @@ const LOCAL_STATE_ANNOTATIONS = {
   openWorldHint: false,
 } as const;
 
+// Routine project-confined source mutations are already authorized by the
+// caller's verified write lane. Advertising them as destructive makes ChatGPT
+// add a second per-call confirmation even though the capability boundary was
+// established by project_lane_open. Keep truly consequential operations on
+// their separate destructive/approval annotations.
+const PROJECT_WRITE_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  openWorldHint: false,
+} as const;
+
 const LOCAL_WRITE_ANNOTATIONS = {
   readOnlyHint: false,
   destructiveHint: true,
@@ -797,7 +850,11 @@ const VERIFIED_LOCAL_FILE_ANNOTATIONS = {
 
 const COMMAND_RUN_ANNOTATIONS = {
   readOnlyHint: false,
-  destructiveHint: true,
+  // The allowlisted command/E2E tools classify each invocation by intent and
+  // issue their own exact-operation approval before network/destructive work.
+  // Marking every invocation destructive makes harmless local tests trigger a
+  // redundant host confirmation before C2CT can apply that finer-grained gate.
+  destructiveHint: false,
   openWorldHint: true,
 } as const;
 
@@ -958,13 +1015,112 @@ const ChatGptListToolsRequestSchema = ListToolsRequestSchema.extend({
 function chatGptToolMeta(invoking: string, invoked: string, extra?: Record<string, unknown>): Record<string, unknown> {
   return {
     securitySchemes: CHATGPT2CODEX_SECURITY_SCHEMES,
-    ui: { visibility: ["model"] },
     "openai/visibility": "public",
     "openai/toolInvocation/invoking": invoking,
     "openai/toolInvocation/invoked": invoked,
     ...(extra ?? {}),
   };
 }
+
+const chatGptPendingPresenterBySession = new Map<string, "widget-capability-lab">();
+
+function rememberChatGptPresenter(ctx: ToolContext, kind: "widget-capability-lab"): void {
+  if (!ctx.sessionScope) return;
+  chatGptPendingPresenterBySession.set(ctx.sessionScope, kind);
+}
+
+function consumeChatGptPresenter(ctx: ToolContext): "widget-capability-lab" | undefined {
+  if (!ctx.sessionScope) return undefined;
+  const kind = chatGptPendingPresenterBySession.get(ctx.sessionScope);
+  if (kind) chatGptPendingPresenterBySession.delete(ctx.sessionScope);
+  return kind;
+}
+
+interface ChatGptPendingOperationPresentation {
+  requestId: string;
+  tool: string;
+  allowFollowUpPrompt: string;
+  denyFollowUpPrompt: string;
+  extra?: Record<string, unknown>;
+}
+
+const chatGptPendingOperationBySession = new Map<string, ChatGptPendingOperationPresentation>();
+
+function rememberChatGptPendingOperation(
+  ctx: ToolContext,
+  input: ChatGptPendingOperationPresentation,
+): void {
+  if (!ctx.sessionScope) return;
+  chatGptPendingOperationBySession.set(ctx.sessionScope, { ...input });
+}
+
+function forgetChatGptPendingOperation(ctx: ToolContext, requestId?: string): void {
+  if (!ctx.sessionScope) return;
+  const current = chatGptPendingOperationBySession.get(ctx.sessionScope);
+  if (!current || (requestId && current.requestId !== requestId)) return;
+  chatGptPendingOperationBySession.delete(ctx.sessionScope);
+}
+
+async function chatGptOperationApprovalPending(
+  ctx: ToolContext,
+  input: {
+    requestId: string;
+    tool: string;
+    allowFollowUpPrompt: string;
+    denyFollowUpPrompt: string;
+    extra?: Record<string, unknown>;
+  },
+) {
+  const approvalRequest = (await listOperationApprovalRequests(ctx.stateDir))
+    .find((candidate) => candidate.requestId === input.requestId);
+  if (!approvalRequest ||
+      approvalRequest.tool !== input.tool ||
+      approvalRequest.status !== "pending" ||
+      approvalRequest.approvalSurface !== "chatgpt-widget") {
+    throw new DomainError(ErrorCode.APPROVAL_REQUIRED, `${input.tool} approval request is not available for ChatGPT widget approval`, {
+      requestId: input.requestId,
+      tool: approvalRequest?.tool ?? input.tool,
+      actionStarted: false,
+      subprocessStarted: false,
+    });
+  }
+  rememberChatGptPendingOperation(ctx, input);
+  if (ctx.sessionScope) {
+    chatGptOperationApprovalPresenterRequests.set(ctx.sessionScope, { ...input });
+  }
+  const pending = makeResult<Record<string, unknown>>(
+    {
+      requestId: input.requestId,
+      status: "pending",
+      approvalKind: "operation",
+      approvalChannel: "chatgpt-widget",
+      decisionTool: "chatgpt_operation_approval_decide",
+      operationTool: input.tool,
+      preview: approvalRequest.preview,
+      expiresAt: approvalRequest.expiresAt,
+      replayExactInputAfterApproval: true,
+      actionStarted: false,
+      subprocessStarted: false,
+      sideEffects: "approval-state-only",
+      presentApprovalWith: CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL,
+      presentApprovalArgs: { requestId: input.requestId },
+      cardRendered: false,
+      allowFollowUpPrompt: input.allowFollowUpPrompt,
+      denyFollowUpPrompt: input.denyFollowUpPrompt,
+      ...(input.extra ?? {}),
+    },
+    `${input.tool} approval is pending; call ${CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL} with this requestId to render the versioned C2CT approval card.`,
+  );
+  return pending;
+}
+
+const chatGptOperationApprovalPresenterRequests = new Map<string, {
+  requestId: string;
+  tool: string;
+  allowFollowUpPrompt: string;
+  denyFollowUpPrompt: string;
+  extra?: Record<string, unknown>;
+}>();
 
 function schemaToJsonSchema(schema: unknown, pipeStrategy: "input" | "output"): Record<string, unknown> {
   const obj = normalizeObjectSchema(schema as never);
@@ -995,6 +1151,7 @@ function toolSchemaRevision(tools: Record<string, unknown>[]): string {
     inputSchema: tool.inputSchema,
     outputSchema: tool.outputSchema,
     annotations: tool.annotations,
+    _meta: tool._meta,
   }));
   return `sha256:${createHash("sha256").update(JSON.stringify(canonical)).digest("hex").slice(0, 24)}`;
 }
@@ -1056,7 +1213,6 @@ function chatGptToolDefinition(name: string, tool: RegisteredToolLike): Record<s
     execution: tool.execution,
     _meta: {
       securitySchemes: CHATGPT2CODEX_SECURITY_SCHEMES,
-      ui: { visibility: ["model"] },
       "openai/visibility": "public",
       ...(tool._meta ?? {}),
     },
@@ -1076,6 +1232,29 @@ function chatGptVisibleToolDefinitions(
       isChatGptVisibleRegisteredTool(name, tool, desktopControlSupported, exposeNativeE2e, nativeFirstClient),
     )
     .map(([name, tool]) => chatGptToolDefinition(name, tool));
+}
+
+async function sendSchemaRefreshNotifications(extra: unknown): Promise<{ attempted: boolean; sent: number }> {
+  const sendNotification = extra && typeof extra === "object" && !Array.isArray(extra)
+    ? (extra as {
+        sendNotification?: (notification: {
+          method: string;
+          params?: Record<string, unknown>;
+        }) => Promise<void>;
+      }).sendNotification
+    : undefined;
+  if (!sendNotification) return { attempted: false, sent: 0 };
+  let sent = 0;
+  for (const method of ["notifications/tools/list_changed", "notifications/resources/list_changed"] as const) {
+    try {
+      await sendNotification({ method, params: {} });
+      sent += 1;
+    } catch {
+      // Stateless clients may reject server notifications. The stable dispatcher
+      // remains the correctness path until a fresh tools/list request is observed.
+    }
+  }
+  return { attempted: true, sent };
 }
 
 function installChatGptToolListHandler(s: McpServer, ctx: ToolContext): void {
@@ -1575,9 +1754,12 @@ interface E2eAutomation {
  * URL as fallback `src`.
  */
 const E2E_SCREENSHOT_WIDGET_URI = "ui://widget/e2e-screenshots.html";
-const E2E_SCREENSHOT_WIDGET_MIME = "text/html+skybridge";
+const E2E_SCREENSHOT_WIDGET_MIME = "text/html;profile=mcp-app";
 const E2E_SCREENSHOT_META_KEY = "chatgpt2codex/screenshots";
-const E2E_WIDGET_TOOL_META = { "openai/outputTemplate": E2E_SCREENSHOT_WIDGET_URI } as const;
+const E2E_WIDGET_TOOL_META = {
+  "openai/outputTemplate": E2E_SCREENSHOT_WIDGET_URI,
+  ui: { visibility: ["model"], resourceUri: E2E_SCREENSHOT_WIDGET_URI },
+} as const;
 
 const E2E_SCREENSHOT_WIDGET_HTML = `<!doctype html>
 <html>
@@ -1587,28 +1769,104 @@ const E2E_SCREENSHOT_WIDGET_HTML = `<!doctype html>
   body { margin: 0; font-family: -apple-system, system-ui, sans-serif; background: transparent; }
   #status { font-size: 13px; color: #8e8ea0; margin: 8px 10px; }
   #grid { display: flex; flex-direction: column; gap: 10px; padding: 0 10px 10px; }
+  #consent { display: none; border: 1px solid rgba(128,128,128,.35); border-radius: 12px; padding: 14px; margin: 4px; }
+  #consentTitle { font-weight: 650; font-size: 15px; margin-bottom: 6px; }
+  #consentPreview { font-size: 13px; line-height: 1.45; opacity: .82; white-space: pre-wrap; }
+  #consentActions { display: flex; gap: 8px; margin-top: 12px; }
+  #consentActions button { flex: 1; min-height: 38px; border-radius: 9px; border: 1px solid rgba(128,128,128,.35); font: inherit; cursor: pointer; }
+  #consentActions button:disabled { opacity: .5; cursor: default; }
+  #consentStatus { font-size: 12px; opacity: .72; margin-top: 9px; min-height: 18px; }
   figure { margin: 0; }
   img { width: 100%; border-radius: 8px; border: 1px solid rgba(128, 128, 128, 0.35); display: block; }
   figcaption { font-size: 12px; color: #8e8ea0; margin-top: 4px; }
 </style>
 </head>
 <body>
+<div id="consent">
+  <div id="consentTitle">C2CT 확인</div>
+  <div id="consentPreview">승인 내용을 불러오는 중…</div>
+  <div id="consentActions">
+    <button id="consentDeny">거절</button>
+    <button id="consentAllow">허용</button>
+  </div>
+  <div id="consentStatus"></div>
+</div>
 <div id="status">Loading E2E screenshots...</div>
 <div id="grid"></div>
 <script>
 (function () {
+  var consentBusy = false;
+  var latestToolOutput = null;
+  var latestToolMeta = null;
+  var pendingRequests = new Map();
+  var nextRequestId = 1;
+  function api() { return window.openai || {}; }
+  function output() { return latestToolOutput || api().toolOutput || {}; }
+  function responseMeta() { return latestToolMeta || api().toolResponseMetadata || {}; }
+  function request(method, params) {
+    var id = nextRequestId++;
+    window.parent.postMessage({ jsonrpc: "2.0", id: id, method: method, params: params }, "*");
+    return new Promise(function (resolve, reject) {
+      pendingRequests.set(id, { resolve: resolve, reject: reject });
+    });
+  }
+  function consentSecret() {
+    return responseMeta()["${CHATGPT_CONSENT_META_KEY}"] || {};
+  }
+  function setConsentBusy(value) {
+    consentBusy = value;
+    document.getElementById("consentDeny").disabled = value;
+    document.getElementById("consentAllow").disabled = value;
+  }
+  async function callConsentDecision(decision, out, sec) {
+    var args = { requestId: out.requestId, token: sec.token, decision: decision };
+    var a = api();
+    if (a.callTool) return a.callTool("chatgpt_consent_probe_decide", args);
+    return request("tools/call", { name: "chatgpt_consent_probe_decide", arguments: args });
+  }
+  async function decideConsent(decision) {
+    if (consentBusy) return;
+    var out = output();
+    var sec = consentSecret();
+    if (!out.requestId || !sec.token) {
+      document.getElementById("consentStatus").textContent = "확인 채널을 사용할 수 없습니다.";
+      return;
+    }
+    setConsentBusy(true);
+    document.getElementById("consentStatus").textContent = "처리 중…";
+    try {
+      await callConsentDecision(decision, out, sec);
+      document.getElementById("consentStatus").textContent = decision === "allow" ? "허용됨" : "거절됨";
+      var a = api();
+      if (a.sendFollowUpMessage) {
+        await a.sendFollowUpMessage({ prompt: "C2CT 인라인 확인 테스트 결과를 확인해줘." });
+      }
+    } catch (_) {
+      document.getElementById("consentStatus").textContent = "처리하지 못했습니다.";
+      setConsentBusy(false);
+    }
+  }
   function shotList() {
-    var api = window.openai || {};
-    var meta = api.toolResponseMetadata || {};
-    var shots = meta["${E2E_SCREENSHOT_META_KEY}"];
+    var shots = responseMeta()["${E2E_SCREENSHOT_META_KEY}"];
     if (Array.isArray(shots) && shots.length) return shots;
-    var out = api.toolOutput || {};
+    var out = output();
     var set = Array.isArray(out.screenshotSet) ? out.screenshotSet : out.inlineUrl ? [out] : [];
     return set.map(function (s, i) {
       return { label: s.shotLabel || "E2E screenshot " + (i + 1), url: s.inlineUrl };
     });
   }
   function render() {
+    var out = output();
+    if (out.c2ctConsentProbe === true) {
+      document.getElementById("consent").style.display = "block";
+      document.getElementById("status").style.display = "none";
+      document.getElementById("grid").style.display = "none";
+      document.getElementById("consentPreview").textContent = out.preview || "무해한 C2CT 인라인 확인 테스트";
+      return;
+    }
+    document.getElementById("consent").style.display = "none";
+    document.getElementById("status").style.display = "block";
+    document.getElementById("grid").style.display = "flex";
     var shots = shotList();
     var grid = document.getElementById("grid");
     grid.textContent = "";
@@ -1636,6 +1894,26 @@ const E2E_SCREENSHOT_WIDGET_HTML = `<!doctype html>
       ? shown + " E2E screenshot" + (shown > 1 ? "s" : "")
       : "No screenshots returned.";
   }
+  window.addEventListener("message", function (event) {
+    if (event.source !== window.parent) return;
+    var message = event.data;
+    if (!message || message.jsonrpc !== "2.0") return;
+    if (message.id !== undefined && pendingRequests.has(message.id)) {
+      var pending = pendingRequests.get(message.id);
+      pendingRequests.delete(message.id);
+      if (message.error) pending.reject(message.error);
+      else pending.resolve(message.result);
+      return;
+    }
+    if (message.method === "ui/notifications/tool-result") {
+      var params = message.params || {};
+      latestToolOutput = params.structuredContent || {};
+      latestToolMeta = params._meta || latestToolMeta;
+      render();
+    }
+  }, { passive: true });
+  document.getElementById("consentDeny").addEventListener("click", function () { void decideConsent("deny"); });
+  document.getElementById("consentAllow").addEventListener("click", function () { void decideConsent("allow"); });
   window.addEventListener("openai:set_globals", render);
   render();
 })();
@@ -2133,6 +2411,633 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     }),
   );
 
+  const registerConsentWidgetResource = (name: string, uri: string): void => {
+    s.registerResource(
+      name,
+      uri,
+      {
+        title: "C2CT confirmation",
+        description: "Renders a user-clicked C2CT allow/deny card inside ChatGPT.",
+        mimeType: CHATGPT_CONSENT_WIDGET_MIME,
+        _meta: CHATGPT_CONSENT_WIDGET_RESOURCE_META,
+      },
+      async () => ({
+        contents: [{
+          uri,
+          mimeType: CHATGPT_CONSENT_WIDGET_MIME,
+          text: CHATGPT_CONSENT_WIDGET_HTML,
+          _meta: CHATGPT_CONSENT_WIDGET_RESOURCE_META,
+        }],
+      }),
+    );
+  };
+  registerConsentWidgetResource("c2ct-consent-widget", CHATGPT_CONSENT_WIDGET_URI);
+  registerConsentWidgetResource("c2ct-consent-widget-lab-cache-bust", CHATGPT_CONSENT_WIDGET_LAB_URI);
+  registerConsentWidgetResource(CHATGPT_OPERATION_APPROVAL_WIDGET_RESOURCE_NAME, CHATGPT_OPERATION_APPROVAL_WIDGET_URI);
+  CHATGPT_CONSENT_WIDGET_LEGACY_URIS.forEach((uri, index) => {
+    registerConsentWidgetResource(`c2ct-consent-widget-legacy-${index + 1}`, uri);
+  });
+
+  registerTool(
+    CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL,
+    {
+      title: "Show C2CT operation approval",
+      description: "Render one session-bound pending C2CT operation approval through the v9 approval presenter. The presenter is versioned so iOS cannot silently reuse an older host-mounted approval resource after a runtime update.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        ...chatGptToolMeta("Opening C2CT operation approval...", "C2CT operation approval opened"),
+        // Keep the versioned resource on the tool declaration itself. iOS has
+        // ignored per-result outputTemplate/resourceUri overrides for already
+        // mounted presenters, so the static declaration is the cache boundary.
+        "openai/outputTemplate": CHATGPT_OPERATION_APPROVAL_WIDGET_URI,
+        "openai/widgetAccessible": true,
+        ui: { visibility: ["model", "app"], resourceUri: CHATGPT_OPERATION_APPROVAL_WIDGET_URI },
+      },
+      inputSchema: {
+        requestId: z.string().regex(/^op_[0-9a-fA-F-]{36}$/u),
+      },
+    },
+    async (input) => withErrorMapping(ctx, CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL, { requestId: input.requestId }, async () => {
+      if (!ctx.sessionScope) {
+        throw new DomainError(ErrorCode.PERMISSION_DENIED, "Operation approval presenter requires a ChatGPT session scope");
+      }
+      const remembered = chatGptOperationApprovalPresenterRequests.get(ctx.sessionScope);
+      if (!remembered || remembered.requestId !== input.requestId) {
+        throw new DomainError(ErrorCode.PERMISSION_DENIED, "Operation approval request is not bound to this ChatGPT session", {
+          requestId: input.requestId,
+        });
+      }
+      const approvalRequest = (await listOperationApprovalRequests(ctx.stateDir))
+        .find((candidate) => candidate.requestId === input.requestId);
+      if (!approvalRequest ||
+          approvalRequest.status !== "pending" ||
+          approvalRequest.tool !== remembered.tool ||
+          approvalRequest.approvalSurface !== "chatgpt-widget") {
+        chatGptOperationApprovalPresenterRequests.delete(ctx.sessionScope);
+        throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Operation approval request is no longer pending for this session", {
+          requestId: input.requestId,
+          actionStarted: false,
+          subprocessStarted: false,
+        });
+      }
+      const token = mintChatGptWidgetApprovalToken({
+        requestId: approvalRequest.requestId,
+        sessionScope: ctx.sessionScope,
+        expiresAt: approvalRequest.expiresAt,
+      });
+      const result = makeResult<Record<string, unknown>>(
+        {
+          requestId: approvalRequest.requestId,
+          status: "pending",
+          approvalKind: "operation",
+          approvalChannel: "chatgpt-widget",
+          decisionTool: "chatgpt_operation_approval_decide",
+          operationTool: remembered.tool,
+          preview: approvalRequest.preview,
+          summary: approvalRequest.summary ?? approvalRequest.preview,
+          impact: approvalRequest.impact,
+          details: approvalRequest.details,
+          expiresAt: approvalRequest.expiresAt,
+          replayExactInputAfterApproval: true,
+          actionStarted: false,
+          subprocessStarted: false,
+          sideEffects: "approval-state-only",
+          allowFollowUpPrompt: remembered.allowFollowUpPrompt,
+          denyFollowUpPrompt: remembered.denyFollowUpPrompt,
+          ...(remembered.extra ?? {}),
+        },
+        `${remembered.tool} approval opened in the versioned C2CT v9 operation approval presenter.`,
+      );
+      result._meta = {
+        ...(result._meta ?? {}),
+        ui: { resourceUri: CHATGPT_OPERATION_APPROVAL_WIDGET_URI },
+        "openai/outputTemplate": CHATGPT_OPERATION_APPROVAL_WIDGET_URI,
+        [CHATGPT_CONSENT_META_KEY]: { token },
+      };
+      return result;
+    }),
+  );
+
+  s.registerResource(
+    "c2ct-widget-capability-lab",
+    CHATGPT_WIDGET_CAPABILITY_LAB_URI,
+    {
+      title: "C2CT Widget Capability Lab",
+      description: "Renders a safe in-chat lab for host capabilities, widget actions, layout behavior, and model-blind synthetic input experiments.",
+      mimeType: CHATGPT_WIDGET_CAPABILITY_LAB_MIME,
+      _meta: CHATGPT_WIDGET_CAPABILITY_LAB_RESOURCE_META,
+    },
+    async () => ({
+      contents: [{
+        uri: CHATGPT_WIDGET_CAPABILITY_LAB_URI,
+        mimeType: CHATGPT_WIDGET_CAPABILITY_LAB_MIME,
+        text: CHATGPT_WIDGET_CAPABILITY_LAB_HTML,
+        _meta: CHATGPT_WIDGET_CAPABILITY_LAB_RESOURCE_META,
+      }],
+    }),
+  );
+
+  registerTool(
+    "chatgpt_widget_capability_lab",
+    {
+      title: "Prepare C2CT Widget Capability Lab",
+      description: "Prepare the safe C2CT Widget Capability Lab state for rendering through the shared host-mounted presenter. The opener itself intentionally has no standalone output template.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: chatGptToolMeta("Preparing C2CT Widget Capability Lab...", "C2CT Widget Capability Lab prepared"),
+      inputSchema: {},
+    },
+    async () => withErrorMapping(ctx, "chatgpt_widget_capability_lab", {}, async () => {
+      rememberChatGptPresenter(ctx, "widget-capability-lab");
+      return makeResult<Record<string, unknown>>(
+        {
+          labVersion: 1,
+          sideEffects: "none",
+          syntheticSecretExample: "banana-7291-test",
+          presentWith: "chatgpt_widget_lab_presenter",
+          cardRendered: false,
+        },
+        "C2CT Widget Capability Lab is ready; call chatgpt_widget_lab_presenter to render it through its dedicated host-mounted presenter.",
+      );
+    }),
+  );
+
+  registerTool(
+    "chatgpt_widget_lab_presenter",
+    {
+      title: "Show C2CT Widget Capability Lab",
+      description: "Render the safe C2CT Widget Capability Lab through a dedicated host-mounted presenter whose output template is statically bound to the Lab resource revision.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        ...chatGptToolMeta("Opening C2CT Widget Capability Lab...", "C2CT Widget Capability Lab opened"),
+        // Regression guard: keep the Lab resource on the tool declaration itself.
+        // iOS ChatGPT was observed ignoring per-result outputTemplate/resourceUri
+        // overrides and continuing to render the presenter tool's declared URI.
+        "openai/outputTemplate": CHATGPT_CONSENT_WIDGET_LAB_URI,
+        "openai/widgetAccessible": true,
+        ui: { visibility: ["model", "app"], resourceUri: CHATGPT_CONSENT_WIDGET_LAB_URI },
+      },
+      inputSchema: {},
+    },
+    async () => withErrorMapping(ctx, "chatgpt_widget_lab_presenter", {}, async () => {
+      const presenterKind = consumeChatGptPresenter(ctx) as string | undefined;
+      if (presenterKind && presenterKind !== "widget-capability-lab") {
+        throw new DomainError(ErrorCode.INVALID_ARGUMENT, "Another C2CT presenter is pending for this ChatGPT session");
+      }
+      const runtimeManifest = getRuntimeManifest();
+      return makeResult<Record<string, unknown>>(
+        {
+          presentationKind: "widget-capability-lab",
+          labVersion: 1,
+          presenterUiVersion: CHATGPT_CONSENT_WIDGET_LAB_VERSION,
+          presenterResourceUri: CHATGPT_CONSENT_WIDGET_LAB_URI,
+          runtimeVersion: process.env.CHATGPT2CODEX_RUNTIME_VERSION ?? "development",
+          runtimeFingerprint: runtimeManifest.runtimeFingerprint,
+          toolSchemaRevision: runtimeManifest.toolSchemaRevision,
+          sideEffects: "none",
+        },
+        "C2CT Widget Capability Lab opened through its dedicated in-chat presenter.",
+      );
+    }),
+  );
+
+  registerTool(
+    "chatgpt_widget_lab_action",
+    {
+      title: "Run C2CT Widget Capability Lab app action",
+      description: "App-only callback used by the C2CT Widget Capability Lab. It never persists or returns plaintext synthetic secret input.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        securitySchemes: CHATGPT2CODEX_SECURITY_SCHEMES,
+        ui: { visibility: ["app"] },
+        "openai/widgetAccessible": true,
+        "openai/visibility": "private",
+      },
+      inputSchema: {
+        action: z.enum(["ping", "secret-relay"]),
+        secretValue: z.string().min(1).max(128).optional(),
+      },
+    },
+    async (input) => withErrorMapping(ctx, "chatgpt_widget_lab_action", { action: input.action }, async () => {
+      if (input.action === "ping") {
+        return makeResult<Record<string, unknown>>(
+          { ok: true, action: "ping", sideEffects: "none" },
+          "Widget Lab app-only server callback reached C2CT.",
+        );
+      }
+
+      const shellChoice = input.action === "secret-relay" && input.secretValue
+        ? decodeChatGptWidgetChoiceTransport(input.secretValue)
+        : undefined;
+      if (shellChoice) {
+        if (!ctx.sessionScope) throw new DomainError(ErrorCode.PERMISSION_DENIED, "Widget Shell action requires a ChatGPT session scope");
+        const result = resolveChatGptWidgetChoice({
+          sessionScope: ctx.sessionScope,
+          cardId: shellChoice.cardId,
+          choiceId: shellChoice.choiceId,
+        });
+        return makeResult<Record<string, unknown>>(
+          {
+            ok: true,
+            action: "shell-choice",
+            receiptId: result.receiptId,
+            sideEffects: "selection-state-only",
+          },
+          "Widget Shell choice was validated through the compatibility app callback.",
+        );
+      }
+
+      const secretValue = input.secretValue;
+      if (!secretValue) {
+        throw new DomainError(ErrorCode.INVALID_ARGUMENT, "secretValue is required for the Widget Lab synthetic relay");
+      }
+      return makeResult<Record<string, unknown>>(
+        {
+          ok: true,
+          action: "secret-relay",
+          ...summarizeWidgetLabSyntheticSecret(secretValue),
+          sideEffects: "none",
+        },
+        "Widget Lab synthetic input relay verified without returning plaintext.",
+      );
+    }),
+  );
+
+  registerTool(
+    "chatgpt_widget_shell",
+    {
+      title: "Open C2CT Widget Shell",
+      description: "Create a reusable C2CT in-chat interaction card. Version 1 supports a server-defined choice card and reuses the shared host-mounted presenter so later UI primitives can be added without adding another widget resource.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: chatGptToolMeta("Preparing C2CT interaction...", "C2CT interaction prepared"),
+      inputSchema: {
+        kind: z.literal("choice").default("choice"),
+        title: z.string().min(1).max(80),
+        prompt: z.string().min(1).max(240),
+        options: z.array(z.object({
+          id: z.string().regex(/^[A-Za-z0-9._:-]{1,40}$/u),
+          label: z.string().min(1).max(80),
+          description: z.string().max(160).optional(),
+        })).min(2).max(5),
+      },
+    },
+    async (input) => withErrorMapping(ctx, "chatgpt_widget_shell", { kind: input.kind, optionCount: input.options.length }, async () => {
+      if (!ctx.sessionScope) throw new DomainError(ErrorCode.PERMISSION_DENIED, "Widget Shell requires a ChatGPT session scope");
+      const card = createChatGptWidgetChoiceCard({
+        sessionScope: ctx.sessionScope,
+        title: input.title,
+        prompt: input.prompt,
+        options: input.options,
+      });
+      rememberChatGptPresenter(ctx, "widget-shell-choice" as "widget-capability-lab");
+      return makeResult<Record<string, unknown>>(
+        {
+          shellVersion: 1,
+          presentationKind: "widget-shell-choice",
+          card,
+          presentWith: "chatgpt_consent_probe",
+          cardRendered: false,
+          sideEffects: "interaction-state-only",
+        },
+        "C2CT Widget Shell choice card is ready; call chatgpt_consent_probe to render it through the shared presenter.",
+      );
+    }),
+  );
+
+  registerTool(
+    "chatgpt_widget_shell_action",
+    {
+      title: "Run C2CT Widget Shell app action",
+      description: "Private app-only callback for a rendered C2CT Widget Shell card. The server validates that the selected option belongs to the exact session-bound card before issuing a receipt.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        securitySchemes: CHATGPT2CODEX_SECURITY_SCHEMES,
+        ui: { visibility: ["app"] },
+        "openai/widgetAccessible": true,
+        "openai/visibility": "private",
+      },
+      inputSchema: {
+        action: z.literal("choose"),
+        cardId: z.string().regex(/^wcc_[0-9a-fA-F-]{36}$/u),
+        choiceId: z.string().regex(/^[A-Za-z0-9._:-]{1,40}$/u),
+      },
+    },
+    async (input) => withErrorMapping(ctx, "chatgpt_widget_shell_action", { action: input.action, cardId: input.cardId, choiceId: input.choiceId }, async () => {
+      if (!ctx.sessionScope) throw new DomainError(ErrorCode.PERMISSION_DENIED, "Widget Shell action requires a ChatGPT session scope");
+      const result = resolveChatGptWidgetChoice({
+        sessionScope: ctx.sessionScope,
+        cardId: input.cardId,
+        choiceId: input.choiceId,
+      });
+      return makeResult<Record<string, unknown>>(
+        {
+          ok: true,
+          action: "choose",
+          receiptId: result.receiptId,
+          sideEffects: "selection-state-only",
+        },
+        "Widget Shell choice was validated by C2CT and a receipt was issued.",
+      );
+    }),
+  );
+
+  registerTool(
+    "chatgpt_widget_shell_result",
+    {
+      title: "Read C2CT Widget Shell result",
+      description: "Read one session-bound Widget Shell choice result by its receiptId or the original cardId already known to the model.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: chatGptToolMeta("Reading C2CT interaction result...", "C2CT interaction result loaded"),
+      inputSchema: {
+        receiptId: z.string().regex(/^wcr_[0-9a-fA-F-]{36}$/u).optional(),
+        cardId: z.string().regex(/^wcc_[0-9a-fA-F-]{36}$/u).optional(),
+      },
+    },
+    async (input) => withErrorMapping(ctx, "chatgpt_widget_shell_result", { receiptId: input.receiptId, cardId: input.cardId }, async () => {
+      if (!ctx.sessionScope) throw new DomainError(ErrorCode.PERMISSION_DENIED, "Widget Shell result requires a ChatGPT session scope");
+      if (!input.receiptId && !input.cardId) throw new DomainError(ErrorCode.INVALID_ARGUMENT, "Widget Shell result requires a receiptId or cardId");
+      const result = getChatGptWidgetChoiceResult({ sessionScope: ctx.sessionScope, receiptId: input.receiptId, cardId: input.cardId });
+      return makeResult<Record<string, unknown>>(
+        { ok: true, kind: "choice", ...result, sideEffects: "none" },
+        `Widget Shell choice result: ${result.choiceLabel}.`,
+      );
+    }),
+  );
+
+
+  registerTool(
+    "chatgpt_host_approval_probe",
+    {
+      title: "Confirm harmless C2CT host approval probe",
+      description:
+        "Harmless probe for ChatGPT's native MCP Confirm/Deny surface. This tool changes no project files, local state, processes, runtime, app, connector, tunnel, or network state. Its non-read-only/destructive annotation intentionally asks the ChatGPT host to require confirmation before the call reaches C2CT.",
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: false,
+      },
+      _meta: chatGptToolMeta("Confirming harmless C2CT approval probe...", "Harmless C2CT approval probe confirmed"),
+      inputSchema: {},
+    },
+    async () => withErrorMapping(ctx, "chatgpt_host_approval_probe", {}, async () => {
+      return makeResult<Record<string, unknown>>(
+        {
+          hostApprovalReached: true,
+          sideEffects: "none",
+        },
+        "Harmless C2CT host approval probe reached the runtime after ChatGPT confirmation.",
+      );
+    }),
+  );
+
+  registerTool(
+    "chatgpt_consent_probe",
+    {
+      title: "Show C2CT in-chat confirmation",
+      description: "Render the current pending C2CT operation approval for this ChatGPT conversation when one exists; otherwise render a harmless allow/deny probe.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: {
+        ...chatGptToolMeta("Opening C2CT confirmation...", "C2CT confirmation opened"),
+        "openai/outputTemplate": CHATGPT_CONSENT_WIDGET_URI,
+        "openai/widgetAccessible": true,
+        ui: { visibility: ["model", "app"], resourceUri: CHATGPT_CONSENT_WIDGET_URI },
+      },
+      inputSchema: {},
+    },
+    async () => withErrorMapping(ctx, "chatgpt_consent_probe", {}, async () => {
+      const presenterKind = consumeChatGptPresenter(ctx) as string | undefined;
+      if (presenterKind === "widget-shell-choice") {
+        if (!ctx.sessionScope) throw new DomainError(ErrorCode.PERMISSION_DENIED, "Widget Shell presenter requires a ChatGPT session scope");
+        const card = getCurrentChatGptWidgetChoiceCard({ sessionScope: ctx.sessionScope });
+        if (!card) throw new DomainError(ErrorCode.INVALID_ARGUMENT, "Widget Shell card was not found or expired");
+        const result = makeResult<Record<string, unknown>>(
+          {
+            presentationKind: presenterKind,
+            shellVersion: 1,
+            card,
+            sideEffects: "none",
+          },
+          "C2CT Widget Shell choice card opened through the shared in-chat presenter.",
+        );
+        result._meta = {
+          ...(result._meta ?? {}),
+          ui: { resourceUri: CHATGPT_CONSENT_WIDGET_URI },
+          "openai/outputTemplate": CHATGPT_CONSENT_WIDGET_URI,
+        };
+        return result;
+      }
+      if (presenterKind === "widget-capability-lab") {
+        const runtimeManifest = getRuntimeManifest();
+        const result = makeResult<Record<string, unknown>>(
+          {
+            presentationKind: presenterKind,
+            labVersion: 1,
+            // Deliberately expose both the server-expected presenter revision and
+            // live runtime identity. The HTML also bakes in its own UI revision,
+            // so one screenshot can prove whether ChatGPT rendered cached JS.
+            presenterUiVersion: CHATGPT_CONSENT_WIDGET_LAB_VERSION,
+            presenterResourceUri: CHATGPT_CONSENT_WIDGET_LAB_URI,
+            runtimeVersion: process.env.CHATGPT2CODEX_RUNTIME_VERSION ?? "development",
+            runtimeFingerprint: runtimeManifest.runtimeFingerprint,
+            toolSchemaRevision: runtimeManifest.toolSchemaRevision,
+            sideEffects: "none",
+          },
+          "C2CT Widget Capability Lab opened through the shared in-chat presenter.",
+        );
+        result._meta = {
+          ...(result._meta ?? {}),
+          // Do not reuse the default presenter URI here. iOS ChatGPT may cache
+          // widget HTML/JS by URI across fresh presenter instances even after a
+          // runtime replacement, so Lab diagnostics use a dedicated versioned
+          // alias while the normal consent and Widget Shell contracts stay stable.
+          ui: { resourceUri: CHATGPT_CONSENT_WIDGET_LAB_URI },
+          "openai/outputTemplate": CHATGPT_CONSENT_WIDGET_LAB_URI,
+        };
+        return result;
+      }
+      const remembered = ctx.sessionScope
+        ? chatGptPendingOperationBySession.get(ctx.sessionScope)
+        : undefined;
+      if (remembered) {
+        const approvalRequest = (await listOperationApprovalRequests(ctx.stateDir))
+          .find((candidate) => candidate.requestId === remembered.requestId);
+        if (approvalRequest &&
+            approvalRequest.status === "pending" &&
+            approvalRequest.tool === remembered.tool &&
+            approvalRequest.approvalSurface === "chatgpt-widget") {
+          const token = mintChatGptWidgetApprovalToken({
+            requestId: approvalRequest.requestId,
+            sessionScope: ctx.sessionScope,
+            expiresAt: approvalRequest.expiresAt,
+          });
+          const result = makeResult<Record<string, unknown>>(
+            {
+              requestId: approvalRequest.requestId,
+              status: "pending",
+              approvalKind: "operation",
+              approvalChannel: "chatgpt-widget",
+              decisionTool: "chatgpt_operation_approval_decide",
+              operationTool: remembered.tool,
+              preview: approvalRequest.preview,
+              summary: approvalRequest.summary ?? approvalRequest.preview,
+              impact: approvalRequest.impact,
+              details: approvalRequest.details,
+              expiresAt: approvalRequest.expiresAt,
+              replayExactInputAfterApproval: true,
+              actionStarted: false,
+              subprocessStarted: false,
+              sideEffects: "approval-state-only",
+              allowFollowUpPrompt: remembered.allowFollowUpPrompt,
+              denyFollowUpPrompt: remembered.denyFollowUpPrompt,
+              ...(remembered.extra ?? {}),
+            },
+            `${remembered.tool} approval opened in the C2CT in-chat confirmation card.`,
+          );
+          result._meta = {
+            ...(result._meta ?? {}),
+            ui: { resourceUri: CHATGPT_CONSENT_WIDGET_URI },
+            "openai/outputTemplate": CHATGPT_CONSENT_WIDGET_URI,
+            [CHATGPT_CONSENT_META_KEY]: { token },
+          };
+          return result;
+        }
+        forgetChatGptPendingOperation(ctx, remembered.requestId);
+      }
+      const probe = createChatGptConsentProbe({ sessionScope: ctx.sessionScope });
+      const token = mintChatGptWidgetApprovalToken({
+        requestId: probe.requestId,
+        sessionScope: ctx.sessionScope,
+        expiresAt: probe.expiresAt,
+      });
+      const result = makeResult<Record<string, unknown>>(
+        {
+          requestId: probe.requestId,
+          status: probe.status,
+          preview: "무해한 C2CT 인라인 확인 테스트 · 실제 로컬 변경 없음",
+          expiresAt: probe.expiresAt,
+          sideEffects: "none",
+        },
+        "Harmless C2CT in-chat confirmation probe opened.",
+      );
+      result._meta = {
+        ...(result._meta ?? {}),
+        ui: { resourceUri: CHATGPT_CONSENT_WIDGET_URI },
+        "openai/outputTemplate": CHATGPT_CONSENT_WIDGET_URI,
+        [CHATGPT_CONSENT_META_KEY]: { token },
+      };
+      return result;
+    }),
+  );
+
+  registerTool(
+    "chatgpt_consent_probe_decide",
+    {
+      title: "Resolve harmless in-chat confirmation probe",
+      description: "Widget-only callback for the harmless C2CT confirmation probe.",
+      annotations: LOCAL_WRITE_ANNOTATIONS,
+      _meta: {
+        securitySchemes: CHATGPT2CODEX_SECURITY_SCHEMES,
+        ui: { visibility: ["app"] },
+        "openai/widgetAccessible": true,
+        "openai/visibility": "private",
+      },
+      inputSchema: {
+        requestId: z.string().regex(/^consent_[0-9a-fA-F-]{36}$/),
+        token: z.string().min(20).max(200),
+        decision: z.enum(["allow", "deny"]),
+      },
+    },
+    async (input) => withErrorMapping(ctx, "chatgpt_consent_probe_decide", { requestId: input.requestId, decision: input.decision }, async () => {
+      getChatGptConsentProbe({ requestId: input.requestId, sessionScope: ctx.sessionScope });
+      consumeChatGptWidgetApprovalToken({
+        requestId: input.requestId,
+        token: input.token,
+        sessionScope: ctx.sessionScope,
+      });
+      const resolved = resolveChatGptConsentProbe({
+        requestId: input.requestId,
+        decision: input.decision,
+        sessionScope: ctx.sessionScope,
+      });
+      return makeResult<Record<string, unknown>>(
+        { requestId: resolved.requestId, status: resolved.status, sideEffects: "none" },
+        `C2CT in-chat confirmation probe ${resolved.status}.`,
+      );
+    }),
+  );
+
+  registerTool(
+    "chatgpt_operation_approval_decide",
+    {
+      title: "Resolve one ChatGPT operation approval",
+      description: "Widget-only callback that resolves one exact C2CT operation approval request. Currently limited to verified_local_file_apply.",
+      annotations: LOCAL_STATE_ANNOTATIONS,
+      _meta: {
+        securitySchemes: CHATGPT2CODEX_SECURITY_SCHEMES,
+        ui: { visibility: ["app"] },
+        "openai/widgetAccessible": true,
+        "openai/visibility": "private",
+      },
+      inputSchema: {
+        requestId: z.string().regex(/^op_[0-9a-fA-F-]{36}$/),
+        token: z.string().min(20).max(200),
+        decision: z.enum(["allow", "deny"]),
+      },
+    },
+    async (input) => withErrorMapping(ctx, "chatgpt_operation_approval_decide", { requestId: input.requestId, decision: input.decision }, async () => {
+      const request = (await listOperationApprovalRequests(ctx.stateDir))
+        .find((candidate) => candidate.requestId === input.requestId);
+      if (!request) {
+        throw new DomainError(ErrorCode.OPERATION_NOT_FOUND, "C2CT operation approval request not found", { requestId: input.requestId });
+      }
+      if (!isChatGptWidgetApprovableOperationTool(request.tool)) {
+        throw new DomainError(ErrorCode.PERMISSION_DENIED, "ChatGPT operation approval widget cannot authorize this tool", {
+          requestId: input.requestId,
+          tool: request.tool,
+        });
+      }
+      consumeChatGptWidgetApprovalToken({
+        requestId: input.requestId,
+        token: input.token,
+        sessionScope: ctx.sessionScope,
+      });
+      const resolved = await resolveOperationApprovalRequest({
+        stateDir: ctx.stateDir,
+        requestId: input.requestId,
+        decision: input.decision === "allow" ? "approve" : "reject",
+        approvedVia: "chatgpt-widget",
+      });
+      forgetChatGptPendingOperation(ctx, input.requestId);
+      return makeResult<Record<string, unknown>>(
+        {
+          requestId: resolved.requestId,
+          status: resolved.status,
+          tool: resolved.tool,
+          approvedVia: resolved.approvedVia ?? null,
+          sideEffects: "approval-state-only",
+        },
+        `C2CT operation approval ${resolved.status}.`,
+      );
+    }),
+  );
+
+  registerTool(
+    "chatgpt_consent_probe_status",
+    {
+      title: "Check harmless in-chat confirmation probe",
+      description: "Read the result of one harmless C2CT in-chat confirmation probe.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: chatGptToolMeta("Checking C2CT confirmation...", "C2CT confirmation checked"),
+      inputSchema: { requestId: z.string().regex(/^consent_[0-9a-fA-F-]{36}$/) },
+    },
+    async (input) => withErrorMapping(ctx, "chatgpt_consent_probe_status", input, async () => {
+      const probe = getChatGptConsentProbe({ requestId: input.requestId, sessionScope: ctx.sessionScope });
+      return makeResult<Record<string, unknown>>(
+        { requestId: probe.requestId, status: probe.status, expiresAt: probe.expiresAt, sideEffects: "none" },
+        `C2CT in-chat confirmation probe is ${probe.status}.`,
+      );
+    }),
+  );
+
   const outputResourceTemplate = new ResourceTemplate("chatgpt2codex://outputs/{outputRef}", {
     list: async () => {
       const session = await loadSession(ctx);
@@ -2203,7 +3108,11 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       return withErrorMapping(ctx, "agent_guide", input, async () => {
         const nativeE2eSupported = isNativeE2eSupported();
         const multiProjectLanesEnabled = ctx.config.multiProjectLanesEnabled === true;
-        const mobileApproval = await mobileApprovalStatus(ctx.stateDir);
+        const [mobileApproval, schemaRecoveryState] = await Promise.all([
+          mobileApprovalStatus(ctx.stateDir),
+          readToolSchemaRecoveryState(ctx.stateDir),
+        ]);
+        const schemaRecovery = schemaRecoveryState.plan;
         const nativeFirstClient = isNativeFirstClient(ctx);
         const verificationTools = nativeE2eSupported
           ? ["command_list", ...(canRunLocalShell ? ["local_shell_run"] : []), "e2e_test_and_show_screenshot", "e2e_start_server", "e2e_run_command", "e2e_screenshot"]
@@ -2225,6 +3134,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                 ? "Use connection_status or the desktop app's Connection Diagnostics menu."
                 : "Connection diagnostics are unavailable on this transport.",
             },
+            schemaRecovery,
             clientToolPolicy: nativeFirstClient
               ? {
                   mode: "native-first",
@@ -2398,7 +3308,9 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                   "file_edit_lines for redaction-safe line-addressed edits; file_apply_patch/file_create for ordinary controlled edits",
                   "For a predeclared integrity-verified fixed local artifact install, use verified_local_file_apply with only operationSpecId; do not express that operation as command_run, argv, or caller-supplied source/destination paths.",
                   "Remote response-latency rule: never keep one MCP request open while a subprocess, human approval, live session, or readiness condition may run long. Remote command_run and e2e_run_command are forced into persisted background handoff even if synchronous execution is requested. Protected remote approvals return promptly; after the user approves, replay the exact same input so the approved fingerprint is consumed, then poll operation_status with short calls. If a screenshot was requested, capture it only after the background operation is terminal. After any client timeout/cancellation, inspect the exact operation/receipt before deciding whether to retry.",
-                  "Runtime schema freshness rule: after runtime replacement, re-run connection_status -> agent_guide and revalidate tools/list. If the host still exposes a stale named-tool schema, fetch the live schema with tool_schema_get (or c2ct_invoke targeting tool_schema_get when that named tool is itself missing) and execute the operation through stable c2ct_invoke until the host refreshes its mounted catalog.",
+                  schemaRecovery.mode === "stable-dispatcher-preferred"
+                    ? "Automatic schema routing: connection_status/agent_guide reports stable-dispatcher-preferred because a schema-changing runtime apply has not yet been followed by an observed current tools/list fetch. After bootstrap, route public operations through stable c2ct_invoke by default. Keep named bootstrap reads only when their mounted schema accepts the input. Do not re-register the bare /mcp connector."
+                    : "Automatic schema routing: connection_status/agent_guide reports named-tools-preferred, so use named tools normally. If a named call is rejected before runtime dispatch, immediately fall back to tool_schema_get + c2ct_invoke without connector re-registration.",
                   ...(canRunLocalShell ? ["local_shell_run for local-only Codex-style commands inside the selected project"] : []),
                   ...e2eWorkflow,
                   "repo_status/repo_diff_summary, then git_commit and git_push when explicitly requested",
@@ -2459,7 +3371,9 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                 "Apply redaction-safe changes with file_edit_lines when displayed context contains [REDACTED]; otherwise use file_apply_patch or file_create. Never hand the user a script to paste when the action bridge is reachable.",
                 "Use verified_local_file_apply for predeclared integrity-verified fixed local artifact installs; its dedicated schema intentionally has no command, argv, raw source path, or raw destination path fields.",
                 `Use command_run${canRunLocalShell ? " or local-only local_shell_run" : ""} for verification. On remote ChatGPT/MCP, never wait inside one tool request for subprocess completion or human approval: command_run and e2e_run_command are code-forced to persisted background execution even when synchronous is requested. A protected remote approval returns immediately; after approval, replay the exact same input, then poll operation_status with short calls until terminal. Do not use foreground sleep/wait commands to keep a request alive. If visual proof is needed, capture it after the background command is terminal. After timeout/cancellation, inspect the exact operation/receipt and never blind-retry.`,
-                "After runtime replacement, treat a host-mounted named tool schema as potentially stale until revalidated. Use tool_schema_get for the live definition and stable c2ct_invoke for execution; if tool_schema_get is absent from the mounted catalog, invoke tool_schema_get through c2ct_invoke itself.",
+                schemaRecovery.mode === "stable-dispatcher-preferred"
+                  ? "Schema routing is currently stable-dispatcher-preferred. Use c2ct_invoke by default for public operations until connection_status reports named-tools-preferred; use c2ct_invoke targeting tool_schema_get if the named schema helper itself is stale or absent."
+                  : "Schema routing is currently named-tools-preferred. Use named tools normally and keep tool_schema_get + c2ct_invoke as the correctness fallback for host-side stale-schema failures.",
                 "Use repo status/diff/show changes and then commit/push only when requested.",
               ],
               imageSaveFlow: [
@@ -2662,7 +3576,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Get runtime apply status",
       description:
-        "Read one persisted runtime replacement receipt by exact operationId or requestId. This never changes the active runtime, app, connector, tunnel, or supervisor.",
+        "Read one persisted runtime replacement receipt by exact operationId or requestId. When a runtime approval has already been granted in the menu-bar UI, this status also reports that the exact same runtime_apply_local request is ready to resume. This never changes the active runtime, app, connector, tunnel, or supervisor.",
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: chatGptToolMeta("Checking runtime apply status...", "Runtime apply status loaded"),
       inputSchema: {
@@ -2686,9 +3600,27 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             projectId: input.projectId,
           });
         }
+        const approvalRequest = receipt.approvalRequestId
+          ? (await listOperationApprovalRequests(ctx.stateDir)).find((request) => request.requestId === receipt.approvalRequestId)
+          : undefined;
+        const approvalReadyToResume = receipt.state === "APPROVAL_REQUIRED"
+          && approvalRequest?.status === "approved"
+          && approvalRequest.approvedVia === "menu-bar-ui";
+        const publicReceipt = runtimeApplyPublicReceipt(receipt);
+        const approvalPlan = approvalBrokerPlan(RUNTIME_APPLY_PROVIDER_ORDER);
         return makeResult(
-          runtimeApplyPublicReceipt(receipt),
-          `Runtime apply ${receipt.operationId}: ${receipt.state}.`,
+          {
+            ...publicReceipt,
+            ...approvalPlan,
+            approvalProvider: approvalPlan.selectedProvider,
+            approvalStatus: approvalRequest?.status ?? (receipt.approvalRequestId ? "missing" : "not-requested"),
+            approvalApprovedVia: approvalRequest?.approvedVia ?? null,
+            approvalReadyToResume,
+            ...(approvalReadyToResume ? { recommendedAction: "retry-same-runtime-apply-request" } : {}),
+          },
+          approvalReadyToResume
+            ? `Runtime apply ${receipt.operationId}: menu-bar approval granted; retry the exact same runtime_apply_local request to resume activation.`
+            : `Runtime apply ${receipt.operationId}: ${receipt.state}.`,
         );
       });
     },
@@ -2699,7 +3631,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Request safe local runtime apply",
       description:
-        "Validate and request an idempotent runtime-only replacement. Requires a full-write lease plus a one-time approval clicked by the user in the installed ChatGPT To Codex menu-bar UI; generic local-control approval cannot authorize it. The fixed worker preserves the supervisor, app, connector, cloudflared/Tailscale topology, and rolls back on failed health checks.",
+        "Validate and request an idempotent runtime-only replacement. Approval is routed through the C2CT Approval Broker. Host-native ChatGPT approval is preferred when a trusted host authorization event is actually available; until then the broker fails closed to the installed ChatGPT To Codex menu-bar approval provider. Conversational answers, generic local-control approval, and Computer Use confirmations cannot authorize this operation. After approval is granted, call runtime_apply_local again with the exact same requestId and unchanged target parameters to resume the same transaction; runtime_apply_status exposes provider/fallback metadata and reports approvalReadyToResume when replay is required. The fixed worker preserves the supervisor, app, connector, cloudflared/Tailscale topology, and rolls back on failed health checks.",
       annotations: LOCAL_WRITE_ANNOTATIONS,
       _meta: chatGptToolMeta("Preparing safe runtime replacement...", "Runtime replacement request recorded"),
       inputSchema: {
@@ -2781,37 +3713,69 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           );
         }
 
-        let authorization: Awaited<ReturnType<typeof ensureOperationAuthorized>>;
-        try {
-          authorization = await ensureOperationAuthorized({
-            stateDir: ctx.stateDir,
-            lease,
-            tool: "runtime_apply_local",
-            risk: "destructive",
-            operation: {
-              requestId: input.requestId,
-              operationId: prepared.receipt.operationId,
-              expectedCurrentFingerprint: input.expectedCurrentFingerprint,
-              targetFingerprint: input.targetFingerprint,
-              preserveConnector: true,
-            },
-            preview: `Apply verified runtime ${input.targetFingerprint.slice(0, 12)} for ${entry.projectId}; preserve connector/tunnel`,
-            requiredApprovalVia: "menu-bar-ui",
-          });
-        } catch (error) {
-          if (error instanceof DomainError && error.code === ErrorCode.APPROVAL_REQUIRED) {
-            const approvalRequestId = typeof error.details?.requestId === "string" ? error.details.requestId : null;
-            const receipt = approvalRequestId
-              ? await markRuntimeApplyApprovalRequired(ctx.stateDir, prepared.receipt.operationId, approvalRequestId)
-              : prepared.receipt;
-            return makeResult(
-              runtimeApplyPublicReceipt(receipt),
-              `Runtime apply ${receipt.operationId} requires explicit local approval.`,
-            );
+        const approvalOperation = {
+          requestId: input.requestId,
+          operationId: prepared.receipt.operationId,
+          expectedCurrentFingerprint: input.expectedCurrentFingerprint,
+          targetFingerprint: input.targetFingerprint,
+          preserveConnector: true,
+        };
+        let authorization: {
+          requestId: string;
+          scope: "once";
+          operationFingerprint: string;
+          approvalProvider: string;
+        } | null = authorizeDedicatedConsequentialAction({
+          ctx,
+          lease,
+          tool: "runtime_apply_local",
+          risk: "destructive",
+          operation: approvalOperation,
+          requestId: input.requestId,
+        });
+
+        if (authorization) {
+          await ctx.ledger.append({
+            type: "runtime.apply.approval",
+            provider: "chatgpt-host",
+            surface: "gpt-action",
+            operationId: prepared.receipt.operationId,
+            projectId: entry.projectId,
+          }).catch(() => undefined);
+        } else {
+          try {
+            authorization = await ensureBrokeredOperationAuthorized({
+              stateDir: ctx.stateDir,
+              lease,
+              tool: "runtime_apply_local",
+              risk: "destructive",
+              operation: approvalOperation,
+              preview: `Apply verified runtime ${input.targetFingerprint.slice(0, 12)} for ${entry.projectId}; preserve connector/tunnel`,
+              providerOrder: RUNTIME_APPLY_PROVIDER_ORDER,
+            });
+          } catch (error) {
+            if (error instanceof DomainError && error.code === ErrorCode.APPROVAL_REQUIRED) {
+              const approvalRequestId = typeof error.details?.requestId === "string" ? error.details.requestId : null;
+              const receipt = approvalRequestId
+                ? await attachRuntimeApplyApprovalRequest(ctx.stateDir, prepared.receipt.operationId, approvalRequestId)
+                : prepared.receipt;
+              return makeResult(
+                {
+                  ...runtimeApplyPublicReceipt(receipt),
+                  approvalProvider: error.details?.approvalProvider ?? "local-menu-bar",
+                  hostNativeApprovalAvailable: error.details?.hostNativeApprovalAvailable === true,
+                  approvalFallbackActive: error.details?.approvalFallbackActive === true,
+                },
+                `Runtime apply ${receipt.operationId} requires explicit approval via ${String(error.details?.approvalProvider ?? "local-menu-bar")}.`,
+              );
+            }
+            throw error;
           }
-          throw error;
         }
 
+        if (!authorization) {
+          throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Runtime apply authorization was not established");
+        }
         const postApprovalGate = await runtimeApplyGateSnapshot(ctx, entry, authorization.requestId);
         if (postApprovalGate.activeOperationCount > 0 || postApprovalGate.unrelatedPendingApprovalCount > 0) {
           const blocked = await markRuntimeApplyBlocked(ctx.stateDir, prepared.receipt.operationId);
@@ -2962,19 +3926,27 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         });
       }
 
-      const authorization = await ensureOperationAuthorized({
+      const approvalOperation = {
+        requestId: input.requestId,
+        installedPath: MACOS_APP_INSTALL_PATH,
+        bundleId: preflight.source.bundleId,
+        teamIdentifier: preflight.source.teamIdentifier,
+        mainExecutableSha256: preflight.source.mainExecutableSha256,
+        designatedRequirementSha256: preflight.source.designatedRequirementSha256,
+      };
+      const authorization = authorizeDedicatedConsequentialAction({
+        ctx,
+        lease,
+        tool: "macos_app_apply_local",
+        risk: "destructive",
+        operation: approvalOperation,
+        requestId: input.requestId,
+      }) ?? await ensureOperationAuthorized({
         stateDir: ctx.stateDir,
         lease,
         tool: "macos_app_apply_local",
         risk: "destructive",
-        operation: {
-          requestId: input.requestId,
-          installedPath: MACOS_APP_INSTALL_PATH,
-          bundleId: preflight.source.bundleId,
-          teamIdentifier: preflight.source.teamIdentifier,
-          mainExecutableSha256: preflight.source.mainExecutableSha256,
-          designatedRequirementSha256: preflight.source.designatedRequirementSha256,
-        },
+        operation: approvalOperation,
         preview: `Install verified ${preflight.source.bundleId} menu-bar app signed by team ${preflight.source.teamIdentifier}`,
       });
 
@@ -3176,7 +4148,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Get connection status",
       description:
-        "Return the current runtime platform, selected project lease, active operation elapsed state, and recent secret-free connection diagnostics. After a client cancellation, inspect diagnostics.clientCancellationRecovery before retrying the operation.",
+        "Return the current runtime platform, selected project lease, active operation elapsed state, automatic schema-recovery routing mode, and recent secret-free connection diagnostics. After a client cancellation, inspect diagnostics.clientCancellationRecovery before retrying the operation.",
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: chatGptToolMeta("Checking connection status...", "Connection status loaded"),
       inputSchema: {
@@ -3188,7 +4160,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         includeReceipts: z.boolean().optional(),
       },
     },
-    async (input) => {
+    async (input, extra) => {
       return withErrorMapping<Record<string, unknown>>(ctx, "connection_status", input, async () => {
         const compact = input.mode === "compact";
         const includeDiagnostics = !compact || input.includeDiagnostics === true;
@@ -3296,7 +4268,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           runtimeSnapshots,
           activeRuntimePointer,
           runtimeUpdateBarrier,
-          lastRuntimeApply,
+          schemaRecoveryState,
           lastMacosAppApply,
         ] = await Promise.all([
           activeBackgroundOperationsPromise,
@@ -3304,9 +4276,18 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           includeSnapshots ? runtimeSnapshotInventory(ctx.stateDir).catch(() => null) : Promise.resolve(null),
           includeSnapshots ? readActiveRuntimePointer(ctx.stateDir).catch(() => null) : Promise.resolve(null),
           getRuntimeUpdateBarrier(ctx.stateDir).catch(() => null),
-          includeReceipts ? getLatestRuntimeApplyReceipt(ctx.stateDir).catch(() => null) : Promise.resolve(null),
+          readToolSchemaRecoveryState(ctx.stateDir, runtimeManifest),
           includeReceipts ? getLatestMacosAppApplyReceipt(ctx.stateDir).catch(() => null) : Promise.resolve(null),
         ]);
+        const lastRuntimeApply = schemaRecoveryState.lastRuntimeApply;
+        const refreshNotifications = schemaRecoveryState.plan.mode === "stable-dispatcher-preferred"
+          ? await sendSchemaRefreshNotifications(extra)
+          : { attempted: false, sent: 0 };
+        const schemaRecovery = {
+          ...schemaRecoveryState.plan,
+          refreshNotificationsAttempted: refreshNotifications.attempted,
+          refreshNotificationsSent: refreshNotifications.sent,
+        };
         const privilegedProjectBlockers = await inspectPrivilegedProjectBlockers(ctx);
         const runtimeIdentityWarnings = [
           ...(runtimeManifest.sourceRevision ? [] : ["sourceRevision-unavailable"]),
@@ -3353,9 +4334,11 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                 complete: runtimeIdentityWarnings.length === 0,
                 warnings: runtimeIdentityWarnings,
               },
+              schemaRecovery,
               finalHealthy: true,
               sessionStateAvailable: sessionAvailable,
               activeProjectId: session.activeProjectId,
+              boundProjectId: session.boundProjectId ?? null,
               mode: session.mode,
               pendingOperationApprovalCount,
               pendingRgApprovalCount,
@@ -3469,6 +4452,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             buildFingerprint: runtimeManifest.buildFingerprint,
             runtimeSnapshotId: runtimeManifest.runtimeSnapshotId,
             toolSchemaRevision: runtimeManifest.toolSchemaRevision,
+            schemaRecovery,
             nodeVersion: runtimeManifest.nodeVersion,
             runtimeIdentityComplete: runtimeIdentityWarnings.length === 0,
             runtimeIdentityWarnings,
@@ -3520,6 +4504,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             nativeE2eSupported: isNativeE2eSupported(),
             sessionStateAvailable: sessionAvailable,
             activeProjectId: session.activeProjectId,
+            boundProjectId: session.boundProjectId ?? null,
             mode: session.mode,
             executionMode: session.mode,
             modeMeaning: "mode describes the coding execution ladder; desktop-control authorization is reported separately in control",
@@ -4536,6 +5521,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         return makeResult(
           {
             workLaneId: opened.workLaneId,
+            boundProjectId: opened.session.boundProjectId ?? null,
             lease: {
               projectId: opened.lease.projectId,
               leaseId: opened.lease.leaseId,
@@ -4584,6 +5570,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         return makeResult(
           {
             projectId: lease.projectId,
+            boundProjectId: session.boundProjectId ?? null,
             leaseId: lease.leaseId,
             preset: lease.preset,
             issuedAt: lease.issuedAt,
@@ -5905,7 +6892,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       title: "Apply file patch",
       description:
         "Apply a Codex-style patch envelope with hash-precondition and transactional write. Redacted patch context is rejected with PATCH_CONTEXT_REDACTED; use file_edit_lines with a fresh whole-file hash instead.",
-      annotations: LOCAL_WRITE_ANNOTATIONS,
+      annotations: PROJECT_WRITE_ANNOTATIONS,
       _meta: chatGptToolMeta("Applying file patch...", "File patch applied"),
       inputSchema: {
         projectId: z.string(),
@@ -5990,7 +6977,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       title: "Edit file lines safely",
       description:
         "Apply redaction-safe line-addressed replacements using the whole-file fileHash returned by file_read_slice. Use this when displayed source contains [REDACTED] or exact old context must not be echoed. Each file may appear once per transaction.",
-      annotations: LOCAL_WRITE_ANNOTATIONS,
+      annotations: PROJECT_WRITE_ANNOTATIONS,
       _meta: chatGptToolMeta("Editing file lines...", "File lines edited"),
       inputSchema: {
         projectId: z.string(),
@@ -6085,7 +7072,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Create project file",
       description: "Create a new file in the project (fails if it exists unless overwrite=true).",
-      annotations: LOCAL_WRITE_ANNOTATIONS,
+      annotations: PROJECT_WRITE_ANNOTATIONS,
       _meta: chatGptToolMeta("Creating project file...", "Project file created"),
       inputSchema: {
         projectId: z.string(),
@@ -6344,6 +7331,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             lease,
             tool: "verified_local_file_apply",
             risk: "local-file-mutation" as OperationRisk,
+            approvalSurface: (ctx.remote === true ? "chatgpt-widget" : "local") as OperationApprovalSurface,
             operation: {
               operationClass: "verified-fixed-local-file-mutation",
               operationSpecId: prepared.operationSpecId,
@@ -6369,13 +7357,13 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               : undefined;
             if (!requestId) throw error;
             if (ctx.remote === true) {
-              await progress?.update("approval", "Approval requested; returning promptly for host-safe handoff");
-              throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Remote verified file approval is pending; approve it, then replay the exact same verified_local_file_apply input", {
-                ...(error instanceof DomainError ? error.details ?? {} : {}),
+              await progress?.update("approval", "Operation-bound ChatGPT approval requested; returning prompt-safe handoff");
+              return chatGptOperationApprovalPending(ctx, {
                 requestId,
-                hostSafeApprovalHandoff: true,
-                replayExactInputAfterApproval: true,
-                actionStarted: false,
+                tool: "verified_local_file_apply",
+                allowFollowUpPrompt: "C2CT verified_local_file_apply 승인을 허용했어. 방금과 정확히 같은 입력으로 verified_local_file_apply를 다시 호출해서 승인된 1회 작업을 이어서 실행해줘.",
+                denyFollowUpPrompt: "C2CT verified_local_file_apply 승인을 거절했어. 이 작업은 실행하지 말고 거절 상태로 종료해줘.",
+                extra: { operationSpecId: prepared.operationSpecId },
               });
             }
             await progress?.update("approval", "Waiting for approval; this same operation will resume automatically");
@@ -6539,6 +7527,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             lease,
             tool: "command_run",
             risk: operationRisk,
+            approvalSurface: (ctx.remote === true ? "chatgpt-widget" : "local") as OperationApprovalSurface,
             operation: {
               commandId: input.commandId,
               args: input.args ?? [],
@@ -6559,14 +7548,13 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               : undefined;
             if (!requestId) throw error;
             if (ctx.remote === true) {
-              await progress?.update("approval", "Approval requested; returning promptly for host-safe handoff");
-              throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Remote command approval is pending; approve it, then replay the exact same command_run input", {
-                ...(error instanceof DomainError ? error.details ?? {} : {}),
+              await progress?.update("approval", "Operation-bound ChatGPT approval requested; returning inline handoff");
+              return chatGptOperationApprovalPending(ctx, {
                 requestId,
-                hostSafeApprovalHandoff: true,
-                replayExactInputAfterApproval: true,
-                actionStarted: false,
-                subprocessStarted: false,
+                tool: "command_run",
+                allowFollowUpPrompt: "C2CT command_run 승인을 허용했어. 방금과 정확히 같은 입력으로 command_run을 다시 호출해서 승인된 1회 작업을 이어서 실행해줘.",
+                denyFollowUpPrompt: "C2CT command_run 승인을 거절했어. 이 작업은 실행하지 말고 거절 상태로 종료해줘.",
+                extra: { commandId: input.commandId },
               });
             }
             await progress?.update("approval", "Waiting for local approval; this operation will resume automatically");
@@ -6916,7 +7904,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Cancel background operation",
       description:
-        "Request process-tree cleanup for one active background command. Requires full-write plus a separate one-shot local approval; while that bounded approval is pending, the existing command timeout budget is paused. Cancellation is never automatically retried.",
+        "Request process-tree cleanup for one active background command. Requires full-write plus a separate one-shot human approval; remote ChatGPT uses the C2CT inline approval card, while native/local callers keep the local approval surface. While approval is pending, the existing command timeout budget is paused. Cancellation is never automatically retried.",
       annotations: LOCAL_WRITE_ANNOTATIONS,
       _meta: chatGptToolMeta("Requesting background cancellation...", "Background cancellation checked"),
       inputSchema: {
@@ -6949,6 +7937,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           lease,
           tool: "operation_cancel",
           risk: "destructive",
+          approvalSurface: (ctx.remote === true ? "chatgpt-widget" : "local") as OperationApprovalSurface,
           operation: {
             operationId: current.operationId,
             projectId: current.projectId,
@@ -6957,6 +7946,9 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           preview: `Cancel background command ${current.commandId}`,
         });
       } catch (error) {
+        const requestId = error instanceof DomainError && error.code === ErrorCode.APPROVAL_REQUIRED && typeof error.details?.requestId === "string"
+          ? error.details.requestId
+          : undefined;
         const approvalExpiresAt = error instanceof DomainError && error.code === ErrorCode.APPROVAL_REQUIRED
           ? error.details?.expiresAt
           : undefined;
@@ -6965,6 +7957,15 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             binding,
             Math.min(approvalExpiresAt, Date.now() + MAX_CANCEL_APPROVAL_TIMEOUT_HOLD_MS),
           );
+        }
+        if (ctx.remote === true && requestId) {
+          return chatGptOperationApprovalPending(ctx, {
+            requestId,
+            tool: "operation_cancel",
+            allowFollowUpPrompt: "C2CT operation_cancel 승인을 허용했어. 방금과 정확히 같은 입력으로 operation_cancel을 다시 호출해서 승인된 취소를 실행해줘.",
+            denyFollowUpPrompt: "C2CT operation_cancel 승인을 거절했어. 취소 신호를 보내지 말고 현재 작업을 그대로 유지해줘.",
+            extra: { operationId: current.operationId, commandId: current.commandId },
+          });
         }
         throw error;
       }
@@ -7116,7 +8117,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Start E2E dev server",
       description:
-        "Start a long-running local dev/server command in the selected project and return pid/log path. An optional localhost readiness wait is hard-capped for remote ChatGPT/MCP so the request cannot sit open until the host timeout. Use later short status/screenshot calls instead of waiting in one request.",
+        "Start a long-running local dev/server command in the selected project and return pid/log path. Network/destructive starts require one-shot human approval; remote ChatGPT uses the C2CT inline approval card. An optional localhost readiness wait is hard-capped so the request cannot sit open until the host timeout.",
       annotations: COMMAND_RUN_ANNOTATIONS,
       _meta: chatGptToolMeta("Starting E2E server...", "E2E server started"),
       inputSchema: {
@@ -7152,19 +8153,36 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           input.workLaneId,
         );
         if (operationRisk) {
-          await ensureOperationAuthorized({
-            stateDir: ctx.stateDir,
-            lease,
-            tool: "e2e_start_server",
-            risk: operationRisk,
-            operation: {
-              command: input.command,
-              cwd: input.cwd ?? null,
-              waitUrl: input.waitUrl ?? null,
-              waitTimeoutSec: input.waitTimeoutSec ?? null,
-            },
-            preview: redact([input.command, input.waitUrl ? `wait ${input.waitUrl}` : ""].filter(Boolean).join(" · ")),
-          });
+          try {
+            await ensureOperationAuthorized({
+              stateDir: ctx.stateDir,
+              lease,
+              tool: "e2e_start_server",
+              risk: operationRisk,
+              approvalSurface: (ctx.remote === true ? "chatgpt-widget" : "local") as OperationApprovalSurface,
+              operation: {
+                command: input.command,
+                cwd: input.cwd ?? null,
+                waitUrl: input.waitUrl ?? null,
+                waitTimeoutSec: input.waitTimeoutSec ?? null,
+              },
+              preview: redact([input.command, input.waitUrl ? `wait ${input.waitUrl}` : ""].filter(Boolean).join(" · ")),
+            });
+          } catch (error) {
+            const requestId = error instanceof DomainError && error.code === ErrorCode.APPROVAL_REQUIRED && typeof error.details?.requestId === "string"
+              ? error.details.requestId
+              : undefined;
+            if (ctx.remote === true && requestId) {
+              return chatGptOperationApprovalPending(ctx, {
+                requestId,
+                tool: "e2e_start_server",
+                allowFollowUpPrompt: "C2CT e2e_start_server 승인을 허용했어. 방금과 정확히 같은 입력으로 e2e_start_server를 다시 호출해서 승인된 서버 시작을 이어서 실행해줘.",
+                denyFollowUpPrompt: "C2CT e2e_start_server 승인을 거절했어. 서버를 시작하지 말고 거절 상태로 종료해줘.",
+                extra: { risk: operationRisk },
+              });
+            }
+            throw error;
+          }
         }
         await assertRuntimeUpdateNotDraining(ctx.stateDir);
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
@@ -7264,7 +8282,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Run E2E command",
       description:
-        "Run a guarded project E2E/test command. Remote ChatGPT/MCP execution is always handed off to a persisted background operation so the MCP request never waits for subprocess completion; poll operation_status until terminal. If captureScreenshot=true remotely, screenshot capture is deferred until the command is terminal, then use e2e_screenshot or e2e_open_url_screenshot. Native/local callers retain bounded synchronous execution.",
+        "Run a guarded project E2E/test command. Remote ChatGPT/MCP execution is handed off to a persisted background operation. Network/destructive runs require one-shot human approval; remote ChatGPT uses the C2CT inline approval card. Poll operation_status until terminal.",
       annotations: COMMAND_RUN_ANNOTATIONS,
       _meta: chatGptToolMeta("Running E2E command...", "E2E command finished"),
       inputSchema: {
@@ -7308,20 +8326,37 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         );
         let approvedRisk: Extract<OperationRisk, "network" | "destructive"> | undefined;
         if (operationRisk) {
-          await ensureOperationAuthorized({
-            stateDir: ctx.stateDir,
-            lease,
-            tool: "e2e_run_command",
-            risk: operationRisk,
-            operation: {
-              command: input.command,
-              cwd: input.cwd ?? null,
-              screenshotUrl: input.screenshotUrl ?? null,
-              captureScreenshot: input.captureScreenshot ?? false,
-            },
-            preview: redact(input.command),
-          });
-          approvedRisk = operationRisk;
+          try {
+            await ensureOperationAuthorized({
+              stateDir: ctx.stateDir,
+              lease,
+              tool: "e2e_run_command",
+              risk: operationRisk,
+              approvalSurface: (ctx.remote === true ? "chatgpt-widget" : "local") as OperationApprovalSurface,
+              operation: {
+                command: input.command,
+                cwd: input.cwd ?? null,
+                screenshotUrl: input.screenshotUrl ?? null,
+                captureScreenshot: input.captureScreenshot ?? false,
+              },
+              preview: redact(input.command),
+            });
+            approvedRisk = operationRisk;
+          } catch (error) {
+            const requestId = error instanceof DomainError && error.code === ErrorCode.APPROVAL_REQUIRED && typeof error.details?.requestId === "string"
+              ? error.details.requestId
+              : undefined;
+            if (ctx.remote === true && requestId) {
+              return chatGptOperationApprovalPending(ctx, {
+                requestId,
+                tool: "e2e_run_command",
+                allowFollowUpPrompt: "C2CT e2e_run_command 승인을 허용했어. 방금과 정확히 같은 입력으로 e2e_run_command를 다시 호출해서 승인된 작업을 실행하고 operation_status를 폴링해줘.",
+                denyFollowUpPrompt: "C2CT e2e_run_command 승인을 거절했어. 이 명령은 실행하지 말고 거절 상태로 종료해줘.",
+                extra: { risk: operationRisk },
+              });
+            }
+            throw error;
+          }
         }
         await assertRuntimeUpdateNotDraining(ctx.stateDir);
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
@@ -7545,6 +8580,30 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           instruction: input.instruction ? "[instruction redacted]" : undefined,
         },
         async () => {
+          if (input.instruction === "__c2ct_consent_probe__") {
+            const probe = createChatGptConsentProbe({ sessionScope: ctx.sessionScope });
+            const token = mintChatGptWidgetApprovalToken({
+              requestId: probe.requestId,
+              sessionScope: ctx.sessionScope,
+              expiresAt: probe.expiresAt,
+            });
+            const result = makeResult<Record<string, unknown>>(
+              {
+                c2ctConsentProbe: true,
+                requestId: probe.requestId,
+                status: probe.status,
+                preview: "무해한 C2CT 인라인 확인 테스트 · 실제 로컬 변경 없음",
+                expiresAt: probe.expiresAt,
+                sideEffects: "none",
+              },
+              "Harmless C2CT in-chat confirmation probe opened through the existing widget surface.",
+            );
+            result._meta = {
+              ...(result._meta ?? {}),
+              [CHATGPT_CONSENT_META_KEY]: { token },
+            };
+            return result;
+          }
           requireNativeE2eSupport();
           const project = await resolveProjectForE2e(ctx, input.projectId, input.workLaneId);
           await assertRuntimeUpdateNotDraining(ctx.stateDir);
@@ -7900,7 +8959,25 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       return withErrorMapping(ctx, "git_commit", input, async () => {
         await requireProjectLease(ctx, input.projectId, "write", input.workLaneId);
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        if (ctx.remote === true && (!input.paths || input.paths.length === 0)) {
+          throw new DomainError(
+            ErrorCode.COMMAND_NOT_ALLOWED,
+            "Remote git_commit requires an explicit non-empty paths list; implicit git add -A is not allowed",
+          );
+        }
         if (input.paths) {
+          if (ctx.remote === true) {
+            const status = await gitStatus(entry.root);
+            const changedFiles = new Set([...status.dirtyFiles, ...status.staged]);
+            const nonExactPaths = input.paths.filter((rel) => !changedFiles.has(rel));
+            if (nonExactPaths.length > 0) {
+              throw new DomainError(
+                ErrorCode.COMMAND_NOT_ALLOWED,
+                "Remote git_commit paths must name exact changed files; directories and unchanged paths are refused",
+                { paths: nonExactPaths },
+              );
+            }
+          }
           for (const rel of input.paths) {
             const abs = await resolveInProject(entry.root, rel, { allowSymlink: false });
             await guardSecretPath(ctx, abs, "git_commit");
@@ -8593,7 +9670,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       {
         title: "Request a desktop computer-use action (control)",
         description:
-          "Request one computer-use action: click, double_click, drag, scroll, move, type, key, keypress, or wait. Mouse coordinates are app-window-relative rather than unrestricted global screen coordinates. The tool stays visible for capability discovery, but remote ChatGPT calls fail closed until the owner opts in via CHATGPT2CODEX_CONTROL_CHATGPT. Once enabled, an active control lease (project_select preset=control) and the client-side Confirm/Deny prompt on the owner's phone are required; a confirmed call executes through the normal executor path (kill-switch re-check, darwin preflight, a second live-frontmost sensitive-app/allowlist check, before/after evidence, audit — tagged approvedVia=chatgpt). Sensitive apps are always refused, confirmed or not.",
+          "Request one computer-use action: click, double_click, drag, scroll, move, type, key, keypress, or wait. Mouse coordinates are app-window-relative rather than unrestricted global screen coordinates. The tool stays visible for capability discovery, but remote ChatGPT calls fail closed until the owner opts in via CHATGPT2CODEX_CONTROL_CHATGPT. Once enabled, an active control lease (project_select preset=control) and the client-side Confirm/Deny prompt on the owner's phone are required; a confirmed call executes through the normal executor path (kill-switch re-check, darwin preflight, a second live-frontmost sensitive-app/allowlist check, before/after evidence, audit). This Computer Use confirmation authorizes only that queued control action; its audit tag approvedVia=chatgpt is not an OperationApprovalVia grant and can never authorize runtime/app/lane protected operations. Sensitive apps are always refused, confirmed or not.",
         annotations: CONTROL_ANNOTATIONS,
         inputSchema: {
           appName: z.string().min(1),
@@ -8653,15 +9730,16 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Get one live C2CT tool schema",
       description:
-        "Return the live runtime definition for one public C2CT tool plus the exact current tools/list schema revision and runtime schema identity. Use after runtime replacement when the host may still have a stale named-tool schema. If this named tool is missing from a stale host catalog, call it through stable c2ct_invoke.",
+        "Return the live runtime definition for one public C2CT tool plus the exact current tools/list schema revision and runtime schema identity. Optionally compare a previously known canonical tools/list revision so stale host catalogs can be detected explicitly. Use after runtime replacement when the host may still have a stale named-tool schema. If this named tool is missing from a stale host catalog, call it through stable c2ct_invoke.",
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: chatGptToolMeta("Reading live tool schema...", "Live tool schema loaded"),
       inputSchema: {
         toolName: z.string().min(1).max(128),
+        knownSchemaRevision: z.string().regex(/^sha256:[a-f0-9]{24}$/).optional(),
       },
     },
-    async ({ toolName }) => {
-      return withErrorMapping(ctx, "tool_schema_get", { toolName }, async () => {
+    async ({ toolName, knownSchemaRevision }, extra) => {
+      return withErrorMapping(ctx, "tool_schema_get", { toolName, knownSchemaRevision }, async () => {
         const registeredTools = (s as unknown as { _registeredTools: Record<string, RegisteredToolLike> })._registeredTools;
         const target = registeredTools[toolName];
         if (!target || !isChatGptVisibleRegisteredTool(
@@ -8681,11 +9759,36 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         );
         const schemaRevision = toolSchemaRevision(allTools);
         const runtimeManifest = getRuntimeManifest();
+        const sendNotification = extra && typeof extra === "object" && !Array.isArray(extra)
+          ? (extra as {
+              sendNotification?: (notification: {
+                method: string;
+                params?: Record<string, unknown>;
+              }) => Promise<void>;
+            }).sendNotification
+          : undefined;
+        let inlineRefreshNotificationsSent = 0;
+        if (sendNotification) {
+          for (const method of ["notifications/tools/list_changed", "notifications/resources/list_changed"] as const) {
+            try {
+              await sendNotification({ method, params: {} });
+              inlineRefreshNotificationsSent += 1;
+            } catch {
+              // Stateless clients may reject server notifications. Schema lookup
+              // itself stays read-only and must remain usable as the fallback.
+            }
+          }
+        }
         return makeResult(
           {
             tool: chatGptToolDefinition(toolName, target),
             schemaRevision,
             schemaMustRevalidate: true,
+            ...(knownSchemaRevision
+              ? { knownSchemaRevision, knownSchemaMatches: knownSchemaRevision === schemaRevision }
+              : {}),
+            inlineRefreshNotificationsAttempted: Boolean(sendNotification),
+            inlineRefreshNotificationsSent,
             runtimeToolSchemaRevision: runtimeManifest.toolSchemaRevision,
             runtimeFingerprint: runtimeManifest.runtimeFingerprint,
             runtimeRoot: runtimeManifest.runtimeRoot,
