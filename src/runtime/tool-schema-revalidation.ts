@@ -173,7 +173,7 @@ export function toolSchemaRecoveryPlan(input: {
       reason: "no-applied-schema-change",
       toolListRefreshObserved: null,
       preferredExecution: "named-tool",
-      instruction: "Use named tools normally. If host-side schema validation still fails before runtime dispatch, recover through tool_schema_get + c2ct_invoke without re-registering the connector.",
+      instruction: "Use named tools normally. If host-side schema validation still fails before runtime dispatch, recover through tool_schema_get + c2ct_invoke without re-registering the connector. Widget/approval presenter exception: never use c2ct_invoke to render or validate ChatGPT widget UI, approval cards, outputTemplate/resource mounts, or host confirmation UI; those require the dedicated direct named presenter/tool surface because generic dispatch does not reproduce the host's static tool metadata mount.",
     };
   }
 
@@ -184,7 +184,7 @@ export function toolSchemaRecoveryPlan(input: {
       reason: "latest-schema-change-is-not-current-runtime",
       toolListRefreshObserved: null,
       preferredExecution: "named-tool",
-      instruction: "The latest schema-changing apply does not describe this runtime. Prefer named tools and keep c2ct_invoke as the host-schema fallback.",
+      instruction: "The latest schema-changing apply does not describe this runtime. Prefer named tools and keep c2ct_invoke as the host-schema fallback. Widget/approval presenter exception: never use c2ct_invoke to render or validate ChatGPT widget UI, approval cards, outputTemplate/resource mounts, or host confirmation UI; those require the dedicated direct named presenter/tool surface because generic dispatch does not reproduce the host's static tool metadata mount.",
     };
   }
 
@@ -209,7 +209,7 @@ export function toolSchemaRecoveryPlan(input: {
       reason: "post-apply-tools-list-observed",
       toolListRefreshObserved: true,
       preferredExecution: "named-tool",
-      instruction: "A current tools/list response was served after the schema-changing runtime apply. Prefer named tools; if the host still rejects a named call before runtime dispatch, use c2ct_invoke as the correctness fallback.",
+      instruction: "A current tools/list response was served after the schema-changing runtime apply. Prefer named tools; if the host still rejects a named call before runtime dispatch, use c2ct_invoke as the correctness fallback. Widget/approval presenter exception: never use c2ct_invoke to render or validate ChatGPT widget UI, approval cards, outputTemplate/resource mounts, or host confirmation UI; those require the dedicated direct named presenter/tool surface because generic dispatch does not reproduce the host's static tool metadata mount.",
     };
   }
 
@@ -219,7 +219,7 @@ export function toolSchemaRecoveryPlan(input: {
     reason: "runtime-schema-changed-awaiting-tools-list",
     toolListRefreshObserved: false,
     preferredExecution: "c2ct_invoke",
-    instruction: "The runtime schema changed and no current post-apply tools/list fetch has been observed. After bootstrap, route public operations through stable c2ct_invoke by default until connection_status reports named-tools-preferred. If c2ct_invoke refuses a target because that named tool requires host confirmation, do not bypass the boundary; use the dedicated named surface once the host catalog supports it. Do not re-register the bare /mcp connector.",
+    instruction: "The runtime schema changed and no current post-apply tools/list fetch has been observed. After bootstrap, route public operations through stable c2ct_invoke by default until connection_status reports named-tools-preferred. Widget/approval presenter exception: never use c2ct_invoke to render or validate ChatGPT widget UI, approval cards, outputTemplate/resource mounts, or host confirmation UI; those require the dedicated direct named presenter/tool surface because generic dispatch does not reproduce the host's static tool metadata mount. If c2ct_invoke refuses a target because that named tool requires host confirmation, do not bypass the boundary; use the dedicated named surface once the host catalog supports it. Do not re-register the bare /mcp connector.",
   };
 }
 

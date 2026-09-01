@@ -16,7 +16,7 @@ async function main(): Promise<void> {
     return;
   }
   try {
-    await runRuntimeApplyWorker({ stateDir, operationId, port });
+    await runRuntimeApplyWorker({ stateDir, operationId, port, stabilityProbeCount: 7 });
   } finally {
     await clearRuntimeApplyMaintenanceMarker(stateDir, operationId).catch(() => undefined);
     await releaseRuntimeUpdateBarrier(stateDir, operationId).catch(() => false);

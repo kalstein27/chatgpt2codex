@@ -81,6 +81,13 @@ function decorateModernResult(
       [MCP_SCHEMA_REVALIDATE_META_KEY]: true,
     };
   }
+  if (method === "resources/list" || method === "resources/read") {
+    // MCP 2026-07-28 defines these as CacheableResult responses and requires
+    // both cache fields on the wire. Keep the conservative zero-TTL/private
+    // policy used by discovery/tools so templates are always revalidated.
+    decorated.ttlMs = 0;
+    decorated.cacheScope = "private";
+  }
   if (method === "tools/call" && !Array.isArray(decorated.content)) {
     decorated.content = [];
   }

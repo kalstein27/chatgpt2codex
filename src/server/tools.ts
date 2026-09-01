@@ -1107,6 +1107,15 @@ async function chatGptOperationApprovalPending(
       subprocessStarted: false,
     });
   }
+  const schemaRecovery = (await readToolSchemaRecoveryState(ctx.stateDir)).plan;
+  const useSharedPresenter = schemaRecovery.mode === "stable-dispatcher-preferred";
+  if (ctx.sessionScope) {
+    if (useSharedPresenter) {
+      chatGptSharedApprovalPresenterRequests.set(ctx.sessionScope, { ...input });
+    } else {
+      chatGptSharedApprovalPresenterRequests.delete(ctx.sessionScope);
+    }
+  }
   rememberChatGptPendingOperation(ctx, input);
   if (ctx.sessionScope) {
     chatGptOperationApprovalPresenterRequests.set(ctx.sessionScope, { ...input });
@@ -1125,17 +1134,27 @@ async function chatGptOperationApprovalPending(
       actionStarted: false,
       subprocessStarted: false,
       sideEffects: "approval-state-only",
-      presentApprovalWith: CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL,
-      presentApprovalArgs: { requestId: input.requestId },
+      presentApprovalWith: useSharedPresenter ? "chatgpt_consent_probe" : CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL,
+      presentApprovalArgs: useSharedPresenter ? {} : { requestId: input.requestId },
       cardRendered: false,
       allowFollowUpPrompt: input.allowFollowUpPrompt,
       denyFollowUpPrompt: input.denyFollowUpPrompt,
       ...(input.extra ?? {}),
     },
-    `${input.tool} approval is pending; call ${CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL} with this requestId to render the versioned C2CT approval card.`,
+    useSharedPresenter
+      ? `${input.tool} approval is pending; the host catalog is stale, so call chatgpt_consent_probe once to render the already-mounted shared C2CT approval card.`
+      : `${input.tool} approval is pending; call ${CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL} with this requestId to render the versioned C2CT approval card.`,
   );
   return pending;
 }
+
+const chatGptSharedApprovalPresenterRequests = new Map<string, {
+  requestId: string;
+  tool: string;
+  allowFollowUpPrompt: string;
+  denyFollowUpPrompt: string;
+  extra?: Record<string, unknown>;
+}>();
 
 const chatGptOperationApprovalPresenterRequests = new Map<string, {
   requestId: string;
@@ -2813,7 +2832,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     "chatgpt_consent_probe",
     {
       title: "Show C2CT in-chat confirmation",
-      description: "Render the shared C2CT Widget Shell presenter when one is pending; otherwise render a harmless allow/deny probe. Protected operation approvals always use the dedicated versioned operation presenter.",
+      description: "Render the shared C2CT Widget Shell presenter when one is pending; while the host tool catalog is stale, it can also render the exact remembered protected operation through the already-mounted shared resource. Otherwise render a harmless allow/deny probe. Fresh host catalogs use the dedicated versioned operation presenter.",
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: {
         ...chatGptToolMeta("Opening C2CT confirmation...", "C2CT confirmation opened"),
@@ -2873,6 +2892,57 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           "openai/outputTemplate": CHATGPT_CONSENT_WIDGET_LAB_URI,
         };
         return result;
+      }
+      const sharedPending = ctx.sessionScope
+        ? chatGptSharedApprovalPresenterRequests.get(ctx.sessionScope)
+        : undefined;
+      if (sharedPending) {
+        const schemaRecovery = (await readToolSchemaRecoveryState(ctx.stateDir)).plan;
+        const approvalRequest = schemaRecovery.mode === "stable-dispatcher-preferred"
+          ? (await listOperationApprovalRequests(ctx.stateDir))
+            .find((candidate) => candidate.requestId === sharedPending.requestId)
+          : undefined;
+        if (approvalRequest &&
+            approvalRequest.status === "pending" &&
+            approvalRequest.tool === sharedPending.tool &&
+            approvalRequest.approvalSurface === "chatgpt-widget") {
+          const token = mintChatGptWidgetApprovalToken({
+            requestId: approvalRequest.requestId,
+            sessionScope: ctx.sessionScope,
+            expiresAt: approvalRequest.expiresAt,
+          });
+          const result = makeResult<Record<string, unknown>>(
+            {
+              requestId: approvalRequest.requestId,
+              status: "pending",
+              approvalKind: "operation",
+              approvalChannel: "chatgpt-widget",
+              decisionTool: "chatgpt_operation_approval_decide",
+              operationTool: sharedPending.tool,
+              preview: approvalRequest.preview,
+              summary: approvalRequest.summary ?? approvalRequest.preview,
+              impact: approvalRequest.impact,
+              details: approvalRequest.details,
+              expiresAt: approvalRequest.expiresAt,
+              replayExactInputAfterApproval: true,
+              actionStarted: false,
+              subprocessStarted: false,
+              sideEffects: "approval-state-only",
+              allowFollowUpPrompt: sharedPending.allowFollowUpPrompt,
+              denyFollowUpPrompt: sharedPending.denyFollowUpPrompt,
+              ...(sharedPending.extra ?? {}),
+            },
+            `${sharedPending.tool} approval opened through the stale-catalog shared C2CT presenter.`,
+          );
+          result._meta = {
+            ...(result._meta ?? {}),
+            ui: { resourceUri: CHATGPT_CONSENT_WIDGET_URI },
+            "openai/outputTemplate": CHATGPT_CONSENT_WIDGET_URI,
+            [CHATGPT_CONSENT_META_KEY]: { token },
+          };
+          return result;
+        }
+        chatGptSharedApprovalPresenterRequests.delete(ctx.sessionScope!);
       }
       const probe = createChatGptConsentProbe({ sessionScope: ctx.sessionScope });
       const token = mintChatGptWidgetApprovalToken({
@@ -2979,6 +3049,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         approvedVia: "chatgpt-widget",
       });
       forgetChatGptPendingOperation(ctx, input.requestId);
+      if (ctx.sessionScope) chatGptSharedApprovalPresenterRequests.delete(ctx.sessionScope);
       return makeResult<Record<string, unknown>>(
         {
           requestId: resolved.requestId,
@@ -3283,6 +3354,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                   schemaRecovery.mode === "stable-dispatcher-preferred"
                     ? "Automatic schema routing: connection_status/agent_guide reports stable-dispatcher-preferred because a schema-changing runtime apply has not yet been followed by an observed current tools/list fetch. After bootstrap, route public operations through stable c2ct_invoke by default. If the dispatcher refuses a target because its named surface carries the host confirmation boundary, do not bypass that boundary; use the named tool once the host catalog supports it. Keep named bootstrap reads only when their mounted schema accepts the input. Do not re-register the bare /mcp connector."
                     : "Automatic schema routing: connection_status/agent_guide reports named-tools-preferred, so use named tools normally. If a named call is rejected before runtime dispatch, immediately fall back to tool_schema_get + c2ct_invoke without connector re-registration.",
+                  "Widget/presenter UI exception: never use c2ct_invoke to render or validate ChatGPT widget UI, approval cards, outputTemplate/resource mounts, or host confirmation UI. Generic dispatch can prove backend execution only; it does not reproduce the direct named tool's host-mounted static metadata. Always call the dedicated named presenter/tool directly for UI render or approval-surface E2E.",
                   ...(canRunLocalShell ? ["local_shell_run for local-only Codex-style commands inside the selected project"] : []),
                   ...e2eWorkflow,
                   "repo_status/repo_diff_summary, then git_commit and git_push when explicitly requested",
@@ -3346,6 +3418,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                 schemaRecovery.mode === "stable-dispatcher-preferred"
                   ? "Schema routing is currently stable-dispatcher-preferred. Use c2ct_invoke by default for public operations until connection_status reports named-tools-preferred; use c2ct_invoke targeting tool_schema_get if the named schema helper itself is stale or absent."
                   : "Schema routing is currently named-tools-preferred. Use named tools normally and keep tool_schema_get + c2ct_invoke as the correctness fallback for host-side stale-schema failures.",
+                "Widget/presenter UI exception: never use c2ct_invoke to render or validate ChatGPT widget UI, approval cards, outputTemplate/resource mounts, or host confirmation UI. Use the dedicated direct named presenter/tool; dispatcher success is backend execution proof only, never presenter-mount proof.",
                 "Use repo status/diff/show changes and then commit/push only when requested.",
               ],
               imageSaveFlow: [
@@ -9777,7 +9850,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Invoke one public C2CT operation",
       description:
-        "Dispatch one already-public C2CT operation through a stable generic schema. Use with tool_schema_get as the runtime-replacement fallback when a host-mounted named schema is stale. The target operation keeps its original input validation, lease checks, C2CT-owned approval gates, audit trail, and result shape. Targets whose safety boundary depends on host confirmation are refused and must use their dedicated named surface. Hidden operations, desktop control, recursive dispatch, and unsupported platform operations are also refused.",
+        "Dispatch one already-public C2CT operation through a stable generic schema. Use with tool_schema_get as the runtime-replacement fallback when a host-mounted named schema is stale. The target operation keeps its original input validation, lease checks, C2CT-owned approval gates, audit trail, and result shape. Do not use this dispatcher to render or validate ChatGPT widget/approval presenters: generic dispatch cannot reproduce the direct named tool's host-mounted static outputTemplate/resource metadata, so presenter tools are refused and must use their dedicated named surface. Targets whose safety boundary depends on host confirmation are likewise refused. Hidden operations, desktop control, recursive dispatch, and unsupported platform operations are also refused.",
       annotations: COMMAND_RUN_ANNOTATIONS,
       inputSchema: {
         toolName: z.string().min(1).max(128),
@@ -9796,6 +9869,16 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
 
       if (toolName === "c2ct_invoke") {
         return reject("PERMISSION_DENIED", "Recursive C2CT dispatch is not allowed.");
+      }
+      if (
+        toolName === CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL ||
+        toolName === "chatgpt_consent_probe" ||
+        toolName === "chatgpt_widget_lab_presenter"
+      ) {
+        return reject(
+          "PERMISSION_DENIED",
+          "ChatGPT widget/approval presenters require their dedicated direct named tool surface; generic C2CT dispatch cannot preserve host static outputTemplate/resource mounting.",
+        );
       }
       if (CONTROL_TOOL_NAMES.has(toolName)) {
         return reject("PERMISSION_DENIED", "Desktop-control operations require their dedicated confirmed tool surface.");

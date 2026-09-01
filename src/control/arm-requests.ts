@@ -6,6 +6,9 @@ import { DomainError, ErrorCode } from "../types.js";
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 export const DEFAULT_ARM_REQUEST_TTL_MS = 5 * 60 * 1000;
+const ARM_LOCK_STALE_MS = 30_000;
+const ARM_LOCK_OWNER_FILE = "owner.json";
+const ARM_LOCK_INSTANCE_ID = randomUUID();
 
 export type ArmRequestStatus = "pending" | "approved" | "rejected" | "expired";
 
@@ -52,6 +55,48 @@ const SESSION_SCOPE_RE = /^[a-z0-9-]{1,40}:[0-9a-f]{64}$/;
 // appear actionable again.
 const STATUSES: readonly ArmRequestStatus[] = ["approved", "rejected", "expired", "pending"];
 
+interface ArmLockOwner {
+  pid: number;
+  instanceId: string;
+  createdAt: number;
+}
+
+function processAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function readArmLockOwner(lockDir: string): Promise<ArmLockOwner | null> {
+  try {
+    const parsed = JSON.parse(await fs.readFile(path.join(lockDir, ARM_LOCK_OWNER_FILE), "utf8")) as Partial<ArmLockOwner>;
+    if (!Number.isSafeInteger(parsed.pid) || Number(parsed.pid) <= 0 || typeof parsed.instanceId !== "string") return null;
+    return {
+      pid: Number(parsed.pid),
+      instanceId: parsed.instanceId,
+      createdAt: typeof parsed.createdAt === "number" ? parsed.createdAt : 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function writeArmLockOwner(lockDir: string): Promise<void> {
+  const owner: ArmLockOwner = {
+    pid: process.pid,
+    instanceId: ARM_LOCK_INSTANCE_ID,
+    createdAt: Date.now(),
+  };
+  await fs.writeFile(path.join(lockDir, ARM_LOCK_OWNER_FILE), `${JSON.stringify(owner)}\n`, {
+    mode: FILE_MODE,
+    flag: "wx",
+  });
+}
+
 function armRoot(stateDir: string): string {
   return path.join(stateDir, "control", "arm-requests");
 }
@@ -77,6 +122,7 @@ async function withArmLock<T>(
     try {
       await fs.mkdir(lockDir, { mode: DIR_MODE });
       try {
+        await writeArmLockOwner(lockDir);
         return await operation();
       } finally {
         await fs.rm(lockDir, { recursive: true, force: true });
@@ -84,8 +130,13 @@ async function withArmLock<T>(
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "EEXIST") throw error;
+      const owner = await readArmLockOwner(lockDir);
+      if (owner && !processAlive(owner.pid)) {
+        await fs.rm(lockDir, { recursive: true, force: true }).catch(() => undefined);
+        continue;
+      }
       const lockStat = await fs.stat(lockDir).catch(() => null);
-      if (lockStat && Date.now() - lockStat.mtimeMs > 30_000) {
+      if (lockStat && Date.now() - lockStat.mtimeMs > ARM_LOCK_STALE_MS) {
         await fs.rm(lockDir, { recursive: true, force: true }).catch(() => undefined);
         continue;
       }

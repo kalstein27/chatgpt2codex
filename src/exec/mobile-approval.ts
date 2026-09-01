@@ -19,6 +19,7 @@ import {
   activityDashboardSnapshot,
   type ActivityDashboardApproval,
 } from "../server/activity-dashboard.js";
+import { DomainError } from "../types.js";
 
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -31,6 +32,7 @@ export const MOBILE_APPROVAL_TAILSCALE_HTTPS_PORT = 8443;
 const POLL_INTERVAL_MS = 1_000;
 const RETRY_INTERVAL_MS = 15_000;
 const PUBLISH_TIMEOUT_MS = 5_000;
+const POLL_ERROR_BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 15_000] as const;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
 const TOPIC_PATTERN = /^c2ct-[A-Za-z0-9_-]{43}$/u;
 
@@ -202,6 +204,7 @@ function topicHint(topic: string): string {
 
 function safeError(error: unknown): string {
   if (!(error instanceof Error)) return "unknown error";
+  if (error instanceof DomainError) return `${error.name}(${error.code})`;
   return error.name || "Error";
 }
 
@@ -570,6 +573,8 @@ export class MobileApprovalBridge {
   private readonly sentLocalNoticeKeys = new Set<string>();
   private readonly localNoticeLastAttemptAt = new Map<string, number>();
   private polling = false;
+  private pollFailureCount = 0;
+  private nextPollAttemptAt = 0;
 
   constructor(options: BridgeOptions) {
     this.stateDir = path.resolve(options.stateDir);
@@ -785,7 +790,7 @@ export class MobileApprovalBridge {
   }
 
   async poll(now = Date.now()): Promise<void> {
-    if (this.polling) return;
+    if (this.polling || now < this.nextPollAttemptAt) return;
     this.polling = true;
     try {
       if (!this.state().listening) {
@@ -813,7 +818,12 @@ export class MobileApprovalBridge {
         }
       }
       this.syncChallengeCount();
-      if (!config?.enabled) return;
+      if (!config?.enabled) {
+        this.pollFailureCount = 0;
+        this.nextPollAttemptAt = 0;
+        if (this.state().listening) this.state().error = null;
+        return;
+      }
 
       await this.pollNtfyResponses(config, now);
       const refreshedRequests = await listOperationApprovalRequests(this.stateDir, now);
@@ -881,6 +891,20 @@ export class MobileApprovalBridge {
           this.state().lastPublishError = safeError(error);
         }
       }
+      this.pollFailureCount = 0;
+      this.nextPollAttemptAt = 0;
+      if (this.state().listening) this.state().error = null;
+    } catch (error) {
+      this.pollFailureCount = Math.min(this.pollFailureCount + 1, POLL_ERROR_BACKOFF_MS.length);
+      const retryAfterMs = POLL_ERROR_BACKOFF_MS[this.pollFailureCount - 1]
+        ?? POLL_ERROR_BACKOFF_MS[POLL_ERROR_BACKOFF_MS.length - 1]!;
+      this.nextPollAttemptAt = now + retryAfterMs;
+      this.state().error = safeError(error);
+      await this.ledgerAppend?.({
+        type: "approval.mobile.poll_failed",
+        failureCount: this.pollFailureCount,
+        retryAfterMs,
+      }).catch(() => undefined);
     } finally {
       this.polling = false;
     }

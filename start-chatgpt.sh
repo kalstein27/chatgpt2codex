@@ -375,6 +375,7 @@ hung_recovery_budget_allows() {
 recover_hung_managed_runtime() {
   local reason="$1"
   local previous_root="${SERVER_RUNTIME_ROOT:-}"
+  local retry_delay attempt=0
   if operator_stop_requested; then
     echo "[chatgpt2codex] explicit operator stop suppresses managed runtime recovery."
     return 1
@@ -385,17 +386,34 @@ recover_hung_managed_runtime() {
   echo "[chatgpt2codex] managed runtime recovery attempt $HUNG_RECOVERY_ATTEMPTS/$HUNG_RECOVERY_MAX_ATTEMPTS: $reason; preserving supervisor=$$, tunnel mode=$TUNNEL_MODE."
   stop_managed_server_process
 
-  if start_server_process "$previous_root" &&
-     wait_http_ok "http://127.0.0.1:$PORT/healthz" 20 "recovered managed runtime"; then
-    HEALTH_TICK=0
-    CONSECUTIVE_HEALTH_FAILURES=0
-    echo "[chatgpt2codex] managed runtime recovered; supervisor and connector/tunnel were preserved."
-    return 0
-  fi
+  # A previous runtime may have died while holding a short-lived local state
+  # lock. Retry long enough to cross the 30s stale-lock fallback rather than
+  # declaring the managed runtime unrecoverable after one immediate restart.
+  # The sequence is fixed and bounded: immediate, +5s, +10s, +20s.
+  for retry_delay in 0 5 10 20; do
+    attempt=$((attempt + 1))
+    if [[ "$retry_delay" -gt 0 ]]; then
+      echo "[chatgpt2codex] managed runtime recovery sub-attempt $attempt/4 after ${retry_delay}s backoff."
+      while [[ "$retry_delay" -gt 0 ]]; do
+        operator_stop_requested && return 1
+        sleep_1s
+        retry_delay=$((retry_delay - 1))
+      done
+    fi
 
-  echo "[chatgpt2codex] managed runtime recovery failed health verification; disabling automatic recovery and preserving the supervisor/tunnel for explicit inspection." >&2
-  persist_server_failure_log
-  [[ -n "${SRV_PID:-}" ]] && stop_managed_server_process || true
+    if start_server_process "$previous_root" &&
+       wait_http_ok "http://127.0.0.1:$PORT/healthz" 20 "recovered managed runtime"; then
+      HEALTH_TICK=0
+      CONSECUTIVE_HEALTH_FAILURES=0
+      echo "[chatgpt2codex] managed runtime recovered; supervisor and connector/tunnel were preserved."
+      return 0
+    fi
+
+    persist_server_failure_log
+    [[ -n "${SRV_PID:-}" ]] && stop_managed_server_process || true
+  done
+
+  echo "[chatgpt2codex] managed runtime recovery exhausted the bounded retry sequence; preserving the supervisor/tunnel for explicit inspection." >&2
   HUNG_RECOVERY_DISABLED=1
   return 1
 }

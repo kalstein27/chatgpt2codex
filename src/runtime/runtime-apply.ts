@@ -865,6 +865,7 @@ export async function runRuntimeApplyWorker(input: {
   port: number;
   healthTimeoutMs?: number;
   pollIntervalMs?: number;
+  stabilityProbeCount?: number;
   dependencies?: RuntimeApplyWorkerDependencies;
 }): Promise<RuntimeApplyReceipt> {
   const dependencies = input.dependencies ?? {};
@@ -876,6 +877,7 @@ export async function runRuntimeApplyWorker(input: {
   const now = dependencies.now ?? (() => new Date());
   const healthTimeoutMs = input.healthTimeoutMs ?? 45_000;
   const pollIntervalMs = input.pollIntervalMs ?? 500;
+  const requiredStableTargetProbes = Math.max(1, Math.min(20, input.stabilityProbeCount ?? 1));
 
   let receipt = await getRuntimeApplyReceipt(input.stateDir, { operationId: input.operationId });
   if (!receipt) throw new Error(`Runtime apply receipt not found: ${input.operationId}`);
@@ -936,35 +938,63 @@ export async function runRuntimeApplyWorker(input: {
   await reload(input.stateDir, input.operationId);
 
   const deadline = Date.now() + healthTimeoutMs;
+  let stableTargetPid: number | null = null;
+  let stableTargetProbes = 0;
+  let unstableTargetProbes = 0;
+  let targetObserved = false;
+  let stabilityFailureAction = "rollback-in-progress";
   while (Date.now() < deadline) {
     const health = await probe(input.port);
     const pointer = await readActiveRuntimePointer(input.stateDir);
+    const targetPidAlive = health.runtimePid !== null && pidAlive(health.runtimePid);
     const targetActivated = health.healthy &&
       health.manifest?.buildFingerprint === receipt.targetFingerprint &&
       health.manifest.runtimeRoot === receipt.targetManifest.runtimeRoot &&
       pointer === receipt.targetManifest.runtimeRoot &&
-      health.runtimePid !== null &&
+      targetPidAlive &&
       health.runtimePid !== receipt.previousRuntimePid;
     if (targetActivated) {
-      const preserved = preservation(receipt, health, pidAlive);
-      return updateRuntimeApplyReceipt(input.stateDir, input.operationId, (value) => {
-        const next = transition(value, "APPLIED", "complete", now());
-        next.currentRuntimePid = health.runtimePid;
-        next.currentRuntimeRoot = health.manifest?.runtimeRoot ?? value.targetManifest.runtimeRoot;
-        next.activeRuntimePointer = pointer;
-        next.postApplyHealth = health;
-        next.supervisorPreserved = preserved.supervisorPreserved;
-        next.connectorPreserved = preserved.connectorPreserved;
-        next.tunnelProcessesPreserved = preserved.tunnelProcessesPreserved;
-        next.rollbackAttempted = false;
-        next.rollbackSucceeded = null;
-        next.previousRuntimeRestored = false;
-        next.finalHealthy = true;
-        next.recommendedAction = runtimeSchemaRefreshRequired(value.previousManifest, value.targetManifest)
-          ? "refresh-tool-schema-and-bootstrap"
-          : "none";
-        return next;
-      });
+      targetObserved = true;
+      unstableTargetProbes = 0;
+      if (stableTargetPid === health.runtimePid) {
+        stableTargetProbes += 1;
+      } else {
+        stableTargetPid = health.runtimePid;
+        stableTargetProbes = 1;
+      }
+      if (stableTargetProbes >= requiredStableTargetProbes) {
+        const preserved = preservation(receipt, health, pidAlive);
+        return updateRuntimeApplyReceipt(input.stateDir, input.operationId, (value) => {
+          const next = transition(value, "APPLIED", "complete", now());
+          next.currentRuntimePid = health.runtimePid;
+          next.currentRuntimeRoot = health.manifest?.runtimeRoot ?? value.targetManifest.runtimeRoot;
+          next.activeRuntimePointer = pointer;
+          next.postApplyHealth = health;
+          next.supervisorPreserved = preserved.supervisorPreserved;
+          next.connectorPreserved = preserved.connectorPreserved;
+          next.tunnelProcessesPreserved = preserved.tunnelProcessesPreserved;
+          next.rollbackAttempted = false;
+          next.rollbackSucceeded = null;
+          next.previousRuntimeRestored = false;
+          next.finalHealthy = true;
+          next.recommendedAction = runtimeSchemaRefreshRequired(value.previousManifest, value.targetManifest)
+            ? "refresh-tool-schema-and-bootstrap"
+            : "none";
+          return next;
+        });
+      }
+    } else {
+      stableTargetProbes = 0;
+      if (targetObserved) {
+        const observedPidDied = stableTargetPid !== null && !pidAlive(stableTargetPid);
+        unstableTargetProbes += 1;
+        if (observedPidDied || unstableTargetProbes >= 3) {
+          stabilityFailureAction = observedPidDied
+            ? "candidate-runtime-exited-during-stability-window"
+            : "candidate-runtime-unstable-during-stability-window";
+          break;
+        }
+      }
     }
     const previousRuntimeRestored = health.healthy &&
       health.manifest?.buildFingerprint === receipt.expectedCurrentFingerprint &&
@@ -998,7 +1028,7 @@ export async function runRuntimeApplyWorker(input: {
     const next = transition(value, "HEALTH_CHECK_FAILED", "health", now());
     next.rollbackAttempted = true;
     next.failurePhase = "health";
-    next.recommendedAction = "rollback-in-progress";
+    next.recommendedAction = stabilityFailureAction;
     return next;
   });
   await writeActiveRuntimePointer(input.stateDir, receipt.previousPointerValue);
