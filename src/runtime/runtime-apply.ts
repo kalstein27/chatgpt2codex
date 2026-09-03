@@ -668,6 +668,21 @@ export async function getLatestRuntimeApplyReceipt(stateDir: string): Promise<Ru
   return receipts.at(-1) ?? null;
 }
 
+export function latestAppliedSchemaChangingRuntimeApplyReceipt(
+  receipts: readonly RuntimeApplyReceipt[],
+): RuntimeApplyReceipt | null {
+  return [...receipts].reverse().find((receipt) =>
+    (receipt.state === "APPLIED" || receipt.state === "ALREADY_APPLIED")
+    && receipt.previousManifest.toolSchemaRevision !== receipt.targetManifest.toolSchemaRevision,
+  ) ?? null;
+}
+
+export async function getLatestAppliedSchemaChangingRuntimeApplyReceipt(
+  stateDir: string,
+): Promise<RuntimeApplyReceipt | null> {
+  return latestAppliedSchemaChangingRuntimeApplyReceipt(await listReceiptsUnlocked(stateDir));
+}
+
 /**
  * Reconcile persisted APPROVAL_REQUIRED receipts with operation approval state.
  * Missing, expired, rejected, or consumed approvals are terminalized so they
@@ -978,7 +993,7 @@ export async function runRuntimeApplyWorker(input: {
           next.previousRuntimeRestored = false;
           next.finalHealthy = true;
           next.recommendedAction = runtimeSchemaRefreshRequired(value.previousManifest, value.targetManifest)
-            ? "refresh-tool-schema-and-bootstrap"
+            ? "refresh-hosted-tool-snapshot-and-bootstrap"
             : "none";
           return next;
         });
@@ -1118,8 +1133,19 @@ export function runtimeApplyPublicReceipt(receipt: RuntimeApplyReceipt): Record<
     targetUiResourceRevision: receipt.targetManifest.uiResourceRevision ?? null,
     connectorReregistrationRequired: false,
     connectorEndpointPolicy: "stable-bare-mcp",
+    hostCatalogRebindVerified: null,
+    hostCatalogRefreshRequired: schemaRefreshRequired,
+    hostCatalogRefresh: schemaRefreshRequired
+      ? {
+          surface: "host-app-server",
+          method: "app/installed",
+          params: { forceRefresh: true },
+          requiresFreshChatVerification: false,
+          verificationTarget: "direct-named-tool-mount",
+        }
+      : null,
     schemaRefreshFallback: schemaRefreshRequired
-      ? "keep the registered bare /mcp endpoint; bootstrap the live runtime, then use tool_schema_get plus stable c2ct_invoke whenever a host-mounted named tool is stale; host catalog refresh is optional and never a correctness dependency"
+      ? "keep the registered bare /mcp endpoint; refresh the host's committed connector runtime snapshot with app/installed(forceRefresh=true), then re-query the direct named mount in the current chat; a successful catalog refresh can update the current chat, with a fresh chat used only as fallback when the mount remains stale; refresh plugin/package inventory separately only when plugin metadata itself changed; use tool_schema_get plus stable c2ct_invoke only as the backend correctness fallback while the host catalog is stale; presenter/widget UI still requires the direct named host mount"
       : "none",
     approvalRequestId: receipt.approvalRequestId ?? null,
     createdAt: receipt.createdAt,

@@ -570,6 +570,20 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       buttons.forEach(function (button) { button.disabled = false; });
     }
   }
+  function decideMacApproval(item, decision, buttons, detail) {
+    if (!macBridge) return;
+    buttons.forEach(function (button) { button.disabled = true; });
+    detail.textContent = decision === "approve" ? "Mac에서 승인 처리 중…" : "Mac에서 거절 처리 중…";
+    try {
+      macBridge.postMessage({ action: "decideApproval", requestId: item.id, decision: decision });
+      detail.textContent = decision === "approve" ? "Mac 승인 요청 전달됨…" : "Mac 거절 요청 전달됨…";
+      window.setTimeout(function () { void refresh(); }, 350);
+      window.setTimeout(function () { void refresh(); }, 1200);
+    } catch (error) {
+      detail.textContent = "처리 실패 · " + String(error && error.message ? error.message : error);
+      buttons.forEach(function (button) { button.disabled = false; });
+    }
+  }
   function renderApprovals(items, now) {
     approvalLabel.textContent = items.length + "건";
     if (!items.length) {
@@ -585,9 +599,10 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       var row = el("article", "approval-item " + (item.channel === "mobile" ? "mobile" : "mac"));
       var top = el("div", "approval-top");
       top.appendChild(el("div", "approval-category", item.category || "승인 요청"));
+      var macCanDecide = Boolean(macBridge && item.channel === "mac" && item.kind === "operation");
       var channelText = item.channel === "mobile"
         ? (item.canDecide ? "iPhone 승인 가능" : "Tailscale에서 승인")
-        : "Mac에서 승인 필요";
+        : (macCanDecide ? "Mac에서 바로 승인 가능" : "Mac에서 승인 필요");
       top.appendChild(el("div", "approval-channel " + (item.channel === "mobile" ? "mobile" : "mac"), channelText));
       row.appendChild(top);
       row.appendChild(el("div", "approval-summary", item.summary || "보호 작업 승인 요청"));
@@ -597,17 +612,23 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       meta.appendChild(el("span", "", "요청 " + age(item.createdAt, now)));
       meta.appendChild(el("span", "", "만료까지 " + Math.max(0, Math.ceil((item.expiresAt - now) / 1000)) + "초"));
       row.appendChild(meta);
-      if (item.canDecide) {
-        var detail = el("div", "approval-meta", "이 화면에서 바로 처리 가능");
+      if (item.canDecide || macCanDecide) {
+        var detail = el("div", "approval-meta", macCanDecide ? "이 Mac에서 바로 처리 가능" : "이 화면에서 바로 처리 가능");
         row.appendChild(detail);
         var actions = el("div", "approval-actions");
-        var approve = el("button", "approve", "승인");
+        var approve = el("button", "approve", item.tool === "runtime_apply_local" ? "런타임 교체 허용" : "승인");
         var reject = el("button", "reject", "거절");
         approve.type = "button";
         reject.type = "button";
         var buttons = [approve, reject];
-        approve.onclick = function () { void decideApproval(item, "approve", buttons, detail); };
-        reject.onclick = function () { void decideApproval(item, "reject", buttons, detail); };
+        approve.onclick = function () {
+          if (macCanDecide) decideMacApproval(item, "approve", buttons, detail);
+          else void decideApproval(item, "approve", buttons, detail);
+        };
+        reject.onclick = function () {
+          if (macCanDecide) decideMacApproval(item, "reject", buttons, detail);
+          else void decideApproval(item, "reject", buttons, detail);
+        };
         actions.appendChild(approve);
         actions.appendChild(reject);
         row.appendChild(actions);

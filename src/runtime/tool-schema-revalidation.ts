@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { getRuntimeManifest, type RuntimeManifest } from "./runtime-manifest.js";
-import { getLatestRuntimeApplyReceipt, type RuntimeApplyReceipt } from "./runtime-apply.js";
+import { getLatestAppliedSchemaChangingRuntimeApplyReceipt, type RuntimeApplyReceipt } from "./runtime-apply.js";
 
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -38,6 +38,14 @@ export interface ToolSchemaRecoveryPlan {
   runtimeFingerprint: string | null;
   lastObservedCanonicalSchemaRevision: string | null;
   lastObservedAt: string | null;
+  hostCatalogRebindVerified: boolean | null;
+  hostCatalogRefresh: {
+    surface: "host-app-server";
+    method: "app/installed";
+    forceRefresh: true;
+    requiresFreshChatVerification: false;
+    connectorReregistrationRequired: false;
+  };
   instruction: string;
 }
 
@@ -164,6 +172,14 @@ export function toolSchemaRecoveryPlan(input: {
     runtimeFingerprint: runtimeManifest.runtimeFingerprint,
     lastObservedCanonicalSchemaRevision: revalidation?.schemaRevision ?? null,
     lastObservedAt: revalidation?.observedAt ?? null,
+    hostCatalogRebindVerified: null,
+    hostCatalogRefresh: {
+      surface: "host-app-server" as const,
+      method: "app/installed" as const,
+      forceRefresh: true as const,
+      requiresFreshChatVerification: false as const,
+      connectorReregistrationRequired: false as const,
+    },
   };
 
   if (!lastRuntimeApply || !toolSchemaChanged) {
@@ -173,7 +189,7 @@ export function toolSchemaRecoveryPlan(input: {
       reason: "no-applied-schema-change",
       toolListRefreshObserved: null,
       preferredExecution: "named-tool",
-      instruction: "Use named tools normally. If host-side schema validation still fails before runtime dispatch, recover through tool_schema_get + c2ct_invoke without re-registering the connector. Widget/approval presenter exception: never use c2ct_invoke to render or validate ChatGPT widget UI, approval cards, outputTemplate/resource mounts, or host confirmation UI; those require the dedicated direct named presenter/tool surface because generic dispatch does not reproduce the host's static tool metadata mount.",
+      instruction: "Use named tools normally. If the host catalog is stale while tool_schema_get shows the current live schema, refresh the host connector runtime snapshot with app/installed(forceRefresh=true), then re-query the direct named mount in the current chat. A successful catalog refresh can update the current chat; use a fresh chat only as a fallback when the current host mount still remains stale. Refresh plugin/package inventory separately only when plugin metadata itself changed. Until host convergence, recover backend operations through tool_schema_get + c2ct_invoke without re-registering the connector. Widget/approval presenter exception: never use c2ct_invoke to render or validate ChatGPT widget UI, approval cards, outputTemplate/resource mounts, or host confirmation UI; those require the dedicated direct named presenter/tool surface because generic dispatch does not reproduce the host's static tool metadata mount.",
     };
   }
 
@@ -184,7 +200,7 @@ export function toolSchemaRecoveryPlan(input: {
       reason: "latest-schema-change-is-not-current-runtime",
       toolListRefreshObserved: null,
       preferredExecution: "named-tool",
-      instruction: "The latest schema-changing apply does not describe this runtime. Prefer named tools and keep c2ct_invoke as the host-schema fallback. Widget/approval presenter exception: never use c2ct_invoke to render or validate ChatGPT widget UI, approval cards, outputTemplate/resource mounts, or host confirmation UI; those require the dedicated direct named presenter/tool surface because generic dispatch does not reproduce the host's static tool metadata mount.",
+      instruction: "The latest schema-changing apply does not describe this runtime. Prefer named tools, but if host catalog evidence disagrees with live tool_schema_get, refresh the host connector runtime snapshot with app/installed(forceRefresh=true) and re-query the direct named mount in the current chat. A fresh chat is fallback verification only when the current host mount does not update. Keep c2ct_invoke as the backend host-schema fallback and do not re-register the connector. Widget/approval presenter exception: never use c2ct_invoke to render or validate ChatGPT widget UI, approval cards, outputTemplate/resource mounts, or host confirmation UI; those require the dedicated direct named presenter/tool surface because generic dispatch does not reproduce the host's static tool metadata mount.",
     };
   }
 
@@ -192,6 +208,7 @@ export function toolSchemaRecoveryPlan(input: {
   const observedAt = revalidation ? Date.parse(revalidation.observedAt) : Number.NaN;
   const toolListRefreshObserved = Boolean(
     revalidation
+    && !revalidation.staleClientRevision
     && Number.isFinite(applyAt)
     && Number.isFinite(observedAt)
     && observedAt >= applyAt
@@ -209,7 +226,7 @@ export function toolSchemaRecoveryPlan(input: {
       reason: "post-apply-tools-list-observed",
       toolListRefreshObserved: true,
       preferredExecution: "named-tool",
-      instruction: "A current tools/list response was served after the schema-changing runtime apply. Prefer named tools; if the host still rejects a named call before runtime dispatch, use c2ct_invoke as the correctness fallback. Widget/approval presenter exception: never use c2ct_invoke to render or validate ChatGPT widget UI, approval cards, outputTemplate/resource mounts, or host confirmation UI; those require the dedicated direct named presenter/tool surface because generic dispatch does not reproduce the host's static tool metadata mount.",
+      instruction: "A current tools/list response was served after the schema-changing runtime apply, but this does not prove that the ChatGPT host rebound its mounted catalog. Prefer named tools only when the direct host mount is present; otherwise refresh the host connector runtime snapshot with app/installed(forceRefresh=true), then re-query the direct named mount in the current chat. Use a fresh chat only if the current host mount remains stale. Use c2ct_invoke only as the backend correctness fallback while the host catalog is stale. Widget/approval presenter exception: never use c2ct_invoke to render or validate ChatGPT widget UI, approval cards, outputTemplate/resource mounts, or host confirmation UI; those require the dedicated direct named presenter/tool surface.",
     };
   }
 
@@ -219,7 +236,7 @@ export function toolSchemaRecoveryPlan(input: {
     reason: "runtime-schema-changed-awaiting-tools-list",
     toolListRefreshObserved: false,
     preferredExecution: "c2ct_invoke",
-    instruction: "The runtime schema changed and no current post-apply tools/list fetch has been observed. After bootstrap, route public operations through stable c2ct_invoke by default until connection_status reports named-tools-preferred. Widget/approval presenter exception: never use c2ct_invoke to render or validate ChatGPT widget UI, approval cards, outputTemplate/resource mounts, or host confirmation UI; those require the dedicated direct named presenter/tool surface because generic dispatch does not reproduce the host's static tool metadata mount. If c2ct_invoke refuses a target because that named tool requires host confirmation, do not bypass the boundary; use the dedicated named surface once the host catalog supports it. Do not re-register the bare /mcp connector.",
+    instruction: "The runtime schema changed and no current post-apply tools/list fetch has been observed. Refresh the host connector runtime snapshot with app/installed(forceRefresh=true), then re-query the direct named mount in the current chat. A successful catalog refresh can update the current chat; use a fresh chat only as fallback when the current host mount remains stale. Refresh plugin/package inventory separately only when plugin metadata itself changed. Until host convergence, route backend-safe public operations through stable c2ct_invoke. Widget/approval presenter exception: never use c2ct_invoke to render or validate ChatGPT widget UI, approval cards, outputTemplate/resource mounts, or host confirmation UI; those require the dedicated direct named presenter/tool surface. If c2ct_invoke refuses a target because that named tool requires host confirmation, do not bypass the boundary. Do not re-register the bare /mcp connector.",
   };
 }
 
@@ -228,7 +245,7 @@ export async function readToolSchemaRecoveryState(
   runtimeManifest: RuntimeManifest = getRuntimeManifest(),
 ): Promise<ToolSchemaRecoveryState> {
   const [lastRuntimeApply, revalidation] = await Promise.all([
-    getLatestRuntimeApplyReceipt(stateDir).catch(() => null),
+    getLatestAppliedSchemaChangingRuntimeApplyReceipt(stateDir).catch(() => null),
     readToolSchemaRevalidation(stateDir),
   ]);
   return {

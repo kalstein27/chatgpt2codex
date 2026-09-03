@@ -663,11 +663,14 @@ private final class ServiceController {
         let projectId: String
         let tool: String
         let risk: String
+        let approvalSurface: String
         let preview: String
         let impact: String
         let details: String
         let createdAt: TimeInterval
         let expiresAt: TimeInterval
+
+        var canResolveLocally: Bool { approvalSurface == "local" }
     }
 
     struct PendingOAuthApproval {
@@ -1054,6 +1057,7 @@ private final class ServiceController {
                     projectId: entry["projectId"] as? String ?? "Project",
                     tool: entry["tool"] as? String ?? "operation",
                     risk: entry["risk"] as? String ?? "destructive",
+                    approvalSurface: entry["approvalSurface"] as? String ?? "local",
                     preview: entry["summary"] as? String ?? entry["preview"] as? String ?? "Protected operation",
                     impact: entry["impact"] as? String ?? "승인된 범위에서 시스템 상태가 변경될 수 있습니다.",
                     details: entry["details"] as? String ?? entry["preview"] as? String ?? "상세 정보 없음",
@@ -1621,6 +1625,13 @@ private final class ServiceController {
         runDetachedShell(command)
     }
 
+    func detachManagedRuntimeForAppTermination() {
+        if let managedProcess = process, managedProcess.isRunning {
+            appendLog("app terminating while preserving managed supervisor pid=\(managedProcess.processIdentifier)\n")
+        }
+        process = nil
+    }
+
     func restart(completion: @escaping (Bool) -> Void) {
         setOperatorStopRequested(false)
         let ownsManagedRuntime = process?.isRunning == true
@@ -2186,10 +2197,11 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     private weak var commandStatusLabel: NSTextField?
     private weak var commandProjectLabel: NSTextField?
     private weak var commandMcpButton: NSButton?
-    private weak var commandRemoteControlButton: NSButton?
-    private weak var commandAgentArmButton: NSButton?
-    private weak var commandKillControlButton: NSButton?
+    private weak var commandControlButton: NSButton?
     private weak var commandOperationApprovalsButton: NSButton?
+    private weak var sidebarStatusLabel: NSTextField?
+    private weak var sidebarProjectLabel: NSTextField?
+    private var sidebarButtons: [String: NSButton] = [:]
     private weak var settingsLanguagePopup: NSPopUpButton?
     private weak var settingsProjectField: NSTextField?
     private weak var settingsLaunchAtLogin: NSButton?
@@ -2204,6 +2216,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     private var settingsOwnerTokenConfigured = false
     private weak var settingsHostField: NSTextField?
     private weak var settingsPortField: NSTextField?
+    private weak var settingsAdvancedContainer: NSStackView?
 
     private func t(_ key: String) -> String {
         controller.localized(key)
@@ -2252,6 +2265,16 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             button.toolTip = isDevelopmentBuild ? "ChatGPT To Codex Dev" : "ChatGPT To Codex"
         }
         rebuildMenu()
+        if CommandLine.arguments.contains("--ui-preview") || CommandLine.arguments.contains("--ui-preview-settings") {
+            showActivityWindow()
+            if CommandLine.arguments.contains("--ui-preview-settings") {
+                showSettings()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
+                NSApp.terminate(nil)
+            }
+            return
+        }
         refreshStatus()
         registerGlobalKillHotkeyIfNeeded()
         registerSettingsHotKey()
@@ -2322,7 +2345,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         if let monitor = killHotkeyLocalMonitor { NSEvent.removeMonitor(monitor) }
         unregisterSettingsHotKey()
         unregisterStatusMenuHotKey()
-        controller.stop(terminateExternalRuntime: false)
+        controller.detachManagedRuntimeForAppTermination()
     }
 
     private func rebuildMenu() {
@@ -2475,6 +2498,9 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         settingsItem.target = self
         settingsItem.keyEquivalentModifierMask = [.command]
         appMenu.addItem(settingsItem)
+        let updateItem = NSMenuItem(title: t("checkUpdates"), action: #selector(checkForUpdates), keyEquivalent: "")
+        updateItem.target = self
+        appMenu.addItem(updateItem)
         appMenu.addItem(.separator())
 
         let quitItem = NSMenuItem(title: t("quit"), action: #selector(quit), keyEquivalent: "q")
@@ -2482,6 +2508,23 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         quitItem.keyEquivalentModifierMask = [.command]
         appMenu.addItem(quitItem)
         mainMenu.addItem(appMenuItem)
+
+        if controller.controlEnabled {
+            let controlMenuItem = NSMenuItem()
+            controlMenuItem.title = controller.effectiveLanguageCode == "ko" ? "제어" : "Control"
+            controlMenuItem.submenu = makeControlMenu()
+            mainMenu.addItem(controlMenuItem)
+        }
+
+        let toolsMenuItem = NSMenuItem()
+        let toolsMenu = NSMenu(title: controller.effectiveLanguageCode == "ko" ? "도구" : "Tools")
+        toolsMenuItem.submenu = toolsMenu
+        toolsMenu.addItem(menuItem(t("copyConnector"), #selector(copyConnectorURL), "doc.on.doc"))
+        toolsMenu.addItem(menuItem(controller.effectiveLanguageCode == "ko" ? "권한" : "Permissions", #selector(showPermissionsSection), "lock.shield"))
+        toolsMenu.addItem(menuItem(controller.effectiveLanguageCode == "ko" ? "진단" : "Diagnostics", #selector(showDiagnosticsSection), "stethoscope"))
+        toolsMenu.addItem(.separator())
+        toolsMenu.addItem(menuItem(t("restartMCP"), #selector(restartServer), "arrow.clockwise.circle"))
+        mainMenu.addItem(toolsMenuItem)
 
         let windowMenuItem = NSMenuItem()
         let windowMenu = NSMenu(title: "Window")
@@ -2491,18 +2534,6 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         activityItem.target = self
         activityItem.keyEquivalentModifierMask = [.command]
         windowMenu.addItem(activityItem)
-
-        let logsItem = NSMenuItem(title: t("showLogs"), action: #selector(showLogs), keyEquivalent: "")
-        logsItem.target = self
-        windowMenu.addItem(logsItem)
-
-        let diagnosticsItem = NSMenuItem(title: t("connectionDiagnosticsMenu"), action: #selector(showConnectionDiagnostics), keyEquivalent: "")
-        diagnosticsItem.target = self
-        windowMenu.addItem(diagnosticsItem)
-
-        let doctorItem = NSMenuItem(title: t("doctorTitle"), action: #selector(runDoctor), keyEquivalent: "")
-        doctorItem.target = self
-        windowMenu.addItem(doctorItem)
         mainMenu.addItem(windowMenuItem)
 
         NSApp.mainMenu = mainMenu
@@ -2606,18 +2637,246 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         return label
     }
 
-    private func commandButton(_ title: String, action: Selector, symbolName: String) -> NSButton {
+    private func commandButton(_ title: String, action: Selector, symbolName: String, imageOnly: Bool = false) -> NSButton {
         let button = NSButton(title: title, target: self, action: action)
         button.bezelStyle = .rounded
+        button.controlSize = .small
         button.image = symbol(symbolName)
-        button.imagePosition = .imageLeading
-        button.alignment = .left
-        button.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        button.widthAnchor.constraint(greaterThanOrEqualToConstant: 164).isActive = true
+        button.imagePosition = imageOnly ? .imageOnly : .imageLeading
+        button.alignment = .center
+        if imageOnly {
+            button.widthAnchor.constraint(equalToConstant: 30).isActive = true
+        }
         return button
     }
 
-    @objc private func showUnifiedApprovalsCommandMenu(_ sender: NSButton) {
+    private func sidebarButton(_ id: String, title: String, symbolName: String, action: Selector) -> NSButton {
+        let button = NSButton(title: title, target: self, action: action)
+        button.identifier = NSUserInterfaceItemIdentifier(id)
+        button.bezelStyle = .recessed
+        button.isBordered = false
+        button.image = symbol(symbolName)
+        button.imagePosition = .imageLeading
+        button.alignment = .left
+        button.font = .systemFont(ofSize: 14, weight: .medium)
+        button.contentTintColor = .labelColor
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 10
+        button.heightAnchor.constraint(equalToConstant: 44).isActive = true
+        sidebarButtons[id] = button
+        return button
+    }
+
+    private func makeSidebar() -> NSView {
+        sidebarButtons.removeAll()
+
+        let sidebar = NSVisualEffectView()
+        sidebar.material = .sidebar
+        sidebar.blendingMode = .withinWindow
+        sidebar.state = .active
+        sidebar.translatesAutoresizingMaskIntoConstraints = false
+
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 5
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.addSubview(stack)
+
+        let eyebrow = activityLabel("CHATGPT TO CODEX", font: .systemFont(ofSize: 10, weight: .semibold), color: .secondaryLabelColor)
+        eyebrow.stringValue = "CHATGPT TO CODEX"
+        stack.addArrangedSubview(eyebrow)
+
+        let title = activityLabel(
+            controller.effectiveLanguageCode == "ko" ? "로컬 에이전트" : "Local Agent",
+            font: .systemFont(ofSize: 21, weight: .bold)
+        )
+        stack.addArrangedSubview(title)
+
+        let statusCard = NSVisualEffectView()
+        statusCard.material = .contentBackground
+        statusCard.blendingMode = .withinWindow
+        statusCard.state = .active
+        statusCard.wantsLayer = true
+        statusCard.layer?.cornerRadius = 11
+        statusCard.layer?.borderWidth = 0.5
+        statusCard.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.45).cgColor
+        statusCard.translatesAutoresizingMaskIntoConstraints = false
+
+        let statusStack = NSStackView()
+        statusStack.orientation = .vertical
+        statusStack.alignment = .leading
+        statusStack.spacing = 3
+        statusStack.translatesAutoresizingMaskIntoConstraints = false
+        statusCard.addSubview(statusStack)
+
+        let status = activityLabel(t("statusChecking"), font: .systemFont(ofSize: 12, weight: .semibold))
+        let project = activityLabel(controller.projectDisplayName, font: .systemFont(ofSize: 10), color: .secondaryLabelColor, lines: 2)
+        project.lineBreakMode = .byTruncatingMiddle
+        sidebarStatusLabel = status
+        sidebarProjectLabel = project
+        statusStack.addArrangedSubview(status)
+        statusStack.addArrangedSubview(project)
+        stack.addArrangedSubview(statusCard)
+        statusCard.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        NSLayoutConstraint.activate([
+            statusStack.topAnchor.constraint(equalTo: statusCard.topAnchor, constant: 10),
+            statusStack.leadingAnchor.constraint(equalTo: statusCard.leadingAnchor, constant: 11),
+            statusStack.trailingAnchor.constraint(equalTo: statusCard.trailingAnchor, constant: -11),
+            statusStack.bottomAnchor.constraint(equalTo: statusCard.bottomAnchor, constant: -10),
+        ])
+
+        let primaryLabel = commandSectionLabel(controller.effectiveLanguageCode == "ko" ? "주요 기능" : "Main")
+        stack.addArrangedSubview(primaryLabel)
+        stack.setCustomSpacing(9, after: statusCard)
+        stack.addArrangedSubview(sidebarButton(
+            "activity",
+            title: controller.effectiveLanguageCode == "ko" ? "작업 현황" : "Activity",
+            symbolName: "rectangle.grid.2x2",
+            action: #selector(showActivityDashboardSection)
+        ))
+        stack.addArrangedSubview(sidebarButton(
+            "service",
+            title: controller.effectiveLanguageCode == "ko" ? "MCP / 연결" : "MCP & Connection",
+            symbolName: "bolt.horizontal.circle",
+            action: #selector(showServiceSection)
+        ))
+        stack.addArrangedSubview(sidebarButton(
+            "approvals",
+            title: controller.effectiveLanguageCode == "ko" ? "승인" : "Approvals",
+            symbolName: "checkmark.shield",
+            action: #selector(showApprovalsSection)
+        ))
+        if controller.controlEnabled {
+            stack.addArrangedSubview(sidebarButton(
+                "control",
+                title: controller.effectiveLanguageCode == "ko" ? "제어" : "Control",
+                symbolName: "switch.2",
+                action: #selector(showControlSection)
+            ))
+        }
+
+        let supportLabel = commandSectionLabel(controller.effectiveLanguageCode == "ko" ? "설정 및 시스템" : "Settings & System")
+        stack.addArrangedSubview(supportLabel)
+        stack.setCustomSpacing(10, after: sidebarButtons["control"] ?? sidebarButtons["approvals"]!)
+        stack.addArrangedSubview(sidebarButton(
+            "settings",
+            title: controller.effectiveLanguageCode == "ko" ? "설정" : "Settings",
+            symbolName: "gearshape",
+            action: #selector(showSettings)
+        ))
+        stack.addArrangedSubview(sidebarButton(
+            "permissions",
+            title: controller.effectiveLanguageCode == "ko" ? "권한" : "Permissions",
+            symbolName: "hand.raised",
+            action: #selector(showPermissionsSection)
+        ))
+        stack.addArrangedSubview(sidebarButton(
+            "diagnostics",
+            title: controller.effectiveLanguageCode == "ko" ? "진단" : "Diagnostics",
+            symbolName: "stethoscope",
+            action: #selector(showDiagnosticsSection)
+        ))
+
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.defaultLow, for: .vertical)
+        stack.addArrangedSubview(spacer)
+
+        let version = activityLabel("v\(controller.appVersion)", font: .systemFont(ofSize: 10), color: .tertiaryLabelColor)
+        stack.addArrangedSubview(version)
+
+        for button in sidebarButtons.values {
+            button.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 20),
+            stack.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -14),
+            stack.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -16),
+        ])
+        refreshSidebarSelection()
+        return sidebar
+    }
+
+    private func refreshSidebarSelection() {
+        let selected = activeAppSection == "settings" ? "settings" : activeAppSection
+        for (id, button) in sidebarButtons {
+            let isSelected = id == selected
+            button.layer?.backgroundColor = isSelected
+                ? NSColor.controlAccentColor.withAlphaComponent(0.16).cgColor
+                : NSColor.clear.cgColor
+            button.contentTintColor = isSelected ? .controlAccentColor : .labelColor
+            button.font = .systemFont(ofSize: 14, weight: isSelected ? .semibold : .medium)
+        }
+    }
+
+    private func popUpCommandMenu(_ menu: NSMenu, from sender: NSButton) {
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.minY - 4), in: sender)
+    }
+
+    private func makeServiceMenu() -> NSMenu {
+        let menu = NSMenu()
+        let running = latestHealth || controller.isManagedProcessRunning
+        menu.addItem(menuItem(
+            running ? t("stopMCP") : t("startMCP"),
+            #selector(toggleServer),
+            running ? "stop.circle" : "play.circle"
+        ))
+        menu.addItem(menuItem(t("restartMCP"), #selector(restartServer), "arrow.clockwise.circle"))
+        menu.addItem(.separator())
+        let copyConnector = menuItem(t("copyConnector"), #selector(copyConnectorURL), "doc.on.doc")
+        copyConnector.isEnabled = controller.connectorURL != nil
+        menu.addItem(copyConnector)
+        menu.addItem(menuItem(t("openLocalHealth"), #selector(openLocalHealth), "heart.text.square"))
+        let publicHealth = menuItem(t("openPublicHealth"), #selector(openPublicHealth), "globe")
+        publicHealth.isEnabled = controller.connectorURL != nil
+        menu.addItem(publicHealth)
+        return menu
+    }
+
+    private func makeControlMenu() -> NSMenu {
+        let menu = NSMenu()
+        let remoteEnabled = controller.chatGptRemoteControlEnabled
+        menu.addItem(checkMenuItem(
+            controller.effectiveLanguageCode == "ko" ? "ChatGPT 원격 제어" : "ChatGPT Remote Control",
+            #selector(toggleChatGptRemoteControl),
+            remoteEnabled,
+            "network.badge.shield.half.filled"
+        ))
+        let armed = latestControlSnapshot?.armed == true
+        menu.addItem(checkMenuItem(
+            armed ? t("agentArmOnMenu") : t("agentArmOffMenu"),
+            #selector(toggleAgentArm),
+            armed,
+            "shield.lefthalf.filled"
+        ))
+        let allowlist = menuItem("\(t("controlAllowlistMenu")) (\(controller.controlAllowlist.count))", #selector(editControlAllowlist), "checklist")
+        menu.addItem(allowlist)
+        let actionCount = latestControlSnapshot?.pendingActions.count ?? 0
+        if armed || actionCount > 0 {
+            menu.addItem(.separator())
+            menu.addItem(menuItem(t("killControlMenu"), #selector(killControlAction), "hand.raised.fill"))
+        }
+        menu.addItem(.separator())
+        menu.addItem(menuItem(controller.effectiveLanguageCode == "ko" ? "승인 보기" : "Show Approvals", #selector(showApprovalsSection), "exclamationmark.shield"))
+        return menu
+    }
+
+    private func makeMoreCommandMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.addItem(menuItem(t("settingsMenu"), #selector(showSettings), "gearshape"))
+        menu.addItem(menuItem(controller.effectiveLanguageCode == "ko" ? "권한" : "Permissions", #selector(showPermissionsSection), "lock.shield"))
+        menu.addItem(menuItem(controller.effectiveLanguageCode == "ko" ? "진단" : "Diagnostics", #selector(showDiagnosticsSection), "stethoscope"))
+        menu.addItem(.separator())
+        menu.addItem(menuItem(t("restartMCP"), #selector(restartServer), "arrow.clockwise.circle"))
+        menu.addItem(menuItem(t("copyConnector"), #selector(copyConnectorURL), "doc.on.doc"))
+        menu.addItem(menuItem(t("checkUpdates"), #selector(checkForUpdates), "arrow.clockwise"))
+        return menu
+    }
+
+    @objc private func showApprovalsSection() {
         showIntegratedMenuSection(
             id: "approvals",
             title: controller.effectiveLanguageCode == "ko" ? "승인" : "Approvals",
@@ -2625,7 +2884,15 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         )
     }
 
-    @objc private func showDiagnosticsCommandMenu(_ sender: NSButton) {
+    @objc private func showServiceSection() {
+        showIntegratedMenuSection(
+            id: "service",
+            title: controller.effectiveLanguageCode == "ko" ? "MCP / 연결" : "MCP & Connection",
+            menu: makeServiceMenu()
+        )
+    }
+
+    @objc private func showDiagnosticsSection() {
         showIntegratedMenuSection(
             id: "diagnostics",
             title: controller.effectiveLanguageCode == "ko" ? "진단" : "Diagnostics",
@@ -2633,104 +2900,142 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         )
     }
 
+    @objc private func showPermissionsSection() {
+        showIntegratedMenuSection(
+            id: "permissions",
+            title: controller.effectiveLanguageCode == "ko" ? "권한" : "Permissions",
+            menu: makePermissionsToolsMenu()
+        )
+    }
+
+    @objc private func showControlSection() {
+        showIntegratedMenuSection(
+            id: "control",
+            title: controller.effectiveLanguageCode == "ko" ? "제어" : "Control",
+            menu: makeControlMenu()
+        )
+    }
+
+    @objc private func showControlCommandMenu(_ sender: NSButton) {
+        popUpCommandMenu(makeControlMenu(), from: sender)
+    }
+
+    @objc private func showMoreCommandMenu(_ sender: NSButton) {
+        popUpCommandMenu(makeMoreCommandMenu(), from: sender)
+    }
+
+    @objc private func showUnifiedApprovalsCommandMenu(_ sender: NSButton) {
+        showApprovalsSection()
+    }
+
+    @objc private func showDiagnosticsCommandMenu(_ sender: NSButton) {
+        showDiagnosticsSection()
+    }
+
     private func makeCommandCenter() -> NSView {
-        let sidebar = NSVisualEffectView()
-        sidebar.material = .sidebar
-        sidebar.blendingMode = .withinWindow
-        sidebar.state = .active
-        sidebar.translatesAutoresizingMaskIntoConstraints = false
+        let bar = NSVisualEffectView()
+        bar.material = .headerView
+        bar.blendingMode = .withinWindow
+        bar.state = .active
+        bar.translatesAutoresizingMaskIntoConstraints = false
 
-        let scrollView = NSScrollView()
-        scrollView.hasVerticalScroller = true
-        scrollView.drawsBackground = false
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-        let document = FlippedView()
-        document.translatesAutoresizingMaskIntoConstraints = false
         let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 8
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 6
         stack.translatesAutoresizingMaskIntoConstraints = false
-        document.addSubview(stack)
-        scrollView.documentView = document
-        sidebar.addSubview(scrollView)
+        bar.addSubview(stack)
 
-        let status = activityLabel(t("statusChecking"), font: .systemFont(ofSize: 14, weight: .semibold))
+        let status = activityLabel(t("statusChecking"), font: .systemFont(ofSize: 12, weight: .semibold))
         commandStatusLabel = status
         stack.addArrangedSubview(status)
-        let project = activityLabel(controller.projectDisplayName, font: .systemFont(ofSize: 11), color: .secondaryLabelColor, lines: 2)
+
+        let project = activityLabel(controller.projectDisplayName, font: .systemFont(ofSize: 11), color: .secondaryLabelColor)
+        project.lineBreakMode = .byTruncatingMiddle
+        project.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         commandProjectLabel = project
         stack.addArrangedSubview(project)
 
-        stack.addArrangedSubview(commandSectionLabel(controller.effectiveLanguageCode == "ko" ? "서비스" : "Service"))
+        let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        stack.addArrangedSubview(spacer)
+
+        let home = commandButton("", action: #selector(showActivityDashboardSection), symbolName: "waveform.path.ecg.rectangle", imageOnly: true)
+        home.toolTip = controller.effectiveLanguageCode == "ko" ? "작업 현황" : "Activity"
+        home.setAccessibilityLabel(controller.effectiveLanguageCode == "ko" ? "작업 현황" : "Activity")
+        stack.addArrangedSubview(home)
+
         let mcp = commandButton(t("startMCP"), action: #selector(toggleServer), symbolName: "play.circle")
+        mcp.toolTip = controller.effectiveLanguageCode == "ko" ? "MCP 시작 또는 중지" : "Start or stop MCP"
         commandMcpButton = mcp
         stack.addArrangedSubview(mcp)
 
-        if controller.controlEnabled {
-            let remote = commandButton("ChatGPT 원격 제어", action: #selector(toggleChatGptRemoteControl), symbolName: "network.badge.shield.half.filled")
-            commandRemoteControlButton = remote
-            stack.addArrangedSubview(remote)
-            let arm = commandButton(t("agentArmOffMenu"), action: #selector(toggleAgentArm), symbolName: "shield.lefthalf.filled")
-            commandAgentArmButton = arm
-            stack.addArrangedSubview(arm)
-            let kill = commandButton(t("killControlMenu"), action: #selector(killControlAction), symbolName: "hand.raised.fill")
-            kill.contentTintColor = .systemRed
-            kill.isHidden = true
-            commandKillControlButton = kill
-            stack.addArrangedSubview(kill)
-        }
-
-        stack.addArrangedSubview(commandSectionLabel(controller.effectiveLanguageCode == "ko" ? "작업" : "Work"))
-        stack.addArrangedSubview(commandButton(controller.effectiveLanguageCode == "ko" ? "작업 현황" : "Activity", action: #selector(showActivityDashboardSection), symbolName: "waveform.path.ecg.rectangle"))
-        let approvals = commandButton(controller.effectiveLanguageCode == "ko" ? "승인 대기" : "Approvals", action: #selector(showUnifiedApprovalsCommandMenu(_:)), symbolName: "exclamationmark.shield")
+        let approvals = commandButton(controller.effectiveLanguageCode == "ko" ? "승인" : "Approvals", action: #selector(showUnifiedApprovalsCommandMenu(_:)), symbolName: "exclamationmark.shield")
         commandOperationApprovalsButton = approvals
         stack.addArrangedSubview(approvals)
-        stack.addArrangedSubview(commandButton(controller.effectiveLanguageCode == "ko" ? "진단" : "Diagnostics", action: #selector(showDiagnosticsCommandMenu(_:)), symbolName: "stethoscope"))
-        stack.addArrangedSubview(commandButton(t("settingsMenu"), action: #selector(showSettings), symbolName: "gearshape"))
+
+        if controller.controlEnabled {
+            let control = commandButton("", action: #selector(showControlCommandMenu(_:)), symbolName: "shield.lefthalf.filled", imageOnly: true)
+            control.toolTip = controller.effectiveLanguageCode == "ko" ? "제어" : "Control"
+            control.setAccessibilityLabel(controller.effectiveLanguageCode == "ko" ? "제어" : "Control")
+            commandControlButton = control
+            stack.addArrangedSubview(control)
+        }
+
+        let more = commandButton("", action: #selector(showMoreCommandMenu(_:)), symbolName: "ellipsis.circle", imageOnly: true)
+        more.toolTip = controller.effectiveLanguageCode == "ko" ? "더보기" : "More"
+        more.setAccessibilityLabel(controller.effectiveLanguageCode == "ko" ? "더보기" : "More")
+        stack.addArrangedSubview(more)
 
         NSLayoutConstraint.activate([
-            scrollView.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 12),
-            scrollView.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 10),
-            scrollView.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: -10),
-            scrollView.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -12),
-            document.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
-            document.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
-            document.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
-            document.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
-            stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 4),
-            stack.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 4),
-            stack.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -4),
-            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -4),
+            stack.topAnchor.constraint(equalTo: bar.topAnchor, constant: 8),
+            stack.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -12),
+            stack.bottomAnchor.constraint(equalTo: bar.bottomAnchor, constant: -8),
+            spacer.widthAnchor.constraint(greaterThanOrEqualToConstant: 8),
         ])
-        return sidebar
+        return bar
     }
 
     private func refreshCommandCenter() {
         let running = latestHealth || controller.isManagedProcessRunning
-        commandStatusLabel?.stringValue = "ChatGPT To Codex: \(running ? t("statusOn") : t("statusOff"))"
+        commandStatusLabel?.stringValue = running
+            ? (controller.effectiveLanguageCode == "ko" ? "● 켜짐" : "● On")
+            : (controller.effectiveLanguageCode == "ko" ? "○ 꺼짐" : "○ Off")
         commandStatusLabel?.textColor = running ? .systemGreen : .secondaryLabelColor
-        commandProjectLabel?.stringValue = "\(controller.projectDisplayName) · \(t("portPrefix")) \(controller.port)"
+        commandProjectLabel?.stringValue = controller.projectDisplayName
+        commandProjectLabel?.toolTip = controller.selectedProjectFolder?.path ?? controller.defaultWorkspace
+        sidebarStatusLabel?.stringValue = running
+            ? (controller.effectiveLanguageCode == "ko" ? "● MCP 연결됨" : "● MCP Connected")
+            : (controller.effectiveLanguageCode == "ko" ? "○ MCP 연결 안 됨" : "○ MCP Disconnected")
+        sidebarStatusLabel?.textColor = running ? .systemGreen : .secondaryLabelColor
+        sidebarProjectLabel?.stringValue = controller.projectDisplayName
+        sidebarProjectLabel?.toolTip = controller.selectedProjectFolder?.path ?? controller.defaultWorkspace
         commandMcpButton?.title = running ? t("stopMCP") : t("startMCP")
         commandMcpButton?.image = symbol(running ? "stop.circle" : "play.circle")
 
         let remoteEnabled = controller.chatGptRemoteControlEnabled
-        commandRemoteControlButton?.title = "ChatGPT 원격 제어: \(remoteEnabled ? "켜짐" : "꺼짐")"
-        commandRemoteControlButton?.state = remoteEnabled ? .on : .off
         let armed = latestControlSnapshot?.armed == true
-        commandAgentArmButton?.title = armed ? t("agentArmOnMenu") : t("agentArmOffMenu")
-        commandAgentArmButton?.state = armed ? .on : .off
         let armCount = latestControlSnapshot?.pendingArmRequests.count ?? 0
         let actionCount = latestControlSnapshot?.pendingActions.count ?? 0
         let approvalCount = latestControlSnapshot?.operationApprovals.count ?? 0
         let oauthCount = latestControlSnapshot?.oauthApprovals.count ?? 0
         let rgCount = latestControlSnapshot?.rg.pendingRequests.count ?? 0
         let totalApprovalCount = armCount + actionCount + approvalCount + oauthCount + rgCount
-        commandOperationApprovalsButton?.title = controller.effectiveLanguageCode == "ko"
-            ? "승인 대기 (\(totalApprovalCount))"
-            : "Approvals (\(totalApprovalCount))"
+        commandOperationApprovalsButton?.title = totalApprovalCount > 0
+            ? (controller.effectiveLanguageCode == "ko" ? "승인 \(totalApprovalCount)" : "Approvals \(totalApprovalCount)")
+            : (controller.effectiveLanguageCode == "ko" ? "승인" : "Approvals")
         commandOperationApprovalsButton?.contentTintColor = totalApprovalCount > 0 ? .systemOrange : nil
-        commandKillControlButton?.isHidden = !(armed || actionCount > 0)
+        commandControlButton?.contentTintColor = (remoteEnabled || armed || actionCount > 0) ? .systemBlue : nil
+        if let approvals = sidebarButtons["approvals"] {
+            approvals.title = totalApprovalCount > 0
+                ? (controller.effectiveLanguageCode == "ko" ? "승인  \(totalApprovalCount)" : "Approvals  \(totalApprovalCount)")
+                : (controller.effectiveLanguageCode == "ko" ? "승인" : "Approvals")
+            approvals.contentTintColor = totalApprovalCount > 0 ? .systemOrange : approvals.contentTintColor
+        }
+        refreshSidebarSelection()
     }
 
     private func makeDiagnosticsMenu() -> NSMenu {
@@ -2766,11 +3071,6 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             accessibilityPermission.state = accessibilityAllowed ? .on : .off
             menu.addItem(accessibilityPermission)
         }
-        appendNativeApprovalMenuSection(
-            controller.effectiveLanguageCode == "ko" ? "외부 도구" : "External tools",
-            source: rgPermissionSubmenu,
-            to: menu
-        )
         return menu
     }
 
@@ -2792,6 +3092,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     @objc private func showActivityDashboardSection() {
         showActivityWindow()
         activeAppSection = "activity"
+        refreshSidebarSelection()
         integratedMenuActions.removeAll()
         guard let webView = activityWebView else { return }
         installActivityContent(webView)
@@ -2809,32 +3110,24 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         showActivityWindow()
         guard let host = activityDetailHost else { return }
         activeAppSection = id
+        refreshSidebarSelection()
         installActivityContent(host)
         host.subviews.forEach { $0.removeFromSuperview() }
 
         let wrapper = NSStackView()
         wrapper.orientation = .vertical
         wrapper.alignment = .leading
-        wrapper.spacing = 14
+        wrapper.spacing = 12
         wrapper.translatesAutoresizingMaskIntoConstraints = false
 
         let header = NSStackView()
         header.orientation = .horizontal
         header.alignment = .centerY
-        header.spacing = 10
+        header.spacing = 8
         header.translatesAutoresizingMaskIntoConstraints = false
-        let heading = activityLabel(title, font: .systemFont(ofSize: 20, weight: .semibold))
+        let heading = activityLabel(title, font: .systemFont(ofSize: 22, weight: .bold))
         heading.setContentHuggingPriority(.defaultLow, for: .horizontal)
         header.addArrangedSubview(heading)
-        let activityButton = NSButton(
-            title: controller.effectiveLanguageCode == "ko" ? "작업 현황" : "Activity",
-            target: self,
-            action: #selector(showActivityDashboardSection)
-        )
-        activityButton.bezelStyle = .rounded
-        activityButton.image = symbol("waveform.path.ecg.rectangle")
-        activityButton.imagePosition = .imageLeading
-        header.addArrangedSubview(activityButton)
 
         content.translatesAutoresizingMaskIntoConstraints = false
         wrapper.addArrangedSubview(header)
@@ -2842,10 +3135,10 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         host.addSubview(wrapper)
 
         NSLayoutConstraint.activate([
-            wrapper.topAnchor.constraint(equalTo: host.topAnchor, constant: 22),
-            wrapper.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 24),
-            wrapper.trailingAnchor.constraint(equalTo: host.trailingAnchor, constant: -24),
-            wrapper.bottomAnchor.constraint(equalTo: host.bottomAnchor, constant: -20),
+            wrapper.topAnchor.constraint(equalTo: host.topAnchor, constant: 20),
+            wrapper.leadingAnchor.constraint(equalTo: host.leadingAnchor, constant: 20),
+            wrapper.trailingAnchor.constraint(equalTo: host.trailingAnchor, constant: -20),
+            wrapper.bottomAnchor.constraint(equalTo: host.bottomAnchor, constant: -18),
             header.widthAnchor.constraint(equalTo: wrapper.widthAnchor),
             content.widthAnchor.constraint(equalTo: wrapper.widthAnchor),
         ])
@@ -2856,13 +3149,13 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         let scrollView = NSScrollView()
         scrollView.hasVerticalScroller = true
         scrollView.drawsBackground = false
-        scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 420).isActive = true
+        scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
         let document = FlippedView()
         document.translatesAutoresizingMaskIntoConstraints = false
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 8
+        stack.spacing = 16
         stack.translatesAutoresizingMaskIntoConstraints = false
         document.addSubview(stack)
         scrollView.documentView = document
@@ -2936,12 +3229,16 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
 
     private func refreshIntegratedSection() {
         switch activeAppSection {
+        case "service":
+            showIntegratedMenuSection(id: "service", title: controller.effectiveLanguageCode == "ko" ? "MCP / 연결" : "MCP & Connection", menu: makeServiceMenu())
         case "approvals":
             showIntegratedMenuSection(id: "approvals", title: controller.effectiveLanguageCode == "ko" ? "승인" : "Approvals", menu: makeNativeApprovalMenu())
         case "diagnostics":
             showIntegratedMenuSection(id: "diagnostics", title: controller.effectiveLanguageCode == "ko" ? "진단" : "Diagnostics", menu: makeDiagnosticsMenu())
         case "permissions":
-            showIntegratedMenuSection(id: "permissions", title: controller.effectiveLanguageCode == "ko" ? "권한 / 도구" : "Permissions / Tools", menu: makePermissionsToolsMenu())
+            showIntegratedMenuSection(id: "permissions", title: controller.effectiveLanguageCode == "ko" ? "권한" : "Permissions", menu: makePermissionsToolsMenu())
+        case "control":
+            showIntegratedMenuSection(id: "control", title: controller.effectiveLanguageCode == "ko" ? "제어" : "Control", menu: makeControlMenu())
         case "settings":
             showSettings()
         default:
@@ -3007,7 +3304,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     @objc private func showPermissionsToolsCommandMenu(_ sender: NSButton) {
         showIntegratedMenuSection(
             id: "permissions",
-            title: controller.effectiveLanguageCode == "ko" ? "권한 / 도구" : "Permissions / Tools",
+            title: controller.effectiveLanguageCode == "ko" ? "권한" : "Permissions",
             menu: makePermissionsToolsMenu()
         )
     }
@@ -3094,20 +3391,24 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             if activeAppSection == "activity", activityWebView?.url == nil {
                 loadActivityDashboard()
             }
-            refreshStatus()
+            if isUIPreview {
+                refreshCommandCenter()
+            } else {
+                refreshStatus()
+            }
             return
         }
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1080, height: 700),
+            contentRect: NSRect(x: 0, y: 0, width: 760, height: 540),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = t("activityWindowTitle")
         window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 980, height: 520)
-        window.setFrameAutosaveName("ChatGPTToCodexActivityWindow")
+        window.minSize = NSSize(width: 700, height: 500)
+        window.setFrameAutosaveName("ChatGPTToCodexActivityWindowSidebarV2")
         window.collectionBehavior = [.moveToActiveSpace]
 
         let configuration = WKWebViewConfiguration()
@@ -3120,28 +3421,41 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         webView.translatesAutoresizingMaskIntoConstraints = false
         webView.navigationDelegate = self
 
-        let root = NSView()
+        let root = NSVisualEffectView()
+        root.material = .underWindowBackground
+        root.blendingMode = .behindWindow
+        root.state = .active
         root.translatesAutoresizingMaskIntoConstraints = false
-        let commandCenter = makeCommandCenter()
+        let splitView = NSSplitView()
+        splitView.isVertical = true
+        splitView.dividerStyle = .thin
+        splitView.translatesAutoresizingMaskIntoConstraints = false
+        let sidebar = makeSidebar()
+        let mainPane = NSView()
+        mainPane.translatesAutoresizingMaskIntoConstraints = false
         let contentHost = NSView()
         contentHost.translatesAutoresizingMaskIntoConstraints = false
         let fallback = makeActivityFallbackView()
         let detailHost = NSVisualEffectView()
-        detailHost.material = .contentBackground
+        detailHost.material = .underWindowBackground
         detailHost.blendingMode = .withinWindow
         detailHost.state = .active
 
-        root.addSubview(commandCenter)
-        root.addSubview(contentHost)
+        splitView.addArrangedSubview(sidebar)
+        splitView.addArrangedSubview(mainPane)
+        root.addSubview(splitView)
+        mainPane.addSubview(contentHost)
         NSLayoutConstraint.activate([
-            commandCenter.topAnchor.constraint(equalTo: root.topAnchor),
-            commandCenter.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            commandCenter.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            commandCenter.widthAnchor.constraint(equalToConstant: 196),
-            contentHost.topAnchor.constraint(equalTo: root.topAnchor),
-            contentHost.leadingAnchor.constraint(equalTo: commandCenter.trailingAnchor),
-            contentHost.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            contentHost.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            splitView.topAnchor.constraint(equalTo: root.topAnchor),
+            splitView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            splitView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            splitView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            sidebar.widthAnchor.constraint(equalToConstant: 210),
+            mainPane.widthAnchor.constraint(greaterThanOrEqualToConstant: 490),
+            contentHost.topAnchor.constraint(equalTo: mainPane.topAnchor),
+            contentHost.leadingAnchor.constraint(equalTo: mainPane.leadingAnchor),
+            contentHost.trailingAnchor.constraint(equalTo: mainPane.trailingAnchor),
+            contentHost.bottomAnchor.constraint(equalTo: mainPane.bottomAnchor),
         ])
 
         window.contentView = root
@@ -3156,7 +3470,11 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         window.center()
         window.makeKeyAndOrderFront(nil)
         loadActivityDashboard()
-        refreshStatus()
+        if isUIPreview {
+            refreshCommandCenter()
+        } else {
+            refreshStatus()
+        }
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
@@ -3164,13 +3482,35 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
               message.webView === activityWebView,
               isTrustedActivityDashboardURL(message.webView?.url),
               let body = message.body as? [String: Any],
-              body["action"] as? String == "openApprovals"
+              let action = body["action"] as? String
         else { return }
-        showIntegratedMenuSection(
-            id: "approvals",
-            title: controller.effectiveLanguageCode == "ko" ? "승인" : "Approvals",
-            menu: makeNativeApprovalMenu()
-        )
+
+        if action == "openApprovals" {
+            showIntegratedMenuSection(
+                id: "approvals",
+                title: controller.effectiveLanguageCode == "ko" ? "승인" : "Approvals",
+                menu: makeNativeApprovalMenu()
+            )
+            return
+        }
+
+        guard action == "decideApproval",
+              let requestId = body["requestId"] as? String,
+              let decision = body["decision"] as? String,
+              decision == "approve" || decision == "reject"
+        else { return }
+
+        controller.fetchLocalControlStatus { [weak self] snapshot in
+            guard let self, let snapshot else { return }
+            self.latestControlSnapshot = snapshot
+            guard let request = snapshot.operationApprovals.first(where: { $0.requestId == requestId }),
+                  request.canResolveLocally
+            else {
+                self.refreshStatus()
+                return
+            }
+            self.resolveOperationApproval(request, decision: decision)
+        }
     }
 
     func webView(
@@ -3437,8 +3777,24 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         return formatter.string(from: Date(timeIntervalSince1970: request.expiresAt))
     }
 
-    private func runForegroundApprovalAlert(_ alert: NSAlert) -> NSApplication.ModalResponse {
+    private func runForegroundApprovalAlert(
+        _ alert: NSAlert,
+        expiresAt: TimeInterval? = nil,
+    ) -> NSApplication.ModalResponse {
         let window = alert.window
+        var expiryWorkItem: DispatchWorkItem?
+        if let expiresAt, expiresAt > 0 {
+            let remaining = expiresAt - Date().timeIntervalSince1970
+            guard remaining > 0 else { return .abort }
+            let workItem = DispatchWorkItem { [weak window] in
+                guard let window, NSApp.modalWindow === window else { return }
+                NSApp.abortModal()
+                window.orderOut(nil)
+            }
+            expiryWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + remaining, execute: workItem)
+        }
+        defer { expiryWorkItem?.cancel() }
         window.level = .modalPanel
         window.collectionBehavior.insert(.moveToActiveSpace)
         window.hidesOnDeactivate = false
@@ -3493,7 +3849,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             ],
             primaryTitle: "연결 승인"
         )
-        let response = runForegroundApprovalAlert(alert)
+        let response = runForegroundApprovalAlert(alert, expiresAt: request.expiresAt)
         if response == .alertFirstButtonReturn {
             resolveOAuthApproval(request, decision: "approve")
         } else if response == .alertSecondButtonReturn {
@@ -3515,7 +3871,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     private func presentFirstSeenOperationApproval(from requests: [ServiceController.PendingOperationApproval]) {
-        guard let request = requests.first(where: { !presentedOperationApprovalIDs.contains($0.requestId) }) else { return }
+        guard let request = requests.first(where: { $0.canResolveLocally && !presentedOperationApprovalIDs.contains($0.requestId) }) else { return }
         presentedOperationApprovalIDs.insert(request.requestId)
         presentOperationApproval(request)
     }
@@ -3544,7 +3900,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         if request.details != request.preview {
             alert.accessoryView = ApprovalDetailsAccessory(details: request.details)
         }
-        let response = runForegroundApprovalAlert(alert)
+        let response = runForegroundApprovalAlert(alert, expiresAt: request.expiresAt)
         if response == .alertFirstButtonReturn {
             resolveOperationApproval(request, decision: "approve")
         } else if response == .alertSecondButtonReturn {
@@ -3563,7 +3919,8 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
 
     @objc private func reviewPendingOperationApproval(_ sender: NSMenuItem) {
         guard let requestId = sender.representedObject as? String,
-              let request = latestControlSnapshot?.operationApprovals.first(where: { $0.requestId == requestId })
+              let request = latestControlSnapshot?.operationApprovals.first(where: { $0.requestId == requestId }),
+              request.canResolveLocally
         else { return }
         presentOperationApproval(request)
     }
@@ -3593,7 +3950,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             secondaryTitle: t("rgReject"),
             tertiaryTitle: "추가 옵션…"
         )
-        let response = runForegroundApprovalAlert(alert)
+        let response = runForegroundApprovalAlert(alert, expiresAt: request.expiresAt)
         if response == .alertFirstButtonReturn {
             resolveRgRequest(request.requestId, decision: "once")
         } else if response == .alertSecondButtonReturn {
@@ -3615,7 +3972,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             secondaryTitle: t("rgApproveAlways"),
             tertiaryTitle: t("cancel")
         )
-        let response = runForegroundApprovalAlert(alert)
+        let response = runForegroundApprovalAlert(alert, expiresAt: request.expiresAt)
         if response == .alertFirstButtonReturn {
             resolveRgRequest(request.requestId, decision: "session")
         } else if response == .alertSecondButtonReturn {
@@ -3687,7 +4044,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             ],
             primaryTitle: "제어 허용"
         )
-        let response = runForegroundApprovalAlert(alert)
+        let response = runForegroundApprovalAlert(alert, expiresAt: request.expiresAt)
         if response == .alertFirstButtonReturn {
             controller.performLocalControl("/control/arm-requests/\(request.requestId)/approve") { [weak self] _ in
                 self?.refreshStatus()
@@ -3745,14 +4102,23 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
                 return
             }
             for request in requests {
+                let routeLabel: String
+                if request.canResolveLocally {
+                    routeLabel = controller.effectiveLanguageCode == "ko" ? "이 Mac에서 승인 가능" : "Approve on this Mac"
+                } else if request.approvalSurface == "chatgpt-widget-critical" {
+                    routeLabel = controller.effectiveLanguageCode == "ko" ? "ChatGPT 중요 승인 카드에서 승인 필요" : "Approve in the ChatGPT critical approval card"
+                } else {
+                    routeLabel = controller.effectiveLanguageCode == "ko" ? "ChatGPT 승인 카드에서 승인 필요" : "Approve in the ChatGPT approval card"
+                }
                 let item = NSMenuItem(
-                    title: "\(request.tool) · \(operationApprovalRiskText(request.risk)) · \(operationApprovalExpiryText(request))",
-                    action: #selector(reviewPendingOperationApproval(_:)),
+                    title: "\(request.tool) · \(operationApprovalRiskText(request.risk)) · \(routeLabel) · \(operationApprovalExpiryText(request))",
+                    action: request.canResolveLocally ? #selector(reviewPendingOperationApproval(_:)) : nil,
                     keyEquivalent: ""
                 )
                 item.target = self
                 item.representedObject = request.requestId
-                item.toolTip = request.preview
+                item.isEnabled = latestHealth && request.canResolveLocally
+                item.toolTip = "\(request.preview)\n\(routeLabel)"
                 menu.addItem(item)
             }
             return
@@ -4235,6 +4601,10 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         controller.performLocalControl("/control/kill") { [weak self] _ in self?.refreshStatus() }
     }
 
+    private var isUIPreview: Bool {
+        CommandLine.arguments.contains("--ui-preview") || CommandLine.arguments.contains("--ui-preview-settings")
+    }
+
     private var isUISmokeTest: Bool {
         CommandLine.arguments.contains("--ui-smoke-test")
     }
@@ -4262,7 +4632,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     private func runUISmokeStep(_ index: Int) {
-        let sections = ["activity", "settings", "activity", "approvals", "diagnostics", "settings", "activity"]
+        let sections = ["activity", "service", "approvals", "permissions", "settings", "diagnostics", "activity"]
         guard index < sections.count else {
             uiSmokeLog("PASS all-sections")
             Darwin.exit(0)
@@ -4273,6 +4643,8 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         switch expected {
         case "activity":
             showActivityDashboardSection()
+        case "service":
+            showServiceSection()
         case "settings":
             showSettings()
         case "approvals":
@@ -4287,6 +4659,8 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
                 title: controller.effectiveLanguageCode == "ko" ? "진단" : "Diagnostics",
                 menu: makeDiagnosticsMenu()
             )
+        case "permissions":
+            showPermissionsSection()
         default:
             failUISmokeTest("unknown-section-\(expected)")
             return
@@ -4343,41 +4717,78 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         scrollView.hasVerticalScroller = true
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
-        scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 440).isActive = true
+        scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
 
         let document = FlippedView()
         document.translatesAutoresizingMaskIntoConstraints = false
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 10
+        stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
         document.addSubview(stack)
         scrollView.documentView = document
 
         func sectionTitle(_ text: String) -> NSTextField {
-            let label = activityLabel(text, font: .systemFont(ofSize: 13, weight: .semibold), color: .secondaryLabelColor)
-            label.stringValue = text.uppercased()
+            let label = activityLabel(text, font: .systemFont(ofSize: 16, weight: .semibold))
             return label
         }
 
-        func addRow(_ title: String, _ control: NSView) {
+        var currentSectionStack: NSStackView?
+
+        func beginCard(_ title: String, subtitle: String) -> NSStackView {
+            let card = NSVisualEffectView()
+            card.material = .contentBackground
+            card.blendingMode = .withinWindow
+            card.state = .active
+            card.wantsLayer = true
+            card.layer?.cornerRadius = 14
+            card.layer?.borderWidth = 0.5
+            card.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.45).cgColor
+            card.translatesAutoresizingMaskIntoConstraints = false
+
+            let content = NSStackView()
+            content.orientation = .vertical
+            content.alignment = .leading
+            content.spacing = 11
+            content.translatesAutoresizingMaskIntoConstraints = false
+            card.addSubview(content)
+            content.addArrangedSubview(sectionTitle(title))
+            if !subtitle.isEmpty {
+                let detail = activityLabel(subtitle, font: .systemFont(ofSize: 11), color: .secondaryLabelColor, lines: 2)
+                content.addArrangedSubview(detail)
+            }
+            stack.addArrangedSubview(card)
+            card.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            NSLayoutConstraint.activate([
+                content.topAnchor.constraint(equalTo: card.topAnchor, constant: 16),
+                content.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
+                content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -16),
+                content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -16),
+            ])
+            currentSectionStack = content
+            return content
+        }
+
+        func addRow(_ title: String, _ control: NSView, to target: NSStackView? = nil) {
+            let container = target ?? currentSectionStack ?? stack
             let row = NSStackView()
             row.orientation = .horizontal
             row.alignment = .centerY
-            row.spacing = 12
-            let label = activityLabel(title, font: .systemFont(ofSize: 12), color: .secondaryLabelColor, lines: 2)
-            label.widthAnchor.constraint(equalToConstant: 178).isActive = true
+            row.spacing = 14
+            let label = activityLabel(title, font: .systemFont(ofSize: 11), color: .secondaryLabelColor, lines: 2)
+            label.widthAnchor.constraint(equalToConstant: 148).isActive = true
             control.setContentHuggingPriority(.defaultLow, for: .horizontal)
             row.addArrangedSubview(label)
             row.addArrangedSubview(control)
-            stack.addArrangedSubview(row)
-            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            container.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: container.widthAnchor).isActive = true
         }
 
         func button(_ title: String, action: Selector, symbolName: String? = nil) -> NSButton {
             let button = NSButton(title: title, target: self, action: action)
             button.bezelStyle = .rounded
+            button.controlSize = .small
             if let symbolName {
                 button.image = symbol(symbolName)
                 button.imagePosition = .imageLeading
@@ -4388,21 +4799,16 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         func field(_ value: String, placeholder: String = "") -> NSTextField {
             let field = NSTextField(string: value)
             field.placeholderString = placeholder
-            field.heightAnchor.constraint(equalToConstant: 28).isActive = true
+            field.heightAnchor.constraint(equalToConstant: 26).isActive = true
             return field
         }
 
-        let intro = activityLabel(
-            controller.effectiveLanguageCode == "ko"
-                ? "앱 동작, 연결, 보안 옵션을 한곳에서 관리합니다."
-                : "Manage app behavior, connectivity, and security in one place.",
-            font: .systemFont(ofSize: 12),
-            color: .secondaryLabelColor,
-            lines: 2
+        _ = beginCard(
+            controller.effectiveLanguageCode == "ko" ? "일반" : "General",
+            subtitle: controller.effectiveLanguageCode == "ko"
+                ? "앱의 언어, 기본 프로젝트와 시작 동작을 관리합니다."
+                : "Manage language, the default project, and launch behavior."
         )
-        stack.addArrangedSubview(intro)
-
-        stack.addArrangedSubview(sectionTitle(controller.effectiveLanguageCode == "ko" ? "일반" : "General"))
         let languagePopup = NSPopUpButton(frame: .zero, pullsDown: false)
         for option in desktopLanguageOptions {
             languagePopup.addItem(withTitle: option.name)
@@ -4413,14 +4819,14 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         }
         languagePopup.target = self
         languagePopup.action = #selector(settingsLanguageChanged)
-        languagePopup.widthAnchor.constraint(equalToConstant: 240).isActive = true
+        languagePopup.widthAnchor.constraint(equalToConstant: 180).isActive = true
         settingsLanguagePopup = languagePopup
         addRow(t("language"), languagePopup)
 
         let projectRow = NSStackView()
         projectRow.orientation = .horizontal
         projectRow.alignment = .centerY
-        projectRow.spacing = 8
+        projectRow.spacing = 6
         let projectField = field(controller.selectedProjectFolder?.path ?? "", placeholder: controller.defaultWorkspace)
         projectField.isEditable = false
         projectField.isSelectable = true
@@ -4429,7 +4835,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         let browse = button(t("browse"), action: #selector(browseProjectFolderFromSettings), symbolName: "folder")
         projectRow.addArrangedSubview(projectField)
         projectRow.addArrangedSubview(browse)
-        addRow(t("projectFolder"), projectRow)
+        addRow(controller.effectiveLanguageCode == "ko" ? "기본 프로젝트" : "Default project", projectRow)
 
         let launchAtLogin = NSButton(checkboxWithTitle: t("launchAtLoginSetting"), target: nil, action: nil)
         launchAtLogin.state = controller.launchAtLogin ? .on : .off
@@ -4446,15 +4852,64 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         settingsAutoUpdate = autoUpdate
         addRow("", autoUpdate)
 
-        stack.addArrangedSubview(sectionTitle(controller.effectiveLanguageCode == "ko" ? "보안 / 실행" : "Security / Runtime"))
+        _ = beginCard(
+            controller.effectiveLanguageCode == "ko" ? "연결" : "Connectivity",
+            subtitle: controller.effectiveLanguageCode == "ko"
+                ? "ChatGPT 커넥터와 외부에서 접근할 공개 주소를 설정합니다."
+                : "Configure the ChatGPT connector and its public address."
+        )
+        let publicTunnel = NSButton(checkboxWithTitle: t("publicTunnelSetting"), target: nil, action: nil)
+        publicTunnel.state = controller.enablePublicTunnel ? .on : .off
+        settingsPublicTunnel = publicTunnel
+        addRow("", publicTunnel)
+
+        let hostControls = NSStackView()
+        hostControls.orientation = .horizontal
+        hostControls.alignment = .centerY
+        hostControls.spacing = 6
+        let hostField = field(controller.savedPublicHost ?? "", placeholder: "host.example.com or https://...")
+        settingsHostField = hostField
+        hostControls.addArrangedSubview(hostField)
+        hostControls.addArrangedSubview(button(t("fixedDomainSetup"), action: #selector(showFixedDomainSetup), symbolName: "globe"))
+        addRow(controller.effectiveLanguageCode == "ko" ? "공개 주소" : "Public address", hostControls)
+
+        let publicHintText = controller.effectiveLanguageCode == "ko"
+            ? "비워두면 Quick Tunnel을 사용합니다. https:// 주소는 외부 관리 터널로 취급합니다."
+            : "Blank uses a Quick Tunnel. An https:// URL is treated as an externally managed tunnel."
+        let publicHint = activityLabel(publicHintText, font: .systemFont(ofSize: 10), color: .secondaryLabelColor, lines: 2)
+        addRow("", publicHint)
+
+        let advancedCard = beginCard(
+            controller.effectiveLanguageCode == "ko" ? "고급 설정" : "Advanced",
+            subtitle: controller.effectiveLanguageCode == "ko"
+                ? "보안 토큰, 멀티 프로젝트와 로컬 포트를 관리합니다."
+                : "Manage security tokens, multi-project behavior, and the local port."
+        )
+        let advancedButton = button(
+            controller.effectiveLanguageCode == "ko" ? "고급 옵션 보기" : "Show Advanced Options",
+            action: #selector(toggleAdvancedSettings(_:)),
+            symbolName: "chevron.right"
+        )
+        advancedCard.addArrangedSubview(advancedButton)
+
+        let advanced = NSStackView()
+        advanced.orientation = .vertical
+        advanced.alignment = .leading
+        advanced.spacing = 8
+        advanced.translatesAutoresizingMaskIntoConstraints = false
+        advanced.isHidden = true
+        settingsAdvancedContainer = advanced
+        advancedCard.addArrangedSubview(advanced)
+        advanced.widthAnchor.constraint(equalTo: advancedCard.widthAnchor).isActive = true
+
         settingsOwnerTokenConfigured = false
         let tokenControls = NSStackView()
         tokenControls.orientation = .horizontal
         tokenControls.alignment = .centerY
-        tokenControls.spacing = 8
+        tokenControls.spacing = 6
         let tokenStatus = activityLabel(
             controller.effectiveLanguageCode == "ko" ? "확인 중…" : "Checking…",
-            font: .systemFont(ofSize: 12, weight: .medium),
+            font: .systemFont(ofSize: 11, weight: .medium),
             color: .secondaryLabelColor
         )
         settingsOwnerTokenStatus = tokenStatus
@@ -4467,104 +4922,28 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         tokenCopyButton.isEnabled = false
         settingsOwnerTokenCopyButton = tokenCopyButton
         tokenControls.addArrangedSubview(tokenCopyButton)
-        addRow(t("ownerToken"), tokenControls)
+        addRow(t("ownerToken"), tokenControls, to: advanced)
 
         let multiProjectLanes = NSButton(checkboxWithTitle: t("multiProjectLanesSetting"), target: nil, action: nil)
         multiProjectLanes.state = controller.multiProjectLanesEnabled ? .on : .off
         settingsMultiProjectLanes = multiProjectLanes
-        addRow("", multiProjectLanes)
+        addRow("", multiProjectLanes, to: advanced)
 
         let intermediateTitle = controller.effectiveLanguageCode == "ko" ? "작업 중간 진행 설명 표시" : "Show intermediate progress commentary"
-        let intermediate = NSButton(checkboxWithTitle: intermediateTitle, target: self, action: #selector(toggleIntermediateCommentaryFromSettings(_:)))
+        let intermediate = NSButton(checkboxWithTitle: intermediateTitle, target: self, action: #selector(toggleIntermediateCommentarySetting(_:)))
         intermediate.state = controller.showIntermediateCommentary ? .on : .off
-        addRow("", intermediate)
-
-        stack.addArrangedSubview(sectionTitle(controller.effectiveLanguageCode == "ko" ? "권한" : "Permissions"))
-        let screenAllowed = controller.screenRecordingAllowed
-        let screenPermissionRow = NSStackView()
-        screenPermissionRow.orientation = .horizontal
-        screenPermissionRow.alignment = .centerY
-        screenPermissionRow.spacing = 8
-        let screenPermissionStatus = activityLabel(
-            t(screenAllowed ? "permissionAllowed" : "permissionRequired"),
-            font: .systemFont(ofSize: 12, weight: .medium),
-            color: screenAllowed ? .systemGreen : .systemOrange
-        )
-        screenPermissionRow.addArrangedSubview(screenPermissionStatus)
-        screenPermissionRow.addArrangedSubview(button(
-            screenAllowed
-                ? (controller.effectiveLanguageCode == "ko" ? "확인" : "Review")
-                : (controller.effectiveLanguageCode == "ko" ? "허용하기" : "Allow…"),
-            action: #selector(showScreenRecordingPermission),
-            symbolName: screenAllowed ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
-        ))
-        addRow(t("screenshotPermissionTitle"), screenPermissionRow)
-
-        if controller.controlEnabled {
-            let accessibilityAllowed = controller.accessibilityTrusted
-            let accessibilityPermissionRow = NSStackView()
-            accessibilityPermissionRow.orientation = .horizontal
-            accessibilityPermissionRow.alignment = .centerY
-            accessibilityPermissionRow.spacing = 8
-            let accessibilityPermissionStatus = activityLabel(
-                t(accessibilityAllowed ? "permissionAllowed" : "permissionRequired"),
-                font: .systemFont(ofSize: 12, weight: .medium),
-                color: accessibilityAllowed ? .systemGreen : .systemOrange
-            )
-            accessibilityPermissionRow.addArrangedSubview(accessibilityPermissionStatus)
-            accessibilityPermissionRow.addArrangedSubview(button(
-                accessibilityAllowed
-                    ? (controller.effectiveLanguageCode == "ko" ? "확인" : "Review")
-                    : (controller.effectiveLanguageCode == "ko" ? "허용하기" : "Allow…"),
-                action: #selector(showAccessibilityPermission),
-                symbolName: accessibilityAllowed ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
-            ))
-            addRow(t("accessibilityPermissionTitle"), accessibilityPermissionRow)
-        }
-
-
-        stack.addArrangedSubview(sectionTitle(controller.effectiveLanguageCode == "ko" ? "연결" : "Connectivity"))
-        let publicTunnel = NSButton(checkboxWithTitle: t("publicTunnelSetting"), target: nil, action: nil)
-        publicTunnel.state = controller.enablePublicTunnel ? .on : .off
-        settingsPublicTunnel = publicTunnel
-        addRow("", publicTunnel)
-
-        let hostControls = NSStackView()
-        hostControls.orientation = .horizontal
-        hostControls.alignment = .centerY
-        hostControls.spacing = 8
-        let hostField = field(controller.savedPublicHost ?? "", placeholder: "host.example.com or https://...")
-        settingsHostField = hostField
-        hostControls.addArrangedSubview(hostField)
-        hostControls.addArrangedSubview(button(t("fixedDomainSetup"), action: #selector(showFixedDomainSetup), symbolName: "globe"))
-        let publicEndpointLabel = controller.effectiveLanguageCode == "ko" ? "공개 호스트 / 외부 HTTPS URL" : "Public host / external HTTPS URL"
-        addRow(publicEndpointLabel, hostControls)
-
-        let publicHintText = controller.effectiveLanguageCode == "ko"
-            ? "비워두면 Cloudflare Quick Tunnel을 사용합니다. https:// URL은 Tailscale Funnel 같은 외부 관리 터널로 취급하며 앱이 해당 터널을 시작하거나 종료하지 않습니다."
-            : "Blank uses a Cloudflare Quick Tunnel. An https:// URL is treated as an externally managed tunnel and is never started or stopped by this app."
-        let publicHint = activityLabel(publicHintText, font: .systemFont(ofSize: 10), color: .secondaryLabelColor, lines: 4)
-        addRow("", publicHint)
+        addRow("", intermediate, to: advanced)
 
         let portField = field("\(controller.port)")
-        portField.widthAnchor.constraint(equalToConstant: 120).isActive = true
+        portField.widthAnchor.constraint(equalToConstant: 90).isActive = true
         settingsPortField = portField
-        addRow(t("localPort"), portField)
-
-        stack.addArrangedSubview(sectionTitle(controller.effectiveLanguageCode == "ko" ? "도구" : "Tools"))
-        let toolRow = NSStackView()
-        toolRow.orientation = .horizontal
-        toolRow.spacing = 8
-        toolRow.addArrangedSubview(button(t("copyConnector"), action: #selector(copyConnectorURL), symbolName: "doc.on.doc"))
-        toolRow.addArrangedSubview(button(t("openStatus"), action: #selector(openStatus), symbolName: "heart.text.square"))
-        toolRow.addArrangedSubview(button(t("checkUpdates"), action: #selector(checkForUpdates), symbolName: "arrow.clockwise"))
-        addRow("", toolRow)
+        addRow(t("localPort"), portField, to: advanced)
 
         let footer = NSStackView()
         footer.orientation = .horizontal
         footer.alignment = .centerY
-        footer.spacing = 8
-        let version = activityLabel("v\(controller.appVersion) · Copyright 2026 ezBuilder", font: .systemFont(ofSize: 10), color: .tertiaryLabelColor)
+        footer.spacing = 6
+        let version = activityLabel("v\(controller.appVersion)", font: .systemFont(ofSize: 10), color: .tertiaryLabelColor)
         version.setContentHuggingPriority(.defaultLow, for: .horizontal)
         footer.addArrangedSubview(version)
         let cancel = button(t("cancel"), action: #selector(cancelSettings))
@@ -4572,6 +4951,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         let save = button(t("save"), action: #selector(saveSettings), symbolName: "checkmark")
         save.keyEquivalent = "\r"
         footer.addArrangedSubview(save)
+        currentSectionStack = nil
         stack.addArrangedSubview(footer)
         footer.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
 
@@ -4580,14 +4960,26 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             document.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
             document.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
             document.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
-            stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 4),
-            stack.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 4),
-            stack.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -4),
-            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -4),
+            stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 2),
+            stack.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 2),
+            stack.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -8),
+            stack.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -6),
         ])
 
         showIntegratedDetail(id: "settings", title: t("settingsTitle"), content: scrollView)
-        refreshOwnerTokenSettingsAsync()
+    }
+
+    @objc private func toggleAdvancedSettings(_ sender: NSButton) {
+        guard let advanced = settingsAdvancedContainer else { return }
+        advanced.isHidden.toggle()
+        let expanded = !advanced.isHidden
+        sender.title = controller.effectiveLanguageCode == "ko"
+            ? (expanded ? "고급 설정 접기" : "고급 설정")
+            : (expanded ? "Hide Advanced" : "Advanced")
+        sender.image = symbol(expanded ? "chevron.down" : "chevron.right")
+        if expanded {
+            refreshOwnerTokenSettingsAsync()
+        }
     }
 
     private func refreshOwnerTokenSettingsAsync() {

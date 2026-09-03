@@ -18,6 +18,19 @@ const CHATGPT_WIDGET_APPROVABLE_OPERATION_TOOLS = new Set([
   "verified_local_file_apply",
 ]);
 
+const CHATGPT_WIDGET_CRITICAL_OPERATION_TOOLS = new Set([
+  "runtime_apply_local",
+  "macos_app_apply_local",
+]);
+
+export type ChatGptWidgetApprovalMode = "standard" | "critical";
+
+export function chatGptWidgetApprovalMode(tool: string): ChatGptWidgetApprovalMode | null {
+  if (CHATGPT_WIDGET_CRITICAL_OPERATION_TOOLS.has(tool)) return "critical";
+  if (CHATGPT_WIDGET_APPROVABLE_OPERATION_TOOLS.has(tool)) return "standard";
+  return null;
+}
+
 export function isChatGptWidgetApprovableOperationTool(tool: string): boolean {
   return CHATGPT_WIDGET_APPROVABLE_OPERATION_TOOLS.has(tool);
 }
@@ -88,6 +101,35 @@ export function consumeChatGptWidgetApprovalToken(input: {
     });
   }
   grants.delete(key);
+}
+
+export function validateChatGptWidgetApprovalToken(input: {
+  requestId: string;
+  token: string;
+  sessionScope?: string;
+  now?: number;
+}): void {
+  const now = input.now ?? Date.now();
+  prune(now);
+  const key = grantKey(input.requestId);
+  const grant = grants.get(key);
+  if (!grant || grant.expiresAt <= now) {
+    grants.delete(key);
+    throw new DomainError(ErrorCode.PERMISSION_DENIED, "ChatGPT approval widget token is missing or expired", {
+      requestId: input.requestId,
+    });
+  }
+  if (grant.sessionScope && grant.sessionScope !== input.sessionScope) {
+    throw new DomainError(ErrorCode.PERMISSION_DENIED, "ChatGPT approval widget token belongs to another conversation", {
+      requestId: input.requestId,
+    });
+  }
+  const supplied = hashToken(input.token);
+  if (supplied.length !== grant.tokenHash.length || !timingSafeEqual(supplied, grant.tokenHash)) {
+    throw new DomainError(ErrorCode.PERMISSION_DENIED, "Invalid ChatGPT approval widget token", {
+      requestId: input.requestId,
+    });
+  }
 }
 
 export function clearChatGptWidgetApprovalToken(requestId: string): void {

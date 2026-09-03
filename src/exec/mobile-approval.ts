@@ -7,6 +7,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { listArmRequests, type ArmRequestRecord } from "../control/arm-requests.js";
 import {
+  isChatGptWidgetApprovalSurface,
   isMobileApprovableOperationTool,
   listOperationApprovalRequests,
   resolveOperationApprovalRequest,
@@ -434,7 +435,7 @@ async function dashboardApprovalItems(
     .filter((request) =>
       request.status === "pending" &&
       request.expiresAt > now &&
-      (request.approvalSurface ?? "local") !== "chatgpt-widget",
+      !isChatGptWidgetApprovalSurface(request.approvalSurface),
     )
     .map((request) => {
       const mobile = isMobileApprovableOperationTool(request.tool);
@@ -652,7 +653,7 @@ export class MobileApprovalBridge {
     const request = requests.find((entry) => entry.requestId === challenge.requestId);
     if (!request ||
         request.status !== "pending" ||
-        (request.approvalSurface ?? "local") === "chatgpt-widget" ||
+        isChatGptWidgetApprovalSurface(request.approvalSurface) ||
         !isMobileApprovableOperationTool(request.tool) ||
         request.expiresAt <= now) {
       this.byToken.delete(token);
@@ -803,7 +804,7 @@ export class MobileApprovalBridge {
         requests
           .filter((request) =>
             request.status === "pending" &&
-            (request.approvalSurface ?? "local") !== "chatgpt-widget" &&
+            !isChatGptWidgetApprovalSurface(request.approvalSurface) &&
             isMobileApprovableOperationTool(request.tool) &&
             request.expiresAt > now,
           )
@@ -832,7 +833,7 @@ export class MobileApprovalBridge {
       pending = new Map(
         pendingOperations
           .filter((request) =>
-            (request.approvalSurface ?? "local") !== "chatgpt-widget" &&
+            !isChatGptWidgetApprovalSurface(request.approvalSurface) &&
             isMobileApprovableOperationTool(request.tool),
           )
           .map((request) => [request.requestId, request]),
@@ -840,7 +841,7 @@ export class MobileApprovalBridge {
 
       const localOnlyOperationNotices = pendingOperations
         .filter((request) =>
-          (request.approvalSurface ?? "local") !== "chatgpt-widget" &&
+          !isChatGptWidgetApprovalSurface(request.approvalSurface) &&
           !isMobileApprovableOperationTool(request.tool),
         )
         .map(operationLocalOnlyNotice);
@@ -974,7 +975,7 @@ export class MobileApprovalBridge {
         sendJson(res, 410, { ok: false });
         return;
       }
-      if ((request.approvalSurface ?? "local") === "chatgpt-widget" ||
+      if (isChatGptWidgetApprovalSurface(request.approvalSurface) ||
           !isMobileApprovableOperationTool(request.tool)) {
         sendJson(res, 403, { ok: false });
         return;

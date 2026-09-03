@@ -40,6 +40,7 @@ export const MCP_CORE_TOOL_NAMES = [
   "project_select",
   "project_release",
   "project_renew_lease",
+  "chatgpt_widget_asset_apply",
   "project_status",
   "project_rules",
   "operation_status",

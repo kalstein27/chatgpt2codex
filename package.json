@@ -15,9 +15,12 @@
     "audit:moderate": "npm audit --audit-level=moderate",
     "audit:prod": "npm audit --omit=dev --audit-level=moderate",
     "activity-dashboard:apply": "tsx scripts/apply-activity-dashboard.ts",
-    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json && node dist/runtime/runtime-manifest.js --seal",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json && node dist/runtime/chatgpt-widget-asset-build.js && node dist/runtime/runtime-manifest.js --seal",
     "build:macos-app": "bash scripts/build-macos-app.sh",
     "chatgpt": "bash start-chatgpt.sh",
+    "chatgpt:c2ct:plugin-refresh": "node src/exec/chatgpt-c2ct-command.mjs plugin-refresh",
+    "chatgpt:c2ct:catalog-refresh": "node src/exec/chatgpt-c2ct-command.mjs catalog-refresh",
+    "chatgpt:c2ct:scan-tools": "node src/exec/chatgpt-c2ct-command.mjs scan-tools",
     "chatgpt:windows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File start-chatgpt.ps1",
     "connector:assistant": "tsx src/cli.ts connector-assistant",
     "start": "node dist/cli.js",
@@ -27,11 +30,46 @@
     "typecheck": "tsc --noEmit"
   },
   "c2ct": {
+    "commands": {
+      "chatgpt:c2ct:plugin-refresh": {
+        "sideEffects": {
+          "needsNetwork": true,
+          "writesWorkspace": false,
+          "writesExternalLocalPath": false,
+          "launchesProcess": true,
+          "destructive": false,
+          "fixedDestination": true,
+          "localApproval": "once"
+        }
+      },
+      "chatgpt:c2ct:catalog-refresh": {
+        "sideEffects": {
+          "needsNetwork": true,
+          "writesWorkspace": false,
+          "writesExternalLocalPath": false,
+          "launchesProcess": true,
+          "destructive": false,
+          "fixedDestination": true,
+          "localApproval": "once"
+        }
+      },
+      "chatgpt:c2ct:scan-tools": {
+        "sideEffects": {
+          "needsNetwork": true,
+          "writesWorkspace": false,
+          "writesExternalLocalPath": false,
+          "launchesProcess": true,
+          "destructive": false,
+          "fixedDestination": true,
+          "localApproval": "once"
+        }
+      }
+    },
     "fixedLocalFileOperations": {
       "approval-widget-e2e-20260830": {
         "source": {
           "projectRelativePath": "README.md",
-          "sha256": "c702119269e317216b950b8f8499b7201946d3e2512ef4c4999b6b258eda1643"
+          "sha256": "9d64b852b2b00198b7f30b6dedc5bd96d31c37fbdbf2229764c2dfda226555ad"
         },
         "destination": {
           "class": "user-application-support-measurement",
@@ -51,10 +89,11 @@
   },
   "overrides": {
     "@hono/node-server": "2.0.12",
-    "fast-uri": "3.1.5",
+    "fast-uri": "3.1.6",
     "hono": "4.12.34",
     "ip-address": "10.3.1",
-    "nanoid": "3.3.18"
+    "nanoid": "3.3.18",
+    "qs": "6.16.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",

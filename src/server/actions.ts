@@ -107,8 +107,9 @@ const ACTION_ROUTES: ActionRoute[] = [
     path: "/actions/project-lane-release",
     tool: "project_lane_release",
     operationId: "project_lane_release",
-    summary: "Release a project work lane",
-    description: "Release only the exact current conversation work lane after work is complete.",
+    summary: "Finalize a C2CT project work lane",
+    description:
+      "Idempotently clear only the exact current conversation's temporary C2CT work-lane authorization after work is complete. It does not modify project files, processes, runtime, app, connector, or network state.",
     schema: "ProjectLaneLeaseInput",
   },
   {
@@ -123,9 +124,9 @@ const ACTION_ROUTES: ActionRoute[] = [
     path: "/actions/project-release",
     tool: "project_release",
     operationId: "project_release",
-    summary: "Release the active local project lease",
+    summary: "Finalize the active C2CT project lease",
     description:
-      "Call this after mutation, test, image-save, or control work is complete and before the final response. It releases the privileged lease while keeping the project selected by default, and fails closed if another operation is still running.",
+      "Idempotently clear only the caller's temporary C2CT serial capability lease after work completes. It keeps the project selected by default, does not modify files/processes/runtime/app/connector/network state, and fails closed if tracked work is still running.",
     schema: "ProjectReleaseInput",
   },
   {
@@ -976,7 +977,11 @@ export function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "reason", "purpose"],
           properties: {
             projectId: { type: "string", description: "Project id or name, for example chatgpt2codex." },
-            reason: { type: "string" },
+            reason: {
+              type: "string",
+              enum: ["work", "maintenance", "renew", "done", "cleanup", "control"],
+              description: "Fixed lease audit label. Use one listed value only.",
+            },
             purpose: {
               type: "string",
               enum: ["legacy-admin"],
@@ -997,7 +1002,11 @@ export function openApiSpec(publicOrigin: string): Record<string, unknown> {
           properties: {
             projectId: { type: "string" },
             preset: { type: "string", enum: ["read-only", "tests-only", "full-write", "image-only"] },
-            reason: { type: "string", minLength: 1 },
+            reason: {
+              type: "string",
+              enum: ["work", "maintenance", "renew", "done", "cleanup", "control"],
+              description: "Fixed lease audit label. Use one listed value only.",
+            },
           },
         },
         ProjectLaneStatusInput: {
@@ -1017,7 +1026,11 @@ export function openApiSpec(publicOrigin: string): Record<string, unknown> {
             projectId: { type: "string" },
             workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             leaseId: { type: "string", pattern: "^lease_[0-9a-fA-F-]{36}$" },
-            reason: { type: "string", minLength: 1 },
+            reason: {
+              type: "string",
+              enum: ["work", "maintenance", "renew", "done", "cleanup", "control"],
+              description: "Fixed lease audit label. Use one listed value only.",
+            },
           },
         },
         ProjectLaneRecoverInput: {
@@ -1026,7 +1039,11 @@ export function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "reason"],
           properties: {
             projectId: { type: "string" },
-            reason: { type: "string", minLength: 1 },
+            reason: {
+              type: "string",
+              enum: ["work", "maintenance", "renew", "done", "cleanup", "control"],
+              description: "Fixed lease audit label. Use one listed value only.",
+            },
           },
         },
         ProjectReleaseInput: {
@@ -1036,7 +1053,11 @@ export function openApiSpec(publicOrigin: string): Record<string, unknown> {
           properties: {
             projectId: { type: "string" },
             leaseId: { type: "string", pattern: "^lease_[0-9a-fA-F-]{36}$" },
-            reason: { type: "string", minLength: 1 },
+            reason: {
+              type: "string",
+              enum: ["work", "maintenance", "renew", "done", "cleanup", "control"],
+              description: "Fixed lease audit label. Use one listed value only.",
+            },
             keepProjectSelected: {
               type: "boolean",
               default: true,

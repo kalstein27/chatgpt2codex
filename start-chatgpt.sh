@@ -36,6 +36,7 @@ RUNTIME_APPLY_MAINTENANCE_FILE="$STATE_DIR/runtime-apply-maintenance"
 CFLOG="$(mktemp -t chatgpt2codex-cf.XXXX.log)"
 SRVLOG="$(mktemp -t chatgpt2codex-server.XXXX.log)"
 LAST_RUNTIME_FAILURE_LOG="$STATE_DIR/logs/last-runtime-failure.log"
+SUPERVISOR_LIFECYCLE_LOG="$STATE_DIR/logs/supervisor-lifecycle.log"
 DOCTOR_SCRIPT="$ROOT/macos-dependency-doctor.sh"
 if [[ ! -f "$DOCTOR_SCRIPT" && -f "$ROOT/scripts/macos-dependency-doctor.sh" ]]; then
   DOCTOR_SCRIPT="$ROOT/scripts/macos-dependency-doctor.sh"
@@ -54,21 +55,28 @@ HUNG_RECOVERY_LAST_AT=0
 HUNG_RECOVERY_ATTEMPTS=0
 HUNG_RECOVERY_DISABLED=0
 
+append_supervisor_lifecycle() {
+  mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
+  printf '%s pid=%s ppid=%s event=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$PPID" "$1" >>"$SUPERVISOR_LIFECYCLE_LOG" 2>/dev/null || true
+}
+
 cleanup() {
+  local reason="${1:-EXIT}"
   # Command substitutions run in Bash subshells and inherit EXIT traps on some
   # macOS Bash versions. Only the top-level launcher may own/stop these PIDs.
   [[ "${BASH_SUBSHELL:-0}" == "$LAUNCHER_SUBSHELL_LEVEL" ]] || return 0
   [[ "$CLEANED_UP" == "0" ]] || return 0
   CLEANED_UP=1
+  append_supervisor_lifecycle "stop reason=$reason child=${SRV_PID:-none}"
   echo
   echo "[chatgpt2codex] stopping server/tunnel..."
   [[ -n "${SRV_PID:-}" ]] && kill "$SRV_PID" 2>/dev/null || true
   [[ -n "${CF_PID:-}" ]] && kill "$CF_PID" 2>/dev/null || true
   rm -f "$CFLOG" "$SRVLOG"
 }
-trap 'cleanup' EXIT
-trap 'cleanup; exit 130' INT
-trap 'cleanup; exit 143' TERM
+trap 'cleanup EXIT' EXIT
+trap 'cleanup INT; exit 130' INT
+trap 'cleanup TERM; exit 143' TERM
 
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -223,6 +231,7 @@ restore_runtime_pointer() {
 reload_server_runtime() {
   local previous_root="$SERVER_RUNTIME_ROOT"
   rm -f "$RUNTIME_RELOAD_FILE"
+  append_supervisor_lifecycle "reload-begin child=${SRV_PID:-none}"
   echo "[chatgpt2codex] applying runtime update while preserving the connector URL..."
   echo "[chatgpt2codex] stopping runtime process $SRV_PID (supervisor=$$)."
   stop_managed_server_process
@@ -230,16 +239,19 @@ reload_server_runtime() {
   if start_server_process &&
      wait_http_ok "http://127.0.0.1:$PORT/healthz" 20 "updated local server"; then
     reset_hung_recovery_state
+    append_supervisor_lifecycle "reload-complete child=${SRV_PID:-none}"
     echo "[chatgpt2codex] runtime updated; connector URL is unchanged."
     return 0
   fi
 
   echo "[chatgpt2codex] updated runtime failed health check; rolling back." >&2
+  append_supervisor_lifecycle "reload-target-health-failed child=${SRV_PID:-none}"
   [[ -n "${SRV_PID:-}" ]] && stop_managed_server_process || true
   restore_runtime_pointer "$previous_root"
   start_server_process
   if wait_http_ok "http://127.0.0.1:$PORT/healthz" 20 "rolled-back local server"; then
     reset_hung_recovery_state
+    append_supervisor_lifecycle "reload-rollback-complete child=${SRV_PID:-none}"
     echo "[chatgpt2codex] previous runtime restored; connector URL is unchanged." >&2
     return 1
   fi
@@ -636,6 +648,7 @@ mkdir -p "$WORKSPACE"
 WORKSPACE="$(cd "$WORKSPACE" && pwd)"
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR" 2>/dev/null || true
+append_supervisor_lifecycle "start"
 
 if operator_stop_requested; then
   echo "[chatgpt2codex] explicit operator stop is active; leaving MCP stopped."

@@ -1,6 +1,6 @@
 import { CHATGPT_WIDGET_SHELL_COMPAT_PREFIX } from "../exec/chatgpt-widget-shell.js";
 
-export const CHATGPT_OPERATION_APPROVAL_WIDGET_VERSION = 9;
+export const CHATGPT_OPERATION_APPROVAL_WIDGET_VERSION = 13;
 export const CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL =
   `chatgpt_operation_approval_presenter_v${CHATGPT_OPERATION_APPROVAL_WIDGET_VERSION}`;
 export const CHATGPT_OPERATION_APPROVAL_WIDGET_URI =
@@ -8,17 +8,19 @@ export const CHATGPT_OPERATION_APPROVAL_WIDGET_URI =
 export const CHATGPT_OPERATION_APPROVAL_WIDGET_RESOURCE_NAME =
   `c2ct-operation-approval-widget-v${CHATGPT_OPERATION_APPROVAL_WIDGET_VERSION}`;
 
-export const CHATGPT_CONSENT_WIDGET_URI = "ui://widget/c2ct-consent-v6.html";
-// Keep the shared consent/Widget Shell presenter URI stable. iOS ChatGPT can
-// keep a host-mounted presenter's declared resource across runtime updates, so
-// operation-approval UI revisions use their own versioned presenter instead of
-// churning the shared presenter contract.
-// Lab-only cache-buster. Keep the default presenter URI stable so existing
-// consent/Widget Shell host bindings do not churn when only Lab JS changes.
-export const CHATGPT_CONSENT_WIDGET_LAB_VERSION = 8;
+// One final cache-boundary bump introduces the stable hot-loader resource. Once
+// this generation is mounted, UI-only card changes are delivered through the
+// state-dir widget asset and no longer require presenter URI churn.
+export const CHATGPT_CONSENT_WIDGET_URI = "ui://widget/c2ct-consent-v7.html";
+export const CHATGPT_CONSENT_WIDGET_LAB_VERSION = 9;
 export const CHATGPT_CONSENT_WIDGET_LAB_URI = `ui://widget/c2ct-consent-v${CHATGPT_CONSENT_WIDGET_LAB_VERSION}.html`;
 export const CHATGPT_CONSENT_WIDGET_MIME = "text/html;profile=mcp-app";
 export const CHATGPT_CONSENT_META_KEY = "chatgpt2codex/consent";
+export const CHATGPT_WIDGET_ASSET_PROTOCOL_VERSION = 1;
+export const CHATGPT_WIDGET_ASSET_GET_TOOL = "chatgpt_widget_asset_get";
+export function chatGptWidgetSessionId(requestId: string): string {
+  return `c2ct-approval-${requestId}`;
+}
 export const CHATGPT_CONSENT_WIDGET_RESOURCE_META = {
   "openai/widgetDescription": "Shared C2CT harmless confirmation and widget interaction surface.",
   "openai/widgetPrefersBorder": true,
@@ -29,15 +31,111 @@ export const CHATGPT_CONSENT_WIDGET_RESOURCE_META = {
   },
 } as const;
 
+export const CHATGPT_CONSENT_WIDGET_LOADER_HTML = `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html { color-scheme: light dark; }
+  html, body { margin: 0; padding: 0; background: transparent; }
+  body { box-sizing: border-box; padding: 10px 12px; font-family: -apple-system, system-ui, sans-serif; color: #111827; }
+  @media (prefers-color-scheme: dark) { body { color: #f5f5f5; } }
+  #status { font-size: 12px; line-height: 1.45; opacity: .68; }
+</style>
+</head>
+<body>
+<div id="status">C2CT 카드 로딩 중…</div>
+<script>
+(function () {
+  var pending = new Map();
+  var nextId = 1;
+  function structured(result) {
+    if (!result || typeof result !== "object") return {};
+    if (result.structuredContent && typeof result.structuredContent === "object") return result.structuredContent;
+    return result;
+  }
+  function request(method, params) {
+    var id = nextId++;
+    return new Promise(function (resolve, reject) {
+      pending.set(id, { resolve: resolve, reject: reject });
+      window.parent.postMessage({ jsonrpc: "2.0", id: id, method: method, params: params }, "*");
+    });
+  }
+  function notify(method, params) {
+    window.parent.postMessage({ jsonrpc: "2.0", method: method, params: params || {} }, "*");
+  }
+  window.addEventListener("message", function (event) {
+    if (event.source !== window.parent) return;
+    var message = event.data;
+    if (!message || message.jsonrpc !== "2.0" || message.id === undefined || !pending.has(message.id)) return;
+    var waiter = pending.get(message.id);
+    pending.delete(message.id);
+    if (message.error) waiter.reject(message.error);
+    else waiter.resolve(message.result);
+  }, { passive: true });
+  function withTimeout(promise, timeoutMs) {
+    return Promise.race([
+      promise,
+      new Promise(function (_, reject) {
+        setTimeout(function () { reject(new Error("widget asset bridge timeout")); }, timeoutMs);
+      })
+    ]);
+  }
+  async function loadThroughMcpApps() {
+    var initialized = await request("ui/initialize", {
+      appInfo: { name: "C2CT Widget Loader", version: "1.0.0" },
+      appCapabilities: {},
+      protocolVersion: "2026-01-26"
+    });
+    notify("ui/notifications/initialized", {});
+    var capabilities = initialized && initialized.hostCapabilities ? initialized.hostCapabilities : {};
+    if (!capabilities.serverTools) throw new Error("MCP Apps serverTools unavailable");
+    return request("tools/call", { name: "${CHATGPT_WIDGET_ASSET_GET_TOOL}", arguments: {} });
+  }
+  async function load() {
+    var result;
+    try {
+      result = await withTimeout(loadThroughMcpApps(), 1800);
+    } catch (_) {
+      var a = window.openai || {};
+      if (typeof a.callTool !== "function") throw _;
+      result = await a.callTool("${CHATGPT_WIDGET_ASSET_GET_TOOL}", {});
+    }
+    var out = structured(result);
+    if (typeof out.html !== "string" || !out.html) throw new Error("widget asset HTML unavailable");
+    document.open();
+    document.write(out.html);
+    document.close();
+  }
+  void load().catch(function () {
+    var status = document.getElementById("status");
+    if (status) status.textContent = "C2CT 카드 asset을 불러오지 못했습니다. presenter/runtime 상태를 다시 확인해줘.";
+  });
+})();
+</script>
+</body>
+</html>`;
+
 export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
 <style>
+  html { color-scheme: light dark; }
   html, body { margin: 0; padding: 0; background: transparent; }
-  body { display: none; box-sizing: border-box; padding: 6px 4px 4px; font-family: -apple-system, system-ui, sans-serif; color: inherit; overflow: visible; }
-  .card { box-sizing: border-box; border: 1px solid rgba(128,128,128,.35); border-radius: 12px; padding: 14px; margin: 0; }
-  .title { font-weight: 650; font-size: 15px; line-height: 1.35; padding-top: 1px; margin-bottom: 10px; }
+  body { display: none; box-sizing: border-box; padding: 6px 4px 4px; font-family: -apple-system, system-ui, sans-serif; color: #111827; overflow: visible; }
+  @media (prefers-color-scheme: dark) { body { color: #f5f5f5; } }
+  .card { box-sizing: border-box; border: 1px solid rgba(128,128,128,.35); border-radius: 12px; padding: 14px; margin: 0; color: inherit; background: transparent; }
+  .card.critical { border-color: rgba(220,72,48,.78); background: rgba(220,72,48,.08); box-shadow: inset 0 0 0 1px rgba(220,72,48,.12); }
+  .title-row { display: flex; gap: 8px; align-items: flex-start; justify-content: space-between; margin-bottom: 10px; }
+  .title { min-width: 0; font-weight: 650; font-size: 15px; line-height: 1.35; padding-top: 1px; }
+  .title-state { flex: none; font-size: 12px; font-weight: 650; line-height: 1.35; padding-top: 2px; opacity: .78; white-space: nowrap; }
+  .critical-badge { display: inline-block; margin-bottom: 9px; border: 1px solid rgba(220,72,48,.72); border-radius: 999px; padding: 4px 8px; font-size: 11px; font-weight: 750; letter-spacing: .01em; }
+  .critical-warning { margin-bottom: 10px; border-radius: 9px; padding: 10px 11px; background: rgba(220,72,48,.12); font-size: 12px; font-weight: 620; line-height: 1.48; }
+  .critical-meta { margin: 9px 0 2px; border-top: 1px solid rgba(220,72,48,.28); padding-top: 8px; font-size: 11px; line-height: 1.5; }
+  .critical-meta-row { display: flex; gap: 8px; justify-content: space-between; }
+  .critical-meta-key { opacity: .68; }
+  .critical-meta-value { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 650; text-align: right; }
   .entry-head { display: flex; gap: 8px; align-items: flex-start; justify-content: space-between; }
   .preview { min-width: 0; font-size: 13px; font-weight: 620; line-height: 1.45; white-space: pre-wrap; }
   .state { flex: none; font-size: 12px; font-weight: 650; opacity: .78; white-space: nowrap; }
@@ -46,7 +144,9 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
   .approval-details summary { cursor: pointer; user-select: none; font-size: 12px; font-weight: 620; opacity: .78; }
   .detail-command { box-sizing: border-box; max-height: 220px; overflow: auto; margin-top: 8px; padding: 9px 10px; border-radius: 8px; background: rgba(128,128,128,.10); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
   .actions { display: flex; gap: 8px; margin-top: 10px; }
-  button { flex: 1; min-height: 38px; border-radius: 9px; border: 1px solid rgba(128,128,128,.35); font: inherit; cursor: pointer; }
+  button { flex: 1; min-height: 38px; border-radius: 9px; border: 1px solid rgba(128,128,128,.35); background: #f8fafc; color: #0a63c9; font: inherit; cursor: pointer; }
+  @media (prefers-color-scheme: dark) { button { background: rgba(255,255,255,.08); color: #62a9ff; } }
+  button.critical-allow { border-color: rgba(220,72,48,.85); background: rgba(220,72,48,.16); font-weight: 760; }
   button:disabled { opacity: .5; cursor: default; }
   .status { font-size: 12px; opacity: .72; margin-top: 7px; }
   .shell-prompt { font-size: 13px; line-height: 1.5; opacity: .86; white-space: pre-wrap; }
@@ -76,7 +176,10 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
 </head>
 <body>
 <div class="card">
-  <div class="title" id="card-title">C2CT 확인</div>
+  <div class="title-row">
+    <div class="title" id="card-title">C2CT 확인</div>
+    <div class="title-state" id="card-title-state"></div>
+  </div>
   <div id="approval"></div>
   <div id="shell" hidden>
     <div class="shell-prompt" id="shell-prompt"></div>
@@ -127,6 +230,10 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
   var lastReportedHeight = 0;
   var presentationKind = null;
   var shellBusy = false;
+  var statusRefreshInFlight = false;
+  var statusRefreshedRequestId = null;
+  var statusRefreshAttempts = Object.create(null);
+  var hydrationExhausted = false;
   function api() { return window.openai || {}; }
   function output() { return latestToolOutput || api().toolOutput || {}; }
   function responseMeta() { return latestToolMeta || api().toolResponseMetadata || {}; }
@@ -163,6 +270,29 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
       throw error;
     });
     return mcpAppsReady;
+  }
+  async function sendFollowUpTurn(prompt) {
+    try {
+      // Prefer the MCP Apps standard messaging path. On iOS the legacy
+      // window.openai.sendFollowUpMessage compatibility API can resolve without
+      // creating a new conversation turn, while ui/message is the standard path.
+      await withTimeout(ensureMcpAppsReady(), 1200);
+      notify("ui/message", {
+        role: "user",
+        content: [{ type: "text", text: prompt }]
+      });
+      return true;
+    } catch (_) {
+      // Compatibility fallback for hosts that do not expose the MCP Apps bridge.
+    }
+    var a = api();
+    if (typeof a.sendFollowUpMessage === "function") {
+      try {
+        await a.sendFollowUpMessage({ prompt: prompt });
+        return true;
+      } catch (_) {}
+    }
+    return false;
   }
   function reportIntrinsicHeight() {
     heightFrame = 0;
@@ -250,59 +380,217 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
   function stateLabel(status) {
     if (status === "allowed") return "허용됨";
     if (status === "denied") return "거절됨";
+    if (status === "consumed") return "처리 완료";
+    if (status === "expired") return "만료됨";
+    if (status === "unavailable") return "확인 불가";
     if (status === "working") return "처리 중…";
     if (status === "error") return "처리 실패";
-    return "승인 필요";
+    return "승인 대기";
+  }
+  function mapPersistedStatus(status) {
+    if (status === "approved" || status === "allowed") return "allowed";
+    if (status === "rejected" || status === "denied") return "denied";
+    if (status === "consumed") return "consumed";
+    if (status === "expired") return "expired";
+    return "pending";
+  }
+  function persistedStatusMessage(status) {
+    if (status === "allowed") return "이 승인은 처리되었습니다.";
+    if (status === "denied") return "이 승인은 거절되었습니다.";
+    if (status === "consumed") return "승인된 작업이 이미 처리되었습니다.";
+    if (status === "expired") return "이 승인은 만료되었습니다.";
+    return "";
+  }
+  function restoredWidgetDecision(requestId) {
+    var state = api().widgetState;
+    if (!state || typeof state !== "object" || Array.isArray(state)) return null;
+    var saved = state.c2ctApprovalDecision;
+    if (!saved || typeof saved !== "object" || saved.requestId !== requestId) return null;
+    var mapped = mapPersistedStatus(saved.status);
+    return mapped === "pending" ? null : mapped;
+  }
+  async function persistWidgetDecision(requestId, status) {
+    if (status === "pending" || status === "working" || status === "error" || status === "unavailable") return;
+    var a = api();
+    if (typeof a.setWidgetState !== "function") return;
+    var current = a.widgetState && typeof a.widgetState === "object" && !Array.isArray(a.widgetState)
+      ? a.widgetState
+      : {};
+    var next = Object.assign({}, current, {
+      c2ctApprovalDecision: {
+        version: 1,
+        requestId: requestId,
+        status: status,
+        updatedAt: Date.now()
+      }
+    });
+    try {
+      await a.setWidgetState(next);
+    } catch (_) {
+      // Server persisted status remains the source-of-truth fallback.
+    }
+  }
+  function restoredShellChoice(cardId) {
+    var state = api().widgetState;
+    if (!state || typeof state !== "object" || Array.isArray(state)) return null;
+    var saved = state.c2ctShellChoice;
+    if (!saved || typeof saved !== "object" || saved.cardId !== cardId || saved.status !== "resolved") return null;
+    if (typeof saved.choiceId !== "string" || !saved.choiceId) return null;
+    return saved;
+  }
+  async function persistShellChoice(card, choiceId, receiptId) {
+    var a = api();
+    if (typeof a.setWidgetState !== "function") return;
+    var current = a.widgetState && typeof a.widgetState === "object" && !Array.isArray(a.widgetState)
+      ? a.widgetState
+      : {};
+    var matched = (Array.isArray(card.options) ? card.options : []).find(function (option) { return option.id === choiceId; });
+    var next = Object.assign({}, current, {
+      c2ctShellChoice: {
+        version: 1,
+        cardId: card.cardId,
+        choiceId: choiceId,
+        choiceLabel: matched && matched.label ? matched.label : choiceId,
+        receiptId: receiptId,
+        status: "resolved",
+        updatedAt: Date.now()
+      }
+    });
+    try {
+      await a.setWidgetState(next);
+    } catch (_) {
+      // The server receipt remains the source-of-truth if widget state persistence fails.
+    }
+  }
+  function maybeRefreshPersistedStatus() {
+    if (!entry || presentationKind === "widget-capability-lab" || presentationKind === "widget-shell-choice") return;
+    if (entry.status !== "pending" && entry.status !== "error") return;
+    if (statusRefreshedRequestId === entry.requestId || statusRefreshInFlight) return;
+    var attempts = statusRefreshAttempts[entry.requestId] || 0;
+    if (attempts >= 3) return;
+    var requestId = entry.requestId;
+    var token = entry.token;
+    statusRefreshAttempts[requestId] = attempts + 1;
+    statusRefreshInFlight = true;
+    void (async function () {
+      try {
+        var result;
+        if (requestId.indexOf("op_") === 0 && token) {
+          result = structured(await callServerTool(entry.decisionTool, {
+            requestId: requestId,
+            token: token,
+            decision: "status"
+          }));
+        } else if (requestId.indexOf("consent_") === 0) {
+          result = structured(await callServerTool("chatgpt_consent_probe_status", { requestId: requestId }));
+        } else {
+          return;
+        }
+        if (!entry || entry.requestId !== requestId) return;
+        var mapped = mapPersistedStatus(result.status);
+        statusRefreshedRequestId = requestId;
+        entry.status = mapped;
+        entry.message = persistedStatusMessage(mapped);
+        if (mapped !== "pending") entry.token = null;
+        if (mapped !== "pending") await persistWidgetDecision(requestId, mapped);
+        render();
+      } catch (_) {
+        if (entry && entry.requestId === requestId) {
+          var attemptCount = statusRefreshAttempts[requestId] || 0;
+          if (attemptCount < 3) {
+            setTimeout(maybeRefreshPersistedStatus, 300 * Math.max(1, attemptCount));
+          } else {
+            entry.status = "unavailable";
+            entry.token = null;
+            entry.message = "이 승인 카드는 상태를 확인할 수 없어 비활성화되었습니다. 새 승인 카드를 요청해줘.";
+            render();
+          }
+        }
+      } finally {
+        statusRefreshInFlight = false;
+      }
+    })();
   }
   function syncCurrentRequest() {
     var out = output();
     presentationKind = out.presentationKind || null;
     if (presentationKind === "widget-capability-lab" || presentationKind === "widget-shell-choice") return;
     var sec = secret();
-    if (!out.requestId || !sec.token) return;
+    if (!out.requestId) return;
+    var restored = restoredWidgetDecision(out.requestId);
+    if (!sec.token && !restored) return;
     if (!entry || entry.requestId !== out.requestId) {
       entry = {
         requestId: out.requestId,
         preview: out.summary || out.preview || "C2CT 작업 승인",
         impact: out.impact || "",
         details: out.details || "",
+        approvalSeverity: out.approvalSeverity || "standard",
+        criticalBadge: out.criticalBadge || "Mac 시스템 변경",
+        criticalWarning: out.criticalWarning || "",
+        criticalIdentityBefore: out.criticalIdentityBefore || "",
+        criticalIdentityAfter: out.criticalIdentityAfter || "",
+        criticalRollback: out.criticalRollback || "",
         decisionTool: out.decisionTool || "chatgpt_consent_probe_decide",
         allowFollowUpPrompt: out.allowFollowUpPrompt,
         denyFollowUpPrompt: out.denyFollowUpPrompt,
-        token: sec.token,
-        status: "pending",
-        message: ""
+        token: restored ? null : sec.token,
+        status: restored || "pending",
+        message: restored ? persistedStatusMessage(restored) : ""
       };
+      if (restored) {
+        statusRefreshedRequestId = out.requestId;
+        return;
+      }
+      maybeRefreshPersistedStatus();
+      return;
+    }
+    if (restored) {
+      entry.status = restored;
+      entry.token = null;
+      entry.message = persistedStatusMessage(restored);
+      statusRefreshedRequestId = out.requestId;
       return;
     }
     if (entry.status === "pending" || entry.status === "error") {
       entry.preview = out.summary || out.preview || entry.preview;
       entry.impact = out.impact || entry.impact;
       entry.details = out.details || entry.details;
+      entry.approvalSeverity = out.approvalSeverity || entry.approvalSeverity;
+      entry.criticalBadge = out.criticalBadge || entry.criticalBadge;
+      entry.criticalWarning = out.criticalWarning || entry.criticalWarning;
+      entry.criticalIdentityBefore = out.criticalIdentityBefore || entry.criticalIdentityBefore;
+      entry.criticalIdentityAfter = out.criticalIdentityAfter || entry.criticalIdentityAfter;
+      entry.criticalRollback = out.criticalRollback || entry.criticalRollback;
       entry.decisionTool = out.decisionTool || entry.decisionTool;
       entry.allowFollowUpPrompt = out.allowFollowUpPrompt || entry.allowFollowUpPrompt;
       entry.denyFollowUpPrompt = out.denyFollowUpPrompt || entry.denyFollowUpPrompt;
       entry.token = sec.token;
       if (entry.status === "error") entry.status = "pending";
+      maybeRefreshPersistedStatus();
     }
   }
   function renderShellChoice(out) {
     var card = out && out.card && out.card.kind === "choice" ? out.card : null;
     var prompt = document.getElementById("shell-prompt");
     var options = document.getElementById("shell-options");
+    var status = document.getElementById("shell-status");
     options.replaceChildren();
     if (!card) {
       prompt.textContent = "표시할 선택 카드가 없습니다.";
       return;
     }
+    var restored = restoredShellChoice(card.cardId);
+    var resolved = card.status === "resolved" || Boolean(restored);
     prompt.textContent = card.prompt || "하나를 선택해줘.";
     (Array.isArray(card.options) ? card.options : []).forEach(function (option) {
       var button = document.createElement("button");
       button.className = "shell-option";
-      button.disabled = shellBusy || card.status === "resolved";
+      button.disabled = shellBusy || resolved;
       var title = document.createElement("span");
       title.className = "shell-option-title";
       title.textContent = option.label || option.id || "선택";
+      if (restored && restored.choiceId === option.id) title.textContent += " ✓";
       button.appendChild(title);
       if (option.description) {
         var description = document.createElement("span");
@@ -313,31 +601,48 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
       button.addEventListener("click", function () { void submitShellChoice(option.id, button); });
       options.appendChild(button);
     });
+    if (restored) {
+      status.textContent = "✅ 선택 완료 · " + (restored.choiceLabel || restored.choiceId);
+    } else if (!shellBusy) {
+      status.textContent = "";
+    }
   }
   async function submitShellChoice(choiceId, clickedButton) {
     if (shellBusy) return;
     var out = output();
     var card = out && out.card && out.card.kind === "choice" ? out.card : null;
     if (!card || !card.cardId || !choiceId) return;
+    if (restoredShellChoice(card.cardId)) return;
     shellBusy = true;
     document.querySelectorAll(".shell-option").forEach(function (button) { button.disabled = true; });
-    document.getElementById("shell-status").textContent = "선택 확인 중…";
+    document.getElementById("shell-status").textContent = "후속 대화 요청 중…";
+    var a = api();
+    var followUpFailed = false;
+    if (typeof a.sendFollowUpMessage === "function") {
+      try {
+        // Match the Capability Lab path that is proven to create a new iOS
+        // conversation turn. Do not overlap this host request with the server
+        // receipt call: iOS can silently drop the follow-up when both are in flight.
+        await a.sendFollowUpMessage({
+          prompt: "C2CT Widget Shell 선택 버튼을 눌렀어. cardId: " + card.cardId + ", choiceId: " + choiceId + ". chatgpt_widget_shell_result로 서버 결과를 확인하고 다음 단계를 진행해줘."
+        });
+      } catch (_) {
+        followUpFailed = true;
+      }
+    } else {
+      followUpFailed = true;
+    }
     try {
       var result = structured(await callServerTool("chatgpt_widget_lab_action", {
         action: "secret-relay",
         secretValue: "${CHATGPT_WIDGET_SHELL_COMPAT_PREFIX}" + card.cardId + "|" + choiceId
       }));
       if (!result.ok || typeof result.receiptId !== "string") throw new Error("missing server receipt");
+      await persistShellChoice(card, choiceId, result.receiptId);
       if (clickedButton) clickedButton.querySelector(".shell-option-title").textContent += " ✓";
-      document.getElementById("shell-status").textContent = "✅ C2CT에서 선택 검증 완료";
-      var a = api();
-      if (typeof a.sendFollowUpMessage === "function") {
-        await a.sendFollowUpMessage({
-          prompt: "C2CT Widget Shell 선택이 완료됐어. receiptId: " + result.receiptId + ". chatgpt_widget_shell_result로 서버 결과를 확인하고 다음 단계를 진행해줘."
-        });
-      } else {
-        document.getElementById("shell-status").textContent = "✅ 선택 검증 완료 · receipt " + result.receiptId;
-      }
+      document.getElementById("shell-status").textContent = followUpFailed
+        ? "✅ 선택 저장 완료 · 후속 대화 요청 실패"
+        : "✅ 선택 저장 완료 · 후속 대화 요청 전송";
     } catch (_) {
       shellBusy = false;
       document.getElementById("shell-status").textContent = "❌ 선택을 처리하지 못했습니다. 다시 시도해줘.";
@@ -356,9 +661,14 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
     // event is delivered. A visible loading state plus bounded polling makes that
     // race recoverable and gives us observable evidence when hydration fails.
     document.body.style.display = "block";
+    var cardNode = document.querySelector(".card");
+    var criticalMode = Boolean(entry && entry.approvalSeverity === "critical" && !labMode && !shellMode);
+    if (cardNode) cardNode.classList.toggle("critical", criticalMode);
     document.getElementById("card-title").textContent = shellMode
       ? ((out.card && out.card.title) || "C2CT 선택")
-      : (labMode ? "C2CT Widget Capability Lab" : "C2CT 확인");
+      : (labMode ? "C2CT Widget Capability Lab" : (criticalMode ? "⚠️ C2CT 고위험 승인" : "C2CT 확인"));
+    document.getElementById("card-title-state").textContent =
+      !labMode && !shellMode ? (entry ? stateLabel(entry.status) : (hydrationExhausted ? "확인 불가" : "")) : "";
     var approval = document.getElementById("approval");
     var shell = document.getElementById("shell");
     var lab = document.getElementById("lab");
@@ -380,20 +690,52 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
     if (!entry) {
       var loading = document.createElement("div");
       loading.className = "status";
-      loading.textContent = "승인 정보를 불러오는 중…";
+      loading.textContent = hydrationExhausted
+        ? "승인 정보를 불러오지 못했습니다. 이 카드는 실행에 사용할 수 없습니다. 새 승인 카드를 요청해줘."
+        : "승인 정보를 불러오는 중…";
       approval.appendChild(loading);
       scheduleIntrinsicHeight();
       return;
+    }
+    if (criticalMode) {
+      var badge = document.createElement("div");
+      badge.className = "critical-badge";
+      badge.textContent = entry.criticalBadge || "Mac 시스템 변경";
+      approval.appendChild(badge);
+      var warning = document.createElement("div");
+      warning.className = "critical-warning";
+      warning.textContent = entry.criticalWarning || "이 승인은 Mac의 실행 상태를 실제로 변경합니다. 요청 내용을 확인한 뒤 승인해줘.";
+      approval.appendChild(warning);
+      if (entry.criticalIdentityBefore || entry.criticalIdentityAfter || entry.criticalRollback) {
+        var criticalMeta = document.createElement("div");
+        criticalMeta.className = "critical-meta";
+        if (entry.criticalIdentityBefore || entry.criticalIdentityAfter) {
+          var identityRow = document.createElement("div");
+          identityRow.className = "critical-meta-row";
+          var identityKey = document.createElement("span");
+          identityKey.className = "critical-meta-key";
+          identityKey.textContent = "대상";
+          var identityValue = document.createElement("span");
+          identityValue.className = "critical-meta-value";
+          identityValue.textContent = (entry.criticalIdentityBefore || "?") + " → " + (entry.criticalIdentityAfter || "?");
+          identityRow.append(identityKey, identityValue);
+          criticalMeta.appendChild(identityRow);
+        }
+        if (entry.criticalRollback) {
+          var rollback = document.createElement("div");
+          rollback.style.marginTop = "5px";
+          rollback.textContent = "롤백: " + entry.criticalRollback;
+          criticalMeta.appendChild(rollback);
+        }
+        approval.appendChild(criticalMeta);
+      }
     }
     var head = document.createElement("div");
     head.className = "entry-head";
     var preview = document.createElement("div");
     preview.className = "preview";
     preview.textContent = entry.preview;
-    var state = document.createElement("div");
-    state.className = "state";
-    state.textContent = stateLabel(entry.status);
-    head.append(preview, state);
+    head.append(preview);
     approval.appendChild(head);
     if (entry.impact) {
       var impact = document.createElement("div");
@@ -419,7 +761,8 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
       var deny = document.createElement("button");
       deny.textContent = "거절";
       var allow = document.createElement("button");
-      allow.textContent = "허용";
+      allow.textContent = criticalMode ? "위험을 이해하고 승인" : "허용";
+      if (criticalMode) allow.className = "critical-allow";
       var disabled = entry.status === "working";
       deny.disabled = disabled;
       allow.disabled = disabled;
@@ -580,22 +923,27 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
     entry.status = "working";
     entry.message = "";
     render();
+    var a = api();
+    var followUpPrompt = decision === "allow"
+      ? (entry.allowFollowUpPrompt || "C2CT 인라인 확인에서 허용을 눌렀어. 다음 단계를 진행해줘.")
+      : (entry.denyFollowUpPrompt || "C2CT 인라인 확인에서 거절을 눌렀어. 결과를 반영해줘.");
+    // Queue the next conversation turn before the app-to-server decision call.
+    // The server-side approval state remains authoritative, so an allow replay
+    // still cannot execute unless the persisted decision has actually been saved.
+    var followUpFailed = !(await sendFollowUpTurn(
+      "C2CT 승인 카드에서 버튼을 눌렀어. 서버에 저장된 승인 상태를 최종 기준으로 확인해서 진행해줘. " + followUpPrompt
+    ));
     try {
       await callDecision(entry, decision);
       entry.status = decision === "allow" ? "allowed" : "denied";
       entry.token = null;
       entry.message = decision === "allow" ? "이 승인은 처리되었습니다." : "이 승인은 거절되었습니다.";
+      if (followUpFailed) entry.message += " 다음 대화를 자동으로 열지 못했습니다.";
+      await persistWidgetDecision(entry.requestId, entry.status);
       render();
-      var a = api();
-      if (a.sendFollowUpMessage) {
-        var followUpPrompt = decision === "allow"
-          ? (entry.allowFollowUpPrompt || "C2CT 인라인 확인에서 허용을 눌렀어. 다음 단계를 진행해줘.")
-          : (entry.denyFollowUpPrompt || "C2CT 인라인 확인에서 거절을 눌렀어. 결과를 반영해줘.");
-        await a.sendFollowUpMessage({ prompt: followUpPrompt });
-      }
     } catch (_) {
       entry.status = "error";
-      entry.message = "처리하지 못했습니다. 다시 시도할 수 있습니다.";
+      entry.message = "승인 상태를 저장하지 못했습니다. 서버 상태를 다시 확인해줘.";
       render();
     }
   }
@@ -634,6 +982,9 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
   document.getElementById("lab-secret-input").addEventListener("keydown", function (event) {
     if (event.key === "Enter") { event.preventDefault(); void labRelaySecret(); }
   });
+  // Warm the MCP Apps bridge before the user can press an approval button so
+  // ui/message normally stays inside the original transient user interaction.
+  void ensureMcpAppsReady().catch(function () {});
   render();
   // iOS can hydrate window.openai globals after the iframe's first script turn
   // without emitting openai:set_globals. Poll briefly so the approval payload
@@ -642,7 +993,11 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
   var hydrationTimer = setInterval(function () {
     hydrationPolls += 1;
     render();
-    if (entry || hydrationPolls >= 40) clearInterval(hydrationTimer);
+    if (entry || hydrationPolls >= 40) {
+      if (!entry) hydrationExhausted = true;
+      clearInterval(hydrationTimer);
+      render();
+    }
   }, 125);
 })();
 </script>

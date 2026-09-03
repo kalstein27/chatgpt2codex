@@ -321,9 +321,7 @@ export function registerLocalControlRoutes(
       const allPendingArmRequests = armRequests.requests.filter((request) => request.status === "pending");
       const pendingArmRequests = allPendingArmRequests.slice(0, 50);
       const autoActive = Boolean(auto && auto.expiresAt > now);
-      const pendingOperationApprovals = operationApprovalRequests.filter((request) =>
-        request.status === "pending" && (request.approvalSurface ?? "local") === "local",
-      );
+      const pendingOperationApprovals = operationApprovalRequests.filter((request) => request.status === "pending");
       const pendingScreenshotCaptures = listPendingScreenshotCaptures(now);
       const pendingAccessibilityBridgeRequests = listPendingAccessibilityBridgeRequests(now);
       const pendingOAuthApprovals = config.oauthLocalApproval?.listPendingLocalApprovals(now) ?? [];
