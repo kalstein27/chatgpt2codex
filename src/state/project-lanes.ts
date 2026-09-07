@@ -138,13 +138,13 @@ function releasedLaneTombstone(
 export function wasProjectLaneReleased(input: {
   session: SessionDocument;
   projectId: string;
-  workLaneId: string;
+  workLaneId?: string;
   leaseId: string;
 }): boolean {
-  const laneDigest = projectLaneDigest(input.workLaneId);
+  const laneDigest = input.workLaneId ? projectLaneDigest(input.workLaneId) : undefined;
   return (input.session.releasedLanes ?? []).some((record) =>
     record.projectId === input.projectId
-    && record.laneDigest === laneDigest
+    && (!laneDigest || record.laneDigest === laneDigest)
     && record.leaseId === input.leaseId,
   );
 }
@@ -365,6 +365,7 @@ export async function releaseOwnedProjectLane(input: {
   project: ProjectRegistryEntry;
   ownerScope?: string;
   now?: number;
+  includeReadOnly?: boolean;
 }): Promise<{ session: SessionDocument; releasedLease: Lease } | undefined> {
   const now = input.now ?? Date.now();
   const canonicalRoot = await canonicalProjectRoot(input.project.root);
@@ -376,7 +377,7 @@ export async function releaseOwnedProjectLane(input: {
     .filter(({ record }) =>
       record.projectId === input.project.projectId &&
       record.projectRootDigest === rootDigest &&
-      record.preset !== "read-only" &&
+      (input.includeReadOnly === true || record.preset !== "read-only") &&
       record.expiresAt >= now &&
       record.ownerScopeDigest === ownerDigest,
     );
@@ -398,7 +399,17 @@ export async function releaseOwnedProjectLane(input: {
   if (!ownedLane) return undefined;
   const { record, index } = ownedLane;
   return {
-    session: version2Session(input.session, lanes.filter((_, candidate) => candidate !== index)),
+    session: version2Session(
+      input.session,
+      lanes.filter((_, candidate) => candidate !== index),
+      input.session.boundProjectId,
+      releasedLaneTombstone(input.session, {
+        laneDigest: record.laneDigest,
+        projectId: record.projectId,
+        leaseId: record.leaseId,
+        releasedAt: now,
+      }),
+    ),
     releasedLease: laneLease(record, canonicalRoot),
   };
 }

@@ -2,6 +2,11 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { getRuntimeManifestForRoot, type RuntimeManifest } from "./runtime-manifest.js";
+import {
+  pruneRuntimeSnapshots,
+  type RuntimeSnapshotInventoryOptions,
+  type RuntimeSnapshotRetentionPolicy,
+} from "./runtime-snapshot-retention.js";
 
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -42,6 +47,12 @@ export interface RuntimeUpdatePrepareReceipt {
   currentManifest: RuntimeManifest;
   candidateManifest: RuntimeManifest;
   reusedSnapshot: boolean;
+  automaticRetention?: {
+    policy: RuntimeSnapshotRetentionPolicy | null;
+    removedSnapshotIds: string[];
+    remainingSnapshotCount: number | null;
+    warning: "automatic-prune-failed" | "running-process-scan-unavailable" | null;
+  };
   recommendedAction: string;
 }
 
@@ -235,6 +246,7 @@ function receipt(input: {
   runtimeSnapshotId?: string | null;
   snapshotRuntimeRoot?: string | null;
   reusedSnapshot?: boolean;
+  automaticRetention?: RuntimeUpdatePrepareReceipt["automaticRetention"];
   recommendedAction: string;
 }): RuntimeUpdatePrepareReceipt {
   const now = new Date().toISOString();
@@ -253,6 +265,7 @@ function receipt(input: {
     currentManifest: input.currentManifest,
     candidateManifest: input.candidateManifest,
     reusedSnapshot: input.reusedSnapshot ?? false,
+    ...(input.automaticRetention ? { automaticRetention: input.automaticRetention } : {}),
     recommendedAction: input.recommendedAction,
   };
 }
@@ -265,6 +278,7 @@ export async function prepareRuntimeUpdateSnapshot(input: {
   expectedCurrentFingerprint: string;
   expectedCandidateFingerprint: string;
   requestId: string;
+  retentionOptions?: RuntimeSnapshotInventoryOptions;
 }): Promise<RuntimeUpdatePrepareReceipt> {
   if (!REQUEST_ID_PATTERN.test(input.requestId)) throw new Error("Invalid runtime prepare requestId");
   if (!SHA256_PATTERN.test(input.expectedCurrentFingerprint) || !SHA256_PATTERN.test(input.expectedCandidateFingerprint)) {
@@ -316,7 +330,58 @@ export async function prepareRuntimeUpdateSnapshot(input: {
     return result;
   }
 
+  const candidateSnapshotId = candidateManifest.runtimeSnapshotId;
+  if (!candidateSnapshotId) throw new Error("Candidate runtime snapshot identity is incomplete");
+  const candidateSnapshotPath = path.join(
+    snapshotRoot(input.stateDir),
+    `runtime-${candidateSnapshotId.slice("sha256:".length)}`,
+  );
+  const existingCandidateSnapshotRoot = await fs.realpath(candidateSnapshotPath).catch(() => null);
+  if (existingCandidateSnapshotRoot) {
+    const existingManifest = getRuntimeManifestForRoot(existingCandidateSnapshotRoot);
+    if (existingManifest.runtimeSnapshotId !== candidateSnapshotId ||
+        existingManifest.runtimeFingerprint !== candidateManifest.runtimeFingerprint) {
+      throw new Error("Existing runtime snapshot path contains a different artifact");
+    }
+  }
+
+  const removedSnapshotNames = new Set<string>();
+  let retentionPolicy: RuntimeSnapshotRetentionPolicy | null = null;
+  let retentionWarning: "automatic-prune-failed" | "running-process-scan-unavailable" | null = null;
+  let remainingSnapshotCount: number | null = null;
+  if (!existingCandidateSnapshotRoot) {
+    try {
+      // Reserve one slot only when a new copy is actually required. Reusing an
+      // already-verified snapshot must not discard an extra rollback candidate.
+      const pruned = await pruneRuntimeSnapshots(input.stateDir, { maxSnapshots: 9 }, input.retentionOptions);
+      pruned.removed.forEach((name) => removedSnapshotNames.add(name));
+      retentionPolicy = pruned.after.policy;
+      remainingSnapshotCount = pruned.after.snapshotCount;
+      if (pruned.after.snapshots.some((entry) => entry.protectedReasons.includes("running-process-scan-unavailable"))) {
+        retentionWarning = "running-process-scan-unavailable";
+      }
+    } catch {
+      retentionWarning = "automatic-prune-failed";
+    }
+  }
   const snapshot = await prepareSnapshot({ stateDir: input.stateDir, currentRuntimeRoot, candidateRuntimeRoot, candidateManifest });
+  try {
+    const pruned = await pruneRuntimeSnapshots(input.stateDir, {}, {
+      ...input.retentionOptions,
+      protectedSnapshotRoots: [
+        ...(input.retentionOptions?.protectedSnapshotRoots ?? []),
+        snapshot.snapshotRuntimeRoot,
+      ],
+    });
+    pruned.removed.forEach((name) => removedSnapshotNames.add(name));
+    retentionPolicy = pruned.after.policy;
+    remainingSnapshotCount = pruned.after.snapshotCount;
+    if (pruned.after.snapshots.some((entry) => entry.protectedReasons.includes("running-process-scan-unavailable"))) {
+      retentionWarning = "running-process-scan-unavailable";
+    }
+  } catch {
+    retentionWarning = "automatic-prune-failed";
+  }
   const result = receipt({
     requestId: input.requestId,
     projectId: input.projectId,
@@ -328,6 +393,12 @@ export async function prepareRuntimeUpdateSnapshot(input: {
     runtimeSnapshotId: candidateManifest.runtimeSnapshotId,
     snapshotRuntimeRoot: snapshot.snapshotRuntimeRoot,
     reusedSnapshot: snapshot.reusedSnapshot,
+    automaticRetention: {
+      policy: retentionPolicy,
+      removedSnapshotIds: [...removedSnapshotNames].map((name) => `sha256:${name.slice("runtime-".length)}`),
+      remainingSnapshotCount,
+      warning: retentionWarning,
+    },
     recommendedAction: "runtime_apply_local",
   });
   await writePrepareReceipt(input.stateDir, result);

@@ -58,6 +58,9 @@ id_ed25519
 *.der
 *.mobileprovision
 *.provisionprofile
+*.ppk
+*.kdbx
+*.mobileconfig
 .runtime/
 .chatgpt2codex/
 .gpt2codex/
@@ -85,6 +88,8 @@ id_ed25519
 *.msi
 *.zip
 *.tar.gz
+*.ipa
+*.xip
 
 # Development-only tests, automation, packaging helpers, and measurements.
 *.test.ts
@@ -94,11 +99,20 @@ id_ed25519
 /benchmarks/
 /script/
 /scripts/*
+!/scripts/apply-activity-dashboard.ts
 !/scripts/macos-dependency-doctor.sh
+!/scripts/check-publication-boundary.ts
 /linux/
 /windows/Build-ChatGPTToCodexExe.ps1
 /windows/ChatGPTToCodexSetup.cs
 !/windows/README.md
+
+# Ad-hoc local review/patch material should never ride along with product commits.
+*.patch
+*.diff
+*.rej
+/tmp/
+/private/
 
 # Only final runtime/readme assets belong in the public tree.
 /assets/*
@@ -107,10 +121,13 @@ id_ed25519
 !/assets/readme-hero.png
 
 # Documentation and working notes are local-only. Existing tracked files are
-# not untracked by .gitignore; handle any historical tracked docs separately.
+# still matched by these rules when publication guards use check-ignore --no-index.
 /docs/
 
-# Platform noise.
+# Platform noise and machine-local IDE state.
+DerivedData/
+xcuserdata/
+*.xcuserstate
 .DS_Store
 Thumbs.db
 Desktop.ini

@@ -279,6 +279,93 @@ function syncState(
   return "up-to-date";
 }
 
+function gitExitCode(err: unknown): number | null {
+  const code = (err as { code?: unknown } | undefined)?.code;
+  return typeof code === "number" ? code : null;
+}
+
+async function matchesPublicationIgnore(
+  root: string,
+  rel: string,
+  gitExecutable = "git",
+): Promise<boolean> {
+  try {
+    await runGit(root, ["check-ignore", "--no-index", "-q", "--", rel], gitExecutable);
+    return true;
+  } catch (err) {
+    if (gitExitCode(err) === 1) return false;
+    throw err;
+  }
+}
+
+async function publicationBlockedPaths(
+  root: string,
+  files: string[],
+  gitExecutable = "git",
+): Promise<string[]> {
+  const blocked: string[] = [];
+  for (const rel of [...new Set(files.filter(Boolean))]) {
+    if (isSecretPath(path.resolve(root, rel)) || await matchesPublicationIgnore(root, rel, gitExecutable)) {
+      blocked.push(rel);
+    }
+  }
+  return blocked.sort();
+}
+
+async function gitNameOnly(root: string, args: string[], gitExecutable = "git"): Promise<string[]> {
+  const result = await runGit(root, args, gitExecutable);
+  return result.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+}
+
+async function pushCandidateFiles(
+  root: string,
+  gitExecutable = "git",
+): Promise<{ upstream: string | null; files: string[] }> {
+  const upstream = await readGitUpstream(root, gitExecutable);
+  if (upstream) {
+    return {
+      upstream,
+      files: await gitNameOnly(root, ["diff", "--name-only", "--diff-filter=ACMRTUXB", `${upstream}...HEAD`], gitExecutable),
+    };
+  }
+  return { upstream: null, files: await gitNameOnly(root, ["ls-files"], gitExecutable) };
+}
+
+export interface GitPublicationAudit {
+  safeForCommit: boolean;
+  safeForPush: boolean;
+  workingBlockedPaths: string[];
+  stagedBlockedPaths: string[];
+  pushBlockedPaths: string[];
+  pushCandidateCount: number;
+  upstream: string | null;
+}
+
+export async function gitPublicationAudit(
+  root: string,
+  options: GitReadOptions = {},
+): Promise<GitPublicationAudit> {
+  const gitExecutable = options.gitExecutable ?? "git";
+  const status = await gitStatus(root, options);
+  const workingFiles = [...new Set([...status.dirtyFiles, ...status.staged])];
+  const stagedFiles = await gitNameOnly(root, ["diff", "--cached", "--name-only"], gitExecutable);
+  const pushCandidates = await pushCandidateFiles(root, gitExecutable);
+  const [workingBlockedPaths, stagedBlockedPaths, pushBlockedPaths] = await Promise.all([
+    publicationBlockedPaths(root, workingFiles, gitExecutable),
+    publicationBlockedPaths(root, stagedFiles, gitExecutable),
+    publicationBlockedPaths(root, pushCandidates.files, gitExecutable),
+  ]);
+  return {
+    safeForCommit: workingBlockedPaths.length === 0 && stagedBlockedPaths.length === 0,
+    safeForPush: pushBlockedPaths.length === 0,
+    workingBlockedPaths,
+    stagedBlockedPaths,
+    pushBlockedPaths,
+    pushCandidateCount: pushCandidates.files.length,
+    upstream: pushCandidates.upstream,
+  };
+}
+
 /**
  * Git diff summary with secret redaction applied (PRD §8.6
  * git_diff_summary, §9.4 outputGuard).
@@ -318,6 +405,25 @@ export async function gitStageAndCommit(
   message: string,
   paths?: string[],
 ): Promise<{ commit: string; branch: string; stagedFiles: string[]; stdout: string; stderr: string }> {
+  const preStaged = await gitNameOnly(root, ["diff", "--cached", "--name-only"]);
+  if (preStaged.length > 0) {
+    throw new DomainError(
+      ErrorCode.COMMAND_NOT_ALLOWED,
+      "Refusing to commit while pre-existing staged changes are present; review and clear the index first",
+      { stagedFiles: preStaged },
+    );
+  }
+
+  const candidateFiles = paths && paths.length > 0 ? paths : (await gitStatus(root)).dirtyFiles;
+  const blockedCandidates = await publicationBlockedPaths(root, candidateFiles);
+  if (blockedCandidates.length > 0) {
+    throw new DomainError(
+      ErrorCode.COMMAND_NOT_ALLOWED,
+      "Refusing to stage paths excluded by the repository publication policy",
+      { paths: blockedCandidates },
+    );
+  }
+
   const addArgs = paths && paths.length > 0 ? ["add", "--", ...paths] : ["add", "-A"];
   await runGit(root, addArgs);
 
@@ -327,11 +433,11 @@ export async function gitStageAndCommit(
     .map((line) => line.trim())
     .filter(Boolean);
 
-  const secretFiles = stagedFiles.filter((file) => isSecretPath(path.resolve(root, file)));
-  if (secretFiles.length > 0) {
-    await runGit(root, ["reset", "--", ...secretFiles]).catch(() => ({ stdout: "", stderr: "" }));
-    throw new DomainError(ErrorCode.SECRET_BLOCKED, "Refusing to commit secret-classified paths", {
-      paths: secretFiles,
+  const publicationBlockedFiles = await publicationBlockedPaths(root, stagedFiles);
+  if (publicationBlockedFiles.length > 0) {
+    await runGit(root, ["reset", "--", ...publicationBlockedFiles]).catch(() => ({ stdout: "", stderr: "" }));
+    throw new DomainError(ErrorCode.COMMAND_NOT_ALLOWED, "Refusing to commit publication-blocked paths", {
+      paths: publicationBlockedFiles,
     });
   }
 
@@ -357,6 +463,14 @@ export async function gitPush(
   branch?: string,
 ): Promise<{ remote: string; branch: string; stdout: string; stderr: string }> {
   const targetBranch = branch || (await runGit(root, ["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim();
+  const audit = await gitPublicationAudit(root);
+  if (!audit.safeForPush) {
+    throw new DomainError(
+      ErrorCode.COMMAND_NOT_ALLOWED,
+      "Refusing to push commits containing repository publication-blocked paths",
+      { paths: audit.pushBlockedPaths, upstream: audit.upstream },
+    );
+  }
   const result = await runGit(root, ["push", "-u", remote, targetBranch]);
   return {
     remote,

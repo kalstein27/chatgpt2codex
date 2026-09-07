@@ -4,7 +4,7 @@ import { verifyOwnerToken } from "../auth/owner-token.js";
 import type { ToolContext } from "../types.js";
 import { remoteConversationSessionScope, remoteTransientSessionScope } from "../state/session-scope.js";
 import { createE2eScreenshotShare, readE2eScreenshotShare } from "../e2e/screenshot-share.js";
-import { CONTROL_TOOL_NAMES, isControlChatGptExposed, isDesktopControlSupported } from "../control/policy.js";
+import { CONTROL_TOOL_NAMES, isDesktopControlSupported } from "../control/policy.js";
 import { NATIVE_E2E_TOOL_NAMES, isNativeE2eSupported } from "../e2e/capabilities.js";
 import { currentOutputPolicy } from "../runtime/output-policy.js";
 import { createServer as createMcpServer } from "./mcp-server.js";
@@ -30,6 +30,7 @@ interface ActionRoute {
   summary: string;
   description: string;
   schema: string;
+  consequential?: boolean;
 }
 
 function actionRequestMeta(body: unknown): unknown {
@@ -106,9 +107,10 @@ const ACTION_ROUTES: ActionRoute[] = [
     path: "/actions/project-lane-release",
     tool: "project_lane_release",
     operationId: "project_lane_release",
-    summary: "Release a project work lane",
-    description: "Release only the exact current conversation work lane after work is complete.",
-    schema: "ProjectLaneLeaseInput",
+    summary: "Finalize a C2CT project work lane",
+    description:
+      "Idempotently clear only the exact current conversation's temporary C2CT work-lane authorization after work is complete. Remote callers may omit the raw workLaneId and release by exact projectId + leaseId. It does not modify project files, processes, runtime, app, connector, or network state.",
+    schema: "ProjectLaneReleaseInput",
   },
   {
     path: "/actions/project-lane-recover",
@@ -122,9 +124,9 @@ const ACTION_ROUTES: ActionRoute[] = [
     path: "/actions/project-release",
     tool: "project_release",
     operationId: "project_release",
-    summary: "Release the active local project lease",
+    summary: "Finalize the active C2CT project lease",
     description:
-      "Call this after mutation, test, image-save, or control work is complete and before the final response. It releases the privileged lease while keeping the project selected by default, and fails closed if another operation is still running.",
+      "Idempotently clear only the caller's temporary C2CT serial capability lease after work completes. It keeps the project selected by default, does not modify files/processes/runtime/app/connector/network state, and fails closed if tracked work is still running.",
     schema: "ProjectReleaseInput",
   },
   {
@@ -134,6 +136,26 @@ const ACTION_ROUTES: ActionRoute[] = [
     summary: "Read background operation status",
     description: "Read one exact background operation and carry the same workLaneId when the operation is lane-bound.",
     schema: "OperationStatusInput",
+  },
+  {
+    path: "/actions/runtime-apply-local",
+    tool: "runtime_apply_local",
+    operationId: "runtime_apply_local",
+    summary: "Apply a verified local C2CT runtime",
+    description:
+      "Consequential runtime replacement. ChatGPT must confirm this exact action before the request is sent. The dedicated route is the only GPT Actions path allowed to provide ChatGPT approval provenance for runtime_apply_local; generic call_tool cannot invoke it.",
+    schema: "RuntimeApplyLocalInput",
+    consequential: true,
+  },
+  {
+    path: "/actions/macos-app-apply-local",
+    tool: "macos_app_apply_local",
+    operationId: "macos_app_apply_local",
+    summary: "Install the verified C2CT macOS app",
+    description:
+      "Consequential app replacement. ChatGPT must confirm this exact action before the request is sent. Generic call_tool cannot invoke this tool, and the existing local approval path remains the fallback outside GPT Actions.",
+    schema: "MacosAppApplyLocalInput",
+    consequential: true,
   },
   {
     path: "/actions/connection-audit",
@@ -157,7 +179,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "workspace_refresh_index",
     operationId: "workspace_refresh_index",
     summary: "Refresh the local project index",
-    description: "Rescan the local workspace root and refresh chatgpt2codex's project registry.",
+    description: "Rescan authorized local workspace/project roots and refresh the project registry, including agent-managed folders with AGENTS.md or CLAUDE.md. Use bounded depth for nested projects.",
     schema: "WorkspaceRefreshIndexInput",
   },
   {
@@ -215,7 +237,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "file_apply_patch",
     summary: "Apply a project file patch",
     description:
-      "Apply a Codex-style patch directly to the selected local project. Requires project_select preset=full-write. Redacted patch context is rejected; use file_edit_lines with a fresh whole-file hash instead.",
+      "Apply a Codex-style patch directly to the local project. Normal remote coding requires a matching full-write workLaneId; project_select is reserved for explicit legacy/admin serial workflows. Redacted patch context is rejected; use file_edit_lines with a fresh whole-file hash instead.",
     schema: "FileApplyPatchInput",
   },
   {
@@ -232,7 +254,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "file_create",
     operationId: "file_create",
     summary: "Create a project file",
-    description: "Create or overwrite a project-confined file directly through chatgpt2codex. Requires project_select preset=full-write.",
+    description: "Create or overwrite a project-confined file directly through chatgpt2codex. Normal remote coding requires a matching full-write workLaneId; project_select is reserved for explicit legacy/admin serial workflows.",
     schema: "FileCreateInput",
   },
   {
@@ -250,7 +272,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "command_run",
     summary: "Run allowlisted project command",
     description:
-      "Run an allowlisted project command through chatgpt2codex. Foreground is the remote default for ordinary bounded checks. If executionMode is omitted and expectedDurationSec is above 20 seconds, or background is explicitly requested, the command is handed off. While turnContinuationRequired=true, immediately poll operation_status through generic call_tool and do not finalize the assistant turn.",
+      "Run an allowlisted project command through chatgpt2codex. Remote execution is always handed off to a persisted background operation, even if synchronous is requested, so one Action/MCP request never waits for subprocess completion. Protected approvals return promptly; after approval replay the exact same input, then poll operation_status until terminal.",
     schema: "CommandRunInput",
   },
   {
@@ -259,8 +281,9 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "verified_local_file_apply",
     summary: "Apply one verified fixed local file",
     description:
-      "Apply one predeclared integrity-verified local artifact to one predeclared fixed local destination. This action cannot accept commands, argv, raw source paths, raw destination paths, network access, or process launch requests.",
+      "Apply one predeclared integrity-verified local artifact to one predeclared fixed local destination. ChatGPT must confirm this exact action before it is sent; no commands, argv, raw paths, network access, or process launch are accepted.",
     schema: "VerifiedLocalFileApplyInput",
+    consequential: true,
   },
   {
     path: "/actions/output-read",
@@ -293,7 +316,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "e2e_run_command",
     summary: "Run a guarded E2E command",
     description:
-      "Run a guarded project E2E/test command. A tests-only or full-write lease is required even when captureScreenshot=false because nonvisual execution still requires verify capability. Capture visual proof only when captureScreenshot=true is explicitly requested.",
+      "Run a guarded project E2E/test command. Remote execution is always persisted as a background operation; poll operation_status until terminal. If visual proof is requested, capture it afterward with the screenshot action instead of holding this request open for both the long command and screenshot.",
     schema: "E2eRunCommandInput",
   },
   {
@@ -425,6 +448,8 @@ const OPENAPI_ACTION_TOOL_NAMES = new Set([
   "project_lane_recover",
   "project_select",
   "operation_status",
+  "runtime_apply_local",
+  "macos_app_apply_local",
   "workspace_list_projects",
   "project_status",
   "project_rules",
@@ -435,14 +460,11 @@ const OPENAPI_ACTION_TOOL_NAMES = new Set([
   "file_create",
   "command_run",
   "verified_local_file_apply",
-  "output_read",
   "e2e_test_and_show_screenshot",
   "repo_status",
   "repo_diff_summary",
   "git_commit",
   "git_push",
-  "save_chatgpt_image",
-  "save_chatgpt_image_from_url",
 ]);
 
 function openApiActionRoutes(): ActionRoute[] {
@@ -526,11 +548,11 @@ async function callRegisteredTool(
   }
   // Desktop-control tools are blocked on the generic action bridge (even for
   // the owner-bearer /actions/call-tool route, even if isControlEnabled() is
-  // on) unless the owner has separately opted in to exposing them to ChatGPT
-  // via CHATGPT2CODEX_CONTROL_CHATGPT (isControlChatGptExposed) — the
-  // public-product default keeps this block in place, matching the
-  // tools/list hide in src/server/tools.ts installChatGptToolListHandler.
-  if (CONTROL_TOOL_NAMES.has(toolName) && !isControlChatGptExposed()) {
+  // on). Generic Actions do not carry the dedicated Computer Use confirmation
+  // provenance required for desktop control, so this bridge always fails
+  // closed regardless of CHATGPT2CODEX_CONTROL_CHATGPT. Remote ChatGPT control
+  // is available only on the dedicated confirmed MCP tool surface.
+  if (CONTROL_TOOL_NAMES.has(toolName)) {
     const message = `Tool ${toolName} is not available through the chatgpt2codex action bridge.`;
     return {
       isError: true,
@@ -551,6 +573,19 @@ async function callRegisteredTool(
   if (toolName === "project_select" && input.preset === "control") {
     const message = "preset=control cannot be granted through the chatgpt2codex action bridge.";
     await ctx.ledger.append({ type: "control.bridge.rejected", preset: "control" }).catch(() => undefined);
+    return {
+      isError: true,
+      structuredContent: { code: "PERMISSION_DENIED", error: message },
+      content: [{ type: "text", text: message }],
+    };
+  }
+  const consequentialOnlyTools = new Set(["runtime_apply_local", "macos_app_apply_local"]);
+  if (consequentialOnlyTools.has(toolName) &&
+      !(ctx.actionInvocation?.surface === "gpt-action" &&
+        ctx.actionInvocation.dedicatedRoute === true &&
+        ctx.actionInvocation.consequential === true &&
+        ctx.actionInvocation.operationId === toolName)) {
+    const message = `${toolName} is available through GPT Actions only on its dedicated consequential route.`;
     return {
       isError: true,
       structuredContent: { code: "PERMISSION_DENIED", error: message },
@@ -675,6 +710,11 @@ async function actionErrorResponse(ctx: ToolContext, tool: string, error: unknow
   };
 }
 
+function openApiOperationDescription(value: string): string {
+  if (value.length <= 300) return value;
+  return `${value.slice(0, 297).trimEnd()}...`;
+}
+
 export function openApiSpec(publicOrigin: string): Record<string, unknown> {
   const paths: Record<string, unknown> = {
     "/actions/health": {
@@ -690,12 +730,42 @@ export function openApiSpec(publicOrigin: string): Record<string, unknown> {
         },
       },
     },
+    "/actions/approval-probe": {
+      post: {
+        operationId: "approval_probe",
+        "x-openai-isConsequential": true,
+        summary: "Confirm ChatGPT consequential-action approval",
+        description:
+          "Harmless confirmation probe. This endpoint performs no local mutation, launches no process, reads no project data, and exists only to verify that ChatGPT presents and honors its native consequential-action Confirm/Deny gate.",
+        security: [],
+        responses: {
+          "200": {
+            description: "Confirmation probe result",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["ok", "probe", "sideEffects"],
+                  properties: {
+                    ok: { type: "boolean" },
+                    probe: { type: "string" },
+                    sideEffects: { type: "boolean" },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
     "/actions/call-tool": {
       post: {
         operationId: "call_tool",
         summary: "Call any chatgpt2codex MCP tool",
-        description:
-          "Full-power owner bridge for Custom GPTs. Use this when a dedicated action route is missing. It calls the named chatgpt2codex MCP tool on the local Mac; do not try to write /Users/... directly from ChatGPT's sandbox. For source edits, follow the live agent_guide: when multi-project lanes are enabled, open and verify a full-write work lane and carry its exact workLaneId into file_apply_patch/file_create; use serial project_select only when the live contract explicitly requires that legacy mode. The response toolCall object is the required proof that the local tool was actually callable.",
+        description: openApiOperationDescription(
+          "Full-power owner bridge for Custom GPTs. Use when a dedicated action route is missing. It calls a named chatgpt2codex tool on the local Mac. Follow the live agent_guide for project lanes, local writes, approvals, and verification. A successful toolCall response is proof the local tool was callable.",
+        ),
         security: [{ ownerBearer: [] }],
         requestBody: {
           required: true,
@@ -719,8 +789,9 @@ export function openApiSpec(publicOrigin: string): Record<string, unknown> {
     paths[route.path] = {
       post: {
         operationId: route.tool,
+        ...(route.consequential === undefined ? {} : { "x-openai-isConsequential": route.consequential }),
         summary: route.summary,
-        description: `ChatGPT_To_Codex tool: ${route.tool}. ${route.description}`,
+        description: openApiOperationDescription(`ChatGPT_To_Codex tool: ${route.tool}. ${route.description}`),
         security: [{ ownerBearer: [] }],
         requestBody: {
           required: route.schema !== "EmptyInput",
@@ -906,7 +977,11 @@ export function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "reason", "purpose"],
           properties: {
             projectId: { type: "string", description: "Project id or name, for example chatgpt2codex." },
-            reason: { type: "string" },
+            reason: {
+              type: "string",
+              enum: ["work", "maintenance", "renew", "done", "cleanup", "control"],
+              description: "Fixed lease audit label. Use one listed value only.",
+            },
             purpose: {
               type: "string",
               enum: ["legacy-admin"],
@@ -927,7 +1002,11 @@ export function openApiSpec(publicOrigin: string): Record<string, unknown> {
           properties: {
             projectId: { type: "string" },
             preset: { type: "string", enum: ["read-only", "tests-only", "full-write", "image-only"] },
-            reason: { type: "string", minLength: 1 },
+            reason: {
+              type: "string",
+              enum: ["work", "maintenance", "renew", "done", "cleanup", "control"],
+              description: "Fixed lease audit label. Use one listed value only.",
+            },
           },
         },
         ProjectLaneStatusInput: {
@@ -947,7 +1026,26 @@ export function openApiSpec(publicOrigin: string): Record<string, unknown> {
             projectId: { type: "string" },
             workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             leaseId: { type: "string", pattern: "^lease_[0-9a-fA-F-]{36}$" },
-            reason: { type: "string", minLength: 1 },
+            reason: {
+              type: "string",
+              enum: ["work", "maintenance", "renew", "done", "cleanup", "control"],
+              description: "Fixed lease audit label. Use one listed value only.",
+            },
+          },
+        },
+        ProjectLaneReleaseInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["projectId", "leaseId", "reason"],
+          properties: {
+            projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
+            leaseId: { type: "string", pattern: "^lease_[0-9a-fA-F-]{36}$" },
+            reason: {
+              type: "string",
+              enum: ["work", "maintenance", "renew", "done", "cleanup", "control"],
+              description: "Fixed lease audit label. Use one listed value only.",
+            },
           },
         },
         ProjectLaneRecoverInput: {
@@ -956,7 +1054,11 @@ export function openApiSpec(publicOrigin: string): Record<string, unknown> {
           required: ["projectId", "reason"],
           properties: {
             projectId: { type: "string" },
-            reason: { type: "string", minLength: 1 },
+            reason: {
+              type: "string",
+              enum: ["work", "maintenance", "renew", "done", "cleanup", "control"],
+              description: "Fixed lease audit label. Use one listed value only.",
+            },
           },
         },
         ProjectReleaseInput: {
@@ -966,7 +1068,11 @@ export function openApiSpec(publicOrigin: string): Record<string, unknown> {
           properties: {
             projectId: { type: "string" },
             leaseId: { type: "string", pattern: "^lease_[0-9a-fA-F-]{36}$" },
-            reason: { type: "string", minLength: 1 },
+            reason: {
+              type: "string",
+              enum: ["work", "maintenance", "renew", "done", "cleanup", "control"],
+              description: "Fixed lease audit label. Use one listed value only.",
+            },
             keepProjectSelected: {
               type: "boolean",
               default: true,
@@ -982,6 +1088,41 @@ export function openApiSpec(publicOrigin: string): Record<string, unknown> {
             projectId: { type: "string" },
             workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
             operationId: { type: "string", pattern: "^bg_[0-9a-f-]{36}$" },
+          },
+        },
+        RuntimeApplyLocalInput: {
+          type: "object",
+          additionalProperties: false,
+          required: [
+            "projectId",
+            "expectedCurrentFingerprint",
+            "targetRuntimeRoot",
+            "targetFingerprint",
+            "requestId",
+            "preserveConnector",
+          ],
+          properties: {
+            projectId: { type: "string", minLength: 1, maxLength: 120 },
+            expectedCurrentFingerprint: { type: "string", pattern: "^[a-f0-9]{64}$" },
+            targetRuntimeRoot: { type: "string", minLength: 1, maxLength: 4096 },
+            targetFingerprint: { type: "string", pattern: "^[a-f0-9]{64}$" },
+            requestId: {
+              type: "string",
+              pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
+            },
+            preserveConnector: { type: "boolean", enum: [true] },
+          },
+        },
+        MacosAppApplyLocalInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["projectId", "requestId"],
+          properties: {
+            projectId: { type: "string", minLength: 1, maxLength: 120 },
+            requestId: {
+              type: "string",
+              pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
+            },
           },
         },
         ConnectionAuditInput: {
@@ -1433,7 +1574,7 @@ export function registerActionRoutes(app: Express, ctx: ToolContext, publicUrl: 
       ok: true,
       name: "chatgpt2codex-actions",
       actions: ACTION_ROUTES.length,
-      openApiOperations: openApiActionRoutes().length + 2,
+      openApiOperations: openApiActionRoutes().length + 3,
       openApiToolNames: openApiActionRoutes().map((route) => route.tool),
       toolAvailabilityGate: TOOL_AVAILABILITY_GATE,
     });
@@ -1441,6 +1582,14 @@ export function registerActionRoutes(app: Express, ctx: ToolContext, publicUrl: 
 
   app.get("/actions/openapi.json", (_req, res) => {
     res.json(openApiSpec(publicOrigin));
+  });
+
+  app.post("/actions/approval-probe", (_req, res) => {
+    res.json({
+      ok: true,
+      probe: "chatgpt-consequential-action",
+      sideEffects: false,
+    });
   });
 
   app.get("/actions/e2e-screenshot-inline/:token/:filename", async (req, res) => {
@@ -1476,7 +1625,17 @@ export function registerActionRoutes(app: Express, ctx: ToolContext, publicUrl: 
     app.post(route.path, async (req, res) => {
       try {
         if (!(await requireOwnerBearer(ctx, req, res))) return;
-        const scopedCtx = { ...ctx, remote: true, sessionScope: remoteActionSessionScope(req.body) };
+        const scopedCtx: ToolContext = {
+          ...ctx,
+          remote: true,
+          sessionScope: remoteActionSessionScope(req.body),
+          actionInvocation: {
+            surface: "gpt-action",
+            operationId: route.operationId,
+            dedicatedRoute: true,
+            consequential: route.consequential === true,
+          },
+        };
         const result = await callRegisteredTool(scopedCtx, route.tool, actionInputForRoute(route, req.body));
         res.json(await actionResponse(scopedCtx, publicOrigin, route.tool, result));
       } catch (error) {

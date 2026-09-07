@@ -264,6 +264,7 @@ export class AgentGoalStore {
   /** mkdir is an atomic cross-process lock primitive on the same filesystem. */
   private async withFilesystemLock<T>(goalId: string, fn: () => Promise<T>): Promise<T> {
     const lock = path.join(goalDir(this.stateRoot, goalId), ".write-lock");
+    const reclaimLock = `${lock}.reclaim`;
     await mkdir(goalDir(this.stateRoot, goalId), { recursive: true, mode: 0o700 });
     const deadline = Date.now() + 5_000;
     while (true) {
@@ -275,18 +276,29 @@ export class AgentGoalStore {
         const info = await stat(lock).catch(() => null);
         if (!info) continue;
         if (Date.now() - info.mtimeMs > 30_000) {
-          // Never delete the shared lock path directly: another process could
-          // acquire a fresh lock between stat() and rm().  Atomically move the
-          // observed stale lock to a unique tombstone first, then remove only
-          // that tombstone.
-          const stale = `${lock}.stale.${process.pid}.${randomUUID()}`;
+          // Serialize stale-lock reclaimers. Without this second atomic mkdir,
+          // two processes can both observe the same stale directory, then the
+          // first renames it away while the second later renames a *fresh* lock
+          // that another owner acquired in the gap. Re-stat under the reclaim
+          // guard so no stale observation is ever carried across ownership.
           try {
+            await mkdir(reclaimLock, { mode: 0o700 });
+          } catch (guardError) {
+            if ((guardError as NodeJS.ErrnoException).code !== "EEXIST") throw invalid("Agent goal state lock recovery failed");
+            if (Date.now() >= deadline) throw invalid("Agent goal state is busy");
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            continue;
+          }
+          try {
+            const current = await stat(lock).catch(() => null);
+            if (!current || Date.now() - current.mtimeMs <= 30_000) continue;
+            const stale = `${lock}.stale.${process.pid}.${randomUUID()}`;
             await rename(lock, stale);
             await rm(stale, { recursive: true, force: true });
           } catch (reclaimError) {
-            if ((reclaimError as NodeJS.ErrnoException).code !== "ENOENT") {
-              throw invalid("Agent goal state lock recovery failed");
-            }
+            if ((reclaimError as NodeJS.ErrnoException).code !== "ENOENT") throw invalid("Agent goal state lock recovery failed");
+          } finally {
+            await rm(reclaimLock, { recursive: true, force: true });
           }
           continue;
         }

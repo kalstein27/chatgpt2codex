@@ -4,11 +4,24 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { DomainError, ErrorCode } from "../types.js";
 import {
   getRuntimeManifest,
   getRuntimeManifestForRoot,
   type RuntimeManifest,
 } from "./runtime-manifest.js";
+import {
+  refreshChatGptHostCatalog,
+  type ChatGptHostCatalogRefreshResult,
+} from "../exec/chatgpt-host-catalog-refresh.js";
+import { sendRegisteredChatGptRecoveryWake } from "../exec/chatgpt-recovery-wake.js";
+import {
+  readReplacementReconnectPlan,
+  recordReplacementReconnectSample,
+  type ReplacementReconnectPlan,
+  type ReplacementReconnectOutcome,
+} from "./replacement-reconnect-timing.js";
+import { inspectChatGptWidgetPreapplyGate } from "./chatgpt-widget-preapply.js";
 
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -38,6 +51,7 @@ export type RuntimeApplyPhase =
   | "approval"
   | "activation"
   | "health"
+  | "catalog-refresh"
   | "rollback"
   | "complete";
 
@@ -99,6 +113,18 @@ export interface RuntimeApplyReceipt {
   recommendedAction: string;
   approvalRequestId?: string;
   workerPid?: number;
+  disconnectStartedAt?: string;
+  reconnectObservedAt?: string;
+  reconnectDurationMs?: number;
+  reconnectPlan?: ReplacementReconnectPlan;
+  hostCatalogRefreshAttempted?: boolean;
+  hostCatalogRefreshStatus?: "not-needed" | "not-started" | "in-progress" | ChatGptHostCatalogRefreshResult["status"];
+  hostCatalogRefreshRequested?: boolean;
+  hostCatalogScanCompleted?: boolean;
+  hostCatalogRefreshErrorCode?: string | null;
+  hostCatalogRefreshMessage?: string | null;
+  hostCatalogRefreshRecommendedAction?: string;
+  hostCatalogRefreshCompletedAt?: string | null;
   externalIdentityBefore: RuntimeExternalIdentity;
   history: RuntimeApplyHistoryEntry[];
 }
@@ -130,9 +156,23 @@ export interface RuntimeApplyWorkerDependencies {
   probeHealth?: (port: number) => Promise<RuntimeHealthSnapshot>;
   probeActivationHealth?: (port: number) => Promise<RuntimeHealthSnapshot>;
   requestReload?: (stateDir: string, operationId: string) => Promise<void>;
+  refreshHostCatalog?: () => Promise<ChatGptHostCatalogRefreshResult>;
+  sendRecoveryWake?: typeof sendRegisteredChatGptRecoveryWake;
   sleep?: (ms: number) => Promise<void>;
   pidAlive?: (pid: number) => boolean;
   now?: () => Date;
+}
+
+function runtimeSchemaRefreshRequired(previous: RuntimeManifest, target: RuntimeManifest): boolean {
+  const hostCatalogChanged =
+    typeof previous.hostCatalogRevision === "string"
+    && typeof target.hostCatalogRevision === "string"
+    && previous.hostCatalogRevision !== target.hostCatalogRevision;
+  const uiResourceChanged =
+    typeof previous.uiResourceRevision === "string"
+    && typeof target.uiResourceRevision === "string"
+    && previous.uiResourceRevision !== target.uiResourceRevision;
+  return previous.toolSchemaRevision !== target.toolSchemaRevision || hostCatalogChanged || uiResourceChanged;
 }
 
 function receiptRoot(stateDir: string): string {
@@ -238,7 +278,11 @@ async function listReceiptsUnlocked(stateDir: string): Promise<RuntimeApplyRecei
     throw error;
   });
   const receipts: RuntimeApplyReceipt[] = [];
-  for (const name of names.filter((entry) => /^rt_[0-9a-f-]{36}\.json$/u.test(entry)).slice(-200)) {
+  // Runtime apply requestId is an idempotency key. Never truncate the receipt
+  // set before requestId lookup or active-operation reconciliation: fs.readdir
+  // ordering is not a recency guarantee, so slicing an arbitrary suffix can
+  // hide a live/recent receipt and accidentally create a second transaction.
+  for (const name of names.filter((entry) => /^rt_[0-9a-f-]{36}\.json$/u.test(entry))) {
     const receipt = await readReceiptFile(path.join(directory, name));
     if (receipt) receipts.push(receipt);
   }
@@ -427,6 +471,40 @@ export async function requestRuntimeReload(stateDir: string, operationId: string
   }
 }
 
+export async function writeRuntimeApplyMaintenanceMarker(
+  stateDir: string,
+  operationId: string,
+  supervisorPid: number,
+): Promise<void> {
+  if (!/^rt_[0-9a-f-]{36}$/u.test(operationId) || !Number.isSafeInteger(supervisorPid) || supervisorPid <= 0) {
+    throw new Error("INVALID_RUNTIME_MAINTENANCE_IDENTITY");
+  }
+  await ensurePrivateDirectory(stateDir);
+  const marker = path.join(stateDir, "runtime-apply-maintenance");
+  const temporary = `${marker}.${process.pid}.${randomUUID()}.tmp`;
+  await fs.writeFile(temporary, `${supervisorPid} ${operationId}\n`, { mode: FILE_MODE, flag: "wx" });
+  try {
+    await fs.rename(temporary, marker);
+    await fs.chmod(marker, FILE_MODE).catch(() => undefined);
+  } finally {
+    await fs.unlink(temporary).catch(() => undefined);
+  }
+}
+
+export async function clearRuntimeApplyMaintenanceMarker(stateDir: string, operationId: string): Promise<void> {
+  const marker = path.join(stateDir, "runtime-apply-maintenance");
+  const raw = await fs.readFile(marker, "utf8").catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  });
+  if (raw === null) return;
+  const currentOperationId = raw.trim().split(/\s+/u)[1] ?? "";
+  if (currentOperationId !== operationId) return;
+  await fs.unlink(marker).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  });
+}
+
 function newReceipt(input: {
   projectId: string;
   requestId: string;
@@ -443,6 +521,7 @@ function newReceipt(input: {
   const now = timestamp();
   const externalIdentityBefore = input.preApplyHealth.externalIdentity ?? currentRuntimeExternalIdentity();
   const previousRuntimePid = input.preApplyHealth.runtimePid;
+  const schemaRefreshRequired = runtimeSchemaRefreshRequired(input.currentManifest, input.targetManifest);
   return {
     schemaVersion: RECEIPT_SCHEMA_VERSION,
     requestId: input.requestId,
@@ -480,6 +559,14 @@ function newReceipt(input: {
     diagnosticId: `diag_runtime_${randomUUID()}`,
     failurePhase: null,
     recommendedAction: input.recommendedAction,
+    hostCatalogRefreshAttempted: false,
+    hostCatalogRefreshStatus: schemaRefreshRequired ? "not-started" : "not-needed",
+    hostCatalogRefreshRequested: false,
+    hostCatalogScanCompleted: false,
+    hostCatalogRefreshErrorCode: null,
+    hostCatalogRefreshMessage: null,
+    hostCatalogRefreshRecommendedAction: schemaRefreshRequired ? "automatic-refresh-pending-runtime-apply" : "none",
+    hostCatalogRefreshCompletedAt: null,
     externalIdentityBefore,
     history: [{ at: now, state: input.state, phase: input.phase }],
   };
@@ -603,6 +690,22 @@ export async function prepareRuntimeApply(
       return { receipt: next, replayed: Boolean(existing), conflict: false };
     }
 
+    const widgetPreapply = await inspectChatGptWidgetPreapplyGate({
+      stateDir: input.stateDir,
+      projectId: input.projectId,
+      targetRuntimeRoot: target.runtimeRoot,
+      currentManifest,
+      targetManifest: target.manifest,
+    });
+    if (widgetPreapply.required && !widgetPreapply.ready) {
+      const next = transition(base, "PRECONDITION_FAILED", "complete");
+      next.failurePhase = "preflight";
+      next.finalHealthy = true;
+      next.recommendedAction = widgetPreapply.recommendedAction;
+      await writeReceiptUnlocked(input.stateDir, next);
+      return { receipt: next, replayed: Boolean(existing), conflict: false };
+    }
+
     const anotherActive = receipts.find((entry) => entry.requestId !== input.requestId && ACTIVE_APPLY_STATES.has(entry.state));
     const blocked = Boolean(anotherActive) ||
       (input.activeOperationCount ?? 0) > 0 ||
@@ -624,6 +727,21 @@ export async function prepareRuntimeApply(
 export async function getLatestRuntimeApplyReceipt(stateDir: string): Promise<RuntimeApplyReceipt | null> {
   const receipts = await listReceiptsUnlocked(stateDir);
   return receipts.at(-1) ?? null;
+}
+
+export function latestAppliedSchemaChangingRuntimeApplyReceipt(
+  receipts: readonly RuntimeApplyReceipt[],
+): RuntimeApplyReceipt | null {
+  return [...receipts].reverse().find((receipt) =>
+    (receipt.state === "APPLIED" || receipt.state === "ALREADY_APPLIED")
+    && receipt.previousManifest.toolSchemaRevision !== receipt.targetManifest.toolSchemaRevision,
+  ) ?? null;
+}
+
+export async function getLatestAppliedSchemaChangingRuntimeApplyReceipt(
+  stateDir: string,
+): Promise<RuntimeApplyReceipt | null> {
+  return latestAppliedSchemaChangingRuntimeApplyReceipt(await listReceiptsUnlocked(stateDir));
 }
 
 /**
@@ -678,14 +796,29 @@ export async function markRuntimeApplyApprovalRequired(
   });
 }
 
+export async function attachRuntimeApplyApprovalRequest(
+  stateDir: string,
+  operationId: string,
+  approvalRequestId: string,
+): Promise<RuntimeApplyReceipt> {
+  return updateRuntimeApplyReceipt(stateDir, operationId, (receipt) => {
+    const next = transition(receipt, "APPROVAL_REQUIRED", "approval");
+    next.approvalRequestId = approvalRequestId;
+    next.recommendedAction = "approve-runtime-apply-locally";
+    return next;
+  });
+}
+
 export async function markRuntimeApplyActivationRequested(
   stateDir: string,
   operationId: string,
 ): Promise<RuntimeApplyReceipt> {
+  const reconnectPlan = await readReplacementReconnectPlan(stateDir, "runtime").catch(() => undefined);
   return updateRuntimeApplyReceipt(stateDir, operationId, (receipt) => {
     if (receipt.state === "ACTIVATION_REQUESTED") return receipt;
     const next = transition(receipt, "ACTIVATION_REQUESTED", "activation");
-    next.recommendedAction = "poll-runtime-apply-status";
+    if (reconnectPlan) next.reconnectPlan = reconnectPlan;
+    next.recommendedAction = "wait-then-poll-runtime-apply-status";
     return next;
   });
 }
@@ -723,6 +856,44 @@ export async function recordRuntimeApplyWorkerPid(
   workerPid: number,
 ): Promise<RuntimeApplyReceipt> {
   return updateRuntimeApplyReceipt(stateDir, operationId, (receipt) => ({ ...receipt, workerPid, updatedAt: timestamp() }));
+}
+
+/**
+ * Start the fixed runtime worker after an exact approval has already been
+ * consumed by the caller. This deliberately does not perform approval, lease,
+ * project-isolation, or drain checks; those remain at the server boundary.
+ * Keeping the activation transition and detached-worker launch together gives
+ * widget-driven continuation the same persisted worker-start semantics as the
+ * normal runtime_apply_local path without redispatching that public tool.
+ */
+export async function startAuthorizedRuntimeApplyWorker(
+  stateDir: string,
+  operationId: string,
+): Promise<{ receipt: RuntimeApplyReceipt; workerStarted: boolean }> {
+  const reconnectPlan = await readReplacementReconnectPlan(stateDir, "runtime").catch(() => undefined);
+  const activation = await updateRuntimeApplyReceipt(stateDir, operationId, (receipt) => {
+    if (receipt.state !== "APPROVAL_REQUIRED") {
+      throw new DomainError(
+        ErrorCode.INVALID_ARGUMENT,
+        `Runtime apply ${operationId} is not awaiting approval continuation`,
+        { operationId, state: receipt.state, actionStarted: receipt.state === "ACTIVATION_REQUESTED" },
+      );
+    }
+    const next = transition(receipt, "ACTIVATION_REQUESTED", "activation");
+    if (reconnectPlan) next.reconnectPlan = reconnectPlan;
+    next.recommendedAction = "wait-then-poll-runtime-apply-status";
+    return next;
+  });
+  try {
+    const workerPid = launchRuntimeApplyWorker(stateDir, activation.operationId);
+    const started = await recordRuntimeApplyWorkerPid(stateDir, activation.operationId, workerPid);
+    return { receipt: started, workerStarted: true };
+  } catch {
+    return {
+      receipt: await markRuntimeApplyStartFailed(stateDir, activation.operationId),
+      workerStarted: false,
+    };
+  }
 }
 
 function manifestFromHealth(value: unknown): RuntimeManifest | null {
@@ -810,20 +981,25 @@ export async function runRuntimeApplyWorker(input: {
   port: number;
   healthTimeoutMs?: number;
   pollIntervalMs?: number;
+  stabilityProbeCount?: number;
   dependencies?: RuntimeApplyWorkerDependencies;
 }): Promise<RuntimeApplyReceipt> {
   const dependencies = input.dependencies ?? {};
   const probe = dependencies.probeHealth ?? probeRuntimeHealth;
   const probeActivationHealth = dependencies.probeActivationHealth ?? probe;
   const reload = dependencies.requestReload ?? requestRuntimeReload;
+  const refreshHostCatalog = dependencies.refreshHostCatalog ?? refreshChatGptHostCatalog;
+  const sendRecoveryWake = dependencies.sendRecoveryWake ?? sendRegisteredChatGptRecoveryWake;
   const sleep = dependencies.sleep ?? delay;
   const pidAlive = dependencies.pidAlive ?? processAlive;
   const now = dependencies.now ?? (() => new Date());
   const healthTimeoutMs = input.healthTimeoutMs ?? 45_000;
   const pollIntervalMs = input.pollIntervalMs ?? 500;
+  const requiredStableTargetProbes = Math.max(1, Math.min(20, input.stabilityProbeCount ?? 1));
 
-  let receipt = await getRuntimeApplyReceipt(input.stateDir, { operationId: input.operationId });
-  if (!receipt) throw new Error(`Runtime apply receipt not found: ${input.operationId}`);
+  const initialReceipt = await getRuntimeApplyReceipt(input.stateDir, { operationId: input.operationId });
+  if (!initialReceipt) throw new Error(`Runtime apply receipt not found: ${input.operationId}`);
+  let receipt: RuntimeApplyReceipt = initialReceipt;
   if (receipt.state !== "ACTIVATION_REQUESTED") return receipt;
 
   const current = getRuntimeManifest();
@@ -872,6 +1048,14 @@ export async function runRuntimeApplyWorker(input: {
     });
   }
 
+  await writeRuntimeApplyMaintenanceMarker(input.stateDir, input.operationId, expectedSupervisorPid);
+  const disconnectStartedAt = now().toISOString();
+  receipt = await updateRuntimeApplyReceipt(input.stateDir, input.operationId, (value) => ({
+    ...value,
+    disconnectStartedAt,
+    reconnectPlan: value.reconnectPlan,
+    updatedAt: disconnectStartedAt,
+  }));
   await writeActiveRuntimePointer(input.stateDir, receipt.targetManifest.runtimeRoot);
   receipt = await updateRuntimeApplyReceipt(input.stateDir, input.operationId, (value) => ({
     ...transition(value, "ACTIVATION_REQUESTED", "activation", now()),
@@ -879,40 +1063,144 @@ export async function runRuntimeApplyWorker(input: {
   }));
   await reload(input.stateDir, input.operationId);
 
+  let reconnectTimingRecorded = Boolean(receipt.reconnectObservedAt);
+  const recordReconnectTiming = async (outcome: ReplacementReconnectOutcome): Promise<void> => {
+    if (reconnectTimingRecorded || !receipt.disconnectStartedAt) return;
+    const reconnectObservedAt = now().toISOString();
+    const reconnectDurationMs = Math.max(0, Date.parse(reconnectObservedAt) - Date.parse(receipt.disconnectStartedAt));
+    const reconnectPlan = await recordReplacementReconnectSample(input.stateDir, {
+      at: reconnectObservedAt,
+      kind: "runtime",
+      durationMs: reconnectDurationMs,
+      outcome,
+    }).catch(() => receipt.reconnectPlan);
+    receipt = await updateRuntimeApplyReceipt(input.stateDir, input.operationId, (value) => ({
+      ...value,
+      reconnectObservedAt,
+      reconnectDurationMs,
+      ...(reconnectPlan ? { reconnectPlan } : {}),
+      updatedAt: reconnectObservedAt,
+    }));
+    reconnectTimingRecorded = true;
+  };
+
   const deadline = Date.now() + healthTimeoutMs;
+  let stableTargetPid: number | null = null;
+  let stableTargetProbes = 0;
+  let unstableTargetProbes = 0;
+  let targetObserved = false;
+  let stabilityFailureAction = "rollback-in-progress";
   while (Date.now() < deadline) {
     const health = await probe(input.port);
     const pointer = await readActiveRuntimePointer(input.stateDir);
+    const targetPidAlive = health.runtimePid !== null && pidAlive(health.runtimePid);
     const targetActivated = health.healthy &&
       health.manifest?.buildFingerprint === receipt.targetFingerprint &&
       health.manifest.runtimeRoot === receipt.targetManifest.runtimeRoot &&
       pointer === receipt.targetManifest.runtimeRoot &&
-      health.runtimePid !== null &&
+      targetPidAlive &&
       health.runtimePid !== receipt.previousRuntimePid;
     if (targetActivated) {
-      const preserved = preservation(receipt, health, pidAlive);
-      return updateRuntimeApplyReceipt(input.stateDir, input.operationId, (value) => {
-        const next = transition(value, "APPLIED", "complete", now());
-        next.currentRuntimePid = health.runtimePid;
-        next.currentRuntimeRoot = health.manifest?.runtimeRoot ?? value.targetManifest.runtimeRoot;
-        next.activeRuntimePointer = pointer;
-        next.postApplyHealth = health;
-        next.supervisorPreserved = preserved.supervisorPreserved;
-        next.connectorPreserved = preserved.connectorPreserved;
-        next.tunnelProcessesPreserved = preserved.tunnelProcessesPreserved;
-        next.rollbackAttempted = false;
-        next.rollbackSucceeded = null;
-        next.previousRuntimeRestored = false;
-        next.finalHealthy = true;
-        next.recommendedAction = "none";
-        return next;
-      });
+      await recordReconnectTiming("healthy");
+      targetObserved = true;
+      unstableTargetProbes = 0;
+      if (stableTargetPid === health.runtimePid) {
+        stableTargetProbes += 1;
+      } else {
+        stableTargetPid = health.runtimePid;
+        stableTargetProbes = 1;
+      }
+      if (stableTargetProbes >= requiredStableTargetProbes) {
+        const preserved = preservation(receipt, health, pidAlive);
+        const schemaRefreshRequired = runtimeSchemaRefreshRequired(receipt.previousManifest, receipt.targetManifest);
+        const applied = await updateRuntimeApplyReceipt(input.stateDir, input.operationId, (value) => {
+          const next = transition(value, "APPLIED", schemaRefreshRequired ? "catalog-refresh" : "complete", now());
+          next.currentRuntimePid = health.runtimePid;
+          next.currentRuntimeRoot = health.manifest?.runtimeRoot ?? value.targetManifest.runtimeRoot;
+          next.activeRuntimePointer = pointer;
+          next.postApplyHealth = health;
+          next.supervisorPreserved = preserved.supervisorPreserved;
+          next.connectorPreserved = preserved.connectorPreserved;
+          next.tunnelProcessesPreserved = preserved.tunnelProcessesPreserved;
+          next.rollbackAttempted = false;
+          next.rollbackSucceeded = null;
+          next.previousRuntimeRestored = false;
+          next.finalHealthy = true;
+          next.hostCatalogRefreshAttempted = schemaRefreshRequired;
+          next.hostCatalogRefreshStatus = schemaRefreshRequired ? "in-progress" : "not-needed";
+          next.hostCatalogRefreshRequested = false;
+          next.hostCatalogScanCompleted = false;
+          next.hostCatalogRefreshErrorCode = null;
+          next.hostCatalogRefreshMessage = null;
+          next.hostCatalogRefreshRecommendedAction = schemaRefreshRequired ? "automatic-refresh-in-progress" : "none";
+          next.hostCatalogRefreshCompletedAt = null;
+          next.recommendedAction = schemaRefreshRequired ? "wait-for-automatic-host-catalog-refresh" : "none";
+          return next;
+        });
+        if (!schemaRefreshRequired) return applied;
+
+        let refreshResult: ChatGptHostCatalogRefreshResult;
+        try {
+          refreshResult = await refreshHostCatalog();
+        } catch {
+          refreshResult = {
+            ok: false,
+            status: "failed",
+            catalogRefreshRequested: false,
+            hostScanCompleted: false,
+            hostCatalogRebindVerified: null,
+            errorCode: "CATALOG_REFRESH_UNEXPECTED_FAILURE",
+            message: "Automatic ChatGPT catalog refresh failed unexpectedly.",
+            recommendedAction: "inspect-chatgpt-send-failure",
+            runtimeRestarted: false,
+            connectorChanged: false,
+            projectFilesChanged: false,
+          };
+        }
+        const completed = await updateRuntimeApplyReceipt(input.stateDir, input.operationId, (value) => {
+          const next = transition(value, "APPLIED", "complete", now());
+          next.hostCatalogRefreshAttempted = true;
+          next.hostCatalogRefreshStatus = refreshResult.status;
+          next.hostCatalogRefreshRequested = refreshResult.catalogRefreshRequested;
+          next.hostCatalogScanCompleted = refreshResult.hostScanCompleted;
+          next.hostCatalogRefreshErrorCode = refreshResult.errorCode ?? null;
+          next.hostCatalogRefreshMessage = refreshResult.message ?? null;
+          next.hostCatalogRefreshRecommendedAction = refreshResult.recommendedAction;
+          next.hostCatalogRefreshCompletedAt = now().toISOString();
+          next.recommendedAction = refreshResult.ok
+            ? "requery-current-chat-direct-named-mount"
+            : refreshResult.recommendedAction;
+          return next;
+        });
+        if (refreshResult.ok && typeof completed.targetManifest.hostCatalogRevision === "string") {
+          await sendRecoveryWake({
+            stateDir: input.stateDir,
+            operationId: input.operationId,
+            runtimeFingerprint: completed.targetFingerprint,
+            hostCatalogRevision: completed.targetManifest.hostCatalogRevision,
+          }).catch(() => null);
+        }
+        return completed;
+      }
+    } else {
+      stableTargetProbes = 0;
+      if (targetObserved) {
+        const observedPidDied = stableTargetPid !== null && !pidAlive(stableTargetPid);
+        unstableTargetProbes += 1;
+        if (observedPidDied || unstableTargetProbes >= 3) {
+          stabilityFailureAction = observedPidDied
+            ? "candidate-runtime-exited-during-stability-window"
+            : "candidate-runtime-unstable-during-stability-window";
+          break;
+        }
+      }
     }
     const previousRuntimeRestored = health.healthy &&
       health.manifest?.buildFingerprint === receipt.expectedCurrentFingerprint &&
       health.manifest.runtimeRoot === receipt.previousRuntimeRoot &&
       pointer === receipt.previousPointerValue;
     if (previousRuntimeRestored) {
+      await recordReconnectTiming("rolled-back");
       const preserved = preservation(receipt, health, pidAlive);
       return updateRuntimeApplyReceipt(input.stateDir, input.operationId, (value) => {
         let next = transition(value, "HEALTH_CHECK_FAILED", "health", now());
@@ -940,7 +1228,7 @@ export async function runRuntimeApplyWorker(input: {
     const next = transition(value, "HEALTH_CHECK_FAILED", "health", now());
     next.rollbackAttempted = true;
     next.failurePhase = "health";
-    next.recommendedAction = "rollback-in-progress";
+    next.recommendedAction = stabilityFailureAction;
     return next;
   });
   await writeActiveRuntimePointer(input.stateDir, receipt.previousPointerValue);
@@ -954,6 +1242,7 @@ export async function runRuntimeApplyWorker(input: {
         health.manifest?.buildFingerprint === receipt.expectedCurrentFingerprint &&
         health.manifest.runtimeRoot === receipt.previousRuntimeRoot &&
         pointer === receipt.previousPointerValue) {
+      await recordReconnectTiming("rolled-back");
       const preserved = preservation(receipt, health, pidAlive);
       return updateRuntimeApplyReceipt(input.stateDir, input.operationId, (value) => {
         const next = transition(value, "APPLY_FAILED_ROLLED_BACK", "complete", now());
@@ -975,6 +1264,7 @@ export async function runRuntimeApplyWorker(input: {
     await sleep(pollIntervalMs);
   }
 
+  await recordReconnectTiming("failed");
   const preserved = preservation(receipt, null, pidAlive);
   return updateRuntimeApplyReceipt(input.stateDir, input.operationId, (value) => {
     const next = transition(value, "APPLY_FAILED_ROLLBACK_FAILED", "complete", now());
@@ -994,6 +1284,9 @@ export async function runRuntimeApplyWorker(input: {
 }
 
 export function runtimeApplyPublicReceipt(receipt: RuntimeApplyReceipt): Record<string, unknown> {
+  const schemaRefreshRequired =
+    (receipt.state === "APPLIED" || receipt.state === "ALREADY_APPLIED")
+    && runtimeSchemaRefreshRequired(receipt.previousManifest, receipt.targetManifest);
   return {
     requestId: receipt.requestId,
     operationId: receipt.operationId,
@@ -1020,6 +1313,47 @@ export function runtimeApplyPublicReceipt(receipt: RuntimeApplyReceipt): Record<
     diagnosticId: receipt.diagnosticId,
     failurePhase: receipt.failurePhase,
     recommendedAction: receipt.recommendedAction,
+    disconnectStartedAt: receipt.disconnectStartedAt ?? null,
+    reconnectObservedAt: receipt.reconnectObservedAt ?? null,
+    reconnectDurationMs: receipt.reconnectDurationMs ?? null,
+    reconnectPlan: receipt.reconnectPlan ?? null,
+    schemaRefreshRequired,
+    previousToolSchemaRevision: receipt.previousManifest.toolSchemaRevision,
+    targetToolSchemaRevision: receipt.targetManifest.toolSchemaRevision,
+    previousHostCatalogRevision: receipt.previousManifest.hostCatalogRevision ?? null,
+    targetHostCatalogRevision: receipt.targetManifest.hostCatalogRevision ?? null,
+    previousUiResourceRevision: receipt.previousManifest.uiResourceRevision ?? null,
+    targetUiResourceRevision: receipt.targetManifest.uiResourceRevision ?? null,
+    connectorReregistrationRequired: false,
+    connectorEndpointPolicy: "stable-bare-mcp",
+    hostCatalogRebindVerified: null,
+    hostCatalogRefreshRequired: schemaRefreshRequired,
+    automaticHostCatalogRefresh: schemaRefreshRequired
+      ? {
+          approvalCoveredByRuntimeApply: true,
+          attempted: receipt.hostCatalogRefreshAttempted ?? false,
+          status: receipt.hostCatalogRefreshStatus ?? "not-started",
+          catalogRefreshRequested: receipt.hostCatalogRefreshRequested ?? false,
+          hostScanCompleted: receipt.hostCatalogScanCompleted ?? false,
+          errorCode: receipt.hostCatalogRefreshErrorCode ?? null,
+          message: receipt.hostCatalogRefreshMessage ?? null,
+          recommendedAction: receipt.hostCatalogRefreshRecommendedAction ?? "automatic-refresh-pending-runtime-apply",
+          completedAt: receipt.hostCatalogRefreshCompletedAt ?? null,
+        }
+      : null,
+    hostCatalogRefresh: schemaRefreshRequired
+      ? {
+          surface: "host-app-server",
+          method: "app/installed",
+          params: { forceRefresh: true },
+          automaticAttemptIncludedInRuntimeApproval: true,
+          requiresFreshChatVerification: false,
+          verificationTarget: "direct-named-tool-mount",
+        }
+      : null,
+    schemaRefreshFallback: schemaRefreshRequired
+      ? "a successful schema-changing runtime apply automatically attempts the fixed C2CT catalog-refresh and scan-tools actions under the same exact runtime approval; re-query the direct named mount in the current chat to verify host rebind; if the automatic attempt fails, use the Settings catalog force-refresh button or the direct chatgpt_catalog_refresh recovery tool; keep the registered bare /mcp endpoint and never re-register the connector"
+      : "none",
     approvalRequestId: receipt.approvalRequestId ?? null,
     createdAt: receipt.createdAt,
     updatedAt: receipt.updatedAt,

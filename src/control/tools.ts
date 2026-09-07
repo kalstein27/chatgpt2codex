@@ -10,7 +10,7 @@ import {
   summarizePrivateText,
   summarizeResolvedTarget,
 } from "../policy/audit-input.js";
-import { assertAllowedTarget, controlAllowlist, isAppAllowed, isControlChatGptExposed } from "./policy.js";
+import { assertAllowedTarget, controlAllowlist, isAppAllowed, isRemoteChatGptControlExposed } from "./policy.js";
 import { assertScreenshotTargetAllowed, maskSensitiveRegions } from "./screenshot-mask.js";
 import { executeApprovedAction } from "./executor.js";
 import * as macInput from "./mac-input.js";
@@ -155,7 +155,7 @@ export async function handleComputerScreenshot(ctx: ToolContext, input: Computer
           appName: input.appName,
         });
       }
-    } else if (isControlChatGptExposed()) {
+    } else if (isRemoteChatGptControlExposed(ctx.remote)) {
       // A full-screen capture (`screencapture -x`) captures every visible
       // window on the display, not just the frontmost one — checking only
       // the live frontmost app's denylist/allowlist status (as an earlier
@@ -354,7 +354,7 @@ export async function handleComputerRequestAction(ctx: ToolContext, input: Compu
       resolved: summarizeResolvedTarget(record.resolved),
     });
 
-    if (isControlChatGptExposed() && !(await isChatGptExposedRateLimited(ctx.stateDir))) {
+    if (isRemoteChatGptControlExposed(ctx.remote) && !(await isChatGptExposedRateLimited(ctx.stateDir))) {
       // Reaching this call at all means the owner's ChatGPT client already
       // showed its Confirm/Deny prompt (driven by this tool's non-read-only
       // annotations) and the owner confirmed on their phone — that is the
@@ -379,7 +379,7 @@ export async function handleComputerRequestAction(ctx: ToolContext, input: Compu
       } satisfies CallToolResultLike;
     }
 
-    if (isControlChatGptExposed()) {
+    if (isRemoteChatGptControlExposed(ctx.remote)) {
       await ctx.ledger.append({
         type: "control.action.rate_limited",
         projectId,

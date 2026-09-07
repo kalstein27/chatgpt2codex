@@ -56,6 +56,7 @@ import {
   completeAccessibilityBridgeRequest,
   listPendingAccessibilityBridgeRequests,
 } from "../control/accessibility-bridge.js";
+import type { SingleUserOAuthProvider } from "../auth/oauth-provider.js";
 
 export interface LocalControlRouteConfig {
   port: number;
@@ -63,6 +64,10 @@ export interface LocalControlRouteConfig {
   startedAt: number;
   desktopControlSupported?: boolean;
   diagnostics?: ConnectionDiagnosticsSink;
+  oauthLocalApproval?: Pick<
+    SingleUserOAuthProvider,
+    "listPendingLocalApprovals" | "resolveLocalApproval"
+  >;
   approvalState?: {
     clearKill?: typeof clearKill;
     isKilled?: typeof isKilled;
@@ -319,6 +324,7 @@ export function registerLocalControlRoutes(
       const pendingOperationApprovals = operationApprovalRequests.filter((request) => request.status === "pending");
       const pendingScreenshotCaptures = listPendingScreenshotCaptures(now);
       const pendingAccessibilityBridgeRequests = listPendingAccessibilityBridgeRequests(now);
+      const pendingOAuthApprovals = config.oauthLocalApproval?.listPendingLocalApprovals(now) ?? [];
       const backgroundSessions = backgroundOperations.map((operation) => ({
         sessionLabel: "BACKGROUND",
         transport: "http",
@@ -356,7 +362,7 @@ export function registerLocalControlRoutes(
         }));
 
       res.json({
-        schemaVersion: 7,
+        schemaVersion: 8,
         server: { ok: true, pid: process.pid, startedAt: config.startedAt },
         outputPolicy: currentOutputPolicy(),
         project: project ? { projectId: project.projectId, name: project.name } : null,
@@ -384,6 +390,10 @@ export function registerLocalControlRoutes(
         operationApprovals: {
           pendingRequestCount: pendingOperationApprovals.length,
           pendingRequests: pendingOperationApprovals.slice(0, 50).map(operationApprovalSummary),
+        },
+        oauthApprovals: {
+          pendingRequestCount: pendingOAuthApprovals.length,
+          pendingRequests: pendingOAuthApprovals.slice(0, 20),
         },
         screenshotCapture: {
           pendingRequestCount: pendingScreenshotCaptures.length,
@@ -524,6 +534,29 @@ export function registerLocalControlRoutes(
       });
     }),
   );
+
+  for (const decision of ["approve", "reject"] as const) {
+    app.post(
+      `${base}/oauth-approvals/:requestId/${decision}`,
+      asyncRoute(async (req, res) => {
+        const requestId = String(req.params.requestId ?? "");
+        if (!config.oauthLocalApproval) {
+          res.status(404).json({ error: "oauth_local_approval_unavailable" });
+          return;
+        }
+        try {
+          const request = config.oauthLocalApproval.resolveLocalApproval(requestId, decision);
+          await ctx.ledger.append({
+            type: decision === "approve" ? "oauth.local_approval.approved" : "oauth.local_approval.rejected",
+            requestId: request.requestId,
+          }).catch(() => undefined);
+          res.json({ ok: true, request });
+        } catch {
+          res.status(409).json({ error: "oauth_local_approval_failed" });
+        }
+      }),
+    );
+  }
 
   for (const decision of ["approve", "reject"] as const) {
     app.post(

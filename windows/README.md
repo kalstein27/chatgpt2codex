@@ -58,7 +58,7 @@ Releases, not in the Git tree.
 
 ## Runtime behavior
 
-- Default loopback port: `7979`
+- Loopback port: use the value currently configured/shown by the tray runtime; do not treat a historical default as process identity.
 - Starting MCP is loopback-only unless the web connector is enabled.
 - Temporary Quick Tunnel URLs may change after restart.
 - The tray shows MCP state, selected project, local port, active sessions,
@@ -92,7 +92,7 @@ commands or claim native-control parity.
 
 ## Troubleshooting
 
-- If port `7979` is busy, use **Restart MCP** from the tray and inspect logs.
+- If the currently configured loopback port is busy, use **Restart MCP** from the tray and inspect logs.
 - If the connector URL is empty, enable the web connector and restart MCP.
 - If a temporary connector URL changes, replace the old ChatGPT connection.
 - If tools are visible but calls fail, open **Connection Diagnostics...**. No

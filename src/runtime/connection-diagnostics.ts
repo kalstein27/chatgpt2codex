@@ -8,6 +8,7 @@ const MAX_LOG_BYTES = 1024 * 1024;
 const ARCHIVE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_ARCHIVE_FILES = 128;
 const MAX_SUMMARY_ARCHIVE_FILES = 4;
+const MAX_ARCHIVE_EVENT_CACHE_FILES = 8;
 const MAX_STRING_LENGTH = 160;
 const DEFAULT_RECENT_EVENTS = 40;
 const MAX_RECENT_EVENTS = 200;
@@ -294,9 +295,9 @@ function safeEvent(input: ConnectionDiagnosticInput): ConnectionDiagnosticEvent 
   };
 }
 
-function roundedAverage(values: number[]): number | undefined {
-  if (values.length === 0) return undefined;
-  return Math.round(values.reduce((sum, value) => sum + value, 0) / values.length);
+function roundedAverage(total: number, count: number): number | undefined {
+  if (count === 0) return undefined;
+  return Math.round(total / count);
 }
 
 function percentile(values: number[], ratio: number): number {
@@ -378,52 +379,75 @@ function clientCancellationRecovery(
 }
 
 function lifecycleSummary(events: ConnectionDiagnosticEvent[]): ConnectionLifecycleSummary {
-  const sessionDurations = events.flatMap((event) =>
-    Number.isFinite(event.sessionDurationMs) ? [Math.max(0, event.sessionDurationMs ?? 0)] : [],
-  );
-  const reconnectDelays = events.flatMap((event) =>
-    Number.isFinite(event.reconnectDelayMs) ? [Math.max(0, event.reconnectDelayMs ?? 0)] : [],
-  );
-  const setupDurations = events.flatMap((event) =>
-    Number.isFinite(event.sessionSetupMs) ? [Math.max(0, event.sessionSetupMs ?? 0)] : [],
-  );
-  const requestCounts = events.flatMap((event) =>
-    Number.isFinite(event.requestCount) ? [Math.max(0, event.requestCount ?? 0)] : [],
-  );
-  const reusedRequestCounts = events.flatMap((event) =>
-    Number.isFinite(event.reusedRequestCount) ? [Math.max(0, event.reusedRequestCount ?? 0)] : [],
-  );
-  const serverCloseEvents = events.filter((event) => event.event === "mcp.session_closed");
+  let sessionStarts = 0;
+  let normalRequestRotations = 0;
+  let clientDisconnects = 0;
+  let reconnects = 0;
+  let transportErrors = 0;
+  const serverCloses = { capacity: 0, idleTtl: 0, shutdown: 0, other: 0 };
+  let sessionDurationTotal = 0;
+  let sessionDurationCount = 0;
+  let reconnectDelayTotal = 0;
+  let reconnectDelayCount = 0;
+  let setupDurationTotal = 0;
+  let setupDurationCount = 0;
+  let requestCountTotal = 0;
+  let requestCountCount = 0;
+  let reusedRequestCountTotal = 0;
+  let reusedRequestCountCount = 0;
+
+  for (const event of events) {
+    if (event.event === "mcp.session_opened") sessionStarts += 1;
+    else if (event.event === "mcp.request_session_completed") normalRequestRotations += 1;
+    else if (event.event === "mcp.session_disconnected") clientDisconnects += 1;
+    else if (event.event === "mcp.session_reconnected") reconnects += 1;
+    else if (event.event === "mcp.transport_error") transportErrors += 1;
+    else if (event.event === "mcp.session_closed") {
+      if (event.closeReason === "capacity") serverCloses.capacity += 1;
+      else if (event.closeReason === "idle_ttl") serverCloses.idleTtl += 1;
+      else if (event.closeReason === "shutdown") serverCloses.shutdown += 1;
+      else serverCloses.other += 1;
+    }
+    if (Number.isFinite(event.sessionDurationMs)) {
+      sessionDurationTotal += Math.max(0, event.sessionDurationMs ?? 0);
+      sessionDurationCount += 1;
+    }
+    if (Number.isFinite(event.reconnectDelayMs)) {
+      reconnectDelayTotal += Math.max(0, event.reconnectDelayMs ?? 0);
+      reconnectDelayCount += 1;
+    }
+    if (Number.isFinite(event.sessionSetupMs)) {
+      setupDurationTotal += Math.max(0, event.sessionSetupMs ?? 0);
+      setupDurationCount += 1;
+    }
+    if (Number.isFinite(event.requestCount)) {
+      requestCountTotal += Math.max(0, event.requestCount ?? 0);
+      requestCountCount += 1;
+    }
+    if (Number.isFinite(event.reusedRequestCount)) {
+      reusedRequestCountTotal += Math.max(0, event.reusedRequestCount ?? 0);
+      reusedRequestCountCount += 1;
+    }
+  }
+
+  const averageSessionDurationMs = roundedAverage(sessionDurationTotal, sessionDurationCount);
+  const averageReconnectDelayMs = roundedAverage(reconnectDelayTotal, reconnectDelayCount);
+  const averageSessionSetupMs = roundedAverage(setupDurationTotal, setupDurationCount);
+  const averageRequestsPerSession = roundedAverage(requestCountTotal, requestCountCount);
+  const averageReusedRequestsPerSession = roundedAverage(reusedRequestCountTotal, reusedRequestCountCount);
   return {
     retainedEventCount: events.length,
-    sessionStarts: events.filter((event) => event.event === "mcp.session_opened").length,
-    normalRequestRotations: events.filter((event) => event.event === "mcp.request_session_completed").length,
-    clientDisconnects: events.filter((event) => event.event === "mcp.session_disconnected").length,
-    reconnects: events.filter((event) => event.event === "mcp.session_reconnected").length,
-    transportErrors: events.filter((event) => event.event === "mcp.transport_error").length,
-    serverCloses: {
-      capacity: serverCloseEvents.filter((event) => event.closeReason === "capacity").length,
-      idleTtl: serverCloseEvents.filter((event) => event.closeReason === "idle_ttl").length,
-      shutdown: serverCloseEvents.filter((event) => event.closeReason === "shutdown").length,
-      other: serverCloseEvents.filter(
-        (event) => !["capacity", "idle_ttl", "shutdown"].includes(event.closeReason ?? ""),
-      ).length,
-    },
-    ...(roundedAverage(sessionDurations) !== undefined
-      ? { averageSessionDurationMs: roundedAverage(sessionDurations) }
-      : {}),
-    ...(roundedAverage(reconnectDelays) !== undefined
-      ? { averageReconnectDelayMs: roundedAverage(reconnectDelays) }
-      : {}),
-    ...(roundedAverage(setupDurations) !== undefined
-      ? { averageSessionSetupMs: roundedAverage(setupDurations) }
-      : {}),
-    ...(roundedAverage(requestCounts) !== undefined
-      ? { averageRequestsPerSession: roundedAverage(requestCounts) }
-      : {}),
-    ...(roundedAverage(reusedRequestCounts) !== undefined
-      ? { averageReusedRequestsPerSession: roundedAverage(reusedRequestCounts) }
-      : {}),
+    sessionStarts,
+    normalRequestRotations,
+    clientDisconnects,
+    reconnects,
+    transportErrors,
+    serverCloses,
+    ...(averageSessionDurationMs !== undefined ? { averageSessionDurationMs } : {}),
+    ...(averageReconnectDelayMs !== undefined ? { averageReconnectDelayMs } : {}),
+    ...(averageSessionSetupMs !== undefined ? { averageSessionSetupMs } : {}),
+    ...(averageRequestsPerSession !== undefined ? { averageRequestsPerSession } : {}),
+    ...(averageReusedRequestsPerSession !== undefined ? { averageReusedRequestsPerSession } : {}),
   };
 }
 
@@ -448,6 +472,9 @@ export class FileConnectionDiagnostics implements ConnectionDiagnosticsSink {
   private readonly maxLogBytes: number;
   private readonly archiveRetentionMs: number;
   private readonly maxArchiveFiles: number;
+  private currentEventsCache: ConnectionDiagnosticEvent[] | null = null;
+  private readonly archiveEventCache = new Map<string, ConnectionDiagnosticEvent[]>();
+  private currentLogBytes: number | null = null;
 
   constructor(stateDir: string, options: FileConnectionDiagnosticsOptions = {}) {
     this.logPath = path.join(stateDir, LOG_FILE);
@@ -460,9 +487,15 @@ export class FileConnectionDiagnostics implements ConnectionDiagnosticsSink {
   record(input: ConnectionDiagnosticInput): Promise<ConnectionDiagnosticEvent> {
     const event = safeEvent(input);
     const write = this.queue.then(async () => {
-      await mkdir(path.dirname(this.logPath), { recursive: true, mode: 0o700 });
-      await appendFile(this.logPath, `${JSON.stringify(event)}\n`, { encoding: "utf8", mode: 0o600 });
-      await chmod(this.logPath, 0o600).catch(() => undefined);
+      await this.ensureLogState();
+      const line = `${JSON.stringify(event)}\n`;
+      await appendFile(this.logPath, line, { encoding: "utf8", mode: 0o600 });
+      this.currentLogBytes = (this.currentLogBytes ?? 0) + Buffer.byteLength(line, "utf8");
+      // This process is the sole writer of the active diagnostics log. Once a
+      // summary has populated the parsed cache, append the already-sanitized
+      // event directly instead of re-reading and re-parsing the whole JSONL on
+      // every subsequent status poll.
+      if (this.currentEventsCache) this.currentEventsCache.push(event);
       await this.rotateIfNeeded();
       return event;
     });
@@ -470,20 +503,34 @@ export class FileConnectionDiagnostics implements ConnectionDiagnosticsSink {
     return write;
   }
 
+  private async ensureLogState(): Promise<void> {
+    if (this.currentLogBytes !== null) return;
+    await mkdir(path.dirname(this.logPath), { recursive: true, mode: 0o700 });
+    const info = await stat(this.logPath).catch(() => undefined);
+    this.currentLogBytes = info?.size ?? 0;
+    if (info) await chmod(this.logPath, 0o600).catch(() => undefined);
+  }
+
   async summary(limit = DEFAULT_RECENT_EVENTS): Promise<ConnectionDiagnosticSummary> {
     await this.queue.catch(() => undefined);
     const boundedLimit = Math.min(MAX_RECENT_EVENTS, Math.max(1, Math.floor(limit)));
     const archivePaths = (await this.listArchivePaths()).slice(-MAX_SUMMARY_ARCHIVE_FILES);
-    const sourcePaths = [...archivePaths, this.logPath];
-    const texts = await Promise.all(sourcePaths.map((filePath) => readFile(filePath, "utf8").catch(() => "")));
-    const events = texts
-      .flatMap((text) => parseEvents(text))
+    const archivedEvents = await Promise.all(archivePaths.map((filePath) => this.readArchiveEvents(filePath)));
+    const events = [...archivedEvents.flat(), ...await this.readCurrentEvents()]
       .sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
     const recentEvents = events.slice(-boundedLimit);
-    const lastSuccess = [...events].reverse().find((event) => event.outcome === "success");
-    const lastFailure = [...events].reverse().find((event) => event.outcome === "failure");
-    const lastServerRequest = [...events].reverse().find((event) => event.event === "mcp.authenticated_request_received");
-    const lastToolDispatch = [...events].reverse().find((event) => event.event === "tool.dispatch");
+    let lastSuccess: ConnectionDiagnosticEvent | undefined;
+    let lastFailure: ConnectionDiagnosticEvent | undefined;
+    let lastServerRequest: ConnectionDiagnosticEvent | undefined;
+    let lastToolDispatch: ConnectionDiagnosticEvent | undefined;
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index]!;
+      if (!lastSuccess && event.outcome === "success") lastSuccess = event;
+      if (!lastFailure && event.outcome === "failure") lastFailure = event;
+      if (!lastServerRequest && event.event === "mcp.authenticated_request_received") lastServerRequest = event;
+      if (!lastToolDispatch && event.event === "tool.dispatch") lastToolDispatch = event;
+      if (lastSuccess && lastFailure && lastServerRequest && lastToolDispatch) break;
+    }
     const lifecycle = lifecycleSummary(events);
     const cancellationRecovery = clientCancellationRecovery(events);
     return {
@@ -512,10 +559,8 @@ export class FileConnectionDiagnostics implements ConnectionDiagnosticsSink {
     const maxSlowRequests = Math.min(50, Math.max(1, Math.floor(options.maxSlowRequests ?? 20)));
     const maxRecentFailures = Math.min(50, Math.max(1, Math.floor(options.maxRecentFailures ?? 20)));
     const archivePaths = await this.listArchivePaths();
-    const sourcePaths = [...archivePaths, this.logPath];
-    const texts = await Promise.all(sourcePaths.map((filePath) => readFile(filePath, "utf8").catch(() => "")));
-    const events = texts
-      .flatMap((text) => parseEvents(text))
+    const archivedEvents = await Promise.all(archivePaths.map((filePath) => this.readArchiveEvents(filePath)));
+    const events = [...archivedEvents.flat(), ...await this.readCurrentEvents()]
       .filter((event) => {
         const at = Date.parse(event.at);
         return Number.isFinite(at) && at >= sinceMs && at <= untilMs;
@@ -550,7 +595,7 @@ export class FileConnectionDiagnostics implements ConnectionDiagnosticsSink {
       ...(options.until ? { requestedUntil: options.until } : {}),
       firstEventAt: events.at(0)?.at,
       lastEventAt: events.at(-1)?.at,
-      sourceFileCount: sourcePaths.length,
+      sourceFileCount: archivePaths.length + 1,
       eventCount: events.length,
       outcomes: {
         success: events.filter((event) => event.outcome === "success").length,
@@ -590,9 +635,37 @@ export class FileConnectionDiagnostics implements ConnectionDiagnosticsSink {
       .sort();
   }
 
+  private cacheArchiveEvents(filePath: string, events: ConnectionDiagnosticEvent[]): void {
+    this.archiveEventCache.delete(filePath);
+    this.archiveEventCache.set(filePath, events);
+    while (this.archiveEventCache.size > MAX_ARCHIVE_EVENT_CACHE_FILES) {
+      const oldest = this.archiveEventCache.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.archiveEventCache.delete(oldest);
+    }
+  }
+
+  private async readArchiveEvents(filePath: string): Promise<ConnectionDiagnosticEvent[]> {
+    const cached = this.archiveEventCache.get(filePath);
+    if (cached) {
+      this.archiveEventCache.delete(filePath);
+      this.archiveEventCache.set(filePath, cached);
+      return cached;
+    }
+    const events = parseEvents(await readFile(filePath, "utf8").catch(() => ""));
+    this.cacheArchiveEvents(filePath, events);
+    return events;
+  }
+
+  private async readCurrentEvents(): Promise<ConnectionDiagnosticEvent[]> {
+    if (this.currentEventsCache === null) {
+      this.currentEventsCache = parseEvents(await readFile(this.logPath, "utf8").catch(() => ""));
+    }
+    return this.currentEventsCache;
+  }
+
   private async rotateIfNeeded(): Promise<void> {
-    const info = await stat(this.logPath).catch(() => undefined);
-    if (!info || info.size <= this.maxLogBytes) return;
+    if ((this.currentLogBytes ?? 0) <= this.maxLogBytes) return;
     await mkdir(this.archiveDir, { recursive: true, mode: 0o700 });
     const timestamp = new Date().toISOString().replace(/[:.]/gu, "-");
     const archivePath = path.join(
@@ -600,6 +673,9 @@ export class FileConnectionDiagnostics implements ConnectionDiagnosticsSink {
       `connection-events-${timestamp}-${randomUUID().slice(0, 8)}.jsonl`,
     );
     await rename(this.logPath, archivePath);
+    this.currentLogBytes = 0;
+    if (this.currentEventsCache) this.cacheArchiveEvents(archivePath, this.currentEventsCache);
+    this.currentEventsCache = [];
     await chmod(archivePath, 0o600).catch(() => undefined);
     await writeFile(this.logPath, "", { mode: 0o600 });
     await chmod(this.logPath, 0o600).catch(() => undefined);
@@ -617,6 +693,8 @@ export class FileConnectionDiagnostics implements ConnectionDiagnosticsSink {
     const expired = entries.filter((entry) => now - entry.mtimeMs > this.archiveRetentionMs);
     const retained = entries.filter((entry) => now - entry.mtimeMs <= this.archiveRetentionMs);
     const overflow = retained.slice(0, Math.max(0, retained.length - this.maxArchiveFiles));
-    await Promise.all([...expired, ...overflow].map((entry) => rm(entry.filePath, { force: true })));
+    const removed = [...expired, ...overflow];
+    await Promise.all(removed.map((entry) => rm(entry.filePath, { force: true })));
+    for (const entry of removed) this.archiveEventCache.delete(entry.filePath);
   }
 }

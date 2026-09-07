@@ -1,4 +1,4 @@
-import { runRuntimeApplyWorker } from "./runtime-apply.js";
+import { clearRuntimeApplyMaintenanceMarker, runRuntimeApplyWorker } from "./runtime-apply.js";
 import { releaseRuntimeUpdateBarrier } from "./runtime-update-barrier.js";
 
 function argument(name: string): string | null {
@@ -16,8 +16,9 @@ async function main(): Promise<void> {
     return;
   }
   try {
-    await runRuntimeApplyWorker({ stateDir, operationId, port });
+    await runRuntimeApplyWorker({ stateDir, operationId, port, stabilityProbeCount: 7 });
   } finally {
+    await clearRuntimeApplyMaintenanceMarker(stateDir, operationId).catch(() => undefined);
     await releaseRuntimeUpdateBarrier(stateDir, operationId).catch(() => false);
   }
 }

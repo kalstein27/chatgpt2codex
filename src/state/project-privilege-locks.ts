@@ -297,6 +297,62 @@ export async function inspectProjectPrivilegeLocks(input: {
 }
 
 /**
+ * Batch form used by global status surfaces. It preserves the exact per-target
+ * overlap semantics of inspectProjectPrivilegeLocks while resolving each
+ * registered root and reading each root lock only once for the whole snapshot.
+ */
+export async function inspectProjectPrivilegeLocksForRegistry(input: {
+  stateDir: string;
+  registry: readonly ProjectRegistryEntry[];
+  requesterScope?: string;
+  now?: number;
+}): Promise<Map<string, ProjectPrivilegeLockInspection[]>> {
+  const now = input.now ?? Date.now();
+  const canonicalEntries = await Promise.all(input.registry.map(async (project) => ({
+    project,
+    canonicalRoot: await canonicalProjectRoot(project.root),
+  })));
+  const uniqueRoots = [...new Set(canonicalEntries.map((entry) => entry.canonicalRoot))];
+  const lockEntries = await Promise.all(uniqueRoots.map(async (canonicalRoot) => [
+    canonicalRoot,
+    await readLock(lockPath(input.stateDir, rootDigest(canonicalRoot))),
+  ] as const));
+  const locksByRoot = new Map(lockEntries);
+  const result = new Map<string, ProjectPrivilegeLockInspection[]>();
+
+  for (const target of canonicalEntries) {
+    const inspected: ProjectPrivilegeLockInspection[] = [];
+    const seenGenerations = new Set<string>();
+    for (const candidate of canonicalEntries) {
+      const sameRoot = candidate.canonicalRoot === target.canonicalRoot;
+      const candidateContainsTarget = !sameRoot && containsRoot(candidate.canonicalRoot, target.canonicalRoot);
+      const targetContainsCandidate = !sameRoot && containsRoot(target.canonicalRoot, candidate.canonicalRoot);
+      if (!sameRoot && !candidateContainsTarget && !targetContainsCandidate) continue;
+      const current = locksByRoot.get(candidate.canonicalRoot);
+      if (!current) continue;
+      const recovery = recoveryTarget(current, input.requesterScope);
+      if (seenGenerations.has(recovery.generation)) continue;
+      seenGenerations.add(recovery.generation);
+      inspected.push({
+        ...recovery,
+        canonicalRoot: candidate.canonicalRoot,
+        projectRootDigest: rootDigest(candidate.canonicalRoot),
+        relation: sameRoot ? "same-root" : candidateContainsTarget ? "ancestor" : "descendant",
+        expired: current.expiresAt < now,
+        updatedAt: current.updatedAt,
+      });
+    }
+    inspected.sort((left, right) => {
+      const leftRank = left.relation === "same-root" ? 0 : 1;
+      const rightRank = right.relation === "same-root" ? 0 : 1;
+      return leftRank - rightRank || left.canonicalRoot.localeCompare(right.canonicalRoot);
+    });
+    result.set(target.project.projectId, inspected);
+  }
+  return result;
+}
+
+/**
  * Retire exactly one inspected root-lock generation. Policy decisions such as
  * live-owner protection and approval requirements stay with the caller; this
  * primitive only provides generation-CAS deletion so a changed owner is never

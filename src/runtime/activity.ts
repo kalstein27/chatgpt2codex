@@ -34,6 +34,7 @@ interface OperationRecord {
   state: Exclude<RuntimeOperationState, "idle">;
   phase?: string;
   message?: string;
+  errorCode?: string;
   lastProgressAt?: number;
   progress?: number;
   clientCancelledAt?: number;
@@ -134,6 +135,7 @@ export interface RuntimeConversationSummary {
     elapsedMs: number;
     phase?: string;
     message?: string;
+    errorCode?: string;
     activityHint?: string;
     lastProgressAt?: number;
     progress?: number;
@@ -161,7 +163,7 @@ const MAX_RECENT_CLOSED_SESSIONS = 16;
 const CONVERSATION_HISTORY_TTL_MS = 6 * 60 * 60 * 1000;
 const MAX_CONVERSATION_HISTORY = 16;
 const MAX_CONVERSATION_OPERATIONS = 32;
-export const DASHBOARD_COMPLETED_TTL_MS = 2 * 60 * 1000;
+export const DASHBOARD_COMPLETED_TTL_MS = 5 * 60 * 1000;
 export const DASHBOARD_FAILED_TTL_MS = 5 * 60 * 1000;
 const MAX_ACTIVITY_HIGHLIGHTS = 5;
 
@@ -513,6 +515,7 @@ export class RuntimeActivityTracker {
         : input.errorCode
           ? "failed"
           : "completed";
+    if (input.errorCode) operation.errorCode = boundedLabel(input.errorCode, "ERROR");
     session.lastActiveAt = now;
     this.touchConversation(session.conversationLabel, now);
   }
@@ -730,6 +733,7 @@ export class RuntimeActivityTracker {
             elapsedMs: Math.max(0, (operation.finishedAt ?? now) - operation.startedAt),
             ...(operation.phase ? { phase: operation.phase } : {}),
             ...(operation.message ? { message: operation.message } : {}),
+            ...(operation.errorCode ? { errorCode: operation.errorCode } : {}),
             ...(operation.activityHint ? { activityHint: operation.activityHint } : {}),
             ...(operation.lastProgressAt !== undefined ? { lastProgressAt: operation.lastProgressAt } : {}),
             ...(operation.progress !== undefined ? { progress: operation.progress } : {}),

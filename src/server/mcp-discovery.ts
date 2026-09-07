@@ -1,20 +1,35 @@
 import type { McpRequestClassification } from "./mcp-request-classification.js";
+import { CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL } from "./chatgpt-consent-widget.js";
 
 export const MCP_MODERN_PROTOCOL_VERSION = "2026-07-28";
 export const MCP_PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion";
 export const MCP_CLIENT_INFO_META_KEY = "io.modelcontextprotocol/clientInfo";
 export const MCP_CLIENT_CAPABILITIES_META_KEY = "io.modelcontextprotocol/clientCapabilities";
 export const MCP_SERVER_INFO_META_KEY = "io.modelcontextprotocol/serverInfo";
-export const MCP_SCHEMA_CACHE_TTL_MS = 5 * 60 * 1000;
+// Remote ChatGPT may keep a mounted tool schema across a runtime replacement.
+// C2CT therefore never asks clients/proxies to persist schema discovery results:
+// every discovery/list read is a revalidation point for the live runtime.
+export const MCP_SCHEMA_CACHE_TTL_MS = 0;
 export const MCP_DISCOVERY_TTL_MS = MCP_SCHEMA_CACHE_TTL_MS;
 export const MCP_TOOL_LIST_TTL_MS = MCP_SCHEMA_CACHE_TTL_MS;
-export const MCP_SCHEMA_CONTRACT_VERSION = 2;
+export const MCP_SCHEMA_CONTRACT_VERSION = 4;
 export const MCP_SCHEMA_REVISION_META_KEY = "io.ezbuilder.chatgpt2codex/schemaRevision";
 export const MCP_SCHEMA_EXPIRED_META_KEY = "io.ezbuilder.chatgpt2codex/schemaExpired";
+export const MCP_SCHEMA_REVALIDATE_META_KEY = "io.ezbuilder.chatgpt2codex/schemaMustRevalidate";
 export const MCP_CORE_TOOLS_META_KEY = "io.ezbuilder.chatgpt2codex/coreToolNames";
+
+// Keep stateful SDK initialize responses and the stateless ChatGPT discovery
+// adapter on the same capability contract. Hosts that support MCP list-change
+// notifications can invalidate their mounted catalog, while reconnect/refresh
+// still revalidates against the live tools/list response with a zero TTL.
+export const MCP_TOOL_CAPABILITIES = {
+  listChanged: true,
+} as const;
 
 export const MCP_CORE_TOOL_NAMES = [
   "c2ct_invoke",
+  "chatgpt_catalog_refresh",
+  CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL,
   "connection_status",
   "connection_audit",
   "session_context_update",
@@ -26,6 +41,7 @@ export const MCP_CORE_TOOL_NAMES = [
   "project_select",
   "project_release",
   "project_renew_lease",
+  "chatgpt_widget_asset_apply",
   "project_status",
   "project_rules",
   "operation_status",
@@ -38,6 +54,7 @@ export const MCP_CORE_TOOL_NAMES = [
   "file_edit_lines",
   "file_apply_patch",
   "file_create",
+  "tool_schema_get",
   "mutation_status",
   "repo_status",
   "git_diff_summary",
@@ -103,19 +120,28 @@ export function modernServerMeta(serverInfo: McpServerIdentity): Record<string, 
   return { [MCP_SERVER_INFO_META_KEY]: serverInfo };
 }
 
-export function createMcpDiscoveryResult(serverInfo: McpServerIdentity): Record<string, unknown> {
+export function createMcpDiscoveryResult(
+  serverInfo: McpServerIdentity,
+  schemaRevision?: string,
+): Record<string, unknown> {
   return {
     resultType: "complete",
     supportedVersions: [MCP_MODERN_PROTOCOL_VERSION],
-    capabilities: { tools: {} },
+    capabilities: { tools: { ...MCP_TOOL_CAPABILITIES } },
     instructions:
-      "Cache the advertised tool schemas for ttlMs. tools/list also supports exact-name query, explicit names, and coreOnly extensions for compact schema discovery.",
+      "Revalidate tools/list for the live runtime instead of persisting tool schemas across runtime replacement. tools/list supports exact-name query, explicit names, and coreOnly extensions. tool_schema_get plus c2ct_invoke is the stable fallback when a host-mounted named schema is stale.",
     ttlMs: MCP_DISCOVERY_TTL_MS,
     toolListTtlMs: MCP_TOOL_LIST_TTL_MS,
     cacheScope: "private",
     schemaContractVersion: MCP_SCHEMA_CONTRACT_VERSION,
     schemaExpired: false,
+    schemaMustRevalidate: true,
+    ...(schemaRevision ? { schemaRevision } : {}),
     coreToolNames: [...MCP_CORE_TOOL_NAMES],
-    _meta: modernServerMeta(serverInfo),
+    _meta: {
+      ...modernServerMeta(serverInfo),
+      [MCP_SCHEMA_REVALIDATE_META_KEY]: true,
+      ...(schemaRevision ? { [MCP_SCHEMA_REVISION_META_KEY]: schemaRevision } : {}),
+    },
   };
 }

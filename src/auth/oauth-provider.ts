@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID, createHash } from "node:crypto";
+import { randomBytes, randomUUID, createHash, timingSafeEqual } from "node:crypto";
 import type { Response } from "express";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
 import type { OAuthServerProvider, AuthorizationParams } from "@modelcontextprotocol/sdk/server/auth/provider.js";
@@ -52,7 +52,39 @@ interface AuthorizationCodeRecord {
   expiresAtMs: number;
 }
 
+export interface PendingOAuthLocalApprovalSummary {
+  requestId: string;
+  status: "pending" | "approved" | "rejected" | "expired";
+  clientName: string;
+  scopes: string[];
+  resource: string;
+  redirectHost: string;
+  createdAt: number;
+  expiresAt: number;
+}
+
+interface PendingOAuthLocalApprovalRecord extends PendingOAuthLocalApprovalSummary {
+  browserToken: string;
+  browserTokenHash: string;
+  requestKey: string;
+  client: OAuthClientInformationFull;
+  params: AuthorizationParams;
+  redirectUrl?: string;
+}
+
+export interface OAuthLocalApprovalPageSession {
+  requestId: string;
+  browserToken: string;
+}
+
+export interface OAuthLocalApprovalBrowserStatus {
+  status: PendingOAuthLocalApprovalSummary["status"];
+  redirectUrl?: string;
+}
+
 const CODE_TTL_MS = 5 * 60 * 1000;
+const LOCAL_APPROVAL_TTL_MS = 5 * 60 * 1000;
+const MAX_PENDING_LOCAL_APPROVALS = 32;
 
 /** SR-05: bounded in-memory rate limiting for the owner-token prompt. */
 const MAX_ATTEMPTS_BEFORE_BACKOFF = 5;
@@ -176,6 +208,19 @@ function copyForLocale(locale: OAuthPageLocale): OAuthPageCopy {
 
 function pageDirection(locale: OAuthPageLocale): "ltr" | "rtl" {
   return locale === "ar" ? "rtl" : "ltr";
+}
+
+function localApprovalPageCopy(locale: OAuthPageLocale): { waiting: string; fallback: string } {
+  if (locale === "ko") {
+    return {
+      waiting: "ChatGPT To Codex Mac 앱에서 이 연결을 승인해 주세요. 승인하면 자동으로 계속됩니다.",
+      fallback: "앱 승인을 사용할 수 없을 때만 아래 Owner Token 입력을 사용하세요.",
+    };
+  }
+  return {
+    waiting: "Approve this connection in the ChatGPT To Codex Mac app. This page will continue automatically.",
+    fallback: "Use the Owner Token field below only when local app approval is unavailable.",
+  };
 }
 
 const OAUTH_PAGE_TEXT: Record<OAuthPageLocale, OAuthPageCopy> = {
@@ -489,8 +534,10 @@ function formHtml(params: {
   csrfToken: string;
   fields: Record<string, string | undefined>;
   locale: OAuthPageLocale;
+  localApproval?: OAuthLocalApprovalPageSession;
 }): string {
   const copy = copyForLocale(params.locale);
+  const localCopy = localApprovalPageCopy(params.locale);
   const dir = pageDirection(params.locale);
   const scopeText = params.scopes.length > 0 ? params.scopes.join(" ") : "chatgpt2codex";
   const resourceText = params.resource?.href ?? "chatgpt2codex MCP endpoint";
@@ -499,6 +546,12 @@ function formHtml(params: {
     .filter((entry): entry is [string, string] => entry[1] !== undefined)
     .map(([name, value]) => `        <input type="hidden" name="${htmlEscape(name)}" value="${htmlEscape(value)}" />`)
     .join("\n");
+  const localApproval = params.localApproval
+    ? `<section id="oauth_local_approval" class="local-approval" data-request-id="${htmlEscape(params.localApproval.requestId)}" data-browser-token="${htmlEscape(params.localApproval.browserToken)}">
+          <p id="oauth_local_approval_status" class="local-approval-status" role="status">${htmlEscape(localCopy.waiting)}</p>
+          <p class="hint">${htmlEscape(localCopy.fallback)}</p>
+        </section>`
+    : "";
 
   return `<!doctype html>
 <html lang="${htmlEscape(params.locale)}" dir="${dir}">
@@ -608,6 +661,14 @@ function formHtml(params: {
         box-shadow: 0 0 0 4px rgba(16, 163, 127, .16);
       }
       .hint { margin: 9px 0 0; color: #47625b; font-size: 13px; line-height: 1.45; }
+      .local-approval {
+        margin: 0 0 20px;
+        padding: 14px 16px;
+        border: 1px solid #99d8c8;
+        border-radius: 8px;
+        background: #ecfdf5;
+      }
+      .local-approval-status { margin: 0; color: #065f46; font-weight: 800; line-height: 1.45; }
       button[type="submit"] {
         width: 100%;
         min-height: 52px;
@@ -654,6 +715,8 @@ function formHtml(params: {
         .token-toggle { color: #cbd5e1; }
         .token-toggle:hover { background: #1f2937; color: #f8fafc; }
         .hint { color: #a7f3d0; }
+        .local-approval { background: #052e2b; border-color: #0f766e; }
+        .local-approval-status { color: #a7f3d0; }
       }
     </style>
   </head>
@@ -669,9 +732,11 @@ function formHtml(params: {
           <dt>${htmlEscape(copy.scope)}</dt><dd>${htmlEscape(scopeText)}</dd>
           <dt>${htmlEscape(copy.resource)}</dt><dd>${htmlEscape(resourceText)}</dd>
         </dl>
+        ${localApproval}
         <form method="post" action="/authorize">
 ${hiddenFields}
           <input type="hidden" name="csrf_token" value="${htmlEscape(params.csrfToken)}" />
+          ${params.localApproval ? `<input type="hidden" name="local_approval_id" value="${htmlEscape(params.localApproval.requestId)}" />` : ""}
           <label for="owner_token">${htmlEscape(copy.label)}</label>
           <div class="token-field">
             <input id="owner_token" name="owner_token" type="password" autocomplete="one-time-code" inputmode="text" spellcheck="false" autocapitalize="off" placeholder="${htmlEscape(copy.placeholder)}" autofocus required />
@@ -686,6 +751,7 @@ ${hiddenFields}
       </section>
     </main>
     <script src="/assets/owner-token-toggle.js" defer></script>
+    ${params.localApproval ? `<script src="/assets/oauth-local-approval.js" defer></script>` : ""}
   </body>
 </html>`;
 }
@@ -771,6 +837,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   private readonly loginAttempts = new LoginAttemptTracker();
   private readonly oauthStore: JsonOAuthStore;
   private readonly resourceServerUrl: URL;
+  private readonly localApprovals = new Map<string, PendingOAuthLocalApprovalRecord>();
 
   constructor(
     private readonly config: OAuthConfig,
@@ -780,6 +847,125 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
     this.oauthStore = new JsonOAuthStore(stateDir);
     this.clientsStore = new JsonOAuthClientsStore(this.oauthStore, config.allowedRedirectHosts);
+  }
+
+  requestLocalApproval(
+    client: OAuthClientInformationFull,
+    params: AuthorizationParams,
+    now = Date.now(),
+  ): OAuthLocalApprovalPageSession | undefined {
+    this.sweepLocalApprovals(now);
+    const requestKey = hashToken([
+      client.client_id,
+      params.redirectUri,
+      params.codeChallenge,
+      params.state ?? "",
+      params.resource?.href ?? "",
+      ...(params.scopes ?? []),
+    ].join("\u0000"));
+    const existing = [...this.localApprovals.values()].find((record) =>
+      record.requestKey === requestKey && record.status === "pending" && record.expiresAt > now,
+    );
+    if (existing) return { requestId: existing.requestId, browserToken: existing.browserToken };
+
+    if ([...this.localApprovals.values()].filter((record) => record.status === "pending").length
+      >= MAX_PENDING_LOCAL_APPROVALS) {
+      return undefined;
+    }
+
+    const requestId = `oauth_${randomUUID()}`;
+    const browserToken = randomToken();
+    const redirectHost = (() => {
+      try { return new URL(params.redirectUri).hostname; } catch { return "unknown"; }
+    })();
+    const record: PendingOAuthLocalApprovalRecord = {
+      requestId,
+      status: "pending",
+      clientName: (client.client_name ?? "ChatGPT").slice(0, 160),
+      scopes: [...(params.scopes ?? this.config.scopes)],
+      resource: params.resource?.href ?? this.resourceServerUrl.href,
+      redirectHost,
+      createdAt: now,
+      expiresAt: now + LOCAL_APPROVAL_TTL_MS,
+      browserToken,
+      browserTokenHash: hashToken(browserToken),
+      requestKey,
+      client,
+      params,
+    };
+    this.localApprovals.set(requestId, record);
+    return { requestId, browserToken };
+  }
+
+  listPendingLocalApprovals(now = Date.now()): PendingOAuthLocalApprovalSummary[] {
+    this.sweepLocalApprovals(now);
+    return [...this.localApprovals.values()]
+      .filter((record) => record.status === "pending" && record.expiresAt > now)
+      .sort((left, right) => left.createdAt - right.createdAt)
+      .map((record) => this.localApprovalSummary(record));
+  }
+
+  resolveLocalApproval(
+    requestId: string,
+    decision: "approve" | "reject",
+    now = Date.now(),
+  ): PendingOAuthLocalApprovalSummary {
+    this.sweepLocalApprovals(now);
+    const record = this.localApprovals.get(requestId);
+    if (!record) throw new InvalidRequestError("OAuth local approval request was not found");
+    if (record.status !== "pending" || record.expiresAt <= now) {
+      throw new InvalidRequestError("OAuth local approval request is no longer pending");
+    }
+    if (decision === "approve") {
+      record.redirectUrl = this.issueAuthorizationRedirect(record.client, record.params);
+      record.status = "approved";
+    } else {
+      record.status = "rejected";
+    }
+    return this.localApprovalSummary(record);
+  }
+
+  localApprovalBrowserStatus(
+    requestId: string,
+    browserToken: string,
+    now = Date.now(),
+  ): OAuthLocalApprovalBrowserStatus | undefined {
+    this.sweepLocalApprovals(now);
+    const record = this.localApprovals.get(requestId);
+    if (!record || !this.localApprovalBrowserTokenMatches(record, browserToken)) return undefined;
+    return {
+      status: record.status,
+      ...(record.status === "approved" && record.redirectUrl ? { redirectUrl: record.redirectUrl } : {}),
+    };
+  }
+
+  private localApprovalBrowserTokenMatches(
+    record: PendingOAuthLocalApprovalRecord,
+    candidate: string,
+  ): boolean {
+    const supplied = Buffer.from(hashToken(candidate), "utf8");
+    const expected = Buffer.from(record.browserTokenHash, "utf8");
+    return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+  }
+
+  private localApprovalSummary(record: PendingOAuthLocalApprovalRecord): PendingOAuthLocalApprovalSummary {
+    return {
+      requestId: record.requestId,
+      status: record.status,
+      clientName: record.clientName,
+      scopes: [...record.scopes],
+      resource: record.resource,
+      redirectHost: record.redirectHost,
+      createdAt: record.createdAt,
+      expiresAt: record.expiresAt,
+    };
+  }
+
+  private sweepLocalApprovals(now: number): void {
+    for (const [requestId, record] of this.localApprovals) {
+      if (record.status === "pending" && record.expiresAt <= now) record.status = "expired";
+      if (record.expiresAt + LOCAL_APPROVAL_TTL_MS <= now) this.localApprovals.delete(requestId);
+    }
   }
 
   async authorize(client: OAuthClientInformationFull, params: AuthorizationParams, res: Response): Promise<void> {
@@ -800,6 +986,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     // limiter below still bounds forwarded-IP rotation.
     const lockoutKey = `${client.client_id}:${clientIp}`;
     const locale = localeFromRequest(res);
+    const localApproval = this.requestLocalApproval(client, params);
 
     if (res.req.method !== "POST") {
       const csrfToken = this.issueCsrfToken();
@@ -812,6 +999,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           csrfToken,
           fields: authorizationFormFields(client, params),
           locale,
+          localApproval,
         }),
       );
       return;
@@ -834,6 +1022,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           csrfToken: this.issueCsrfToken(),
           fields: authorizationFormFields(client, params),
           locale,
+          localApproval,
         }),
       );
       return;
@@ -851,6 +1040,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           csrfToken: this.issueCsrfToken(),
           fields: authorizationFormFields(client, params),
           locale,
+          localApproval,
         }),
       );
       return;
@@ -868,6 +1058,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           csrfToken: this.issueCsrfToken(),
           fields: authorizationFormFields(client, params),
           locale,
+          localApproval,
         }),
       );
       return;
@@ -892,6 +1083,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           csrfToken: this.issueCsrfToken(),
           fields: authorizationFormFields(client, params),
           locale,
+          localApproval,
         }),
       );
       return;
@@ -910,25 +1102,15 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           csrfToken: this.issueCsrfToken(),
           fields: authorizationFormFields(client, params),
           locale,
+          localApproval,
         }),
       );
       return;
     }
 
     this.loginAttempts.recordSuccess(lockoutKey);
-
-    const code = `code-${randomUUID()}`;
-    this.codes.set(code, {
-      clientId: client.client_id,
-      params,
-      expiresAtMs: Date.now() + CODE_TTL_MS,
-    });
-    this.sweepExpiredCodes();
-
-    const redirectUrl = new URL(params.redirectUri);
-    redirectUrl.searchParams.set("code", code);
-    if (params.state !== undefined) redirectUrl.searchParams.set("state", params.state);
-    res.redirect(302, redirectUrl.href);
+    this.cancelLocalApproval(String(res.req.body?.local_approval_id ?? ""));
+    res.redirect(302, this.issueAuthorizationRedirect(client, params));
   }
 
   async challengeForAuthorizationCode(
@@ -1008,6 +1190,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   }
 
   close(): void {
+    this.localApprovals.clear();
     this.oauthStore.close();
   }
 
@@ -1035,6 +1218,30 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     for (const [code, record] of this.codes) {
       if (record.expiresAtMs < now) this.codes.delete(code);
     }
+  }
+
+  private issueAuthorizationRedirect(
+    client: OAuthClientInformationFull,
+    params: AuthorizationParams,
+  ): string {
+    const code = `code-${randomUUID()}`;
+    this.codes.set(code, {
+      clientId: client.client_id,
+      params,
+      expiresAtMs: Date.now() + CODE_TTL_MS,
+    });
+    this.sweepExpiredCodes();
+
+    const redirectUrl = new URL(params.redirectUri);
+    redirectUrl.searchParams.set("code", code);
+    if (params.state !== undefined) redirectUrl.searchParams.set("state", params.state);
+    return redirectUrl.href;
+  }
+
+  private cancelLocalApproval(requestId: string): void {
+    if (!requestId) return;
+    const record = this.localApprovals.get(requestId);
+    if (record?.status === "pending") record.status = "rejected";
   }
 
   private async recordOwnerTokenAttempt(

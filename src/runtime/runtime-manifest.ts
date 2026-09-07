@@ -16,6 +16,8 @@ export interface RuntimeManifest {
   buildTimestamp: string | null;
   cliSha256: string | null;
   toolSchemaRevision: string | null;
+  hostCatalogRevision?: string | null;
+  uiResourceRevision: string | null;
   nodeVersion: string;
   runtimeSnapshotId: string | null;
   runtimeRoot: string;
@@ -38,6 +40,8 @@ interface SealedRuntimeBuildIdentity {
   buildTimestamp: string;
   cliSha256: string;
   toolSchemaRevision: string;
+  hostCatalogRevision?: string;
+  uiResourceRevision?: string;
   nodeVersion: string;
   runtimeSnapshotId: string;
   platform: NodeJS.Platform;
@@ -150,6 +154,50 @@ function toolSchemaRevision(root: string): string | null {
   return fingerprint ? `sha256:${fingerprint.slice(0, 24)}` : null;
 }
 
+function hostCatalogRevision(root: string): string | null {
+  // Preserve toolSchemaRevision as the legacy runtime-update compatibility
+  // identity. The host catalog has additional direct dependencies because
+  // presenter names and static _meta/outputTemplate values are imported from
+  // widget descriptor modules. Track those bytes in a separate generation so
+  // old runtimes can still validate a newly built candidate while new runtimes
+  // can detect every host-visible catalog change.
+  const compiled = [
+    "dist/server/tools.js",
+    "dist/server/actions.js",
+    "dist/server/mcp-discovery.js",
+    "dist/server/chatgpt-consent-widget.js",
+    "dist/server/chatgpt-widget-capability-lab.js",
+    "dist/server/e2e-screenshot-widget.js",
+  ];
+  const source = [
+    "src/server/tools.ts",
+    "src/server/actions.ts",
+    "src/server/mcp-discovery.ts",
+    "src/server/chatgpt-consent-widget.ts",
+    "src/server/chatgpt-widget-capability-lab.ts",
+    "src/server/e2e-screenshot-widget.ts",
+  ];
+  const selected = compiled.every((entry) => existsSync(path.join(root, entry))) ? compiled : source;
+  const fingerprint = fingerprintRuntimeFiles(root, selected);
+  return fingerprint ? `sha256:${fingerprint.slice(0, 24)}` : null;
+}
+
+function uiResourceRevision(root: string): string | null {
+  const compiled = [
+    "dist/server/chatgpt-consent-widget.js",
+    "dist/server/chatgpt-widget-capability-lab.js",
+    "dist/server/e2e-screenshot-widget.js",
+  ];
+  const source = [
+    "src/server/chatgpt-consent-widget.ts",
+    "src/server/chatgpt-widget-capability-lab.ts",
+    "src/server/e2e-screenshot-widget.ts",
+  ];
+  const selected = compiled.every((entry) => existsSync(path.join(root, entry))) ? compiled : source;
+  const fingerprint = fingerprintRuntimeFiles(root, selected);
+  return fingerprint ? `sha256:${fingerprint.slice(0, 24)}` : null;
+}
+
 function packageVersion(root: string): string {
   try {
     const pkg = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")) as { version?: unknown };
@@ -239,6 +287,10 @@ function isSealedRuntimeBuildIdentity(value: unknown): value is SealedRuntimeBui
     typeof candidate.buildTimestamp === "string" && Number.isFinite(Date.parse(candidate.buildTimestamp)) &&
     typeof candidate.cliSha256 === "string" && SHA256_PATTERN.test(candidate.cliSha256) &&
     typeof candidate.toolSchemaRevision === "string" && TOOL_SCHEMA_REVISION_PATTERN.test(candidate.toolSchemaRevision) &&
+    (candidate.hostCatalogRevision === undefined ||
+      (typeof candidate.hostCatalogRevision === "string" && TOOL_SCHEMA_REVISION_PATTERN.test(candidate.hostCatalogRevision))) &&
+    (candidate.uiResourceRevision === undefined ||
+      (typeof candidate.uiResourceRevision === "string" && TOOL_SCHEMA_REVISION_PATTERN.test(candidate.uiResourceRevision))) &&
     typeof candidate.nodeVersion === "string" && /^v\d+\.\d+\.\d+/u.test(candidate.nodeVersion) &&
     typeof candidate.runtimeSnapshotId === "string" && SNAPSHOT_ID_PATTERN.test(candidate.runtimeSnapshotId) &&
     typeof candidate.platform === "string" &&
@@ -250,6 +302,8 @@ function readSealedRuntimeBuildIdentity(root: string, observed: {
   buildFingerprint: string | null;
   cliSha256: string | null;
   toolSchemaRevision: string | null;
+  hostCatalogRevision: string | null;
+  uiResourceRevision: string | null;
 }): SealedRuntimeBuildIdentity | null {
   try {
     const candidate = JSON.parse(readFileSync(path.join(root, SEALED_MANIFEST_RELATIVE_PATH), "utf8")) as unknown;
@@ -259,6 +313,8 @@ function readSealedRuntimeBuildIdentity(root: string, observed: {
         candidate.runtimeFingerprint !== observed.buildFingerprint ||
         candidate.cliSha256 !== observed.cliSha256 ||
         candidate.toolSchemaRevision !== observed.toolSchemaRevision ||
+        (candidate.hostCatalogRevision !== undefined && candidate.hostCatalogRevision !== observed.hostCatalogRevision) ||
+        (candidate.uiResourceRevision !== undefined && candidate.uiResourceRevision !== observed.uiResourceRevision) ||
         candidate.platform !== process.platform ||
         candidate.architecture !== process.arch) return null;
     const expectedSnapshot = runtimeSnapshotId(candidate);
@@ -275,6 +331,8 @@ function freshRuntimeManifestForRoot(runtimeRoot: string, timestamp: string | nu
   const buildFingerprintValue = buildFingerprint(runtimeRoot);
   const cliSha256Value = cliSha256(runtimeRoot);
   const toolSchemaRevisionValue = toolSchemaRevision(runtimeRoot);
+  const hostCatalogRevisionValue = hostCatalogRevision(runtimeRoot);
+  const uiResourceRevisionValue = uiResourceRevision(runtimeRoot);
   const nodeVersion = process.version;
   const runtimeFingerprint = buildFingerprintValue;
   return {
@@ -287,6 +345,8 @@ function freshRuntimeManifestForRoot(runtimeRoot: string, timestamp: string | nu
     buildTimestamp: timestamp,
     cliSha256: cliSha256Value,
     toolSchemaRevision: toolSchemaRevisionValue,
+    hostCatalogRevision: hostCatalogRevisionValue,
+    uiResourceRevision: uiResourceRevisionValue,
     nodeVersion,
     runtimeSnapshotId: runtimeSnapshotId({
       packageVersion: packageVersionValue,
@@ -322,6 +382,10 @@ export function sealRuntimeBuildManifest(runtimeRootValue = inferredRuntimeRoot(
     buildTimestamp: manifest.buildTimestamp!,
     cliSha256: manifest.cliSha256,
     toolSchemaRevision: manifest.toolSchemaRevision,
+    // Host-catalog and UI-resource revisions are intentionally not sealed.
+    // Older active runtimes may compute these derived revisions differently;
+    // leaving them optional lets each runtime recompute them from the exact
+    // candidate bytes while the immutable executable identity remains sealed.
     nodeVersion: manifest.nodeVersion,
     runtimeSnapshotId: manifest.runtimeSnapshotId,
     platform: manifest.platform,
@@ -356,14 +420,23 @@ export function getRuntimeManifestForRoot(runtimeRootValue: string): RuntimeMani
   const buildFingerprintValue = buildFingerprint(runtimeRoot);
   const cliSha256Value = cliSha256(runtimeRoot);
   const toolSchemaRevisionValue = toolSchemaRevision(runtimeRoot);
+  const hostCatalogRevisionValue = hostCatalogRevision(runtimeRoot);
+  const uiResourceRevisionValue = uiResourceRevision(runtimeRoot);
   const sealed = readSealedRuntimeBuildIdentity(runtimeRoot, {
     packageVersion: packageVersionValue,
     buildFingerprint: buildFingerprintValue,
     cliSha256: cliSha256Value,
     toolSchemaRevision: toolSchemaRevisionValue,
+    hostCatalogRevision: hostCatalogRevisionValue,
+    uiResourceRevision: uiResourceRevisionValue,
   });
   const manifest = sealed
-    ? { ...sealed, runtimeRoot }
+    ? {
+        ...sealed,
+        hostCatalogRevision: sealed.hostCatalogRevision ?? hostCatalogRevisionValue,
+        uiResourceRevision: sealed.uiResourceRevision ?? uiResourceRevisionValue,
+        runtimeRoot,
+      }
     : freshRuntimeManifestForRoot(runtimeRoot, configuredBuildTimestamp());
   return manifest;
 }

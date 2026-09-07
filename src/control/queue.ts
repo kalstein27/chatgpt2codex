@@ -305,6 +305,21 @@ export async function listActions(stateDir: string): Promise<ControlActionRecord
   return out.sort((a, b) => a.createdAt - b.createdAt);
 }
 
+/** Fast status path that ignores terminal action history. */
+export async function listPendingActions(stateDir: string): Promise<ControlActionRecord[]> {
+  const dir = statusDir(stateDir, "pending");
+  const files = await fs.readdir(dir).catch(() => [] as string[]);
+  const out: ControlActionRecord[] = [];
+  for (const file of files) {
+    if (!file.endsWith(".json")) continue;
+    const record = await readRecord(dir, file.slice(0, -5));
+    if (!record) continue;
+    const resolved = await expireIfNeeded(stateDir, { record, dir });
+    if (resolved.status === "pending") out.push(resolved);
+  }
+  return out.sort((a, b) => a.createdAt - b.createdAt);
+}
+
 export async function approveAction(
   stateDir: string,
   actionId: string,

@@ -31,9 +31,12 @@ CLOUDFLARED_TUNNEL_NAME="${CLOUDFLARED_TUNNEL_NAME:-}"
 STATE_DIR="${CHATGPT2CODEX_STATE_DIR:-$HOME/.local/share/chatgpt2codex}"
 ACTIVE_RUNTIME_FILE="$STATE_DIR/active-runtime"
 RUNTIME_RELOAD_FILE="$STATE_DIR/runtime-reload-request"
+OPERATOR_STOP_FILE="$STATE_DIR/operator-stop"
+RUNTIME_APPLY_MAINTENANCE_FILE="$STATE_DIR/runtime-apply-maintenance"
 CFLOG="$(mktemp -t chatgpt2codex-cf.XXXX.log)"
 SRVLOG="$(mktemp -t chatgpt2codex-server.XXXX.log)"
 LAST_RUNTIME_FAILURE_LOG="$STATE_DIR/logs/last-runtime-failure.log"
+SUPERVISOR_LIFECYCLE_LOG="$STATE_DIR/logs/supervisor-lifecycle.log"
 DOCTOR_SCRIPT="$ROOT/macos-dependency-doctor.sh"
 if [[ ! -f "$DOCTOR_SCRIPT" && -f "$ROOT/scripts/macos-dependency-doctor.sh" ]]; then
   DOCTOR_SCRIPT="$ROOT/scripts/macos-dependency-doctor.sh"
@@ -52,21 +55,28 @@ HUNG_RECOVERY_LAST_AT=0
 HUNG_RECOVERY_ATTEMPTS=0
 HUNG_RECOVERY_DISABLED=0
 
+append_supervisor_lifecycle() {
+  mkdir -p "$STATE_DIR/logs" 2>/dev/null || true
+  printf '%s pid=%s ppid=%s event=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$PPID" "$1" >>"$SUPERVISOR_LIFECYCLE_LOG" 2>/dev/null || true
+}
+
 cleanup() {
+  local reason="${1:-EXIT}"
   # Command substitutions run in Bash subshells and inherit EXIT traps on some
   # macOS Bash versions. Only the top-level launcher may own/stop these PIDs.
   [[ "${BASH_SUBSHELL:-0}" == "$LAUNCHER_SUBSHELL_LEVEL" ]] || return 0
   [[ "$CLEANED_UP" == "0" ]] || return 0
   CLEANED_UP=1
+  append_supervisor_lifecycle "stop reason=$reason child=${SRV_PID:-none}"
   echo
   echo "[chatgpt2codex] stopping server/tunnel..."
   [[ -n "${SRV_PID:-}" ]] && kill "$SRV_PID" 2>/dev/null || true
   [[ -n "${CF_PID:-}" ]] && kill "$CF_PID" 2>/dev/null || true
   rm -f "$CFLOG" "$SRVLOG"
 }
-trap 'cleanup' EXIT
-trap 'cleanup; exit 130' INT
-trap 'cleanup; exit 143' TERM
+trap 'cleanup EXIT' EXIT
+trap 'cleanup INT; exit 130' INT
+trap 'cleanup TERM; exit 143' TERM
 
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -92,6 +102,37 @@ sleep_1s() {
   # this delay through $ROOT/bin/node because that path can temporarily
   # disappear while /Applications/ChatGPT To Codex.app is being swapped.
   /bin/sleep 1
+}
+
+operator_stop_requested() {
+  [[ -f "$OPERATOR_STOP_FILE" ]]
+}
+
+runtime_apply_maintenance_active() {
+  local owner_pid operation_id modified_at now age command
+  [[ -f "$RUNTIME_APPLY_MAINTENANCE_FILE" ]] || return 1
+  IFS=' ' read -r owner_pid operation_id <"$RUNTIME_APPLY_MAINTENANCE_FILE" || true
+  if [[ ! "$owner_pid" =~ ^[0-9]+$ || ! "$operation_id" =~ ^rt_[0-9a-f-]{36}$ ]]; then
+    rm -f "$RUNTIME_APPLY_MAINTENANCE_FILE"
+    return 1
+  fi
+  modified_at="$(stat -f %m "$RUNTIME_APPLY_MAINTENANCE_FILE" 2>/dev/null || stat -c %Y "$RUNTIME_APPLY_MAINTENANCE_FILE" 2>/dev/null || printf '0')"
+  now="$(date +%s)"
+  if [[ ! "$modified_at" =~ ^[0-9]+$ || "$modified_at" == "0" ]]; then
+    rm -f "$RUNTIME_APPLY_MAINTENANCE_FILE"
+    return 1
+  fi
+  age=$((now - modified_at))
+  if [[ "$age" -gt 180 || "$age" -lt 0 ]] || ! kill -0 "$owner_pid" 2>/dev/null; then
+    rm -f "$RUNTIME_APPLY_MAINTENANCE_FILE"
+    return 1
+  fi
+  command="$(ps -o command= -p "$owner_pid" 2>/dev/null || true)"
+  if [[ "$command" != *"start-chatgpt.sh"* ]]; then
+    rm -f "$RUNTIME_APPLY_MAINTENANCE_FILE"
+    return 1
+  fi
+  return 0
 }
 
 persist_server_failure_log() {
@@ -190,6 +231,7 @@ restore_runtime_pointer() {
 reload_server_runtime() {
   local previous_root="$SERVER_RUNTIME_ROOT"
   rm -f "$RUNTIME_RELOAD_FILE"
+  append_supervisor_lifecycle "reload-begin child=${SRV_PID:-none}"
   echo "[chatgpt2codex] applying runtime update while preserving the connector URL..."
   echo "[chatgpt2codex] stopping runtime process $SRV_PID (supervisor=$$)."
   stop_managed_server_process
@@ -197,16 +239,19 @@ reload_server_runtime() {
   if start_server_process &&
      wait_http_ok "http://127.0.0.1:$PORT/healthz" 20 "updated local server"; then
     reset_hung_recovery_state
+    append_supervisor_lifecycle "reload-complete child=${SRV_PID:-none}"
     echo "[chatgpt2codex] runtime updated; connector URL is unchanged."
     return 0
   fi
 
   echo "[chatgpt2codex] updated runtime failed health check; rolling back." >&2
+  append_supervisor_lifecycle "reload-target-health-failed child=${SRV_PID:-none}"
   [[ -n "${SRV_PID:-}" ]] && stop_managed_server_process || true
   restore_runtime_pointer "$previous_root"
   start_server_process
   if wait_http_ok "http://127.0.0.1:$PORT/healthz" 20 "rolled-back local server"; then
     reset_hung_recovery_state
+    append_supervisor_lifecycle "reload-rollback-complete child=${SRV_PID:-none}"
     echo "[chatgpt2codex] previous runtime restored; connector URL is unchanged." >&2
     return 1
   fi
@@ -231,6 +276,54 @@ server_process_state() {
 local_runtime_healthy() {
   curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" 2>/dev/null |
     grep -Eq '"ok"[[:space:]]*:[[:space:]]*true'
+}
+
+reclaim_healthy_runtime_for_handoff() {
+  local health runtime_pid supervisor_pid runtime_parent supervisor_command target_pid i
+  health="$(curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" 2>/dev/null || true)"
+  runtime_pid="$(printf '%s' "$health" | node -e '
+    let s=""; process.stdin.on("data",c=>s+=c); process.stdin.on("end",()=>{try{const j=JSON.parse(s);const v=j.runtimePid; if(Number.isSafeInteger(v)&&v>0) process.stdout.write(String(v));}catch{}})
+  ')"
+  supervisor_pid="$(printf '%s' "$health" | node -e '
+    let s=""; process.stdin.on("data",c=>s+=c); process.stdin.on("end",()=>{try{const j=JSON.parse(s);const v=j.runtimeExternalIdentity?.supervisorPid ?? j.supervisorPid; if(Number.isSafeInteger(v)&&v>0) process.stdout.write(String(v));}catch{}})
+  ')"
+  [[ "$runtime_pid" =~ ^[0-9]+$ ]] || return 1
+
+  target_pid="$runtime_pid"
+  if [[ "$supervisor_pid" =~ ^[0-9]+$ ]]; then
+    runtime_parent="$(ps -o ppid= -p "$runtime_pid" 2>/dev/null | tr -d '[:space:]')"
+    supervisor_command="$(ps -o command= -p "$supervisor_pid" 2>/dev/null || true)"
+    if [[ "$runtime_parent" == "$supervisor_pid" && "$supervisor_command" == *"start-chatgpt.sh"* ]]; then
+      target_pid="$supervisor_pid"
+    fi
+  fi
+
+  echo "[chatgpt2codex] approved app handoff reclaiming healthy runtime ownership (target=$target_pid, runtime=$runtime_pid)."
+  kill -TERM "$target_pid" 2>/dev/null || true
+  for i in $(seq 1 24); do
+    if ! port_busy; then
+      return 0
+    fi
+    /bin/sleep 0.25
+  done
+
+  # Bounded exact-PID fallback. Re-check that the same runtime is still the
+  # healthy C2CT listener before escalating, so PID reuse cannot widen scope.
+  health="$(curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" 2>/dev/null || true)"
+  local current_runtime_pid
+  current_runtime_pid="$(printf '%s' "$health" | node -e '
+    let s=""; process.stdin.on("data",c=>s+=c); process.stdin.on("end",()=>{try{const j=JSON.parse(s);const v=j.runtimePid; if(Number.isSafeInteger(v)&&v>0) process.stdout.write(String(v));}catch{}})
+  ')"
+  [[ "$current_runtime_pid" == "$runtime_pid" ]] || return 1
+  kill -KILL "$target_pid" 2>/dev/null || true
+  [[ "$target_pid" == "$runtime_pid" ]] || kill -TERM "$runtime_pid" 2>/dev/null || true
+  for i in $(seq 1 12); do
+    if ! port_busy; then
+      return 0
+    fi
+    /bin/sleep 0.25
+  done
+  return 1
 }
 
 stop_managed_server_process() {
@@ -294,23 +387,45 @@ hung_recovery_budget_allows() {
 recover_hung_managed_runtime() {
   local reason="$1"
   local previous_root="${SERVER_RUNTIME_ROOT:-}"
+  local retry_delay attempt=0
+  if operator_stop_requested; then
+    echo "[chatgpt2codex] explicit operator stop suppresses managed runtime recovery."
+    return 1
+  fi
   [[ -n "$previous_root" ]] || return 1
   hung_recovery_budget_allows || return 1
 
   echo "[chatgpt2codex] managed runtime recovery attempt $HUNG_RECOVERY_ATTEMPTS/$HUNG_RECOVERY_MAX_ATTEMPTS: $reason; preserving supervisor=$$, tunnel mode=$TUNNEL_MODE."
   stop_managed_server_process
 
-  if start_server_process "$previous_root" &&
-     wait_http_ok "http://127.0.0.1:$PORT/healthz" 20 "recovered managed runtime"; then
-    HEALTH_TICK=0
-    CONSECUTIVE_HEALTH_FAILURES=0
-    echo "[chatgpt2codex] managed runtime recovered; supervisor and connector/tunnel were preserved."
-    return 0
-  fi
+  # A previous runtime may have died while holding a short-lived local state
+  # lock. Retry long enough to cross the 30s stale-lock fallback rather than
+  # declaring the managed runtime unrecoverable after one immediate restart.
+  # The sequence is fixed and bounded: immediate, +5s, +10s, +20s.
+  for retry_delay in 0 5 10 20; do
+    attempt=$((attempt + 1))
+    if [[ "$retry_delay" -gt 0 ]]; then
+      echo "[chatgpt2codex] managed runtime recovery sub-attempt $attempt/4 after ${retry_delay}s backoff."
+      while [[ "$retry_delay" -gt 0 ]]; do
+        operator_stop_requested && return 1
+        sleep_1s
+        retry_delay=$((retry_delay - 1))
+      done
+    fi
 
-  echo "[chatgpt2codex] managed runtime recovery failed health verification; disabling automatic recovery and preserving the supervisor/tunnel for explicit inspection." >&2
-  persist_server_failure_log
-  [[ -n "${SRV_PID:-}" ]] && stop_managed_server_process || true
+    if start_server_process "$previous_root" &&
+       wait_http_ok "http://127.0.0.1:$PORT/healthz" 20 "recovered managed runtime"; then
+      HEALTH_TICK=0
+      CONSECUTIVE_HEALTH_FAILURES=0
+      echo "[chatgpt2codex] managed runtime recovered; supervisor and connector/tunnel were preserved."
+      return 0
+    fi
+
+    persist_server_failure_log
+    [[ -n "${SRV_PID:-}" ]] && stop_managed_server_process || true
+  done
+
+  echo "[chatgpt2codex] managed runtime recovery exhausted the bounded retry sequence; preserving the supervisor/tunnel for explicit inspection." >&2
   HUNG_RECOVERY_DISABLED=1
   return 1
 }
@@ -319,6 +434,11 @@ handle_managed_server_exit() {
   local exit_status="$1"
   local exited_pid="$2"
   SRV_PID=""
+
+  if operator_stop_requested; then
+    echo "[chatgpt2codex] server stopped by explicit operator request."
+    return 2
+  fi
 
   if [[ "$exit_status" == "0" && -n "$IDLE_SHUTDOWN_MINUTES" ]]; then
     echo "[chatgpt2codex] server stopped."
@@ -528,6 +648,16 @@ mkdir -p "$WORKSPACE"
 WORKSPACE="$(cd "$WORKSPACE" && pwd)"
 mkdir -p "$STATE_DIR"
 chmod 700 "$STATE_DIR" 2>/dev/null || true
+append_supervisor_lifecycle "start"
+
+if operator_stop_requested; then
+  echo "[chatgpt2codex] explicit operator stop is active; leaving MCP stopped."
+  exit 0
+fi
+if runtime_apply_maintenance_active; then
+  echo "[chatgpt2codex] runtime apply maintenance is owned by the existing managed supervisor; refusing a competing launcher."
+  exit 0
+fi
 
 cd "$ROOT"
 
@@ -539,12 +669,20 @@ fi
 
 if port_busy; then
   if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" 2>/dev/null | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true'; then
-    echo "[chatgpt2codex] existing healthy runtime detected on port $PORT; leaving it untouched."
-    exit 0
+    if [[ "${CHATGPT2CODEX_HANDOFF_RECOVERY:-0}" == "1" ]]; then
+      if ! reclaim_healthy_runtime_for_handoff; then
+        echo "[chatgpt2codex] approved app handoff could not safely reclaim the healthy runtime listener." >&2
+        exit 1
+      fi
+    else
+      echo "[chatgpt2codex] existing healthy runtime detected on port $PORT; leaving it untouched."
+      exit 0
+    fi
+  else
+    echo "[chatgpt2codex] port $PORT is already in use, but its local health could not be verified." >&2
+    echo "[chatgpt2codex] refusing automatic process reclamation; use an explicit Stop/Restart action after inspecting the runtime." >&2
+    exit 1
   fi
-  echo "[chatgpt2codex] port $PORT is already in use, but its local health could not be verified." >&2
-  echo "[chatgpt2codex] refusing automatic process reclamation; use an explicit Stop/Restart action after inspecting the runtime." >&2
-  exit 1
 fi
 
 INITIAL_RUNTIME_ROOT="$(resolve_server_runtime_root)"
@@ -684,6 +822,10 @@ EOF
 fi
 
 while true; do
+  if operator_stop_requested; then
+    echo "[chatgpt2codex] explicit operator stop observed; shutting down the managed supervisor."
+    exit 0
+  fi
   desired_runtime_root="$(resolve_server_runtime_root)"
   if [[ "$desired_runtime_root" != "${SERVER_RUNTIME_ROOT:-}" ]]; then
     echo "[chatgpt2codex] active runtime pointer changed; converging managed runtime to $desired_runtime_root."

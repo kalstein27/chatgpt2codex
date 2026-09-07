@@ -244,7 +244,11 @@ export async function startE2eServer(
   // execution-capability: e2e-project-server-shell
   const child = spawn("/bin/zsh", ["-lc", input.command], {
     cwd: commandCwd,
-    env: buildSafeChildEnv(),
+    // Mark E2E-launched descendants so a ChatGPT2Codex candidate runtime does
+    // not bind the operator's fixed mobile/activity callback port (7980). A
+    // detached candidate can outlive the runtime that started it, so sharing
+    // that port would let a test runtime steal the live Activity dashboard.
+    env: { ...buildSafeChildEnv(), CHATGPT2CODEX_E2E_CHILD: "1" },
     detached: true,
     stdio: ["ignore", out.fd, out.fd],
   });

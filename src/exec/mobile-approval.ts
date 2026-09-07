@@ -7,6 +7,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { listArmRequests, type ArmRequestRecord } from "../control/arm-requests.js";
 import {
+  isChatGptWidgetApprovalSurface,
   isMobileApprovableOperationTool,
   listOperationApprovalRequests,
   resolveOperationApprovalRequest,
@@ -14,11 +15,18 @@ import {
 } from "./operation-approval.js";
 import { listPendingRgApprovalRequests, type RgApprovalRequest } from "./rg-capability.js";
 import type { RuntimeActivityTracker } from "../runtime/activity.js";
+import type { ConnectionDiagnosticsSink } from "../runtime/connection-diagnostics.js";
+import { readExternalWatchdogStatus } from "../runtime/external-watchdog-status.js";
+import { getLatestRuntimeApplyReceipt } from "../runtime/runtime-apply.js";
+import { getLatestMacosAppApplyReceipt } from "../runtime/macos-app-apply-transaction.js";
 import {
-  ACTIVITY_DASHBOARD_HTML,
+  activityDashboardDocument,
   activityDashboardSnapshot,
   type ActivityDashboardApproval,
+  type ActivityDashboardDeployment,
 } from "../server/activity-dashboard.js";
+import { activityMcpHealth } from "../server/activity-mcp-health.js";
+import { DomainError } from "../types.js";
 
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -31,6 +39,7 @@ export const MOBILE_APPROVAL_TAILSCALE_HTTPS_PORT = 8443;
 const POLL_INTERVAL_MS = 1_000;
 const RETRY_INTERVAL_MS = 15_000;
 const PUBLISH_TIMEOUT_MS = 5_000;
+const POLL_ERROR_BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 15_000] as const;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
 const TOPIC_PATTERN = /^c2ct-[A-Za-z0-9_-]{43}$/u;
 
@@ -102,6 +111,7 @@ interface BridgeOptions {
   callbackPort?: number;
   fetchImpl?: typeof fetch;
   activityTracker?: RuntimeActivityTracker;
+  diagnostics?: ConnectionDiagnosticsSink;
   ledgerAppend?: (event: { type: string; [key: string]: unknown }) => Promise<void>;
 }
 
@@ -202,6 +212,7 @@ function topicHint(topic: string): string {
 
 function safeError(error: unknown): string {
   if (!(error instanceof Error)) return "unknown error";
+  if (error instanceof DomainError) return `${error.name}(${error.code})`;
   return error.name || "Error";
 }
 
@@ -428,7 +439,11 @@ async function dashboardApprovalItems(
     listArmRequests(stateDir, now),
   ]);
   const operationItems: ActivityDashboardApproval[] = operationRequests
-    .filter((request) => request.status === "pending" && request.expiresAt > now)
+    .filter((request) =>
+      request.status === "pending" &&
+      request.expiresAt > now &&
+      !isChatGptWidgetApprovalSurface(request.approvalSurface),
+    )
     .map((request) => {
       const mobile = isMobileApprovableOperationTool(request.tool);
       return {
@@ -558,6 +573,7 @@ export class MobileApprovalBridge {
   private readonly callbackPort: number;
   private readonly fetchImpl: typeof fetch;
   private readonly activityTracker?: RuntimeActivityTracker;
+  private readonly diagnostics?: ConnectionDiagnosticsSink;
   private readonly ledgerAppend?: BridgeOptions["ledgerAppend"];
   private server: ReturnType<typeof createServer> | undefined;
   private timer: NodeJS.Timeout | undefined;
@@ -566,12 +582,15 @@ export class MobileApprovalBridge {
   private readonly sentLocalNoticeKeys = new Set<string>();
   private readonly localNoticeLastAttemptAt = new Map<string, number>();
   private polling = false;
+  private pollFailureCount = 0;
+  private nextPollAttemptAt = 0;
 
   constructor(options: BridgeOptions) {
     this.stateDir = path.resolve(options.stateDir);
     this.callbackPort = options.callbackPort ?? MOBILE_APPROVAL_CALLBACK_PORT;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.activityTracker = options.activityTracker;
+    this.diagnostics = options.diagnostics;
     this.ledgerAppend = options.ledgerAppend;
     bridgeStates.set(this.stateDir, {
       listening: false,
@@ -641,7 +660,11 @@ export class MobileApprovalBridge {
 
     const requests = await listOperationApprovalRequests(this.stateDir, now);
     const request = requests.find((entry) => entry.requestId === challenge.requestId);
-    if (!request || request.status !== "pending" || !isMobileApprovableOperationTool(request.tool) || request.expiresAt <= now) {
+    if (!request ||
+        request.status !== "pending" ||
+        isChatGptWidgetApprovalSurface(request.approvalSurface) ||
+        !isMobileApprovableOperationTool(request.tool) ||
+        request.expiresAt <= now) {
       this.byToken.delete(token);
       this.tokenByRequest.delete(challenge.requestId);
       this.syncChallengeCount();
@@ -777,7 +800,7 @@ export class MobileApprovalBridge {
   }
 
   async poll(now = Date.now()): Promise<void> {
-    if (this.polling) return;
+    if (this.polling || now < this.nextPollAttemptAt) return;
     this.polling = true;
     try {
       if (!this.state().listening) {
@@ -788,7 +811,12 @@ export class MobileApprovalBridge {
       const requests = await listOperationApprovalRequests(this.stateDir, now);
       let pending = new Map(
         requests
-          .filter((request) => request.status === "pending" && isMobileApprovableOperationTool(request.tool) && request.expiresAt > now)
+          .filter((request) =>
+            request.status === "pending" &&
+            !isChatGptWidgetApprovalSurface(request.approvalSurface) &&
+            isMobileApprovableOperationTool(request.tool) &&
+            request.expiresAt > now,
+          )
           .map((request) => [request.requestId, request]),
       );
 
@@ -800,7 +828,12 @@ export class MobileApprovalBridge {
         }
       }
       this.syncChallengeCount();
-      if (!config?.enabled) return;
+      if (!config?.enabled) {
+        this.pollFailureCount = 0;
+        this.nextPollAttemptAt = 0;
+        if (this.state().listening) this.state().error = null;
+        return;
+      }
 
       await this.pollNtfyResponses(config, now);
       const refreshedRequests = await listOperationApprovalRequests(this.stateDir, now);
@@ -808,12 +841,18 @@ export class MobileApprovalBridge {
         .filter((request) => request.status === "pending" && request.expiresAt > now);
       pending = new Map(
         pendingOperations
-          .filter((request) => isMobileApprovableOperationTool(request.tool))
+          .filter((request) =>
+            !isChatGptWidgetApprovalSurface(request.approvalSurface) &&
+            isMobileApprovableOperationTool(request.tool),
+          )
           .map((request) => [request.requestId, request]),
       );
 
       const localOnlyOperationNotices = pendingOperations
-        .filter((request) => !isMobileApprovableOperationTool(request.tool))
+        .filter((request) =>
+          !isChatGptWidgetApprovalSurface(request.approvalSurface) &&
+          !isMobileApprovableOperationTool(request.tool),
+        )
         .map(operationLocalOnlyNotice);
       const rgNotices = (await listPendingRgApprovalRequests(this.stateDir, now)).map(rgLocalOnlyNotice);
       const armNotices = (await listArmRequests(this.stateDir, now)).requests
@@ -862,6 +901,20 @@ export class MobileApprovalBridge {
           this.state().lastPublishError = safeError(error);
         }
       }
+      this.pollFailureCount = 0;
+      this.nextPollAttemptAt = 0;
+      if (this.state().listening) this.state().error = null;
+    } catch (error) {
+      this.pollFailureCount = Math.min(this.pollFailureCount + 1, POLL_ERROR_BACKOFF_MS.length);
+      const retryAfterMs = POLL_ERROR_BACKOFF_MS[this.pollFailureCount - 1]
+        ?? POLL_ERROR_BACKOFF_MS[POLL_ERROR_BACKOFF_MS.length - 1]!;
+      this.nextPollAttemptAt = now + retryAfterMs;
+      this.state().error = safeError(error);
+      await this.ledgerAppend?.({
+        type: "approval.mobile.poll_failed",
+        failureCount: this.pollFailureCount,
+        retryAfterMs,
+      }).catch(() => undefined);
     } finally {
       this.polling = false;
     }
@@ -877,23 +930,82 @@ export class MobileApprovalBridge {
       setDashboardHeaders(res);
       if (requestPath === "/activity/api/activity") {
         const now = Date.now();
+        const dashboard = await activityDashboardDocument(this.stateDir);
         const config = await readMobileApprovalConfig(this.stateDir);
-        const approvalItems = await dashboardApprovalItems(
-          this.stateDir,
-          Boolean(config?.enabled && tailscaleIdentity(req)),
-          now,
-        );
-        sendJson(res, 200, activityDashboardSnapshot(this.activityTracker, approvalItems, now));
+        const [approvalItems, runtimeApply, macosAppApply, diagnostics, watchdog] = await Promise.all([
+          dashboardApprovalItems(
+            this.stateDir,
+            Boolean(config?.enabled && tailscaleIdentity(req)),
+            now,
+          ),
+          getLatestRuntimeApplyReceipt(this.stateDir).catch(() => null),
+          getLatestMacosAppApplyReceipt(this.stateDir).catch(() => null),
+          this.diagnostics?.summary(80).catch(() => null) ?? Promise.resolve(null),
+          readExternalWatchdogStatus().catch(() => null),
+        ]);
+        const deployments: ActivityDashboardDeployment[] = [];
+        if (runtimeApply) {
+          deployments.push({
+            kind: "runtime",
+            projectId: runtimeApply.projectId,
+            requestId: runtimeApply.requestId,
+            operationId: runtimeApply.operationId,
+            state: runtimeApply.state,
+            phase: runtimeApply.phase,
+            createdAt: Date.parse(runtimeApply.createdAt),
+            updatedAt: Date.parse(runtimeApply.updatedAt),
+            currentIdentity: runtimeApply.previousManifest.runtimeFingerprint ?? undefined,
+            targetIdentity: runtimeApply.targetFingerprint,
+            approvalRequestId: runtimeApply.approvalRequestId,
+            finalHealthy: runtimeApply.finalHealthy,
+            rollbackAttempted: runtimeApply.rollbackAttempted,
+            rollbackSucceeded: runtimeApply.rollbackSucceeded,
+            reconnectDurationMs: runtimeApply.reconnectDurationMs,
+            message: runtimeApply.recommendedAction,
+          });
+        }
+        if (macosAppApply) {
+          deployments.push({
+            kind: "macos-app",
+            projectId: macosAppApply.projectId,
+            requestId: macosAppApply.requestId,
+            operationId: macosAppApply.operationId,
+            state: macosAppApply.state,
+            createdAt: Date.parse(macosAppApply.createdAt),
+            updatedAt: Date.parse(macosAppApply.updatedAt),
+            currentIdentity: macosAppApply.installedBefore?.mainExecutableSha256,
+            targetIdentity: macosAppApply.source.mainExecutableSha256,
+            approvalRequestId: macosAppApply.approvalRequestId,
+            rollbackAttempted: macosAppApply.result?.rollbackAttempted,
+            rollbackSucceeded: macosAppApply.result?.rollbackSucceeded,
+            reconnectDurationMs: macosAppApply.reconnectDurationMs,
+            message: macosAppApply.failure ?? macosAppApply.recommendedAction,
+          });
+        }
+        const mcpHealth = activityMcpHealth(diagnostics, watchdog, now);
+        sendJson(res, 200, activityDashboardSnapshot(this.activityTracker, approvalItems, now, dashboard.revision, deployments, mcpHealth));
         return;
       }
       if (requestPath === "/activity/api/health") {
-        sendJson(res, 200, { ok: true, generatedAt: Date.now() });
+        const now = Date.now();
+        const [diagnostics, watchdog] = await Promise.all([
+          this.diagnostics?.summary(80).catch(() => null) ?? Promise.resolve(null),
+          readExternalWatchdogStatus().catch(() => null),
+        ]);
+        const health = activityMcpHealth(diagnostics, watchdog, now);
+        sendJson(res, health.state === "unhealthy" ? 503 : 200, {
+          ok: health.state !== "unhealthy",
+          state: health.state,
+          label: health.label,
+          generatedAt: now,
+        });
         return;
       }
       if (requestPath === "/activity" || requestPath === "/activity/") {
+        const dashboard = await activityDashboardDocument(this.stateDir);
         res.statusCode = 200;
         res.setHeader("content-type", "text/html; charset=utf-8");
-        res.end(ACTIVITY_DASHBOARD_HTML);
+        res.end(dashboard.html);
         return;
       }
       sendJson(res, 404, { ok: false });
@@ -929,7 +1041,8 @@ export class MobileApprovalBridge {
         sendJson(res, 410, { ok: false });
         return;
       }
-      if (!isMobileApprovableOperationTool(request.tool)) {
+      if (isChatGptWidgetApprovalSurface(request.approvalSurface) ||
+          !isMobileApprovableOperationTool(request.tool)) {
         sendJson(res, 403, { ok: false });
         return;
       }

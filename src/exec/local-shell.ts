@@ -58,6 +58,11 @@ const NETWORK_COMMAND_PATTERNS = [
 
 export type ApprovedShellRisk = "network" | "destructive";
 
+export interface LocalShellRunOptions {
+  signal?: AbortSignal;
+  captureOutput?: boolean;
+}
+
 export function guardShellCommand(command: string, approvedRisk?: ApprovedShellRisk): void {
   for (const pattern of SECRET_COMMAND_PATTERNS) {
     if (pattern.test(command)) {
@@ -93,6 +98,7 @@ export async function runLocalShell(
   cwd?: string,
   timeoutSec?: number,
   approvedRisk?: ApprovedShellRisk,
+  options: LocalShellRunOptions = {},
 ): Promise<ProcessExecutionResult & {
   cwd: string;
   commandNotFound?: CommandNotFoundHint;
@@ -116,16 +122,50 @@ export async function runLocalShell(
   return await new Promise((resolve) => {
     let settled = false;
     let timedOut = false;
+    let cancelled = false;
     let spawnFailed = false;
     let timeoutHandle: NodeJS.Timeout | undefined;
     const stdout = new BoundedOutputCollector(OUTPUT_HEAD_BYTES, OUTPUT_TAIL_BYTES);
     const stderr = new BoundedOutputCollector(OUTPUT_HEAD_BYTES, OUTPUT_TAIL_BYTES);
     const stdoutArtifact = new BoundedOutputCollector(OUTPUT_ARTIFACT_STREAM_BYTES, 0);
     const stderrArtifact = new BoundedOutputCollector(OUTPUT_ARTIFACT_STREAM_BYTES, 0);
+    const capturedOutput = () => {
+      const artifactStd = stdoutArtifact.summarize();
+      const artifactErr = stderrArtifact.summarize();
+      return {
+        stdout: artifactStd.text,
+        stderr: artifactErr.text,
+        stdoutBytes: artifactStd.totalBytes,
+        stderrBytes: artifactErr.totalBytes,
+        artifactTruncated: artifactStd.truncated || artifactErr.truncated,
+      };
+    };
+    const abortHandler = () => {
+      if (settled || timedOut || cancelled) return;
+      cancelled = true;
+      killProcessTree(child.pid, (cleanupStatus) => {
+        const outStd = stdout.summarize();
+        const outErr = stderr.summarize();
+        const outputTruncated = outStd.truncated || outErr.truncated;
+        finish(() => resolve({
+          cwd: path.relative(baseRoot, commandCwd) || ".",
+          commandStatus: "CANCELLED",
+          exitCode: null,
+          terminationSignal: process.platform === "win32" ? null : "SIGKILL",
+          cleanupStatus,
+          stdoutSummary: redact(outStd.text),
+          stderrSummary: redact(outErr.text),
+          durationMs: Date.now() - start,
+          outputTruncated,
+          ...((options.captureOutput || outputTruncated) ? { capturedOutput: capturedOutput() } : {}),
+        }));
+      });
+    };
     const finish = (fn: () => void) => {
       if (settled) return;
       settled = true;
       if (timeoutHandle) clearTimeout(timeoutHandle);
+      options.signal?.removeEventListener("abort", abortHandler);
       fn();
     };
 
@@ -151,11 +191,9 @@ export async function runLocalShell(
       stderr.append(Buffer.from(error instanceof Error ? error.message : String(error)));
     });
     child.on("close", (code, signal) => {
-      if (timedOut) return;
+      if (timedOut || cancelled) return;
       const outStd = stdout.summarize();
       const outErr = stderr.summarize();
-      const artifactStd = stdoutArtifact.summarize();
-      const artifactErr = stderrArtifact.summarize();
       const outputTruncated = outStd.truncated || outErr.truncated;
       const exitCode = spawnFailed ? null : (code ?? 1);
       const commandNotFound = exitCode === null
@@ -173,28 +211,20 @@ export async function runLocalShell(
           durationMs: Date.now() - start,
           outputTruncated,
           ...(commandNotFound ? { commandNotFound } : {}),
-          ...(outputTruncated
-            ? {
-                capturedOutput: {
-                  stdout: artifactStd.text,
-                  stderr: artifactErr.text,
-                  stdoutBytes: artifactStd.totalBytes,
-                  stderrBytes: artifactErr.totalBytes,
-                  artifactTruncated: artifactStd.truncated || artifactErr.truncated,
-                },
-              }
-            : {}),
+          ...((options.captureOutput || outputTruncated) ? { capturedOutput: capturedOutput() } : {}),
         }),
       );
     });
 
+    if (options.signal?.aborted) abortHandler();
+    else options.signal?.addEventListener("abort", abortHandler, { once: true });
+
     timeoutHandle = setTimeout(() => {
+      if (settled || cancelled) return;
       timedOut = true;
       killProcessTree(child.pid, (cleanupStatus) => {
         const outStd = stdout.summarize();
         const outErr = stderr.summarize();
-        const artifactStd = stdoutArtifact.summarize();
-        const artifactErr = stderrArtifact.summarize();
         const outputTruncated = outStd.truncated || outErr.truncated;
         finish(() => resolve({
           cwd: path.relative(baseRoot, commandCwd) || ".",
@@ -206,17 +236,7 @@ export async function runLocalShell(
           stderrSummary: redact(outErr.text),
           durationMs: Date.now() - start,
           outputTruncated,
-          ...(outputTruncated
-            ? {
-                capturedOutput: {
-                  stdout: artifactStd.text,
-                  stderr: artifactErr.text,
-                  stdoutBytes: artifactStd.totalBytes,
-                  stderrBytes: artifactErr.totalBytes,
-                  artifactTruncated: artifactStd.truncated || artifactErr.truncated,
-                },
-              }
-            : {}),
+          ...((options.captureOutput || outputTruncated) ? { capturedOutput: capturedOutput() } : {}),
         }));
       });
     }, effectiveTimeoutSec * 1000);

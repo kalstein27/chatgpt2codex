@@ -9,6 +9,11 @@ import {
   type MacosAppApplyResult,
   type MacosAppIdentity,
 } from "./macos-app-apply.js";
+import {
+  readReplacementReconnectPlan,
+  recordReplacementReconnectSample,
+  type ReplacementReconnectPlan,
+} from "./replacement-reconnect-timing.js";
 
 const SCHEMA_VERSION = 1;
 const DIR_MODE = 0o700;
@@ -37,6 +42,11 @@ export interface MacosAppApplyReceipt {
   installedBefore: MacosAppIdentity | null;
   result: MacosAppApplyResult | null;
   workerPid?: number;
+  approvalRequestId?: string;
+  disconnectStartedAt?: string;
+  reconnectObservedAt?: string;
+  reconnectDurationMs?: number;
+  reconnectPlan?: ReplacementReconnectPlan;
   failure: string | null;
   recommendedAction: string;
 }
@@ -83,6 +93,26 @@ export async function getMacosAppApplyReceipt(stateDir: string, requestId: strin
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
   }
+}
+
+export async function getMacosAppApplyReceiptByOperationId(
+  stateDir: string,
+  operationId: string,
+): Promise<MacosAppApplyReceipt | null> {
+  const directory = receiptDirectory(stateDir);
+  const names = await fs.readdir(directory).catch((error) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [] as string[];
+    throw error;
+  });
+  for (const name of names.filter((entry) => /^[a-f0-9]{64}\.json$/u.test(entry)).slice(-200)) {
+    try {
+      const parsed: unknown = JSON.parse(await fs.readFile(path.join(directory, name), "utf8"));
+      if (isReceipt(parsed) && parsed.operationId === operationId) return parsed;
+    } catch {
+      // Ignore malformed unrelated receipts. Exact requestId lookup remains strict.
+    }
+  }
+  return null;
 }
 
 export async function getLatestMacosAppApplyReceipt(stateDir: string): Promise<MacosAppApplyReceipt | null> {
@@ -161,11 +191,24 @@ async function updateReceipt(
   return next;
 }
 
+export async function bindMacosAppApplyApprovalRequest(
+  stateDir: string,
+  requestId: string,
+  approvalRequestId: string,
+): Promise<MacosAppApplyReceipt> {
+  return updateReceipt(stateDir, requestId, (receipt) => ({
+    ...receipt,
+    approvalRequestId,
+  }));
+}
+
 export async function markMacosAppApplyActivationRequested(stateDir: string, requestId: string): Promise<MacosAppApplyReceipt> {
+  const reconnectPlan = await readReplacementReconnectPlan(stateDir, "macos-app").catch(() => undefined);
   return updateReceipt(stateDir, requestId, (receipt) => ({
     ...receipt,
     state: "ACTIVATION_REQUESTED",
-    recommendedAction: "poll-macos-app-apply-status",
+    ...(reconnectPlan ? { reconnectPlan } : {}),
+    recommendedAction: "wait-then-poll-macos-app-apply-status",
   }));
 }
 
@@ -199,10 +242,41 @@ export function launchMacosAppApplyWorker(stateDir: string, requestId: string): 
   return child.pid;
 }
 
+export async function startMacosAppApplyWorkerAfterApproval(
+  stateDir: string,
+  requestId: string,
+): Promise<{ receipt: MacosAppApplyReceipt; workerStarted: boolean }> {
+  const reconnectPlan = await readReplacementReconnectPlan(stateDir, "macos-app").catch(() => undefined);
+  const activation = await updateReceipt(stateDir, requestId, (receipt) => {
+    if (receipt.state !== "APPROVAL_REQUIRED") {
+      throw new Error(`macOS app apply ${receipt.operationId} is not awaiting approval continuation`);
+    }
+    return {
+      ...receipt,
+      state: "ACTIVATION_REQUESTED",
+      ...(reconnectPlan ? { reconnectPlan } : {}),
+      recommendedAction: "wait-then-poll-macos-app-apply-status",
+    };
+  });
+  try {
+    const workerPid = launchMacosAppApplyWorker(stateDir, requestId);
+    const started = await recordMacosAppApplyWorkerPid(stateDir, requestId, workerPid).catch(() => ({
+      ...activation,
+      workerPid,
+    }));
+    return { receipt: started, workerStarted: true };
+  } catch {
+    return {
+      receipt: await markMacosAppApplyStartFailed(stateDir, requestId),
+      workerStarted: false,
+    };
+  }
+}
+
 export async function runMacosAppApplyWorker(
   stateDir: string,
   requestId: string,
-  dependencies: { apply?: typeof applyVerifiedMacosApp; activationDelayMs?: number } = {},
+  dependencies: { apply?: typeof applyVerifiedMacosApp; activationDelayMs?: number; now?: () => Date } = {},
 ): Promise<MacosAppApplyReceipt> {
   let receipt = await getMacosAppApplyReceipt(stateDir, requestId);
   if (!receipt) throw new Error(`macOS app apply receipt not found: ${requestId}`);
@@ -211,22 +285,50 @@ export async function runMacosAppApplyWorker(
   // Allow the initiating HTTP/MCP response to flush before the app-owned
   // supervisor and runtime are intentionally handed off.
   await new Promise((resolve) => setTimeout(resolve, dependencies.activationDelayMs ?? 750));
+  const now = dependencies.now ?? (() => new Date());
+  const disconnectStartedAt = now().toISOString();
+  receipt = await updateReceipt(stateDir, requestId, (value) => ({
+    ...value,
+    disconnectStartedAt,
+  }));
   try {
     const apply = dependencies.apply ?? applyVerifiedMacosApp;
     const result = await apply(receipt.projectRoot, receipt.source);
+    const reconnectObservedAt = now().toISOString();
+    const reconnectDurationMs = Math.max(0, Date.parse(reconnectObservedAt) - Date.parse(disconnectStartedAt));
+    const reconnectPlan = await recordReplacementReconnectSample(stateDir, {
+      at: reconnectObservedAt,
+      kind: "macos-app",
+      durationMs: reconnectDurationMs,
+      outcome: "healthy",
+    }).catch(() => receipt.reconnectPlan);
     return updateReceipt(stateDir, requestId, (value) => ({
       ...value,
       state: result.status === "ALREADY_APPLIED" ? "ALREADY_APPLIED" : "APPLIED",
       result,
+      reconnectObservedAt,
+      reconnectDurationMs,
+      ...(reconnectPlan ? { reconnectPlan } : {}),
       failure: null,
       recommendedAction: "none",
     }));
   } catch (error) {
     const rollbackAttempted = Boolean((error as { rollbackAttempted?: unknown }).rollbackAttempted);
     const rollbackSucceeded = (error as { rollbackSucceeded?: unknown }).rollbackSucceeded === true;
+    const reconnectObservedAt = now().toISOString();
+    const reconnectDurationMs = Math.max(0, Date.parse(reconnectObservedAt) - Date.parse(disconnectStartedAt));
+    const reconnectPlan = await recordReplacementReconnectSample(stateDir, {
+      at: reconnectObservedAt,
+      kind: "macos-app",
+      durationMs: reconnectDurationMs,
+      outcome: rollbackSucceeded ? "rolled-back" : "failed",
+    }).catch(() => receipt.reconnectPlan);
     return updateReceipt(stateDir, requestId, (value) => ({
       ...value,
       state: rollbackAttempted && rollbackSucceeded ? "APPLY_FAILED_ROLLED_BACK" : "APPLY_FAILED_ROLLBACK_FAILED",
+      reconnectObservedAt,
+      reconnectDurationMs,
+      ...(reconnectPlan ? { reconnectPlan } : {}),
       failure: error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500),
       recommendedAction: rollbackSucceeded ? "inspect-candidate-app-and-runtime-handoff" : "restore-installed-app-locally",
     }));
@@ -249,6 +351,10 @@ export function macosAppApplyPublicReceipt(receipt: MacosAppApplyReceipt): Recor
       mainExecutableSha256: receipt.source.mainExecutableSha256,
     },
     result: receipt.result,
+    disconnectStartedAt: receipt.disconnectStartedAt ?? null,
+    reconnectObservedAt: receipt.reconnectObservedAt ?? null,
+    reconnectDurationMs: receipt.reconnectDurationMs ?? null,
+    reconnectPlan: receipt.reconnectPlan ?? null,
     failure: receipt.failure,
     recommendedAction: receipt.recommendedAction,
   };

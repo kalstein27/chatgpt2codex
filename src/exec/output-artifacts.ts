@@ -17,6 +17,8 @@ export interface OutputArtifactMetadata {
   resourceUri: string;
   projectId: string;
   laneDigest?: string;
+  approvalRequestId?: string;
+  ownerScopeDigest?: string;
   tool: string;
   createdAt: string;
   totalBytes: number;
@@ -92,6 +94,8 @@ export async function createOutputArtifact(input: {
   stateDir: string;
   projectId: string;
   laneDigest?: string;
+  approvalRequestId?: string;
+  ownerScope?: string;
   tool: string;
   stdout: string;
   stderr: string;
@@ -129,6 +133,8 @@ export async function createOutputArtifact(input: {
     resourceUri,
     projectId: input.projectId,
     ...(input.laneDigest ? { laneDigest: input.laneDigest } : {}),
+    ...(input.approvalRequestId ? { approvalRequestId: input.approvalRequestId } : {}),
+    ...(input.ownerScope ? { ownerScopeDigest: createHash("sha256").update(input.ownerScope).digest("hex") } : {}),
     tool: input.tool,
     createdAt: new Date().toISOString(),
     totalBytes: bytes,
@@ -151,6 +157,11 @@ export async function readOutputMetadata(stateDir: string, outputRef: string): P
     throw new DomainError(ErrorCode.NOT_A_FILE, `Output artifact not found: ${outputRef}`, { outputRef });
   }
   return JSON.parse(raw) as OutputArtifactMetadata;
+}
+
+export function outputArtifactMatchesOwner(metadata: OutputArtifactMetadata, ownerScope: string): boolean {
+  return Boolean(metadata.ownerScopeDigest)
+    && metadata.ownerScopeDigest === createHash("sha256").update(ownerScope).digest("hex");
 }
 
 export async function readOutputArtifact(

@@ -1,4 +1,5 @@
 import type { ToolContext } from "../types.js";
+import { recordToolSchemaRevalidation } from "../runtime/tool-schema-revalidation.js";
 import { toRemoteBoundaryError } from "./error-safety.js";
 import { createServer as createMcpServer } from "./mcp-server.js";
 import {
@@ -6,6 +7,9 @@ import {
   MCP_CLIENT_INFO_META_KEY,
   MCP_MODERN_PROTOCOL_VERSION,
   MCP_PROTOCOL_VERSION_META_KEY,
+  MCP_SCHEMA_EXPIRED_META_KEY,
+  MCP_SCHEMA_REVALIDATE_META_KEY,
+  MCP_SCHEMA_REVISION_META_KEY,
   MCP_TOOL_LIST_TTL_MS,
   createMcpDiscoveryResult,
   modernProtocolVersion,
@@ -30,6 +34,16 @@ export interface ModernMcpHttpHeaders {
 export interface ModernMcpDispatchResult {
   status: number;
   response?: Record<string, unknown>;
+}
+
+const IMMUTABLE_APPROVAL_WIDGET_RESOURCE_TTL_MS = 24 * 60 * 60 * 1000;
+const IMMUTABLE_APPROVAL_WIDGET_RESOURCE_RE = /^ui:\/\/widget\/c2ct-operation-approval-v\d+\.html$/;
+
+function isImmutableApprovalWidgetRead(result: Record<string, unknown>): boolean {
+  const contents = Array.isArray(result.contents) ? result.contents : [];
+  if (contents.length !== 1 || !isRecord(contents[0])) return false;
+  return typeof contents[0].uri === "string"
+    && IMMUTABLE_APPROVAL_WIDGET_RESOURCE_RE.test(contents[0].uri);
 }
 
 type LegacyRequestHandler = (
@@ -70,6 +84,28 @@ function decorateModernResult(
   };
   if (method === "tools/list") {
     decorated.ttlMs = MCP_TOOL_LIST_TTL_MS;
+    decorated.cacheScope = "private";
+    decorated.schemaMustRevalidate = true;
+    decorated._meta = {
+      ...(decorated._meta as Record<string, unknown>),
+      [MCP_SCHEMA_REVALIDATE_META_KEY]: true,
+    };
+  }
+  if (method === "resources/list") {
+    // MCP 2026-07-28 defines these as CacheableResult responses and requires
+    // both cache fields on the wire. Resource discovery stays zero-TTL so a
+    // versioned presenter/resource can be discovered immediately.
+    decorated.ttlMs = 0;
+    decorated.cacheScope = "private";
+  }
+  if (method === "resources/read") {
+    // Versioned operation-approval resources are immutable by identity. Cache
+    // those privately so repeated approval cards do not pay a host resource
+    // refetch/revalidation round trip; all mutable/shared widget resources keep
+    // the conservative zero-TTL policy.
+    decorated.ttlMs = isImmutableApprovalWidgetRead(result)
+      ? IMMUTABLE_APPROVAL_WIDGET_RESOURCE_TTL_MS
+      : 0;
     decorated.cacheScope = "private";
   }
   if (method === "tools/call" && !Array.isArray(decorated.content)) {
@@ -177,9 +213,25 @@ export async function dispatchModernMcpRequest(
 
   if (notification) return { status: 202 };
   if (method === "server/discover") {
-    return { status: 200, response: jsonRpcResult(request.id, createMcpDiscoveryResult(serverInfo)) };
+    let schemaRevision: string | undefined;
+    try {
+      const toolList = await invokeLegacyHandler(ctx, "tools/list", {}, { _meta: modernRequestMeta(body) ?? {} });
+      if (typeof toolList.schemaRevision === "string") schemaRevision = toolList.schemaRevision;
+    } catch {
+      // Discovery remains usable even if schema enumeration unexpectedly fails;
+      // the client can still revalidate with a direct tools/list call.
+    }
+    return {
+      status: 200,
+      response: jsonRpcResult(request.id, createMcpDiscoveryResult(serverInfo, schemaRevision)),
+    };
   }
-  if (method !== "tools/list" && method !== "tools/call") {
+  if (
+    method !== "tools/list"
+    && method !== "tools/call"
+    && method !== "resources/list"
+    && method !== "resources/read"
+  ) {
     return { status: 200, response: jsonRpcError(request.id, -32601, "Method not found") };
   }
 
@@ -187,6 +239,27 @@ export async function dispatchModernMcpRequest(
     const result = await invokeLegacyHandler(ctx, method, params, {
       _meta: modernRequestMeta(body) ?? {},
     });
+    if (method === "tools/list") {
+      const currentRevision = typeof result.schemaRevision === "string" ? result.schemaRevision : undefined;
+      const clientRevision = modernRequestMeta(body)?.[MCP_SCHEMA_REVISION_META_KEY];
+      const staleClientRevision = typeof clientRevision === "string"
+        && currentRevision !== undefined
+        && clientRevision !== currentRevision;
+      result.schemaExpired = staleClientRevision;
+      result.schemaMustRevalidate = true;
+      result._meta = {
+        ...(isRecord(result._meta) ? result._meta : {}),
+        [MCP_SCHEMA_EXPIRED_META_KEY]: staleClientRevision,
+        [MCP_SCHEMA_REVALIDATE_META_KEY]: true,
+      };
+      if (currentRevision) {
+        await recordToolSchemaRevalidation(ctx.stateDir, {
+          schemaRevision: currentRevision,
+          clientSchemaRevision: typeof clientRevision === "string" ? clientRevision : null,
+          staleClientRevision,
+        }).catch(() => null);
+      }
+    }
     return { status: 200, response: jsonRpcResult(request.id, decorateModernResult(method, result, serverInfo)) };
   } catch (error) {
     const boundary = toRemoteBoundaryError(error);

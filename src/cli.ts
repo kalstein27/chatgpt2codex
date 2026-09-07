@@ -39,6 +39,11 @@ import {
   inspectConnectorRegistration,
 } from "./connector/registration-assistant.js";
 import { MobileApprovalBridge } from "./exec/mobile-approval.js";
+import { refreshChatGptHostCatalog } from "./exec/chatgpt-host-catalog-refresh.js";
+import { reapplyCurrentRuntimeAndRefresh } from "./runtime/runtime-reapply-refresh.js";
+import { loadLocalRuntimeBootstrapPlan } from "./runtime/local-runtime-bootstrap.js";
+import { runLocalRuntimeBootstrap, type LocalRuntimeBootstrapPhase } from "./runtime/local-runtime-bootstrap-runner.js";
+import { runLocalMacosAppBootstrap, type LocalMacosAppBootstrapPhase } from "./runtime/local-macos-app-bootstrap-runner.js";
 
 // execution-capability: cli-runtime-doctor
 const execFileAsync = promisify(execFile);
@@ -74,6 +79,8 @@ function parseArgs(argv: string[]): ParsedArgs {
 
 /** Default state dir per PRD §10: `~/.local/share/chatgpt2codex/`. */
 function defaultStateDir(): string {
+  const configured = process.env.CHATGPT2CODEX_STATE_DIR?.trim();
+  if (configured) return path.resolve(configured);
   return path.join(os.homedir(), ".local", "share", "chatgpt2codex");
 }
 
@@ -279,12 +286,19 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
   const running = createHttpServer(ctx, httpConfig);
   const { app, activityTracker } = running;
   closeHttpServer = running.close;
-  mobileApprovalBridge = new MobileApprovalBridge({
-    stateDir: ctx.stateDir,
-    activityTracker,
-    ledgerAppend: (event) => ctx.ledger.append(event),
-  });
-  await mobileApprovalBridge.start();
+  // E2E candidate servers are deliberately isolated from the operator's
+  // fixed mobile/activity callback port. They still expose their own MCP/health
+  // endpoint, but cannot steal :7980 from the live runtime if they outlive a
+  // diagnostic run or overlap a runtime handoff.
+  if (process.env.CHATGPT2CODEX_E2E_CHILD !== "1") {
+    mobileApprovalBridge = new MobileApprovalBridge({
+      stateDir: ctx.stateDir,
+      activityTracker,
+      diagnostics: ctx.diagnostics,
+      ledgerAppend: (event) => ctx.ledger.append(event),
+    });
+    await mobileApprovalBridge.start();
+  }
 
   httpServer = app.listen(port, host, () => {
     console.error(`chatgpt2codex serve --http: listening on http://${host}:${port}/mcp`);
@@ -647,6 +661,81 @@ async function cmdConnectorAssistant(flags: Record<string, string | boolean>): P
   if (report.state !== "READY") process.exitCode = 1;
 }
 
+async function cmdChatGptCatalogRefresh(): Promise<void> {
+  const result = await refreshChatGptHostCatalog();
+  console.log(JSON.stringify(result));
+  if (!result.ok) process.exitCode = 3;
+}
+
+async function cmdRuntimeReapplyRefresh(flags: Record<string, string | boolean>): Promise<void> {
+  const rawPort = typeof flags.port === "string" ? flags.port : process.env.PORT ?? "7979";
+  const port = Number.parseInt(rawPort, 10);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    throw new Error("runtime-reapply-refresh requires a valid --port");
+  }
+  const result = await reapplyCurrentRuntimeAndRefresh({
+    stateDir: defaultStateDir(),
+    port,
+  });
+  console.log(JSON.stringify(result));
+  if (!result.ok) process.exitCode = 4;
+}
+
+async function cmdRuntimeBootstrapLocal(flags: Record<string, string | boolean>): Promise<void> {
+  const prepareRequestId = typeof flags["prepare-request"] === "string" ? flags["prepare-request"].trim() : "";
+  const prepareOperationId = typeof flags["prepare-operation"] === "string" ? flags["prepare-operation"].trim() : "";
+  if ((prepareRequestId ? 1 : 0) + (prepareOperationId ? 1 : 0) !== 1) {
+    throw new Error("runtime-bootstrap-local requires exactly one of --prepare-request <requestId> or --prepare-operation <operationId>");
+  }
+  const phase = flags.phase === "begin" || flags.phase === "resume"
+    ? flags.phase as LocalRuntimeBootstrapPhase
+    : null;
+  if (!phase) {
+    throw new Error("runtime-bootstrap-local requires --phase <begin|resume>");
+  }
+  const rawPort = typeof flags.port === "string" ? flags.port : process.env.PORT ?? "7979";
+  const port = Number.parseInt(rawPort, 10);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    throw new Error("runtime-bootstrap-local requires a valid --port");
+  }
+  const stateDir = defaultStateDir();
+  const plan = await loadLocalRuntimeBootstrapPlan({
+    stateDir,
+    ...(prepareRequestId ? { prepareRequestId } : { prepareOperationId }),
+  });
+  const result = await runLocalRuntimeBootstrap({ plan, stateDir, phase, port });
+  console.log(JSON.stringify(result));
+}
+
+async function cmdMacosAppBootstrapLocal(flags: Record<string, string | boolean>): Promise<void> {
+  const projectId = typeof flags["project-id"] === "string" ? flags["project-id"].trim() : "";
+  const requestId = typeof flags["request-id"] === "string" ? flags["request-id"].trim() : "";
+  const phase = flags.phase === "begin" || flags.phase === "resume"
+    ? flags.phase as LocalMacosAppBootstrapPhase
+    : null;
+  if (!projectId) throw new Error("macos-app-bootstrap-local requires --project-id <projectId>");
+  if (!requestId) throw new Error("macos-app-bootstrap-local requires --request-id <requestId>");
+  if (!phase) throw new Error("macos-app-bootstrap-local requires --phase <begin|resume>");
+  const rawPort = typeof flags.port === "string" ? flags.port : process.env.PORT ?? "7979";
+  const port = Number.parseInt(rawPort, 10);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    throw new Error("macos-app-bootstrap-local requires a valid --port");
+  }
+  const projectRoot = typeof flags["project-root"] === "string"
+    ? path.resolve(flags["project-root"])
+    : process.cwd();
+  const result = await runLocalMacosAppBootstrap({
+    projectId,
+    projectRoot,
+    stateDir: defaultStateDir(),
+    requestId,
+    phase,
+    port,
+  });
+  console.log(JSON.stringify(result));
+}
+
+
 async function cmdWorkspaceRoot(positional: string[]): Promise<void> {
   const [action, requestedRoot] = positional;
   const stateDir = defaultStateDir();
@@ -682,6 +771,18 @@ async function main(): Promise<void> {
     case "connector-assistant":
       await cmdConnectorAssistant(flags);
       break;
+    case "chatgpt-catalog-refresh":
+      await cmdChatGptCatalogRefresh();
+      break;
+    case "runtime-reapply-refresh":
+      await cmdRuntimeReapplyRefresh(flags);
+      break;
+    case "runtime-bootstrap-local":
+      await cmdRuntimeBootstrapLocal(flags);
+      break;
+    case "macos-app-bootstrap-local":
+      await cmdMacosAppBootstrapLocal(flags);
+      break;
     case "owner-token":
       await cmdOwnerToken(flags);
       break;
@@ -693,7 +794,7 @@ async function main(): Promise<void> {
       break;
     default:
       console.error(
-        "usage: chatgpt2codex <serve|init|doctor|connector-assistant|owner-token|control|workspace-root> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
+        "usage: chatgpt2codex <serve|init|doctor|connector-assistant|chatgpt-catalog-refresh|runtime-reapply-refresh|runtime-bootstrap-local|macos-app-bootstrap-local|owner-token|control|workspace-root> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
       );
       process.exitCode = 1;
   }

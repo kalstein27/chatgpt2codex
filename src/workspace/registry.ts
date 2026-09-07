@@ -25,7 +25,25 @@ const PROJECT_MARKER_FILES = [
   "Cargo.toml",
   "requirements.txt",
   ".chatgpt2codex",
+  "AGENTS.md",
+  "CLAUDE.md",
 ];
+
+const DEFAULT_SCAN_DEPTH = 1;
+const MAX_SCAN_DEPTH = 4;
+const ALWAYS_SKIPPED_DIRECTORIES = new Set([
+  ".git",
+  "node_modules",
+  "build",
+  "dist",
+  "coverage",
+  ".cache",
+]);
+
+export interface WorkspaceScanOptions {
+  depth?: number;
+  includeHidden?: boolean;
+}
 
 async function pathExists(p: string): Promise<boolean> {
   try {
@@ -102,10 +120,16 @@ function slugify(name: string): string {
  * folders) and build registry entries (PRD §8.1 workspace_list_projects,
  * §10 registry shape).
  */
-export async function scanWorkspace(root: string): Promise<ProjectRegistryEntry[]> {
-  let dirents: import("node:fs").Dirent[];
+export async function scanWorkspace(
+  root: string,
+  options: WorkspaceScanOptions = {},
+): Promise<ProjectRegistryEntry[]> {
+  const requestedDepth = Number.isFinite(options.depth) ? Math.trunc(options.depth ?? DEFAULT_SCAN_DEPTH) : DEFAULT_SCAN_DEPTH;
+  const depth = Math.max(0, Math.min(MAX_SCAN_DEPTH, requestedDepth));
+  const includeHidden = options.includeHidden === true;
+
   try {
-    dirents = await fs.readdir(root, { withFileTypes: true });
+    await fs.access(root);
   } catch (err) {
     throw new DomainError(
       ErrorCode.WORKSPACE_NOT_READY,
@@ -149,15 +173,20 @@ export async function scanWorkspace(root: string): Promise<ProjectRegistryEntry[
     });
   };
 
-  await pushProject(root, path.basename(root));
+  const walk = async (dir: string, level: number): Promise<void> => {
+    await pushProject(dir, path.basename(dir));
+    if (level >= depth) return;
 
-  for (const dirent of dirents) {
-    if (!dirent.isDirectory()) continue;
-    if (dirent.name.startsWith(".")) continue; // skip hidden/system dirs
+    const dirents = await fs.readdir(dir, { withFileTypes: true }).catch(() => [] as import("node:fs").Dirent[]);
+    for (const dirent of dirents) {
+      if (!dirent.isDirectory()) continue;
+      if (ALWAYS_SKIPPED_DIRECTORIES.has(dirent.name)) continue;
+      if (!includeHidden && dirent.name.startsWith(".")) continue;
+      await walk(path.join(dir, dirent.name), level + 1);
+    }
+  };
 
-    const dir = path.join(root, dirent.name);
-    await pushProject(dir, dirent.name);
-  }
+  await walk(root, 0);
 
   return entries;
 }
@@ -168,13 +197,16 @@ export async function scanWorkspace(root: string): Promise<ProjectRegistryEntry[
  * different roots produce the same slug, the later one receives a deterministic
  * numeric suffix while retaining the original slug as an alias.
  */
-export async function scanWorkspaces(roots: readonly string[]): Promise<ProjectRegistryEntry[]> {
+export async function scanWorkspaces(
+  roots: readonly string[],
+  options: WorkspaceScanOptions = {},
+): Promise<ProjectRegistryEntry[]> {
   const entries: ProjectRegistryEntry[] = [];
   const seenRoots = new Set<string>();
   const usedProjectIds = new Set<string>();
 
   for (const root of roots) {
-    const scanned = await scanWorkspace(root);
+    const scanned = await scanWorkspace(root, options);
     for (const entry of scanned) {
       const canonicalRoot = await fs.realpath(entry.root).catch(() => path.resolve(entry.root));
       if (seenRoots.has(canonicalRoot)) continue;
