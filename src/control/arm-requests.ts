@@ -288,6 +288,35 @@ export async function listArmRequests(
   return { requests, expired };
 }
 
+/**
+ * Fast status path for callers that only need currently actionable requests.
+ * Avoid scanning terminal status directories, whose history can grow over the
+ * lifetime of the local control service. Expired pending requests are still
+ * transitioned atomically so polling preserves the same lifecycle semantics.
+ */
+export async function listPendingArmRequests(
+  stateDir: string,
+  now = Date.now(),
+): Promise<{ requests: ArmRequestRecord[]; expired: ArmRequestRecord[] }> {
+  const dir = statusDir(stateDir, "pending");
+  const files = await fs.readdir(dir).catch(() => [] as string[]);
+  const requests: ArmRequestRecord[] = [];
+  const expired: ArmRequestRecord[] = [];
+  for (const file of files) {
+    if (!file.endsWith(".json")) continue;
+    const requestId = file.slice(0, -5);
+    const resolved = await getArmRequest(stateDir, requestId, now);
+    if (!resolved.request) continue;
+    if (resolved.expired) {
+      expired.push(resolved.request);
+    } else if (resolved.request.status === "pending") {
+      requests.push(resolved.request);
+    }
+  }
+  requests.sort((a, b) => a.createdAt - b.createdAt);
+  return { requests, expired };
+}
+
 export async function createArmRequest(
   stateDir: string,
   input: CreateArmRequestInput,

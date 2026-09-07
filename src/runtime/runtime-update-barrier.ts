@@ -116,3 +116,26 @@ export async function assertRuntimeUpdateNotDraining(stateDir: string, now = Dat
     retryAfterMs: Math.max(1, barrier.expiresAt - now),
   });
 }
+
+export async function assertRuntimeMaintenanceAllowsLeaseAcquisition(
+  stateDir: string,
+  now = Date.now(),
+): Promise<void> {
+  const barrier = await getRuntimeUpdateBarrier(stateDir, now);
+  if (!barrier) return;
+  throw new DomainError(
+    ErrorCode.RUNTIME_UPDATE_IN_PROGRESS,
+    "C2CT runtime maintenance is in progress; project lease acquisition and renewal are temporarily disabled",
+    {
+      operationId: barrier.operationId,
+      projectId: barrier.projectId,
+      phase: barrier.phase,
+      maintenanceInProgress: true,
+      leaseAcquisitionBlocked: true,
+      leaseRenewalBlocked: true,
+      releaseOwnedLeasesAllowed: true,
+      recommendedAction: "release-owned-project-capabilities-and-retry-after-maintenance",
+      retryAfterMs: Math.max(1, barrier.expiresAt - now),
+    },
+  );
+}

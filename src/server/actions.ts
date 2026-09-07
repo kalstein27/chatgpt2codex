@@ -109,8 +109,8 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "project_lane_release",
     summary: "Finalize a C2CT project work lane",
     description:
-      "Idempotently clear only the exact current conversation's temporary C2CT work-lane authorization after work is complete. It does not modify project files, processes, runtime, app, connector, or network state.",
-    schema: "ProjectLaneLeaseInput",
+      "Idempotently clear only the exact current conversation's temporary C2CT work-lane authorization after work is complete. Remote callers may omit the raw workLaneId and release by exact projectId + leaseId. It does not modify project files, processes, runtime, app, connector, or network state.",
+    schema: "ProjectLaneReleaseInput",
   },
   {
     path: "/actions/project-lane-recover",
@@ -179,7 +179,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     tool: "workspace_refresh_index",
     operationId: "workspace_refresh_index",
     summary: "Refresh the local project index",
-    description: "Rescan the local workspace root and refresh chatgpt2codex's project registry.",
+    description: "Rescan authorized local workspace/project roots and refresh the project registry, including agent-managed folders with AGENTS.md or CLAUDE.md. Use bounded depth for nested projects.",
     schema: "WorkspaceRefreshIndexInput",
   },
   {
@@ -1022,6 +1022,21 @@ export function openApiSpec(publicOrigin: string): Record<string, unknown> {
           type: "object",
           additionalProperties: false,
           required: ["projectId", "workLaneId", "leaseId", "reason"],
+          properties: {
+            projectId: { type: "string" },
+            workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },
+            leaseId: { type: "string", pattern: "^lease_[0-9a-fA-F-]{36}$" },
+            reason: {
+              type: "string",
+              enum: ["work", "maintenance", "renew", "done", "cleanup", "control"],
+              description: "Fixed lease audit label. Use one listed value only.",
+            },
+          },
+        },
+        ProjectLaneReleaseInput: {
+          type: "object",
+          additionalProperties: false,
+          required: ["projectId", "leaseId", "reason"],
           properties: {
             projectId: { type: "string" },
             workLaneId: { type: "string", pattern: "^lane_[0-9a-fA-F-]{36}$" },

@@ -37,6 +37,7 @@ const OperationRecordSchema = z.object({
   leasePreset: z.enum(["read-only", "tests-only", "full-write", "image-only", "control"]),
   commandId: z.string().min(1).max(240),
   operationFingerprint: z.string().regex(/^[a-f0-9]{64}$/u),
+  approvalRequestId: z.string().regex(/^op_[0-9a-f-]{36}$/u).optional(),
   state: z.enum([
     "queued",
     "spawning",
@@ -157,6 +158,7 @@ export interface StartBackgroundOperationInput extends BackgroundOperationBindin
   leasePreset: LeasePreset;
   commandId: string;
   operationFingerprint: string;
+  approvalRequestId?: string;
   execute: (
     operationId: string,
     signal: AbortSignal,
@@ -344,6 +346,7 @@ export class BackgroundOperationManager {
         leasePreset: input.leasePreset,
         commandId: input.commandId,
         operationFingerprint: input.operationFingerprint,
+        ...(input.approvalRequestId ? { approvalRequestId: input.approvalRequestId } : {}),
         state: "queued",
         phase: "queued",
         createdAt: now,
@@ -463,6 +466,16 @@ export class BackgroundOperationManager {
     }
   }
 
+  private assertOwnerProjectBinding(record: OperationRecord, binding: Omit<BackgroundOperationBinding, "laneDigest">): void {
+    if (
+      record.ownerDigest !== digest(binding.ownerScope)
+      || record.projectId !== binding.projectId
+      || record.projectRootDigest !== digest(path.resolve(binding.projectRoot))
+    ) {
+      throw new DomainError(ErrorCode.PERMISSION_DENIED, "Background operation does not belong to this owner/project");
+    }
+  }
+
   async status(binding: BackgroundOperationBinding & { operationId: string }, now = Date.now()): Promise<BackgroundOperationSnapshot> {
     await this.initialize(now);
     return this.withLock(async () => {
@@ -471,6 +484,21 @@ export class BackgroundOperationManager {
       const record = state.operations.find((candidate) => candidate.operationId === binding.operationId);
       if (!record) throw new DomainError(ErrorCode.OPERATION_NOT_FOUND, "Background operation not found");
       this.assertBinding(record, binding);
+      return toSnapshot(record, now);
+    });
+  }
+
+  async statusByApproval(
+    binding: Omit<BackgroundOperationBinding, "laneDigest"> & { approvalRequestId: string },
+    now = Date.now(),
+  ): Promise<BackgroundOperationSnapshot> {
+    await this.initialize(now);
+    return this.withLock(async () => {
+      const state = await this.readState();
+      prune(state, now);
+      const record = state.operations.find((candidate) => candidate.approvalRequestId === binding.approvalRequestId);
+      if (!record) throw new DomainError(ErrorCode.OPERATION_NOT_FOUND, "Background operation not found for approval request");
+      this.assertOwnerProjectBinding(record, binding);
       return toSnapshot(record, now);
     });
   }

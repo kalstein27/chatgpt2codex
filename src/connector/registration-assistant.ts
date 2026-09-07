@@ -61,6 +61,7 @@ interface LocalHealthPayload {
   runtimePid?: unknown;
   runtimeManifest?: {
     toolSchemaRevision?: unknown;
+    hostCatalogRevision?: unknown;
     runtimeFingerprint?: unknown;
     buildFingerprint?: unknown;
   };
@@ -225,7 +226,8 @@ export async function inspectConnectorRegistration(
   }
 
   const runtimeManifest = localPayload.runtimeManifest;
-  const schemaRevision = safeSchemaRevision(runtimeManifest?.toolSchemaRevision);
+  const schemaRevision = safeSchemaRevision(runtimeManifest?.hostCatalogRevision)
+    ?? safeSchemaRevision(runtimeManifest?.toolSchemaRevision);
   const fingerprint = safeFingerprint(runtimeManifest?.runtimeFingerprint) ??
     safeFingerprint(runtimeManifest?.buildFingerprint);
   const runtimePid = safePositiveInteger(localPayload.runtimePid);

@@ -91,6 +91,13 @@ const SessionSchema = z.object({
 
 export type SessionDocument = z.infer<typeof SessionSchema>;
 
+interface SessionCacheEntry {
+  mtimeMs: number;
+  size: number;
+  ino: number;
+  document: SessionDocument;
+}
+
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 
@@ -122,6 +129,7 @@ function emptySession(): SessionDocument {
 export class Store {
   private readonly stateDir: string;
   private readonly sessionLocks = new Map<string, Promise<void>>();
+  private readonly sessionCache = new Map<string, SessionCacheEntry>();
 
   constructor(stateDir: string) {
     this.stateDir = stateDir;
@@ -175,11 +183,12 @@ export class Store {
 
   /** Keep remote/session-scoped state bounded without touching sessions.json. */
   private async pruneScopedSessionFiles(keepFilename: string): Promise<void> {
-    await this.ensureStateDir();
+    // Called only after atomicWriteJson has already created/tightened stateDir.
     const entries = await readdir(this.stateDir, { withFileTypes: true });
+    const scopedEntries = entries.filter((entry) => entry.isFile() && SCOPED_SESSION_FILE_RE.test(entry.name));
+    if (scopedEntries.length <= MAX_SCOPED_SESSION_FILES) return;
     const candidates = await Promise.all(
-      entries
-        .filter((entry) => entry.isFile() && SCOPED_SESSION_FILE_RE.test(entry.name))
+      scopedEntries
         .map(async (entry) => ({
           filename: entry.name,
           mtimeMs: (await stat(join(this.stateDir, entry.name))).mtimeMs,
@@ -193,6 +202,7 @@ export class Store {
       overflow.map(async (entry) => {
         try {
           await unlink(join(this.stateDir, entry.filename));
+          this.sessionCache.delete(entry.filename);
         } catch (err) {
           if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
         }
@@ -225,6 +235,19 @@ export class Store {
 
   async getSession(scope?: string): Promise<SessionDocument> {
     const filename = sessionFilename(scope);
+    const target = join(this.stateDir, filename);
+    const before = await stat(target).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    });
+    if (!before) {
+      this.sessionCache.delete(filename);
+      return emptySession();
+    }
+    const cached = this.sessionCache.get(filename);
+    if (cached && cached.mtimeMs === before.mtimeMs && cached.size === before.size && cached.ino === before.ino) {
+      return structuredClone(cached.document);
+    }
     const raw = await this.readJson(filename);
     if (raw === undefined) return emptySession();
     const parsed = SessionSchema.safeParse(raw);
@@ -234,7 +257,30 @@ export class Store {
         `Store: ${filename} failed validation: ${parsed.error.message}`,
       );
     }
+    const after = await stat(target).catch(() => undefined);
+    if (after && after.mtimeMs === before.mtimeMs && after.size === before.size && after.ino === before.ino) {
+      this.sessionCache.set(filename, {
+        mtimeMs: after.mtimeMs,
+        size: after.size,
+        ino: after.ino,
+        document: structuredClone(parsed.data),
+      });
+    }
     return parsed.data;
+  }
+
+  private async cacheSessionDocument(filename: string, document: SessionDocument): Promise<void> {
+    const info = await stat(join(this.stateDir, filename)).catch(() => undefined);
+    if (!info) {
+      this.sessionCache.delete(filename);
+      return;
+    }
+    this.sessionCache.set(filename, {
+      mtimeMs: info.mtimeMs,
+      size: info.size,
+      ino: info.ino,
+      document: structuredClone(document),
+    });
   }
 
   private normalizeSession(s: unknown): SessionDocument {
@@ -251,12 +297,12 @@ export class Store {
     const validated = this.normalizeSession(s);
     const filename = sessionFilename(scope);
     await this.atomicWriteJson(filename, validated);
+    await this.cacheSessionDocument(filename, validated);
     if (scope) await this.pruneScopedSessionFiles(filename);
     return validated;
   }
 
-  private async withSessionLock<T>(scope: string | undefined, operation: () => Promise<T>): Promise<T> {
-    const filename = sessionFilename(scope);
+  private async withSessionFilenameLock<T>(filename: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.sessionLocks.get(filename) ?? Promise.resolve();
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
@@ -271,6 +317,10 @@ export class Store {
       release();
       if (this.sessionLocks.get(filename) === tail) this.sessionLocks.delete(filename);
     }
+  }
+
+  private async withSessionLock<T>(scope: string | undefined, operation: () => Promise<T>): Promise<T> {
+    return this.withSessionFilenameLock(sessionFilename(scope), operation);
   }
 
   async setSession(s: unknown, scope?: string): Promise<void> {
@@ -291,6 +341,53 @@ export class Store {
       return this.writeSessionUnlocked(next, scope);
     });
   }
+
+  /**
+   * Clear only the exact persisted serial lease identity after its global
+   * privilege generation has been retired as an abandoned owner. The caller
+   * makes the liveness/CAS decision; this helper only removes matching scoped
+   * session state without exposing or reconstructing the opaque session scope.
+   */
+  async clearSerialLeaseByIdentity(input: {
+    projectId: string;
+    leaseId: string;
+    preset: LeasePreset;
+  }): Promise<{ cleared: boolean; matchedCount: number }> {
+    await this.ensureStateDir();
+    const entries = await readdir(this.stateDir, { withFileTypes: true });
+    const filenames = entries
+      .filter((entry) => entry.isFile() && (entry.name === SESSIONS_FILE || SCOPED_SESSION_FILE_RE.test(entry.name)))
+      .map((entry) => entry.name)
+      .slice(0, MAX_SCOPED_SESSION_FILES + 1);
+    let matchedCount = 0;
+
+    for (const filename of filenames) {
+      await this.withSessionFilenameLock(filename, async () => {
+        const raw = await this.readJson(filename);
+        if (raw === undefined) return;
+        const parsed = SessionSchema.safeParse(raw);
+        if (!parsed.success) return;
+        const lease = parsed.data.lease;
+        if (
+          !lease
+          || lease.projectId !== input.projectId
+          || lease.leaseId !== input.leaseId
+          || lease.preset !== input.preset
+        ) return;
+
+        matchedCount += 1;
+        const next = this.normalizeSession({
+          ...parsed.data,
+          mode: "read",
+          lease: null,
+        });
+        await this.atomicWriteJson(filename, next);
+        await this.cacheSessionDocument(filename, next);
+      });
+    }
+
+    return { cleared: matchedCount > 0, matchedCount };
+  }
 }
 
 export interface PersistedProjectPrivilegeOwner {
@@ -298,6 +395,14 @@ export interface PersistedProjectPrivilegeOwner {
   active: boolean;
   expiresAt: number | null;
   kind: "lane" | "serial";
+}
+
+export interface PersistedProjectPrivilegeOwnerLookup {
+  projectId: string;
+  leaseId: string;
+  preset: LeasePreset;
+  kind: "lane" | "serial";
+  projectRootDigest?: string;
 }
 
 /**
@@ -308,15 +413,11 @@ export interface PersistedProjectPrivilegeOwner {
  * the bounded session set and matches the lock's project/lease/preset tuple.
  * No session filename, scope, or raw owner identifier leaves this helper.
  */
-export async function inspectPersistedPrivilegeOwner(input: {
+export async function inspectPersistedPrivilegeOwners(input: {
   stateDir: string;
-  projectId: string;
-  leaseId: string;
-  preset: LeasePreset;
-  kind: "lane" | "serial";
-  projectRootDigest?: string;
+  lookups: readonly PersistedProjectPrivilegeOwnerLookup[];
   now?: number;
-}): Promise<PersistedProjectPrivilegeOwner> {
+}): Promise<PersistedProjectPrivilegeOwner[]> {
   const now = input.now ?? Date.now();
   const entries = await readdir(input.stateDir, { withFileTypes: true }).catch(() => []);
   const filenames = entries
@@ -324,7 +425,7 @@ export async function inspectPersistedPrivilegeOwner(input: {
     .map((entry) => entry.name)
     .slice(0, MAX_SCOPED_SESSION_FILES + 1);
 
-  let foundExpiry: number | null = null;
+  const foundExpiries = input.lookups.map(() => null as number | null);
   for (const filename of filenames) {
     let parsed: SessionDocument | undefined;
     try {
@@ -338,35 +439,52 @@ export async function inspectPersistedPrivilegeOwner(input: {
     }
     if (!parsed) continue;
 
-    if (input.kind === "serial") {
-      const lease = parsed.lease;
-      if (
-        lease
-        && lease.projectId === input.projectId
-        && lease.leaseId === input.leaseId
-        && lease.preset === input.preset
-      ) {
-        foundExpiry = Math.max(foundExpiry ?? 0, lease.expiresAt);
+    for (let index = 0; index < input.lookups.length; index += 1) {
+      const lookup = input.lookups[index]!;
+      if (lookup.kind === "serial") {
+        const lease = parsed.lease;
+        if (
+          lease
+          && lease.projectId === lookup.projectId
+          && lease.leaseId === lookup.leaseId
+          && lease.preset === lookup.preset
+        ) {
+          foundExpiries[index] = Math.max(foundExpiries[index] ?? 0, lease.expiresAt);
+        }
+        continue;
       }
-      continue;
-    }
-
-    for (const lane of parsed.lanes ?? []) {
-      if (
-        lane.projectId === input.projectId
-        && lane.leaseId === input.leaseId
-        && lane.preset === input.preset
-        && (input.projectRootDigest === undefined || lane.projectRootDigest === input.projectRootDigest)
-      ) {
-        foundExpiry = Math.max(foundExpiry ?? 0, lane.expiresAt);
+      for (const lane of parsed.lanes ?? []) {
+        if (
+          lane.projectId === lookup.projectId
+          && lane.leaseId === lookup.leaseId
+          && lane.preset === lookup.preset
+          && (lookup.projectRootDigest === undefined || lane.projectRootDigest === lookup.projectRootDigest)
+        ) {
+          foundExpiries[index] = Math.max(foundExpiries[index] ?? 0, lane.expiresAt);
+        }
       }
     }
   }
 
-  return {
-    found: foundExpiry !== null,
-    active: foundExpiry !== null && foundExpiry >= now,
-    expiresAt: foundExpiry,
-    kind: input.kind,
-  };
+  return input.lookups.map((lookup, index) => {
+    const foundExpiry = foundExpiries[index] ?? null;
+    return {
+      found: foundExpiry !== null,
+      active: foundExpiry !== null && foundExpiry >= now,
+      expiresAt: foundExpiry,
+      kind: lookup.kind,
+    };
+  });
+}
+
+export async function inspectPersistedPrivilegeOwner(input: PersistedProjectPrivilegeOwnerLookup & {
+  stateDir: string;
+  now?: number;
+}): Promise<PersistedProjectPrivilegeOwner> {
+  const [result] = await inspectPersistedPrivilegeOwners({
+    stateDir: input.stateDir,
+    lookups: [input],
+    now: input.now,
+  });
+  return result!;
 }

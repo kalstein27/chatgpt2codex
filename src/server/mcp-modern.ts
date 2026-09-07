@@ -36,6 +36,16 @@ export interface ModernMcpDispatchResult {
   response?: Record<string, unknown>;
 }
 
+const IMMUTABLE_APPROVAL_WIDGET_RESOURCE_TTL_MS = 24 * 60 * 60 * 1000;
+const IMMUTABLE_APPROVAL_WIDGET_RESOURCE_RE = /^ui:\/\/widget\/c2ct-operation-approval-v\d+\.html$/;
+
+function isImmutableApprovalWidgetRead(result: Record<string, unknown>): boolean {
+  const contents = Array.isArray(result.contents) ? result.contents : [];
+  if (contents.length !== 1 || !isRecord(contents[0])) return false;
+  return typeof contents[0].uri === "string"
+    && IMMUTABLE_APPROVAL_WIDGET_RESOURCE_RE.test(contents[0].uri);
+}
+
 type LegacyRequestHandler = (
   request: { method: string; params?: Record<string, unknown> },
   extra: Record<string, unknown>,
@@ -81,11 +91,21 @@ function decorateModernResult(
       [MCP_SCHEMA_REVALIDATE_META_KEY]: true,
     };
   }
-  if (method === "resources/list" || method === "resources/read") {
+  if (method === "resources/list") {
     // MCP 2026-07-28 defines these as CacheableResult responses and requires
-    // both cache fields on the wire. Keep the conservative zero-TTL/private
-    // policy used by discovery/tools so templates are always revalidated.
+    // both cache fields on the wire. Resource discovery stays zero-TTL so a
+    // versioned presenter/resource can be discovered immediately.
     decorated.ttlMs = 0;
+    decorated.cacheScope = "private";
+  }
+  if (method === "resources/read") {
+    // Versioned operation-approval resources are immutable by identity. Cache
+    // those privately so repeated approval cards do not pay a host resource
+    // refetch/revalidation round trip; all mutable/shared widget resources keep
+    // the conservative zero-TTL policy.
+    decorated.ttlMs = isImmutableApprovalWidgetRead(result)
+      ? IMMUTABLE_APPROVAL_WIDGET_RESOURCE_TTL_MS
+      : 0;
     decorated.cacheScope = "private";
   }
   if (method === "tools/call" && !Array.isArray(decorated.content)) {

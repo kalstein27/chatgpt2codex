@@ -111,6 +111,13 @@ export interface ToolContext {
       scope: string | undefined,
       updater: (current: unknown) => unknown | Promise<unknown>,
     ): Promise<unknown>;
+    /** Remove only one exact persisted serial lease after the caller has
+     * independently proved its global privilege generation abandoned. */
+    clearSerialLeaseByIdentity?(input: {
+      projectId: string;
+      leaseId: string;
+      preset: LeasePreset;
+    }): Promise<{ cleared: boolean; matchedCount: number }>;
   };
   /** Opaque scope for active-project and lease persistence. Absent means the
    * historical local/default session. Raw credentials must never be stored. */

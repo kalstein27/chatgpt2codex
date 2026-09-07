@@ -8,13 +8,17 @@ interface WidgetApprovalGrant {
   expiresAt: number;
 }
 
-const grants = new Map<string, WidgetApprovalGrant>();
+const MAX_WIDGET_APPROVAL_GRANTS_PER_REQUEST = 8;
+const grants = new Map<string, WidgetApprovalGrant[]>();
 
 const CHATGPT_WIDGET_APPROVABLE_OPERATION_TOOLS = new Set([
   "command_run",
   "e2e_run_command",
   "e2e_start_server",
+  "local_shell_run",
   "operation_cancel",
+  "runtime_snapshot_prune_local",
+  "scheduled_goal_create",
   "verified_local_file_apply",
 ]);
 
@@ -44,8 +48,10 @@ function hashToken(token: string): Buffer {
 }
 
 function prune(now = Date.now()): void {
-  for (const [key, grant] of grants) {
-    if (grant.expiresAt <= now) grants.delete(key);
+  for (const [key, requestGrants] of grants) {
+    const active = requestGrants.filter((grant) => grant.expiresAt > now);
+    if (active.length === 0) grants.delete(key);
+    else if (active.length !== requestGrants.length) grants.set(key, active);
   }
 }
 
@@ -64,13 +70,50 @@ export function mintChatGptWidgetApprovalToken(input: {
     });
   }
   const token = randomBytes(32).toString("base64url");
-  grants.set(grantKey(input.requestId), {
+  const key = grantKey(input.requestId);
+  const requestGrants = grants.get(key) ?? [];
+  const nextGrant: WidgetApprovalGrant = {
     requestId: input.requestId,
     tokenHash: hashToken(token),
     ...(input.sessionScope ? { sessionScope: input.sessionScope } : {}),
     expiresAt: input.expiresAt,
-  });
+  };
+  grants.set(key, [...requestGrants, nextGrant].slice(-MAX_WIDGET_APPROVAL_GRANTS_PER_REQUEST));
   return token;
+}
+
+function requireMatchingGrant(input: {
+  requestId: string;
+  token: string;
+  sessionScope?: string;
+  now?: number;
+}): WidgetApprovalGrant {
+  const now = input.now ?? Date.now();
+  prune(now);
+  const key = grantKey(input.requestId);
+  const requestGrants = grants.get(key);
+  if (!requestGrants || requestGrants.length === 0) {
+    grants.delete(key);
+    throw new DomainError(ErrorCode.PERMISSION_DENIED, "ChatGPT approval widget token is missing or expired", {
+      requestId: input.requestId,
+    });
+  }
+  const scopedGrants = requestGrants.filter((grant) => !grant.sessionScope || grant.sessionScope === input.sessionScope);
+  if (scopedGrants.length === 0) {
+    throw new DomainError(ErrorCode.PERMISSION_DENIED, "ChatGPT approval widget token belongs to another conversation", {
+      requestId: input.requestId,
+    });
+  }
+  const supplied = hashToken(input.token);
+  const grant = scopedGrants.find((candidate) =>
+    supplied.length === candidate.tokenHash.length && timingSafeEqual(supplied, candidate.tokenHash),
+  );
+  if (!grant) {
+    throw new DomainError(ErrorCode.PERMISSION_DENIED, "Invalid ChatGPT approval widget token", {
+      requestId: input.requestId,
+    });
+  }
+  return grant;
 }
 
 export function consumeChatGptWidgetApprovalToken(input: {
@@ -79,28 +122,8 @@ export function consumeChatGptWidgetApprovalToken(input: {
   sessionScope?: string;
   now?: number;
 }): void {
-  const now = input.now ?? Date.now();
-  prune(now);
-  const key = grantKey(input.requestId);
-  const grant = grants.get(key);
-  if (!grant || grant.expiresAt <= now) {
-    grants.delete(key);
-    throw new DomainError(ErrorCode.PERMISSION_DENIED, "ChatGPT approval widget token is missing or expired", {
-      requestId: input.requestId,
-    });
-  }
-  if (grant.sessionScope && grant.sessionScope !== input.sessionScope) {
-    throw new DomainError(ErrorCode.PERMISSION_DENIED, "ChatGPT approval widget token belongs to another conversation", {
-      requestId: input.requestId,
-    });
-  }
-  const supplied = hashToken(input.token);
-  if (supplied.length !== grant.tokenHash.length || !timingSafeEqual(supplied, grant.tokenHash)) {
-    throw new DomainError(ErrorCode.PERMISSION_DENIED, "Invalid ChatGPT approval widget token", {
-      requestId: input.requestId,
-    });
-  }
-  grants.delete(key);
+  requireMatchingGrant(input);
+  grants.delete(grantKey(input.requestId));
 }
 
 export function validateChatGptWidgetApprovalToken(input: {
@@ -109,27 +132,7 @@ export function validateChatGptWidgetApprovalToken(input: {
   sessionScope?: string;
   now?: number;
 }): void {
-  const now = input.now ?? Date.now();
-  prune(now);
-  const key = grantKey(input.requestId);
-  const grant = grants.get(key);
-  if (!grant || grant.expiresAt <= now) {
-    grants.delete(key);
-    throw new DomainError(ErrorCode.PERMISSION_DENIED, "ChatGPT approval widget token is missing or expired", {
-      requestId: input.requestId,
-    });
-  }
-  if (grant.sessionScope && grant.sessionScope !== input.sessionScope) {
-    throw new DomainError(ErrorCode.PERMISSION_DENIED, "ChatGPT approval widget token belongs to another conversation", {
-      requestId: input.requestId,
-    });
-  }
-  const supplied = hashToken(input.token);
-  if (supplied.length !== grant.tokenHash.length || !timingSafeEqual(supplied, grant.tokenHash)) {
-    throw new DomainError(ErrorCode.PERMISSION_DENIED, "Invalid ChatGPT approval widget token", {
-      requestId: input.requestId,
-    });
-  }
+  requireMatchingGrant(input);
 }
 
 export function clearChatGptWidgetApprovalToken(requestId: string): void {

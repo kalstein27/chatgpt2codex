@@ -1,10 +1,11 @@
-export type ExecutionNetworkPolicy = "none" | "fixed-official-download" | "caller-declared-denied" | "tailnet-control" | "openai-codex-service";
+export type ExecutionNetworkPolicy = "none" | "fixed-official-download" | "caller-declared-denied" | "tailnet-control" | "openai-codex-service" | "chatgpt-host-ui";
 export type ExecutionApprovalPolicy =
   | "none"
   | "project-lease"
   | "local-human-operation"
   | "local-human-control"
-  | "external-search-local-approval";
+  | "external-search-local-approval"
+  | "caller-authorized-fixed-action";
 
 export interface ExecutionCapabilityDefinition {
   capabilityId: string;
@@ -332,6 +333,40 @@ const definitions = [
     outputPolicy: "bounded Tailscale CLI stdout/stderr retained only on failure",
   },
   {
+    capabilityId: "chatgpt-host-catalog-refresh",
+    purpose: "Request a fixed C2CT host catalog refresh and bounded tool scan through the locally installed chatgpt-send helper.",
+    platforms: ["darwin"],
+    callSites: ["src/exec/chatgpt-host-catalog-refresh.ts"],
+    binaryPolicy: "first executable chatgpt-send from the fixed sibling, user-local, Homebrew, or /usr/local candidate list",
+    allowedArgvGrammar: "only plugin catalog-refresh C2CT --json or plugin scan-tools C2CT --json",
+    allowedCwdRoot: "none",
+    allowedReadRoots: "ChatGPT host plugin/catalog metadata exposed by the fixed helper only",
+    allowedWriteRoots: "ChatGPT host catalog/UI state only; no project, runtime, app, connector, or tunnel files",
+    networkPolicy: "chatgpt-host-ui",
+    environmentProfile: "minimal HOME/PATH/TMPDIR/locale allowlist",
+    approvalPolicy: "caller-authorized-fixed-action",
+    leasePreset: "direct ChatGPT host confirmation, explicit local Settings click, or the already-consumed exact parent runtime-apply approval",
+    maxRuntimeMs: 20_000,
+    outputPolicy: "bounded helper output is parsed and reduced to generic refresh/scan status fields",
+  },
+  {
+    capabilityId: "chatgpt-recovery-wake",
+    purpose: "Resolve one exact ChatGPT conversation title and send one fixed status-only C2CT recovery wake through chatgpt-send.",
+    platforms: ["darwin"],
+    callSites: ["src/exec/chatgpt-recovery-wake.ts"],
+    binaryPolicy: "first executable chatgpt-send from the fixed sibling, user-local, Homebrew, or /usr/local candidate list",
+    allowedArgvGrammar: "exact-title chat resolve --json followed only by one send to the in-memory resolved server chat id with a fixed C2CT recovery message and exact request id",
+    allowedCwdRoot: "none",
+    allowedReadRoots: "ChatGPT host chat identity metadata exposed by the fixed helper only",
+    allowedWriteRoots: "one ChatGPT conversation message only; raw server chat id is never persisted or returned by C2CT",
+    networkPolicy: "chatgpt-host-ui",
+    environmentProfile: "minimal HOME/PATH/TMPDIR/locale allowlist",
+    approvalPolicy: "caller-authorized-fixed-action",
+    leasePreset: "runtime recovery worker after exact runtime apply reaches healthy APPLIED state",
+    maxRuntimeMs: 40_000,
+    outputPolicy: "bounded helper output is reduced to resolve/send status plus a one-way target digest",
+  },
+  {
     capabilityId: "git-readonly-argv",
     purpose: "Read local Git repository state through argv-only git invocations.",
     platforms: ["darwin", "linux", "win32"],
@@ -364,6 +399,40 @@ const definitions = [
     leasePreset: "full-write plus a pre-authorized scheduled-goal envelope",
     maxRuntimeMs: 24 * 60 * 60 * 1_000,
     outputPolicy: "subprocess stdout/stderr are drained without retention; only private receipts and validated bounded result JSON are retained",
+  },
+  {
+    capabilityId: "local-runtime-bootstrap-stdio",
+    purpose: "Bridge one prepared immutable runtime replacement into the currently managed runtime so its existing local menu-bar approval boundary can authorize the exact apply without depending on a remote ChatGPT lease surviving a turn boundary.",
+    platforms: ["darwin"],
+    callSites: ["src/runtime/local-runtime-bootstrap-runner.ts"],
+    binaryPolicy: "bundled Node executable from the exact current managed runtime only",
+    allowedArgvGrammar: "current runtime dist/cli.js serve --stdio --workspace followed only by the project root recovered from the prepare receipt",
+    allowedCwdRoot: "project root recovered from the prepare receipt",
+    allowedReadRoots: "prepared runtime receipt, exact current managed runtime, immutable target snapshot, and prepared project root",
+    allowedWriteRoots: "no direct writes by the wrapper; nested C2CT project_select/runtime_apply_local retain their own private state and exact runtime-apply approval boundaries",
+    networkPolicy: "none",
+    environmentProfile: "MCP stdio default environment plus fixed C2CT state/runtime/port/multi-project variables",
+    approvalPolicy: "local-human-operation",
+    leasePreset: "nested local full-write serial lease plus exact menu-bar runtime approval; wrapper itself grants no mutation authority",
+    maxRuntimeMs: 30_000,
+    outputPolicy: "structured project-select/runtime-apply status only; no arbitrary child stdout is exposed",
+  },
+  {
+    capabilityId: "local-macos-app-bootstrap-stdio",
+    purpose: "Bridge one verified macOS app replacement into the currently managed runtime so its existing local menu-bar approval boundary can authorize the exact install when the remote ChatGPT approval presenter is unavailable.",
+    platforms: ["darwin"],
+    callSites: ["src/runtime/local-macos-app-bootstrap-runner.ts"],
+    binaryPolicy: "bundled Node executable from the exact active managed runtime only",
+    allowedArgvGrammar: "active runtime dist/cli.js serve --stdio --workspace followed only by the canonical project root supplied to the recovery command",
+    allowedCwdRoot: "canonical selected project root",
+    allowedReadRoots: "active-runtime pointer, exact active managed runtime, verified macOS app build, and selected project root",
+    allowedWriteRoots: "no direct writes by the wrapper; nested C2CT project_select/macos_app_apply_local retain their own private state, fixed /Applications destination, signing checks, rollback, and exact local approval boundary",
+    networkPolicy: "none",
+    environmentProfile: "MCP stdio default environment plus fixed C2CT state/runtime/port/multi-project variables",
+    approvalPolicy: "local-human-operation",
+    leasePreset: "nested local full-write serial lease plus exact menu-bar macOS app approval; wrapper itself grants no mutation authority",
+    maxRuntimeMs: 30_000,
+    outputPolicy: "structured project-select/macos-app-apply status only; no arbitrary child stdout is exposed",
   },
   {
     capabilityId: "runtime-apply-fixed-worker",

@@ -50,10 +50,11 @@ import type { ProjectLaneRecord, SessionDocument } from "../state/store.js";
 import { wasProjectLaneReleased } from "../state/project-lanes.js";
 import {
   inspectProjectPrivilegeLocks,
+  inspectProjectPrivilegeLocksForRegistry,
   retireProjectPrivilegeGeneration,
   type ProjectPrivilegeLockInspection,
 } from "../state/project-privilege-locks.js";
-import { inspectPersistedPrivilegeOwner } from "../state/store.js";
+import { inspectPersistedPrivilegeOwner, inspectPersistedPrivilegeOwners } from "../state/store.js";
 import { codeSearch } from "../code/search.js";
 import { readSlice } from "../code/read-slice.js";
 import { applyPatch, createFile } from "../code/patch.js";
@@ -87,7 +88,7 @@ import {
 import { backgroundOperationManager, type BackgroundOperationState } from "../exec/background-operations.js";
 import { guardShellCommand, runLocalShell } from "../exec/local-shell.js";
 import { inspectExecutionEnvironment } from "../exec/runtime-environment.js";
-import { ensureRgAuthorized, executeRgSearch, getRgCapabilityStatus } from "../exec/rg-capability.js";
+import { ensureRgAuthorized, executeRgSearch, getRgCapabilityStatus, listPendingRgApprovalRequests } from "../exec/rg-capability.js";
 import {
   bindOperationApprovalToChatGptSession,
   ensureOperationAuthorized,
@@ -109,6 +110,11 @@ import {
 } from "../exec/chatgpt-widget-approval.js";
 import { isChatGptWidgetApprovableOperationTool } from "../exec/chatgpt-widget-approval.js";
 import {
+  continueRegisteredChatGptTurnlessOperation,
+  hasChatGptTurnlessContinuation,
+  registerChatGptTurnlessContinuation,
+} from "../exec/chatgpt-turnless-continuation.js";
+import {
   createChatGptConsentProbe,
   getChatGptConsentProbe,
   resolveChatGptConsentProbe,
@@ -124,6 +130,7 @@ import {
   CHATGPT_CONSENT_WIDGET_URI,
   chatGptWidgetSessionId,
   CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL,
+  CHATGPT_OPERATION_APPROVAL_WIDGET_HTML,
   CHATGPT_OPERATION_APPROVAL_WIDGET_VERSION,
   CHATGPT_OPERATION_APPROVAL_WIDGET_RESOURCE_NAME,
   CHATGPT_OPERATION_APPROVAL_WIDGET_URI,
@@ -138,6 +145,13 @@ import {
   summarizeWidgetLabSyntheticSecret,
 } from "./chatgpt-widget-capability-lab.js";
 import {
+  E2E_SCREENSHOT_META_KEY,
+  E2E_SCREENSHOT_WIDGET_HTML,
+  E2E_SCREENSHOT_WIDGET_MIME,
+  E2E_SCREENSHOT_WIDGET_URI,
+  E2E_WIDGET_TOOL_META,
+} from "./e2e-screenshot-widget.js";
+import {
   createChatGptWidgetChoiceCard,
   getChatGptWidgetChoiceResult,
   decodeChatGptWidgetChoiceTransport,
@@ -146,6 +160,7 @@ import {
 } from "../exec/chatgpt-widget-shell.js";
 import { disableMobileApproval, enableMobileApproval, mobileApprovalStatus } from "../exec/mobile-approval.js";
 import { installManagedRipgrep } from "../exec/managed-rg-installer.js";
+import { refreshChatGptHostCatalog } from "../exec/chatgpt-host-catalog-refresh.js";
 import { getScheduledGoalRuntime } from "../exec/scheduled-goal-runtime.js";
 import type { ScheduledGoalRuntime } from "../exec/scheduled-goal-runtime.js";
 import { AgentGoalStore } from "../state/agent-goals.js";
@@ -158,6 +173,7 @@ import {
   listOutputArtifacts,
   OUTPUT_READ_DEFAULT_BYTES,
   OUTPUT_READ_MAX_BYTES,
+  outputArtifactMatchesOwner,
   readOutputArtifact,
   readOutputArtifactAll,
   readOutputMetadata,
@@ -175,11 +191,19 @@ import type {
 import { chatGptConversationDisplayTitleFromMeta } from "../runtime/activity.js";
 import { conversationLabelFromRequestMeta } from "../runtime/activity.js";
 import { getRuntimeManifest } from "../runtime/runtime-manifest.js";
+import { bootstrapSnapshot, noteBootstrapStage, requireBootstrapStage } from "../runtime/post-runtime-bootstrap-integration.js";
 import {
   applyCandidateChatGptWidgetAsset,
   readActiveChatGptWidgetAsset,
 } from "../runtime/chatgpt-widget-assets.js";
+import {
+  recordChatGptWidgetPreapplyRenderProof,
+  stageChatGptWidgetPreapplyRenderCandidate,
+} from "../runtime/chatgpt-widget-preapply.js";
+import { recordChatGptWidgetPreapplyAssetLoad } from "../runtime/chatgpt-widget-preapply.js";
 import { readToolSchemaRecoveryState } from "../runtime/tool-schema-revalidation.js";
+import { recordHostCatalogRebind } from "../runtime/host-catalog-rebind.js";
+import { registerChatGptRecoveryWakeTarget } from "../exec/chatgpt-recovery-wake.js";
 import {
   readExternalWatchdogProbeWindow,
   readExternalWatchdogStatus,
@@ -200,6 +224,7 @@ import {
   readActiveRuntimePointer,
   recordRuntimeApplyWorkerPid,
   runtimeApplyPublicReceipt,
+  startAuthorizedRuntimeApplyWorker,
 } from "../runtime/runtime-apply.js";
 import { reconcileRuntimeApplyApprovalReceipts } from "../runtime/runtime-apply.js";
 import { attachRuntimeApplyApprovalRequest } from "../runtime/runtime-apply.js";
@@ -210,6 +235,7 @@ import {
 } from "../runtime/runtime-update.js";
 import {
   acquireRuntimeUpdateBarrier,
+  assertRuntimeMaintenanceAllowsLeaseAcquisition,
   assertRuntimeUpdateNotDraining,
   getRuntimeUpdateBarrier,
   releaseRuntimeUpdateBarrier,
@@ -219,6 +245,9 @@ import {
   preflightMacosAppApply,
 } from "../runtime/macos-app-apply.js";
 import {
+  getMacosAppApplyReceiptByOperationId,
+  startMacosAppApplyWorkerAfterApproval,
+  bindMacosAppApplyApprovalRequest,
   getLatestMacosAppApplyReceipt,
   getMacosAppApplyReceipt,
   launchMacosAppApplyWorker,
@@ -264,11 +293,12 @@ import {
   isControlEnabled,
   isDesktopControlSupported,
 } from "../control/policy.js";
-import { clearKill, isKilled, listActions } from "../control/queue.js";
+import { clearKill, isKilled, listActions, listPendingActions } from "../control/queue.js";
 import {
   createArmRequest,
   findArmRequestForSession,
   listArmRequests,
+  listPendingArmRequests,
 } from "../control/arm-requests.js";
 import {
   handleComputerActionStatus,
@@ -350,6 +380,219 @@ function remoteProjectIsolation(ctx: ToolContext): boolean {
   return ctx.remote === true && ctx.config.multiProjectLanesEnabled === true;
 }
 
+async function receiptApprovalForCaller(
+  ctx: ToolContext,
+  projectId: string,
+  approvalRequestId?: string,
+): Promise<OperationApprovalRequest | undefined> {
+  const approvalRequest = approvalRequestId
+    ? (await listOperationApprovalRequests(ctx.stateDir))
+        .find((request) => request.requestId === approvalRequestId)
+    : undefined;
+  if (ctx.remote !== true) return approvalRequest;
+
+  const session = await loadSession(ctx);
+  const sessionMatchesProject = session.boundProjectId === projectId;
+  const approvalMatchesSession = !approvalRequest?.chatGptSessionScopeDigest
+    || (Boolean(ctx.sessionScope)
+      && operationApprovalBelongsToChatGptSession(approvalRequest, ctx.sessionScope!));
+  if (!sessionMatchesProject || !approvalMatchesSession) {
+    throw new DomainError(
+      ErrorCode.OPERATION_NOT_FOUND,
+      "Operation receipt not found for this ChatGPT session",
+      { projectId },
+    );
+  }
+  return approvalRequest;
+}
+
+async function autoFinalizeSerialAdminLease(
+  ctx: ToolContext,
+  projectId: string,
+  leaseId: string,
+  reason: string,
+): Promise<boolean> {
+  const session = await loadSession(ctx);
+  const current = session.lease;
+  if (!current || current.leaseId !== leaseId || current.projectId !== projectId || current.preset === "control") {
+    return false;
+  }
+  const entry = await resolveOrThrow(ctx, { projectId });
+  if (remoteProjectIsolation(ctx) && current.preset !== "read-only") {
+    await releaseProjectPrivilege({
+      stateDir: ctx.stateDir,
+      project: entry,
+      ownerScope: ctx.sessionScope,
+      leaseId: current.leaseId,
+      kind: "serial",
+    });
+  }
+  await saveSession(ctx, {
+    ...session,
+    activeProjectId: projectId,
+    mode: "read",
+    lease: null,
+  });
+  await ctx.ledger.append({
+    type: "project.lease.auto-finalized",
+    projectId,
+    leaseId: current.leaseId,
+    preset: current.preset,
+    reason,
+  }).catch(() => undefined);
+  return true;
+}
+
+async function autoFinalizeOwnedWorkLaneByLease(
+  ctx: ToolContext,
+  entry: ProjectRegistryEntry,
+  leaseId: string,
+  reason: string,
+): Promise<boolean> {
+  const released = await updateSessionTransaction(ctx, async (session) => {
+    const result = await releaseOwnedProjectLane({
+      session,
+      project: entry,
+      ownerScope: backgroundOwnerScope(ctx),
+      includeReadOnly: true,
+    });
+    if (!result) return { session, value: undefined };
+    if (result.releasedLease.leaseId !== leaseId) {
+      return { session, value: undefined };
+    }
+    if (remoteProjectIsolation(ctx) && result.releasedLease.preset !== "read-only") {
+      await releaseProjectPrivilege({
+        stateDir: ctx.stateDir,
+        project: entry,
+        ownerScope: ctx.sessionScope,
+        leaseId: result.releasedLease.leaseId,
+        kind: "lane",
+      });
+    }
+    return { session: result.session, value: result.releasedLease };
+  });
+  if (!released) return false;
+  await ctx.ledger.append({
+    type: "project.lane.auto-finalized-for-turnless-continuation",
+    projectId: entry.projectId,
+    leaseId: released.leaseId,
+    preset: released.preset,
+    reason,
+  }).catch(() => undefined);
+  return true;
+}
+
+type BackgroundExecute = Parameters<ReturnType<typeof backgroundOperationManager>["start"]>[0]["execute"];
+
+async function startTurnlessApprovedBackgroundOperation(input: {
+  ctx: ToolContext;
+  entry: ProjectRegistryEntry;
+  lease: Lease;
+  approvalRequestId: string;
+  commandId: string;
+  operationFingerprint: string;
+  execute: BackgroundExecute;
+}): Promise<Awaited<ReturnType<ReturnType<typeof backgroundOperationManager>["start"]>>> {
+  const { ctx, entry, lease } = input;
+  await assertRuntimeUpdateNotDraining(ctx.stateDir);
+  await autoFinalizeOwnedWorkLaneByLease(
+    ctx,
+    entry,
+    lease.leaseId,
+    `turnless-${input.commandId}-continuation`,
+  );
+  await claimProjectPrivilege({
+    stateDir: ctx.stateDir,
+    project: entry,
+    registry: await currentRegistry(ctx),
+    ownerScope: ctx.sessionScope,
+    lease,
+    kind: "lane",
+  });
+  let privilegeReleased = false;
+  const releaseContinuationPrivilege = async (): Promise<void> => {
+    if (privilegeReleased) return;
+    privilegeReleased = true;
+    await releaseProjectPrivilege({
+      stateDir: ctx.stateDir,
+      project: entry,
+      ownerScope: ctx.sessionScope,
+      leaseId: lease.leaseId,
+      kind: "lane",
+    }).catch(() => undefined);
+  };
+  try {
+    const snapshot = await backgroundOperationManager(ctx.stateDir).start({
+      ownerScope: backgroundOwnerScope(ctx),
+      projectId: entry.projectId,
+      projectRoot: entry.root,
+      leaseId: lease.leaseId,
+      leasePreset: lease.preset,
+      commandId: input.commandId,
+      operationFingerprint: input.operationFingerprint,
+      approvalRequestId: input.approvalRequestId,
+      execute: async (...args) => {
+        try {
+          return await input.execute(...args);
+        } finally {
+          await releaseContinuationPrivilege();
+        }
+      },
+    });
+    return snapshot;
+  } catch (error) {
+    await releaseContinuationPrivilege();
+    throw error;
+  }
+}
+
+async function autoFinalizeOwnedWorkLaneForSerialAdmin(
+  ctx: ToolContext,
+  entry: ProjectRegistryEntry,
+  now = Date.now(),
+): Promise<Lease | undefined> {
+  const activity = await privilegedOperationActivity(ctx, now, ["project_select"]);
+  if (activity.unknownProjectActive || activity.projectIds.has(entry.projectId)) {
+    throw new DomainError(
+      ErrorCode.ACTIVE_OPERATION_IN_PROGRESS,
+      "Cannot transition an owned work lane to serial admin while project work is still active",
+      {
+        projectId: entry.projectId,
+        recommendedAction: "wait-for-active-operation-to-finish",
+      },
+    );
+  }
+  const released = await updateSessionTransaction(ctx, async (session) => {
+    const result = await releaseOwnedProjectLane({
+      session,
+      project: entry,
+      ownerScope: backgroundOwnerScope(ctx),
+      now,
+    });
+    if (!result) return { session, value: undefined };
+    if (remoteProjectIsolation(ctx) && result.releasedLease.preset !== "read-only") {
+      await releaseProjectPrivilege({
+        stateDir: ctx.stateDir,
+        project: entry,
+        ownerScope: ctx.sessionScope,
+        leaseId: result.releasedLease.leaseId,
+        kind: "lane",
+      });
+    }
+    return { session: result.session, value: result.releasedLease };
+  });
+  if (released) {
+    await ctx.ledger.append({
+      type: "project.lane.auto-finalized-for-serial-admin",
+      projectId: entry.projectId,
+      leaseId: released.leaseId,
+      preset: released.preset,
+      reason: "serial-admin-transition",
+    }).catch(() => undefined);
+  }
+  return released;
+}
+
 function projectAuthorizationPlan(multiProjectLanesEnabled: boolean): Record<string, unknown> {
   return {
     multiProjectLanesEnabled,
@@ -422,8 +665,9 @@ async function describeProjectPrivilegeBlocker(
   lock: ProjectPrivilegeLockInspection,
   activity: { projectIds: Set<string>; unknownProjectActive: boolean },
   now: number,
+  persistedOwner?: Awaited<ReturnType<typeof inspectPersistedPrivilegeOwner>>,
 ): Promise<PrivilegedProjectBlockerDiagnosis> {
-  const persisted = await inspectPersistedPrivilegeOwner({
+  const persisted = persistedOwner ?? await inspectPersistedPrivilegeOwner({
     stateDir: ctx.stateDir,
     projectId: lock.projectId,
     leaseId: lock.leaseId,
@@ -436,6 +680,32 @@ async function describeProjectPrivilegeBlocker(
     excludeTools: ["connection_status", "project_lane_open", "project_lane_recover"],
     now,
   }) ?? { present: false, active: false, recent: false };
+  const serialScopeActivity = ctx.activity?.tracker.capabilityScopeActivity({
+    matchesScope: (scope) => projectPrivilegeOwnerDigest(scope) === lock.ownerScopeDigest,
+    excludeTools: ["connection_status", "project_lane_open", "project_lane_recover"],
+    recentWithinMs: 2 * 60 * 1000,
+    now,
+  }) ?? { present: false, active: false, recent: false };
+  let serialApprovalAttention = false;
+  if (lock.kind === "serial" && lock.preset !== "control") {
+    try {
+      const approvals = await listOperationApprovalRequests(ctx.stateDir, now);
+      serialApprovalAttention = approvals.some((request) =>
+        request.projectId === lock.projectId
+        && request.leaseId === lock.leaseId
+        && (
+          request.status === "pending"
+          || (
+            request.status === "approved"
+            && (request.resolvedAt === undefined || now - request.resolvedAt <= 2 * 60 * 1000)
+          )
+        ),
+      );
+    } catch {
+      // Approval-state read failure must never make a live serial owner look abandoned.
+      serialApprovalAttention = true;
+    }
+  }
   const activeOperation = activity.unknownProjectActive
     || activity.projectIds.has(lock.projectId)
     || scopeActivity.active;
@@ -481,6 +751,29 @@ async function describeProjectPrivilegeBlocker(
   }
 
   if (lock.kind === "serial") {
+    const protectedSerialOwner = lock.preset === "control" || ownerRelation === "current";
+    const foreignSerialLive = ctx.activity === undefined
+      || activeOperation
+      || serialScopeActivity.active
+      || serialScopeActivity.recent
+      || serialApprovalAttention;
+    if (!protectedSerialOwner && !foreignSerialLive) {
+      return {
+        projectId: lock.projectId,
+        canonicalRoot: lock.canonicalRoot,
+        blockerKind: "stale-orphan-root-lock",
+        generation: lock.generation,
+        preset: lock.preset,
+        relation: lock.relation,
+        ownerRelation,
+        ownerState: "abandoned",
+        expiresAt: lock.expiresAt,
+        expiresInSec: Math.max(0, Math.ceil((lock.expiresAt - now) / 1_000)),
+        recoverEligible: true,
+        recoveryReason: ErrorCode.STALE_ROOT_LOCK_RECOVERABLE,
+        recommendedAction: "project_lane_open",
+      };
+    }
     return {
       projectId: lock.projectId,
       canonicalRoot: lock.canonicalRoot,
@@ -547,20 +840,35 @@ async function inspectPrivilegedProjectBlockers(
   ]);
   const seen = new Set<string>();
   const blockers: PrivilegedProjectBlockerDiagnosis[] = [];
+  const inspections = await inspectProjectPrivilegeLocksForRegistry({
+    stateDir: ctx.stateDir,
+    registry,
+    requesterScope: ctx.sessionScope,
+    now,
+  });
+  const locksToDescribe: ProjectPrivilegeLockInspection[] = [];
   for (const project of registry) {
-    const locks = await inspectProjectPrivilegeLocks({
-      stateDir: ctx.stateDir,
-      project,
-      registry,
-      requesterScope: ctx.sessionScope,
-      now,
-    });
+    const locks = inspections.get(project.projectId) ?? [];
     for (const lock of locks) {
       if (seen.has(lock.generation)) continue;
       seen.add(lock.generation);
-      blockers.push(await describeProjectPrivilegeBlocker(ctx, lock, activity, now));
-      if (blockers.length >= 16) return blockers;
+      locksToDescribe.push(lock);
+      if (locksToDescribe.length >= 16) break;
     }
+    if (locksToDescribe.length >= 16) break;
+  }
+  const persistedOwners = await inspectPersistedPrivilegeOwners({
+    stateDir: ctx.stateDir,
+    lookups: locksToDescribe.map((lock) => ({
+      projectId: lock.projectId,
+      leaseId: lock.leaseId,
+      preset: lock.preset,
+      kind: lock.kind,
+    })),
+    now,
+  });
+  for (let index = 0; index < locksToDescribe.length; index += 1) {
+    blockers.push(await describeProjectPrivilegeBlocker(ctx, locksToDescribe[index]!, activity, now, persistedOwners[index]));
   }
   return blockers;
 }
@@ -602,12 +910,22 @@ async function selfHealStalePrivilegeBeforeLaneOpen(
       requesterScope: ctx.sessionScope,
       expectedGeneration: lock.generation,
     });
+    let persistedSerialLeaseCleared = false;
+    if (lock.kind === "serial" && ctx.store.clearSerialLeaseByIdentity) {
+      const cleanup = await ctx.store.clearSerialLeaseByIdentity({
+        projectId: lock.projectId,
+        leaseId: lock.leaseId,
+        preset: lock.preset,
+      }).catch(() => null);
+      persistedSerialLeaseCleared = cleanup?.cleared === true;
+    }
     await ctx.ledger.append({
       type: "project.root-lock.self-healed",
       projectId: lock.projectId,
       preset: lock.preset,
       kind: lock.kind,
       generation: lock.generation,
+      ...(lock.kind === "serial" ? { persistedSerialLeaseCleared } : {}),
     });
   }
 }
@@ -670,6 +988,7 @@ async function runtimeApplyGateSnapshot(
   ctx: ToolContext,
   _entry: ProjectRegistryEntry,
   ownApprovalRequestId?: string,
+  extraExcludedTools: readonly string[] = [],
 ): Promise<{ activeOperationCount: number; unrelatedPendingApprovalCount: number }> {
   const foreground = ctx.activity?.tracker.activeOperations({
     excludeTools: [
@@ -680,6 +999,7 @@ async function runtimeApplyGateSnapshot(
       "runtime_snapshot_status",
       "runtime_snapshot_prune_local",
       "connection_status",
+      ...extraExcludedTools,
     ],
     now: Date.now(),
   }) ?? [];
@@ -690,6 +1010,641 @@ async function runtimeApplyGateSnapshot(
     activeOperationCount: foreground.length + background.length,
     unrelatedPendingApprovalCount: pending.length,
   };
+}
+
+function runtimeApprovalSupportsTurnlessContinuation(request: OperationApprovalRequest): boolean {
+  return hasChatGptTurnlessContinuation({ requestId: request.requestId, tool: request.tool })
+    || (request.approvalSurface === "chatgpt-widget-critical"
+      && request.leasePreset === "full-write"
+      && typeof request.originOperationId === "string"
+      && (
+        (request.tool === "runtime_apply_local" && /^rt_[0-9a-f-]{36}$/u.test(request.originOperationId))
+        || (request.tool === "macos_app_apply_local" && /^app_[0-9a-f-]{36}$/u.test(request.originOperationId))
+      ));
+}
+
+async function continueApprovedRuntimeApplyFromWidget(
+  ctx: ToolContext,
+  request: OperationApprovalRequest,
+): Promise<Record<string, unknown>> {
+  const registeredContinuation = await continueRegisteredChatGptTurnlessOperation({
+    requestId: request.requestId,
+    tool: request.tool,
+    sessionScope: ctx.sessionScope,
+  });
+  if (registeredContinuation) return registeredContinuation;
+
+  if (request.tool === "macos_app_apply_local") {
+    return continueTurnlessMacosAppApply(ctx, request);
+  }
+
+  const fallback = (reason: string, extra: Record<string, unknown> = {}): Record<string, unknown> => {
+    void ctx.diagnostics?.record({
+      event: "approval.turnless_callback_fallback",
+      outcome: "failure",
+      tool: "runtime_apply_local",
+      phase: "approval",
+      operationId: request.originOperationId,
+      errorCode: reason,
+    }).catch(() => undefined);
+    return {
+      turnlessContinuation: true,
+      continuationStarted: false,
+      fallbackRequiresExactReplay: false,
+      actionStarted: false,
+      subprocessStarted: false,
+      continuationReason: reason,
+      ...extra,
+    };
+  };
+
+  void ctx.diagnostics?.record({
+    event: "approval.turnless_callback_received",
+    outcome: "info",
+    tool: "runtime_apply_local",
+    phase: "approval",
+    operationId: request.originOperationId,
+  }).catch(() => undefined);
+
+  if (!ctx.remote || !ctx.sessionScope || !runtimeApprovalSupportsTurnlessContinuation(request)) {
+    return fallback("turnless-continuation-not-eligible");
+  }
+  if (request.status !== "approved" || request.approvedVia !== "chatgpt-widget-critical") {
+    return fallback("approval-not-ready", { approvalStatus: request.status });
+  }
+
+  const receipt = await getRuntimeApplyReceipt(ctx.stateDir, { operationId: request.originOperationId });
+  if (!receipt
+      || receipt.projectId !== request.projectId
+      || receipt.approvalRequestId !== request.requestId
+      || receipt.state !== "APPROVAL_REQUIRED") {
+    return fallback("runtime-receipt-not-awaiting-this-approval", {
+      approvalStatus: request.status,
+      runtimeState: receipt?.state ?? "missing",
+    });
+  }
+  const boundApproval = await receiptApprovalForCaller(ctx, receipt.projectId, request.requestId);
+  if (!boundApproval || boundApproval.requestId !== request.requestId) {
+    return fallback("approval-session-binding-mismatch");
+  }
+  const registry = await currentRegistry(ctx);
+  const entry = registry.find((candidate) => candidate.projectId === receipt.projectId);
+  if (!entry || entry.root !== request.projectRoot) {
+    return fallback("project-binding-mismatch");
+  }
+
+  const now = Date.now();
+  let session = await loadSession(ctx);
+  const originatingSessionLease = session.lease && session.lease.expiresAt > now ? session.lease : null;
+  if (originatingSessionLease
+      && originatingSessionLease.leaseId === request.leaseId
+      && originatingSessionLease.projectId === request.projectId
+      && originatingSessionLease.preset === "full-write") {
+    await autoFinalizeSerialAdminLease(ctx, request.projectId, request.leaseId, "turnless-runtime-approval-handoff").catch(() => false);
+    session = await loadSession(ctx);
+  }
+  const activeSessionLease = session.lease && session.lease.expiresAt > now ? session.lease : null;
+  const activeSessionLanes = (session.lanes ?? []).filter((lane) => lane.expiresAt > now);
+  if (activeSessionLease || activeSessionLanes.length > 0) {
+    return fallback("another-session-capability-is-active");
+  }
+  if (request.leaseExpiresAt <= now) {
+    return {
+      ...fallback("original-approval-capability-expired"),
+      fallbackRequiresExactReplay: false,
+    };
+  }
+
+  const preGate = await runtimeApplyGateSnapshot(
+    ctx,
+    entry,
+    request.requestId,
+    ["chatgpt_operation_approval_decide"],
+  );
+  if (preGate.unrelatedPendingApprovalCount > 0) {
+    return fallback("another-approval-is-active");
+  }
+  const preDrainRequired = preGate.activeOperationCount > 0;
+  const activeLocks = (await inspectProjectPrivilegeLocks({
+    stateDir: ctx.stateDir,
+    project: entry,
+    registry,
+    requesterScope: ctx.sessionScope,
+    now,
+  })).filter((lock) => !lock.expired);
+  if (activeLocks.length > 0) {
+    return fallback("another-project-capability-is-active");
+  }
+
+  const continuationLease = makeLease(
+    entry,
+    "full-write",
+    Math.min(2 * 60_000, request.leaseExpiresAt - now),
+    now,
+  );
+  let privilegeClaimed = false;
+  let barrierAcquired = false;
+  let barrierHandedToWorker = false;
+  try {
+    await claimProjectPrivilege({
+      stateDir: ctx.stateDir,
+      project: entry,
+      registry,
+      ownerScope: ctx.sessionScope,
+      lease: continuationLease,
+      kind: "serial",
+      now,
+    });
+    privilegeClaimed = true;
+
+    const claimGate = await runtimeApplyGateSnapshot(
+      ctx,
+      entry,
+      request.requestId,
+      ["chatgpt_operation_approval_decide"],
+    );
+    if (claimGate.unrelatedPendingApprovalCount > 0) {
+      return fallback("approval-became-active-before-runtime-drain");
+    }
+    const claimDrainRequired = claimGate.activeOperationCount > 0;
+
+    await acquireRuntimeUpdateBarrier({
+      stateDir: ctx.stateDir,
+      operationId: receipt.operationId,
+      projectId: entry.projectId,
+      kind: "runtime-apply",
+    });
+    barrierAcquired = true;
+    const drainGate = await runtimeApplyGateSnapshot(
+      ctx,
+      entry,
+      request.requestId,
+      ["chatgpt_operation_approval_decide"],
+    );
+    if (drainGate.unrelatedPendingApprovalCount > 0) {
+      await releaseRuntimeUpdateBarrier(ctx.stateDir, receipt.operationId);
+      barrierAcquired = false;
+      return fallback("approval-became-active-during-runtime-drain");
+    }
+    const drainRequired = preDrainRequired || claimDrainRequired || drainGate.activeOperationCount > 0;
+
+
+    const approvalOperation = {
+      requestId: receipt.requestId,
+      operationId: receipt.operationId,
+      expectedCurrentFingerprint: receipt.expectedCurrentFingerprint,
+      targetFingerprint: receipt.targetFingerprint,
+      preserveConnector: true,
+      postApplyHostCatalogRefresh: "when-schema-or-ui-changes",
+    };
+    const authorization = await ensureOperationAuthorized({
+      stateDir: ctx.stateDir,
+      lease: continuationLease,
+      tool: "runtime_apply_local",
+      risk: "destructive",
+      operation: approvalOperation,
+      preview: `CRITICAL: continue exact approved runtime apply ${receipt.operationId}`,
+      originOperationId: receipt.operationId,
+      approvalSurface: "chatgpt-widget-critical",
+      resumeRequestId: request.requestId,
+      resumeSessionScope: ctx.sessionScope,
+      requiredApprovalVia: "chatgpt-widget-critical",
+    });
+    await ctx.ledger.append({
+      type: "runtime.apply.approval",
+      provider: "chatgpt-widget-critical",
+      surface: "chatgpt-widget-critical",
+      operationId: receipt.operationId,
+      projectId: entry.projectId,
+      continuation: "widget-turnless",
+    }).catch(() => undefined);
+
+    const startContinuationWorker = async (): Promise<Record<string, unknown>> => {
+    await ctx.diagnostics?.record({
+      event: "runtime.apply_worker_launch_requested",
+      outcome: "info",
+      tool: "runtime_apply_local",
+      phase: "spawn",
+      operationId: receipt.operationId,
+    }).catch(() => undefined);
+    await ctx.ledger.append({
+      type: "runtime.apply.turnless-continuation",
+      outcome: "starting",
+      projectId: entry.projectId,
+      operationId: receipt.operationId,
+      requestId: receipt.requestId,
+      approvalRequestId: request.requestId,
+    }).catch(() => undefined);
+    const started = await startAuthorizedRuntimeApplyWorker(ctx.stateDir, receipt.operationId);
+    if (!started.workerStarted) {
+      await ctx.diagnostics?.record({
+        event: "runtime.apply_worker_launch_failed",
+        outcome: "failure",
+        tool: "runtime_apply_local",
+        phase: "spawn",
+        operationId: receipt.operationId,
+        errorCode: "WORKER_NOT_STARTED",
+      }).catch(() => undefined);
+      await releaseRuntimeUpdateBarrier(ctx.stateDir, receipt.operationId).catch(() => false);
+      barrierAcquired = false;
+      return {
+        turnlessContinuation: true,
+        continuationStarted: false,
+        fallbackRequiresExactReplay: false,
+        approvalStatus: "consumed",
+        authorizationRequestId: authorization.requestId,
+        ...runtimeApplyPublicReceipt(started.receipt),
+        actionStarted: false,
+        subprocessStarted: false,
+        sideEffects: "runtime-worker-start-failed",
+      };
+    }
+    barrierHandedToWorker = true;
+    await ctx.diagnostics?.record({
+      event: "runtime.apply_worker_launch_started",
+      outcome: "success",
+      tool: "runtime_apply_local",
+      phase: "running",
+      operationId: receipt.operationId,
+    }).catch(() => undefined);
+    await ctx.ledger.append({
+      type: "runtime.apply.requested",
+      projectId: entry.projectId,
+      operationId: started.receipt.operationId,
+      requestId: started.receipt.requestId,
+      expectedCurrentFingerprint: started.receipt.expectedCurrentFingerprint,
+      targetFingerprint: started.receipt.targetFingerprint,
+      continuation: "widget-turnless",
+    });
+    return {
+      turnlessContinuation: true,
+      continuationStarted: true,
+      fallbackRequiresExactReplay: false,
+      approvalStatus: "consumed",
+      authorizationRequestId: authorization.requestId,
+      ...runtimeApplyPublicReceipt(started.receipt),
+      actionStarted: true,
+      subprocessStarted: true,
+      sideEffects: "runtime-worker-started",
+    };
+    };
+    if (drainRequired) {
+      const drainDeadline = Math.min(request.leaseExpiresAt, Date.now() + 2 * 60_000);
+      void (async () => {
+        try {
+          while (Date.now() < drainDeadline) {
+            const pendingGate = await runtimeApplyGateSnapshot(
+              ctx,
+              entry,
+              request.requestId,
+              ["chatgpt_operation_approval_decide"],
+            );
+            if (pendingGate.activeOperationCount === 0 && pendingGate.unrelatedPendingApprovalCount === 0) {
+              await startContinuationWorker();
+              return;
+            }
+            await new Promise<void>((resolve) => setTimeout(resolve, 500));
+          }
+          if (!barrierHandedToWorker) {
+            await releaseRuntimeUpdateBarrier(ctx.stateDir, receipt.operationId).catch(() => false);
+            barrierAcquired = false;
+            await markRuntimeApplyBlocked(
+              ctx.stateDir,
+              receipt.operationId,
+              "start-new-runtime-apply-request-after-active-operations-complete",
+            ).catch(() => undefined);
+          }
+          await ctx.ledger.append({
+            type: "runtime.apply.turnless-continuation",
+            outcome: "drain-timeout",
+            projectId: entry.projectId,
+            operationId: receipt.operationId,
+            requestId: receipt.requestId,
+          }).catch(() => undefined);
+        } catch (error) {
+          if (!barrierHandedToWorker) {
+            await releaseRuntimeUpdateBarrier(ctx.stateDir, receipt.operationId).catch(() => false);
+            barrierAcquired = false;
+            await markRuntimeApplyBlocked(
+              ctx.stateDir,
+              receipt.operationId,
+              "inspect-turnless-runtime-drain-failure",
+            ).catch(() => undefined);
+          }
+          await ctx.ledger.append({
+            type: "runtime.apply.turnless-continuation",
+            outcome: "drain-error",
+            projectId: entry.projectId,
+            operationId: receipt.operationId,
+            requestId: receipt.requestId,
+            errorCode: error instanceof DomainError ? error.code : "UNEXPECTED_ERROR",
+          }).catch(() => undefined);
+        }
+      })();
+      return {
+        turnlessContinuation: true,
+        continuationStarted: true,
+        continuationDeferred: true,
+        fallbackRequiresExactReplay: false,
+        approvalStatus: "consumed",
+        authorizationRequestId: authorization.requestId,
+        ...runtimeApplyPublicReceipt(receipt),
+        actionStarted: false,
+        subprocessStarted: false,
+        sideEffects: "runtime-drain-wait-started",
+        pollAfterMs: 1_000,
+      };
+    }
+    return startContinuationWorker();
+  } catch (error) {
+    await ctx.diagnostics?.record({
+      event: "approval.turnless_callback_failed",
+      outcome: "failure",
+      tool: "runtime_apply_local",
+      phase: "approval",
+      operationId: receipt.operationId,
+      errorCode: error instanceof DomainError ? error.code : "UNEXPECTED_ERROR",
+    }).catch(() => undefined);
+    if (barrierAcquired && !barrierHandedToWorker) {
+      await releaseRuntimeUpdateBarrier(ctx.stateDir, receipt.operationId).catch(() => false);
+      barrierAcquired = false;
+    }
+    const [approvalAfter, receiptAfter] = await Promise.all([
+      listOperationApprovalRequests(ctx.stateDir)
+        .then((requests) => requests.find((candidate) => candidate.requestId === request.requestId)),
+      getRuntimeApplyReceipt(ctx.stateDir, { operationId: receipt.operationId }),
+    ]);
+    return {
+      turnlessContinuation: true,
+      continuationStarted: false,
+      fallbackRequiresExactReplay: false,
+      approvalStatus: approvalAfter?.status ?? "missing",
+      runtimeState: receiptAfter?.state ?? "missing",
+      actionStarted: receiptAfter?.state === "ACTIVATION_REQUESTED",
+      subprocessStarted: Boolean(receiptAfter?.workerPid),
+      continuationErrorCode: error instanceof DomainError ? error.code : "UNEXPECTED_ERROR",
+      sideEffects: "inspect-runtime-apply-status",
+    };
+  } finally {
+    if (privilegeClaimed) {
+      await releaseProjectPrivilege({
+        stateDir: ctx.stateDir,
+        project: entry,
+        ownerScope: ctx.sessionScope,
+        leaseId: continuationLease.leaseId,
+        kind: "serial",
+      }).catch(() => undefined);
+    }
+  }
+}
+
+async function continueTurnlessMacosAppApply(
+  ctx: ToolContext,
+  request: OperationApprovalRequest,
+): Promise<Record<string, unknown>> {
+  const fallback = (reason: string, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+    turnlessContinuation: true,
+    continuationStarted: false,
+    fallbackRequiresExactReplay: true,
+    actionStarted: false,
+    subprocessStarted: false,
+    continuationReason: reason,
+    ...extra,
+  });
+
+  if (!ctx.remote || !ctx.sessionScope || request.tool !== "macos_app_apply_local" ||
+      request.approvalSurface !== "chatgpt-widget-critical" ||
+      request.leasePreset !== "full-write" ||
+      typeof request.originOperationId !== "string" ||
+      !/^app_[0-9a-f-]{36}$/u.test(request.originOperationId)) {
+    return fallback("turnless-continuation-not-eligible");
+  }
+  if (request.status !== "approved" || request.approvedVia !== "chatgpt-widget-critical") {
+    return fallback("approval-not-ready", { approvalStatus: request.status });
+  }
+
+  const receipt = await getMacosAppApplyReceiptByOperationId(ctx.stateDir, request.originOperationId);
+  if (!receipt
+      || receipt.projectId !== request.projectId
+      || receipt.approvalRequestId !== request.requestId
+      || receipt.state !== "APPROVAL_REQUIRED") {
+    return fallback("macos-app-receipt-not-awaiting-this-approval", {
+      approvalStatus: request.status,
+      macosAppState: receipt?.state ?? "missing",
+    });
+  }
+  const boundApproval = await receiptApprovalForCaller(ctx, receipt.projectId, request.requestId);
+  if (!boundApproval || boundApproval.requestId !== request.requestId) {
+    return fallback("approval-session-binding-mismatch");
+  }
+  const registry = await currentRegistry(ctx);
+  const entry = registry.find((candidate) => candidate.projectId === receipt.projectId);
+  if (!entry || entry.root !== request.projectRoot) {
+    return fallback("project-binding-mismatch");
+  }
+
+  const now = Date.now();
+  let session = await loadSession(ctx);
+  const originatingSessionLease = session.lease && session.lease.expiresAt > now ? session.lease : null;
+  if (originatingSessionLease
+      && originatingSessionLease.leaseId === request.leaseId
+      && originatingSessionLease.projectId === request.projectId
+      && originatingSessionLease.preset === "full-write") {
+    await autoFinalizeSerialAdminLease(ctx, request.projectId, request.leaseId, "turnless-macos-app-approval-handoff").catch(() => false);
+    session = await loadSession(ctx);
+  }
+  const activeSessionLease = session.lease && session.lease.expiresAt > now ? session.lease : null;
+  const activeSessionLanes = (session.lanes ?? []).filter((lane) => lane.expiresAt > now);
+  if (activeSessionLease || activeSessionLanes.length > 0) {
+    return fallback("another-session-capability-is-active");
+  }
+  if (request.leaseExpiresAt <= now) {
+    return {
+      ...fallback("original-approval-capability-expired"),
+      fallbackRequiresExactReplay: false,
+    };
+  }
+
+  const preGate = await runtimeApplyGateSnapshot(
+    ctx,
+    entry,
+    request.requestId,
+    ["chatgpt_operation_approval_decide"],
+  );
+  if (preGate.activeOperationCount > 0 || preGate.unrelatedPendingApprovalCount > 0) {
+    return fallback("another-operation-or-approval-is-active");
+  }
+  const activeLocks = (await inspectProjectPrivilegeLocks({
+    stateDir: ctx.stateDir,
+    project: entry,
+    registry,
+    requesterScope: ctx.sessionScope,
+    now,
+  })).filter((lock) => !lock.expired);
+  if (activeLocks.length > 0) {
+    return fallback("another-project-capability-is-active");
+  }
+
+  const continuationLease = makeLease(
+    entry,
+    "full-write",
+    Math.min(2 * 60_000, request.leaseExpiresAt - now),
+    now,
+  );
+  const barrierOperationId = `app_${receipt.requestId}`;
+  let privilegeClaimed = false;
+  let barrierAcquired = false;
+  let barrierHandedToWorker = false;
+  try {
+    await claimProjectPrivilege({
+      stateDir: ctx.stateDir,
+      project: entry,
+      registry,
+      ownerScope: ctx.sessionScope,
+      lease: continuationLease,
+      kind: "serial",
+      now,
+    });
+    privilegeClaimed = true;
+
+    const claimGate = await runtimeApplyGateSnapshot(
+      ctx,
+      entry,
+      request.requestId,
+      ["chatgpt_operation_approval_decide"],
+    );
+    if (claimGate.activeOperationCount > 0 || claimGate.unrelatedPendingApprovalCount > 0) {
+      return fallback("operation-became-active-before-macos-app-drain");
+    }
+
+    await acquireRuntimeUpdateBarrier({
+      stateDir: ctx.stateDir,
+      operationId: barrierOperationId,
+      projectId: entry.projectId,
+      kind: "macos-app-apply",
+    });
+    barrierAcquired = true;
+    const drainGate = await runtimeApplyGateSnapshot(
+      ctx,
+      entry,
+      request.requestId,
+      ["chatgpt_operation_approval_decide"],
+    );
+    if (drainGate.activeOperationCount > 0 || drainGate.unrelatedPendingApprovalCount > 0) {
+      await releaseRuntimeUpdateBarrier(ctx.stateDir, barrierOperationId);
+      barrierAcquired = false;
+      return fallback("operation-became-active-during-macos-app-drain");
+    }
+
+    const approvalOperation = {
+      requestId: receipt.requestId,
+      installedPath: MACOS_APP_INSTALL_PATH,
+      bundleId: receipt.source.bundleId,
+      teamIdentifier: receipt.source.teamIdentifier,
+      mainExecutableSha256: receipt.source.mainExecutableSha256,
+      designatedRequirementSha256: receipt.source.designatedRequirementSha256,
+    };
+    const authorization = await ensureOperationAuthorized({
+      stateDir: ctx.stateDir,
+      lease: continuationLease,
+      tool: "macos_app_apply_local",
+      risk: "destructive",
+      operation: approvalOperation,
+      preview: `CRITICAL: continue exact approved macOS app apply ${receipt.operationId}`,
+      originOperationId: receipt.operationId,
+      approvalSurface: "chatgpt-widget-critical",
+      resumeRequestId: request.requestId,
+      resumeSessionScope: ctx.sessionScope,
+      requiredApprovalVia: "chatgpt-widget-critical",
+    });
+    await ctx.ledger.append({
+      type: "macos.app.apply.approval",
+      provider: "chatgpt-widget-critical",
+      surface: "chatgpt-widget-critical",
+      operationId: receipt.operationId,
+      projectId: entry.projectId,
+      continuation: "widget-turnless",
+    }).catch(() => undefined);
+    await ctx.ledger.append({
+      type: "macos.app.apply.turnless-continuation",
+      outcome: "starting",
+      projectId: entry.projectId,
+      operationId: receipt.operationId,
+      requestId: receipt.requestId,
+      approvalRequestId: request.requestId,
+    }).catch(() => undefined);
+
+    const started = await startMacosAppApplyWorkerAfterApproval(ctx.stateDir, receipt.requestId);
+    if (!started.workerStarted) {
+      await releaseRuntimeUpdateBarrier(ctx.stateDir, barrierOperationId).catch(() => false);
+      barrierAcquired = false;
+      return {
+        turnlessContinuation: true,
+        continuationStarted: false,
+        fallbackRequiresExactReplay: false,
+        approvalStatus: "consumed",
+        authorizationRequestId: authorization.requestId,
+        ...macosAppApplyPublicReceipt(started.receipt),
+        actionStarted: false,
+        subprocessStarted: false,
+        sideEffects: "macos-app-worker-start-failed",
+      };
+    }
+    barrierHandedToWorker = true;
+    await ctx.ledger.append({
+      type: "macos.app.apply.requested",
+      projectId: entry.projectId,
+      requestId: started.receipt.requestId,
+      operationId: started.receipt.operationId,
+      bundleId: started.receipt.source.bundleId,
+      teamIdentifier: started.receipt.source.teamIdentifier,
+      mainExecutableSha256: started.receipt.source.mainExecutableSha256,
+      continuation: "widget-turnless",
+    });
+    return {
+      turnlessContinuation: true,
+      continuationStarted: true,
+      fallbackRequiresExactReplay: false,
+      approvalStatus: "consumed",
+      authorizationRequestId: authorization.requestId,
+      ...macosAppApplyPublicReceipt(started.receipt),
+      actionStarted: true,
+      subprocessStarted: true,
+      sideEffects: "macos-app-worker-started",
+    };
+  } catch (error) {
+    if (barrierAcquired && !barrierHandedToWorker) {
+      await releaseRuntimeUpdateBarrier(ctx.stateDir, barrierOperationId).catch(() => false);
+      barrierAcquired = false;
+    }
+    const [approvalAfter, receiptAfter] = await Promise.all([
+      listOperationApprovalRequests(ctx.stateDir)
+        .then((requests) => requests.find((candidate) => candidate.requestId === request.requestId)),
+      getMacosAppApplyReceipt(ctx.stateDir, receipt.requestId),
+    ]);
+    const replaySafe = approvalAfter?.status === "approved" && receiptAfter?.state === "APPROVAL_REQUIRED";
+    return {
+      turnlessContinuation: true,
+      continuationStarted: false,
+      fallbackRequiresExactReplay: replaySafe,
+      approvalStatus: approvalAfter?.status ?? "missing",
+      macosAppState: receiptAfter?.state ?? "missing",
+      actionStarted: receiptAfter?.state === "ACTIVATION_REQUESTED",
+      subprocessStarted: Boolean(receiptAfter?.workerPid),
+      continuationErrorCode: error instanceof DomainError ? error.code : "UNEXPECTED_ERROR",
+      sideEffects: replaySafe ? "approval-state-only" : "inspect-macos-app-apply-status",
+    };
+  } finally {
+    if (privilegeClaimed) {
+      await releaseProjectPrivilege({
+        stateDir: ctx.stateDir,
+        project: entry,
+        ownerScope: ctx.sessionScope,
+        leaseId: continuationLease.leaseId,
+        kind: "serial",
+      }).catch(() => undefined);
+    }
+  }
 }
 
 function backgroundCommandFingerprint(input: {
@@ -1191,8 +2146,10 @@ async function chatGptOperationApprovalPending(
       decisionTool: "chatgpt_operation_approval_decide",
       operationTool: input.tool,
       preview: approvalRequest.preview,
+      createdAt: approvalRequest.createdAt,
       expiresAt: approvalRequest.expiresAt,
-      replayExactInputAfterApproval: true,
+      turnlessContinuationAfterApproval: runtimeApprovalSupportsTurnlessContinuation(approvalRequest),
+      replayExactInputAfterApproval: !runtimeApprovalSupportsTurnlessContinuation(approvalRequest),
       actionStarted: false,
       subprocessStarted: false,
       sideEffects: "approval-state-only",
@@ -1200,12 +2157,13 @@ async function chatGptOperationApprovalPending(
       presentApprovalArgs: { requestId: input.requestId },
       presentApprovalFallbackWith: "chatgpt_consent_probe",
       presentApprovalFallbackArgs: {},
+      presentApprovalPriority: "immediate-next-tool-call",
       cardRendered: false,
       allowFollowUpPrompt: input.allowFollowUpPrompt,
       denyFollowUpPrompt: input.denyFollowUpPrompt,
       ...(input.extra ?? {}),
     },
-    `${input.tool} approval is pending; call ${CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL} with this requestId first. If that direct presenter is unavailable in the host catalog, call chatgpt_consent_probe once as the stable direct fallback.`,
+    `${input.tool} approval is pending; immediately call ${CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL} with this requestId as the next tool call before status polling, extra commentary, or final response. If that presenter network-fails before render, retry only the presenter and never recreate/replay ${input.tool}. If the host catalog rejects the primary presenter, call chatgpt_consent_probe once as the stable direct fallback.`,
   );
   return pending;
 }
@@ -1908,174 +2866,6 @@ interface E2eAutomation {
  * (visible to the widget, not the model) with the short-lived public share
  * URL as fallback `src`.
  */
-const E2E_SCREENSHOT_WIDGET_URI = "ui://widget/e2e-screenshots.html";
-const E2E_SCREENSHOT_WIDGET_MIME = "text/html;profile=mcp-app";
-const E2E_SCREENSHOT_META_KEY = "chatgpt2codex/screenshots";
-const E2E_WIDGET_TOOL_META = {
-  "openai/outputTemplate": E2E_SCREENSHOT_WIDGET_URI,
-  ui: { visibility: ["model"], resourceUri: E2E_SCREENSHOT_WIDGET_URI },
-} as const;
-
-const E2E_SCREENSHOT_WIDGET_HTML = `<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  body { margin: 0; font-family: -apple-system, system-ui, sans-serif; background: transparent; }
-  #status { font-size: 13px; color: #8e8ea0; margin: 8px 10px; }
-  #grid { display: flex; flex-direction: column; gap: 10px; padding: 0 10px 10px; }
-  #consent { display: none; border: 1px solid rgba(128,128,128,.35); border-radius: 12px; padding: 14px; margin: 4px; }
-  #consentTitle { font-weight: 650; font-size: 15px; margin-bottom: 6px; }
-  #consentPreview { font-size: 13px; line-height: 1.45; opacity: .82; white-space: pre-wrap; }
-  #consentActions { display: flex; gap: 8px; margin-top: 12px; }
-  #consentActions button { flex: 1; min-height: 38px; border-radius: 9px; border: 1px solid rgba(128,128,128,.35); font: inherit; cursor: pointer; }
-  #consentActions button:disabled { opacity: .5; cursor: default; }
-  #consentStatus { font-size: 12px; opacity: .72; margin-top: 9px; min-height: 18px; }
-  figure { margin: 0; }
-  img { width: 100%; border-radius: 8px; border: 1px solid rgba(128, 128, 128, 0.35); display: block; }
-  figcaption { font-size: 12px; color: #8e8ea0; margin-top: 4px; }
-</style>
-</head>
-<body>
-<div id="consent">
-  <div id="consentTitle">C2CT 확인</div>
-  <div id="consentPreview">승인 내용을 불러오는 중…</div>
-  <div id="consentActions">
-    <button id="consentDeny">거절</button>
-    <button id="consentAllow">허용</button>
-  </div>
-  <div id="consentStatus"></div>
-</div>
-<div id="status">Loading E2E screenshots...</div>
-<div id="grid"></div>
-<script>
-(function () {
-  var consentBusy = false;
-  var latestToolOutput = null;
-  var latestToolMeta = null;
-  var pendingRequests = new Map();
-  var nextRequestId = 1;
-  function api() { return window.openai || {}; }
-  function output() { return latestToolOutput || api().toolOutput || {}; }
-  function responseMeta() { return latestToolMeta || api().toolResponseMetadata || {}; }
-  function request(method, params) {
-    var id = nextRequestId++;
-    window.parent.postMessage({ jsonrpc: "2.0", id: id, method: method, params: params }, "*");
-    return new Promise(function (resolve, reject) {
-      pendingRequests.set(id, { resolve: resolve, reject: reject });
-    });
-  }
-  function consentSecret() {
-    return responseMeta()["${CHATGPT_CONSENT_META_KEY}"] || {};
-  }
-  function setConsentBusy(value) {
-    consentBusy = value;
-    document.getElementById("consentDeny").disabled = value;
-    document.getElementById("consentAllow").disabled = value;
-  }
-  async function callConsentDecision(decision, out, sec) {
-    var args = { requestId: out.requestId, token: sec.token, decision: decision };
-    var a = api();
-    if (a.callTool) return a.callTool("chatgpt_consent_probe_decide", args);
-    return request("tools/call", { name: "chatgpt_consent_probe_decide", arguments: args });
-  }
-  async function decideConsent(decision) {
-    if (consentBusy) return;
-    var out = output();
-    var sec = consentSecret();
-    if (!out.requestId || !sec.token) {
-      document.getElementById("consentStatus").textContent = "확인 채널을 사용할 수 없습니다.";
-      return;
-    }
-    setConsentBusy(true);
-    document.getElementById("consentStatus").textContent = "처리 중…";
-    try {
-      await callConsentDecision(decision, out, sec);
-      document.getElementById("consentStatus").textContent = decision === "allow" ? "허용됨" : "거절됨";
-      var a = api();
-      if (a.sendFollowUpMessage) {
-        await a.sendFollowUpMessage({ prompt: "C2CT 인라인 확인 테스트 결과를 확인해줘." });
-      }
-    } catch (_) {
-      document.getElementById("consentStatus").textContent = "처리하지 못했습니다.";
-      setConsentBusy(false);
-    }
-  }
-  function shotList() {
-    var shots = responseMeta()["${E2E_SCREENSHOT_META_KEY}"];
-    if (Array.isArray(shots) && shots.length) return shots;
-    var out = output();
-    var set = Array.isArray(out.screenshotSet) ? out.screenshotSet : out.inlineUrl ? [out] : [];
-    return set.map(function (s, i) {
-      return { label: s.shotLabel || "E2E screenshot " + (i + 1), url: s.inlineUrl };
-    });
-  }
-  function render() {
-    var out = output();
-    if (out.c2ctConsentProbe === true) {
-      document.getElementById("consent").style.display = "block";
-      document.getElementById("status").style.display = "none";
-      document.getElementById("grid").style.display = "none";
-      document.getElementById("consentPreview").textContent = out.preview || "무해한 C2CT 인라인 확인 테스트";
-      return;
-    }
-    document.getElementById("consent").style.display = "none";
-    document.getElementById("status").style.display = "block";
-    document.getElementById("grid").style.display = "flex";
-    var shots = shotList();
-    var grid = document.getElementById("grid");
-    grid.textContent = "";
-    var shown = 0;
-    shots.forEach(function (shot, i) {
-      var src = shot.dataUri || shot.url;
-      if (!src) return;
-      var fig = document.createElement("figure");
-      var img = document.createElement("img");
-      img.alt = shot.label || "E2E screenshot " + (i + 1);
-      img.src = src;
-      if (shot.dataUri && shot.url) {
-        img.onerror = function () {
-          if (img.src !== shot.url) img.src = shot.url;
-        };
-      }
-      fig.appendChild(img);
-      var cap = document.createElement("figcaption");
-      cap.textContent = shot.label || "E2E screenshot " + (i + 1);
-      fig.appendChild(cap);
-      grid.appendChild(fig);
-      shown += 1;
-    });
-    document.getElementById("status").textContent = shown
-      ? shown + " E2E screenshot" + (shown > 1 ? "s" : "")
-      : "No screenshots returned.";
-  }
-  window.addEventListener("message", function (event) {
-    if (event.source !== window.parent) return;
-    var message = event.data;
-    if (!message || message.jsonrpc !== "2.0") return;
-    if (message.id !== undefined && pendingRequests.has(message.id)) {
-      var pending = pendingRequests.get(message.id);
-      pendingRequests.delete(message.id);
-      if (message.error) pending.reject(message.error);
-      else pending.resolve(message.result);
-      return;
-    }
-    if (message.method === "ui/notifications/tool-result") {
-      var params = message.params || {};
-      latestToolOutput = params.structuredContent || {};
-      latestToolMeta = params._meta || latestToolMeta;
-      render();
-    }
-  }, { passive: true });
-  document.getElementById("consentDeny").addEventListener("click", function () { void decideConsent("deny"); });
-  document.getElementById("consentAllow").addEventListener("click", function () { void decideConsent("allow"); });
-  window.addEventListener("openai:set_globals", render);
-  render();
-})();
-</script>
-</body>
-</html>
-`;
 
 function e2eWidgetResourceMeta(publicUrl?: string): Record<string, unknown> {
   let resourceDomains: string[] = [];
@@ -2510,9 +3300,30 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     }
     let authorization: Awaited<ReturnType<typeof ensureOperationAuthorized>>;
     try {
-      authorization = await ensureOperationAuthorized({ stateDir: ctx.stateDir, lease, tool: "scheduled_goal_create", risk: "destructive", operation: { requestId: input.requestId, operationFingerprint: definitionDigest, projectId: entry.projectId, model: "gpt-5.6-luna" }, preview: `Create bounded Luna goal for ${entry.projectId}; fixed model and no commit/push/install/runtime/tunnel`, requiredApprovalVia: "local-control-api" });
+      authorization = await ensureOperationAuthorized({
+        stateDir: ctx.stateDir,
+        lease,
+        tool: "scheduled_goal_create",
+        risk: "destructive",
+        operation: { requestId: input.requestId, operationFingerprint: definitionDigest, projectId: entry.projectId, model: "gpt-5.6-luna" },
+        preview: `Create bounded Luna goal for ${entry.projectId}; fixed model and no commit/push/install/runtime/tunnel`,
+        approvalSurface: ctx.remote === true ? "chatgpt-widget" : "local",
+        requiredApprovalVia: ctx.remote === true ? "chatgpt-widget" : "local-control-api",
+      });
     } catch (error) {
-      if (error instanceof DomainError && error.code === ErrorCode.APPROVAL_REQUIRED) return makeResult<Record<string, unknown>>({ approvalRequired: true, approvalRequestId: typeof error.details?.requestId === "string" ? error.details.requestId : undefined, requestDigest: createHash("sha256").update(input.requestId).digest("hex") }, "Scheduled goal requires explicit local approval.");
+      if (error instanceof DomainError && error.code === ErrorCode.APPROVAL_REQUIRED) {
+        const approvalRequestId = typeof error.details?.requestId === "string" ? error.details.requestId : undefined;
+        if (ctx.remote === true && approvalRequestId) {
+          return chatGptOperationApprovalPending(ctx, {
+            requestId: approvalRequestId,
+            tool: "scheduled_goal_create",
+            allowFollowUpPrompt: "C2CT scheduled_goal_create 승인을 허용했어. 방금과 정확히 같은 입력으로 scheduled_goal_create를 다시 호출해서 승인된 목표 생성을 이어서 실행해줘.",
+            denyFollowUpPrompt: "C2CT scheduled_goal_create 승인을 거절했어. 목표를 생성하지 말고 거절 상태로 종료해줘.",
+            extra: { requestDigest: createHash("sha256").update(input.requestId).digest("hex") },
+          });
+        }
+        return makeResult<Record<string, unknown>>({ approvalRequired: true, approvalRequestId, requestDigest: createHash("sha256").update(input.requestId).digest("hex") }, "Scheduled goal requires explicit local approval.");
+      }
       throw error;
     }
     const authorizedAt = Date.now();
@@ -2566,7 +3377,11 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     }),
   );
 
-  const registerConsentWidgetResource = (name: string, uri: string): void => {
+  const registerConsentWidgetResource = (
+    name: string,
+    uri: string,
+    html: string = CHATGPT_CONSENT_WIDGET_LOADER_HTML,
+  ): void => {
     s.registerResource(
       name,
       uri,
@@ -2580,7 +3395,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         contents: [{
           uri,
           mimeType: CHATGPT_CONSENT_WIDGET_MIME,
-          text: CHATGPT_CONSENT_WIDGET_LOADER_HTML,
+          text: html,
           _meta: CHATGPT_CONSENT_WIDGET_RESOURCE_META,
         }],
       }),
@@ -2588,7 +3403,11 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
   };
   registerConsentWidgetResource("c2ct-consent-widget", CHATGPT_CONSENT_WIDGET_URI);
   registerConsentWidgetResource("c2ct-consent-widget-lab-cache-bust", CHATGPT_CONSENT_WIDGET_LAB_URI);
-  registerConsentWidgetResource(CHATGPT_OPERATION_APPROVAL_WIDGET_RESOURCE_NAME, CHATGPT_OPERATION_APPROVAL_WIDGET_URI);
+  registerConsentWidgetResource(
+    CHATGPT_OPERATION_APPROVAL_WIDGET_RESOURCE_NAME,
+    CHATGPT_OPERATION_APPROVAL_WIDGET_URI,
+    CHATGPT_OPERATION_APPROVAL_WIDGET_HTML,
+  );
 
   registerTool(
     CHATGPT_WIDGET_ASSET_GET_TOOL,
@@ -2610,12 +3429,17 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         supportedProtocolVersion: CHATGPT_WIDGET_ASSET_PROTOCOL_VERSION,
         fallbackHtml: CHATGPT_CONSENT_WIDGET_HTML,
       });
+      const preapplyAssetLoadProofRecorded = await recordChatGptWidgetPreapplyAssetLoad({
+        stateDir: ctx.stateDir,
+        widgetAssetRevision: asset.revision,
+      }).catch(() => false);
       return makeResult<Record<string, unknown>>(
         {
           html: asset.html,
           revision: asset.revision,
           protocolVersion: asset.protocolVersion,
           source: asset.source,
+          preapplyAssetLoadProofRecorded,
           sideEffects: "none",
         },
         `C2CT widget asset ${asset.revision.slice(0, 19)} loaded from ${asset.source}.`,
@@ -2644,6 +3468,12 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         stateDir: ctx.stateDir,
         supportedProtocolVersion: CHATGPT_WIDGET_ASSET_PROTOCOL_VERSION,
       });
+      const preapplyStage = await stageChatGptWidgetPreapplyRenderCandidate({
+        stateDir: ctx.stateDir,
+        projectId: input.projectId,
+        projectRoot: entry.root,
+        appliedWidgetAssetRevision: meta.revision,
+      }).catch(() => null);
       await ctx.ledger.append({
         type: "chatgpt.widget_asset.applied",
         projectId: input.projectId,
@@ -2656,6 +3486,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           revision: meta.revision,
           protocolVersion: meta.protocolVersion,
           bytes: meta.bytes,
+          preapplyCandidateStaged: preapplyStage !== null,
           runtimeRestarted: false,
           connectorChanged: false,
           sideEffects: "widget-state-only",
@@ -2682,9 +3513,10 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       },
       inputSchema: {
         requestId: z.string().regex(/^op_[0-9a-fA-F-]{36}$/u),
+        measurePaint: z.boolean().optional(),
       },
     },
-    async (input) => withErrorMapping(ctx, CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL, { requestId: input.requestId }, async () => {
+    async (input) => withErrorMapping(ctx, CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL, { requestId: input.requestId, measurePaint: input.measurePaint === true }, async () => {
       if (!ctx.sessionScope) {
         throw new DomainError(ErrorCode.PERMISSION_DENIED, "Operation approval presenter requires a ChatGPT session scope");
       }
@@ -2704,18 +3536,23 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       const result = makeResult<Record<string, unknown>>(
         {
           requestId: approvalRequest.requestId,
+          projectId: approvalRequest.projectId,
+          ...(approvalRequest.originOperationId ? { originOperationId: approvalRequest.originOperationId } : {}),
           status: "pending",
           approvalKind: "operation",
           approvalChannel: "chatgpt-widget",
           approvalSeverity: approvalMode,
           decisionTool: "chatgpt_operation_approval_decide",
+          measurePaint: input.measurePaint === true,
           operationTool: pending.tool,
           preview: approvalRequest.preview,
           summary: approvalRequest.summary ?? approvalRequest.preview,
           impact: approvalRequest.impact,
           details: approvalRequest.details,
+          createdAt: approvalRequest.createdAt,
           expiresAt: approvalRequest.expiresAt,
-          replayExactInputAfterApproval: true,
+          turnlessContinuationAfterApproval: runtimeApprovalSupportsTurnlessContinuation(approvalRequest),
+          replayExactInputAfterApproval: !runtimeApprovalSupportsTurnlessContinuation(approvalRequest),
           actionStarted: false,
           subprocessStarted: false,
           sideEffects: "approval-state-only",
@@ -2895,18 +3732,20 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     "chatgpt_widget_shell",
     {
       title: "Open C2CT Widget Shell",
-      description: "Prepare a reusable C2CT in-chat interaction card for rendering through the stable shared ChatGPT presenter. Version 1 supports a server-defined choice card.",
+      description: "Prepare a reusable C2CT in-chat interaction card for rendering through the stable shared ChatGPT presenter. Supports ordinary multi-choice cards plus compact single-action continuation cards. unlockAfterMs keeps every action disabled until the server-validated availability time.",
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: chatGptToolMeta("Preparing C2CT interaction...", "C2CT interaction prepared"),
       inputSchema: {
         kind: z.literal("choice").default("choice"),
         title: z.string().min(1).max(80),
         prompt: z.string().min(1).max(240),
+        compact: z.boolean().default(false),
+        unlockAfterMs: z.number().int().min(0).max(30 * 60_000 - 1_000).optional(),
         options: z.array(z.object({
           id: z.string().regex(/^[A-Za-z0-9._:-]{1,40}$/u),
           label: z.string().min(1).max(80),
           description: z.string().max(160).optional(),
-        })).min(2).max(5),
+        })).min(1).max(5),
       },
     },
     async (input) => withErrorMapping(ctx, "chatgpt_widget_shell", { kind: input.kind, optionCount: input.options.length }, async () => {
@@ -2916,6 +3755,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         title: input.title,
         prompt: input.prompt,
         options: input.options,
+        compact: input.compact,
+        unlockAfterMs: input.unlockAfterMs,
       });
       rememberChatGptShellPresenter(ctx, card);
       const result = makeResult<Record<string, unknown>>(
@@ -2923,10 +3764,12 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           shellVersion: 1,
           card,
           cardRendered: false,
+          presentationRequired: true,
           presentWith: "chatgpt_widget_lab_presenter",
+          presentPriority: "immediate-next-tool-call",
           sideEffects: "interaction-state-only",
         },
-        "C2CT Widget Shell choice card is ready; call chatgpt_widget_lab_presenter to render it through the proven host-mounted presenter.",
+        "C2CT Widget Shell choice card is prepared but not yet rendered. Immediately call the direct named chatgpt_widget_lab_presenter as the next tool call in this same turn. Do not send a final response before that presenter succeeds. If the presenter network-fails, retry only the presenter and never recreate the card.",
       );
       return result;
     }),
@@ -2987,11 +3830,53 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       const result = getChatGptWidgetChoiceResult({ sessionScope: ctx.sessionScope, receiptId: input.receiptId, cardId: input.cardId });
       return makeResult<Record<string, unknown>>(
         { ok: true, kind: "choice", ...result, sideEffects: "none" },
-        `Widget Shell choice result: ${result.choiceLabel}.`,
+        result.status === "resolved" ? `Widget Shell choice result: ${result.choiceLabel}.` : "Widget Shell choice result is pending.",
       );
     }),
   );
 
+
+  registerTool(
+    "chatgpt_catalog_refresh",
+    {
+      title: "Force-refresh the ChatGPT C2CT catalog",
+      description:
+        "Stable recovery tool for a stale ChatGPT host catalog after a C2CT runtime/schema update. After ChatGPT's native Confirm/Deny gate, it runs only the fixed C2CT catalog-refresh and scan-tools actions through chatgpt-send. It cannot change project files, replace the runtime/app, or modify the connector/tunnel. Success means refresh was requested; the current chat must still re-query the direct named mount before catalog rebind is considered verified.",
+      // Deliberately ask the ChatGPT host for its native confirmation instead of
+      // using the versioned C2CT approval presenter. This tool is the bootstrap
+      // escape hatch when that presenter itself is newer than the host catalog.
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        openWorldHint: true,
+      },
+      _meta: chatGptToolMeta("Refreshing ChatGPT C2CT catalog...", "ChatGPT C2CT catalog refresh requested"),
+      inputSchema: {},
+    },
+    async () => withErrorMapping(ctx, "chatgpt_catalog_refresh", {}, async () => {
+      if (!ctx.remote || !ctx.sessionScope) {
+        throw new DomainError(
+          ErrorCode.PERMISSION_DENIED,
+          "ChatGPT catalog refresh requires a remote ChatGPT session and its direct host-confirmed tool surface",
+        );
+      }
+      const result = await refreshChatGptHostCatalog();
+      await ctx.ledger.append({
+        type: "chatgpt.catalog_refresh",
+        status: result.status,
+        catalogRefreshRequested: result.catalogRefreshRequested,
+        hostScanCompleted: result.hostScanCompleted,
+        recommendedAction: result.recommendedAction,
+      });
+      return makeResult<Record<string, unknown>>(
+        result,
+        result.ok
+          ? "ChatGPT C2CT catalog refresh requested. Re-query the direct named tool in this chat before treating host catalog rebind as verified."
+          : `ChatGPT C2CT catalog refresh not completed: ${result.status}.`,
+        !result.ok,
+      );
+    }),
+  );
 
   registerTool(
     "chatgpt_host_approval_probe",
@@ -3107,7 +3992,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             impact: approvalRequest.impact,
             details: approvalRequest.details,
             expiresAt: approvalRequest.expiresAt,
-            replayExactInputAfterApproval: true,
+            turnlessContinuationAfterApproval: runtimeApprovalSupportsTurnlessContinuation(approvalRequest),
+            replayExactInputAfterApproval: !runtimeApprovalSupportsTurnlessContinuation(approvalRequest),
             actionStarted: false,
             subprocessStarted: false,
             sideEffects: "approval-state-only",
@@ -3182,8 +4068,18 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         decision: input.decision,
         sessionScope: ctx.sessionScope,
       });
+      const preapplyProof = await recordChatGptWidgetPreapplyRenderProof({
+        stateDir: ctx.stateDir,
+        probeRequestId: input.requestId,
+        decision: input.decision,
+      }).catch(() => null);
       return makeResult<Record<string, unknown>>(
-        { requestId: resolved.requestId, status: resolved.status, sideEffects: "none" },
+        {
+          requestId: resolved.requestId,
+          status: resolved.status,
+          preapplyRenderProofRecorded: preapplyProof !== null,
+          sideEffects: "none",
+        },
         `C2CT in-chat confirmation probe ${resolved.status}.`,
       );
     }),
@@ -3205,9 +4101,28 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         requestId: z.string().regex(/^op_[0-9a-fA-F-]{36}$/),
         token: z.string().min(20).max(200),
         decision: z.enum(["allow", "deny", "status"]),
+        paintTelemetry: z.object({
+          version: z.literal(1),
+          timeOriginMs: z.number().finite().min(0).max(1_000_000_000_000_000).optional(),
+          callbackStartMs: z.number().finite().min(0).max(60_000).optional(),
+          paintEntryCount: z.number().int().min(0).max(16),
+          firstPaintMs: z.number().finite().min(0).max(60_000).optional(),
+          firstContentfulPaintMs: z.number().finite().min(0).max(60_000).optional(),
+        }).strict().optional(),
       },
     },
-    async (input) => withErrorMapping(ctx, "chatgpt_operation_approval_decide", { requestId: input.requestId, decision: input.decision }, async () => {
+    async (input) => withErrorMapping(ctx, "chatgpt_operation_approval_decide", {
+      requestId: input.requestId,
+      decision: input.decision,
+      ...(input.paintTelemetry ? {
+        paintTelemetryVersion: input.paintTelemetry.version,
+        paintTimeOriginMs: input.paintTelemetry.timeOriginMs,
+        paintCallbackStartMs: input.paintTelemetry.callbackStartMs,
+        paintEntryCount: input.paintTelemetry.paintEntryCount,
+        firstPaintMs: input.paintTelemetry.firstPaintMs,
+        firstContentfulPaintMs: input.paintTelemetry.firstContentfulPaintMs,
+      } : {}),
+    }, async () => {
       const request = (await listOperationApprovalRequests(ctx.stateDir))
         .find((candidate) => candidate.requestId === input.requestId);
       if (!request) {
@@ -3248,6 +4163,34 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         decision: input.decision === "allow" ? "approve" : "reject",
         approvedVia: approvalMode === "critical" ? "chatgpt-widget-critical" : "chatgpt-widget",
       });
+      const exactCriticalSerialLeaseDecision =
+        approvalMode === "critical"
+        && resolved.approvalSurface === "chatgpt-widget-critical"
+        && resolved.leasePreset === "full-write"
+        && typeof resolved.originOperationId === "string"
+        && (resolved.tool === "runtime_apply_local" || resolved.tool === "macos_app_apply_local");
+      const serialLeaseReleased = exactCriticalSerialLeaseDecision
+        ? await autoFinalizeSerialAdminLease(
+            ctx,
+            resolved.projectId,
+            resolved.leaseId,
+            input.decision === "allow"
+              ? "critical-widget-approval-decision-handoff"
+              : "critical-widget-rejection-decision-finalize",
+          ).catch(() => false)
+        : false;
+      if (exactCriticalSerialLeaseDecision) {
+        void ctx.diagnostics?.record({
+          event: "approval.serial_lease_decision_handoff",
+          outcome: serialLeaseReleased ? "success" : "info",
+          tool: resolved.tool,
+          phase: "approval",
+          operationId: resolved.originOperationId,
+        }).catch(() => undefined);
+      }
+      const continuation = input.decision === "allow" && runtimeApprovalSupportsTurnlessContinuation(resolved)
+        ? await continueApprovedRuntimeApplyFromWidget(ctx, resolved)
+        : null;
       forgetChatGptPendingOperation(ctx, input.requestId);
       if (ctx.sessionScope) chatGptSharedApprovalPresenterRequests.delete(ctx.sessionScope);
       return makeResult<Record<string, unknown>>(
@@ -3256,9 +4199,12 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           status: resolved.status,
           tool: resolved.tool,
           approvedVia: resolved.approvedVia ?? null,
-          sideEffects: "approval-state-only",
+          ...(continuation ?? {}),
+          sideEffects: continuation?.sideEffects ?? "approval-state-only",
         },
-        `C2CT operation approval ${resolved.status}.`,
+        continuation?.continuationStarted === true
+          ? `C2CT operation approval consumed and exact ${resolved.tool} continuation started without a new ChatGPT turn.`
+          : `C2CT operation approval ${resolved.status}.`,
       );
     }),
   );
@@ -3349,11 +4295,13 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     },
     async (input) => {
       return withErrorMapping(ctx, "agent_guide", input, async () => {
+        noteBootstrapStage(ctx, "agent-guide");
         const nativeE2eSupported = isNativeE2eSupported();
         const multiProjectLanesEnabled = ctx.config.multiProjectLanesEnabled === true;
-        const [mobileApproval, schemaRecoveryState] = await Promise.all([
+        const [mobileApproval, schemaRecoveryState, runtimeMaintenance] = await Promise.all([
           mobileApprovalStatus(ctx.stateDir),
           readToolSchemaRecoveryState(ctx.stateDir),
+          getRuntimeUpdateBarrier(ctx.stateDir).catch(() => null),
         ]);
         const schemaRecovery = schemaRecoveryState.plan;
         const nativeFirstClient = isNativeFirstClient(ctx);
@@ -3377,6 +4325,18 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                 ? "Use connection_status or the desktop app's Connection Diagnostics menu."
                 : "Connection diagnostics are unavailable on this transport.",
             },
+            runtimeMaintenance: runtimeMaintenance
+              ? {
+                  active: true,
+                  kind: runtimeMaintenance.kind,
+                  phase: runtimeMaintenance.phase,
+                  projectId: runtimeMaintenance.projectId,
+                  expiresAt: runtimeMaintenance.expiresAt,
+                  leaseAcquisitionBlocked: true,
+                  leaseRenewalBlocked: true,
+                  releaseOwnedLeasesRequired: true,
+                }
+              : { active: false, leaseAcquisitionBlocked: false, leaseRenewalBlocked: false },
             schemaRecovery,
             clientToolPolicy: nativeFirstClient
               ? {
@@ -3404,6 +4364,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                 "A project folder is not required to learn or verify C2CT usage. connection_status and agent_guide are global and lease-neutral; an empty workspace/project registry is valid during installation or first connection.",
               instructionDiscovery: [
                 "Stage 1 is lease-neutral: connection_status -> agent_guide -> workspace_list_projects/workspace_get_project as needed.",
+                "If an expected project under an authorized workspace/project root is missing, call workspace_refresh_index before concluding that it is unavailable, then query workspace_list_projects/workspace_get_project again. Use the default shallow scan first and bounded depth only for genuinely nested project folders.",
+                "Workspace rescans treat .git, package/tooling markers, .chatgpt2codex, AGENTS.md, and CLAUDE.md as project-root evidence; hidden directories are excluded unless explicitly requested.",
                 "When a target project is known, read project_rules(projectId=...) and project_status(projectId=...) directly. Do not call project_select, project_release, project_renew_lease, project_lane_renew, or project_lane_release merely to inspect instructions or identify the target project.",
                 "Explicit projectId rule/status reads must not disturb another chat's serial lease or work lane. If a specific read unexpectedly requires a lease, use a target-root read-only work lane when multi-project lanes are enabled, verify it with project_lane_status, perform only the required reads, then release only that temporary lane.",
               ],
@@ -3412,6 +4374,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                     "Stage 2 begins only when actual project work needs a capability: open the smallest suitable project_lane_open preset for the target root, then verify the exact workLaneId with project_lane_status.",
                     "Use read-only for lease-requiring inspection, tests-only for test/E2E execution without source mutation, and full-write only when edits or workspace writes are needed.",
                     "Lease audit reasons are fixed labels, not prose. Use only work, maintenance, renew, done, cleanup, or control. Never put commands, paths, runtime/app/install/admin plans, privilege changes, or follow-up steps in a lease reason; those belong in the surrounding workflow, not the audit field.",
+                    "Turn-finalization invariant: before sending the final assistant response for every ChatGPT turn, explicitly release every project capability owned by this conversation after its tracked work is terminal. Release each owned work lane with project_lane_release(reason=done) and any owned serial lease with project_release(reason=done). Do not carry a lease across turns; reacquire it on the next turn if more work is needed.",
+                    "Maintenance invariant: inspect connection_status.runtimeUpdateBarrier and agent_guide.runtimeMaintenance before acquiring or renewing a project capability. While maintenance is active, do not acquire or renew leases; explicitly release this conversation's owned lanes/serial lease and wait for the maintenance state to clear. Never release another conversation's capability.",
                     "To enter an explicit serial-admin workflow from a normal work lane: first finish and verify tracked work, release your exact current work lane with reason=done, then acquire project_select with purpose=legacy-admin and reason=maintenance. Perform the serial-only operation, release that serial lease with reason=done when finished, and reacquire a normal work lane with reason=work only if more coding is needed.",
                     "Runtime/app lifecycle tools may remain serial-admin-bound even when they look read-only. If a live named schema has no workLaneId and returns LEASE_REQUIRED while your normal work lane is healthy, do not treat that as lane failure or steal another lease. Enter serial admin only if that lifecycle operation is actually needed, following the exact release -> project_select purpose=legacy-admin -> operation -> project_release boundary.",
                     "Never switch, release, renew, or replace another chat's serial lease or sibling work lane to prepare your own task.",
@@ -3419,6 +4383,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                   ]
                 : [
                     "Stage 2 begins only when actual project work needs a capability. Legacy runtimes without multi-project lanes use the narrowest serial project_select preset at that point, not during instruction discovery.",
+                    "Turn-finalization invariant: before the final assistant response for every ChatGPT turn, explicitly release this conversation's owned serial project lease after tracked work is terminal. Do not carry it across turns.",
+                    "While runtime maintenance is active, do not acquire or renew project leases; release this conversation's owned lease and wait for maintenance to clear.",
                   ],
               documentationOrder: [
                 "1. live agent_guide from the connected runtime",
@@ -3438,6 +4404,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                   "Privileged ownership is locked across canonical project roots. Non-overlapping roots remain independent; the same root or an ancestor/descendant overlapping root cannot have another active privileged owner and receives ACTIVE_PROJECT_LEASE_HELD.",
                   "project_lane_recover is ownership-sensitive: same-session lost-handle/stale-state cleanup is approval-free de-escalation, while an abandoned foreign privileged lane can be retired only with explicit local approval and an idle-project check. Recovery never grants a replacement capability by itself.",
                   "Remote project_select is reserved for explicit serial-only workflows and requires purpose=legacy-admin; desktop control requires purpose=control plus its existing local approval boundary.",
+                  "No owned project capability may intentionally survive a ChatGPT turn boundary. The current conversation must explicitly release all of its own work lanes and serial leases before its final response once tracked work is terminal.",
                 ]
               : [],
             authorizationPlan: projectAuthorizationPlan(multiProjectLanesEnabled),
@@ -3541,16 +4508,18 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               : [
                   "Hard gate: do not inspect, edit, test, commit, or claim local project work unless a current-turn chatgpt2codex MCP tool or GPT Action result returned ok=true. Seeing the namespace in the UI is not enough.",
                   "Bootstrap before project work: connection_status -> agent_guide. This is global and lease-neutral and remains valid with zero registered projects.",
-                  "Instruction discovery is lease-neutral: resolve the target with workspace_list_projects/workspace_get_project, then read project_rules/project_status with explicit projectId. Do not project_select or disturb any existing serial/work-lane lease just to read instructions.",
+                  "Instruction discovery is lease-neutral: resolve the target with workspace_list_projects/workspace_get_project. If an expected project is missing, call workspace_refresh_index, re-query the registry, and only then conclude it is unavailable. Then read project_rules/project_status with explicit projectId. Do not project_select or disturb any existing serial/work-lane lease just to read instructions.",
                   "Inherited-work rule: before continuing another agent's task, compare repo_status (branch/HEAD/upstream/ahead/behind/staged/dirty), the current working diff, connection_status/agent_guide, any sealed candidate, and host-mounted named-tool evidence. Handoff text is a hypothesis, not current-state proof. See docs/AGENT-ONBOARDING-AND-HANDOFF.ko.md.",
                   "If only image_gen, python_user_visible, browser, or a text-only answer ran, no chatgpt2codex work happened. Stop and ask the user to reselect ChatGPT To Codex, reconnect the app, or refresh the Custom GPT Action.",
                   "If ChatGPT's app selector changed to Image Generation/ImageGen, finish generation there, then reselect ChatGPT To Codex or use the Custom GPT Action bridge before doing source work.",
                   "For /goal, deep research, or broad implementation prompts: call goal_loop or goal_intake immediately, then continue with lease-neutral project discovery/rule inspection before acquiring a work capability. Do not spend a long thinking turn before the first tool call.",
                   "For Codex-style persistence: use goal_loop, perform one small inspect/edit/verify batch, then call goal_loop again with lastResult. Repeat until done or truly blocked.",
-                  "workspace_list_projects or workspace_refresh_index",
+                  "Project discovery recovery: workspace_list_projects -> if missing workspace_refresh_index -> workspace_list_projects/workspace_get_project again. Default depth=1; request a bounded deeper scan only for nested project roots.",
                   multiProjectLanesEnabled
                     ? "Only when actual work begins, open project_lane_open with the smallest required preset and carry the returned workLaneId through every lane-aware inspect/edit/verify/release call. The runtime rejects serial coding fallback, foreign lane manipulation, and privileged project switching within the same remote chat."
                     : "Only when actual work begins, use project_select with the smallest required preset; do not acquire a serial lease just to read instructions.",
+                  "Before the final assistant response of this turn, make every background operation started by this conversation terminal, then explicitly release every project work lane and serial lease owned by this conversation. Reacquire capabilities on a later turn instead of carrying them across the turn boundary.",
+                  "If connection_status.runtimeUpdateBarrier or agent_guide.runtimeMaintenance is active, release this conversation's owned project capabilities and do not acquire or renew another lease until the maintenance state clears.",
                   "project_rules, project_status, code_search",
                   "Avoid broad context-pack calls in ChatGPT; OpenAI safety can block them before they reach chatgpt2codex.",
                   "file_read_slice before editing one existing file; use file_read_batch when several exact slices are already known so ChatGPT can reduce host invocations without using broad context packs",
@@ -3561,6 +4530,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                     ? "Automatic schema routing: connection_status/agent_guide reports stable-dispatcher-preferred because a schema-changing runtime apply has not yet been followed by an observed current tools/list fetch. After bootstrap, route public operations through stable c2ct_invoke by default. If the dispatcher refuses a target because its named surface carries the host confirmation boundary, do not bypass that boundary; use the named tool once the host catalog supports it. Keep named bootstrap reads only when their mounted schema accepts the input. Do not re-register the bare /mcp connector."
                     : "Automatic schema routing: connection_status/agent_guide reports named-tools-preferred, so use named tools normally. If a named call is rejected before runtime dispatch, immediately fall back to tool_schema_get + c2ct_invoke without connector re-registration.",
                   "Schema/catalog divergence rule: if the ChatGPT host catalog and live tool_schema_get result disagree, do not infer live runtime capability from the host catalog alone. Read docs/C2CT-LIVE-SCHEMA-HOST-CATALOG-RECOVERY.ko.md, compare host-mounted catalog, live runtime registry, and manifest/revalidation state separately, and never use c2ct_invoke to render a presenter.",
+                  "Current-chat host rebind recovery: after catalog refresh/scan-tools, re-query the named catalog in the same conversation. If the expected direct mount is still stale, explicitly select/invoke @C2CT again in that same conversation and re-query the direct named surface. Treat recovery as verified only when the expected new named tool/presenter is actually callable; tools/list observation alone is insufficient. Use a fresh conversation only if the mount remains stale after this explicit @C2CT re-invocation.",
                   "Widget/presenter UI exception: never use c2ct_invoke to render or validate ChatGPT widget UI, approval cards, outputTemplate/resource mounts, or host confirmation UI. Generic dispatch can prove backend execution only; it does not reproduce the direct named tool's host-mounted static metadata. Always call the dedicated named presenter/tool directly for UI render or approval-surface E2E.",
                   ...(canRunLocalShell ? ["local_shell_run for local-only Codex-style commands inside the selected project"] : []),
                   ...e2eWorkflow,
@@ -3828,7 +4798,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Get runtime apply status",
       description:
-        "Read one persisted runtime replacement receipt by exact operationId or requestId. When an exact runtime approval has already been granted through either the local menu-bar UI or the session-bound critical ChatGPT approval card, this status reports that the same runtime_apply_local request is ready to resume. This never changes the active runtime, app, connector, tunnel, or supervisor.",
+        "Read one persisted runtime replacement receipt by exact operationId or requestId. Session-bound critical ChatGPT approvals are turnless: status-only polling reports whether continuation is draining, started, terminal, or stalled and must never authorize replay of runtime_apply_local. Local menu-bar approvals may still report that the exact same request is ready to resume before worker start. After worker start, active receipts include a bounded reconnectPlan: wait predictedWaitMs, then use status-only polls within maxAttempts/maxWindowMs and never replay the mutation. This never changes the active runtime, app, connector, tunnel, or supervisor.",
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: chatGptToolMeta("Checking runtime apply status...", "Runtime apply status loaded"),
       inputSchema: {
@@ -3839,7 +4809,6 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     },
     async (input) => {
       return withErrorMapping(ctx, "runtime_apply_status", input, async () => {
-        await requireProjectLease(ctx, input.projectId, "read");
         if ((input.operationId ? 1 : 0) + (input.requestId ? 1 : 0) !== 1) {
           throw new DomainError(ErrorCode.INVALID_ARGUMENT, "Provide exactly one of operationId or requestId");
         }
@@ -3852,17 +4821,34 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             projectId: input.projectId,
           });
         }
-        const approvalRequest = receipt.approvalRequestId
-          ? (await listOperationApprovalRequests(ctx.stateDir)).find((request) => request.requestId === receipt.approvalRequestId)
-          : undefined;
+        const approvalRequest = await receiptApprovalForCaller(
+          ctx,
+          input.projectId,
+          receipt.approvalRequestId,
+        );
+        const runtimeBarrier = await getRuntimeUpdateBarrier(ctx.stateDir);
+        const criticalTurnlessApproved = receipt.state === "APPROVAL_REQUIRED"
+          && approvalRequest?.status === "approved"
+          && approvalRequest.approvedVia === "chatgpt-widget-critical";
+        const turnlessContinuationDeferred = criticalTurnlessApproved
+          && runtimeBarrier?.operationId === receipt.operationId
+          && runtimeBarrier.kind === "runtime-apply";
+        const turnlessContinuationStalled = criticalTurnlessApproved && !turnlessContinuationDeferred;
         const approvalReadyToResume = receipt.state === "APPROVAL_REQUIRED"
           && approvalRequest?.status === "approved"
-          && (approvalRequest.approvedVia === "menu-bar-ui" || approvalRequest.approvedVia === "chatgpt-widget-critical");
+          && approvalRequest.approvedVia === "menu-bar-ui";
         const publicReceipt = runtimeApplyPublicReceipt(receipt);
         const approvalPlan = approvalBrokerPlan(RUNTIME_APPLY_PROVIDER_ORDER);
         const approvalProvider = approvalRequest?.approvalSurface === "chatgpt-widget-critical"
           ? "chatgpt-widget-critical"
           : approvalPlan.selectedProvider;
+        const continuationRecommendation = turnlessContinuationDeferred
+          ? { recommendedAction: "wait-then-poll-runtime-apply-status", pollAfterMs: 1_000 }
+          : turnlessContinuationStalled
+            ? { recommendedAction: "start-new-runtime-apply-request-after-turnless-continuation-stall" }
+            : approvalReadyToResume
+              ? { recommendedAction: "retry-same-runtime-apply-request" }
+              : {};
         return makeResult(
           {
             ...publicReceipt,
@@ -3871,11 +4857,17 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             approvalStatus: approvalRequest?.status ?? (receipt.approvalRequestId ? "missing" : "not-requested"),
             approvalApprovedVia: approvalRequest?.approvedVia ?? null,
             approvalReadyToResume,
-            ...(approvalReadyToResume ? { recommendedAction: "retry-same-runtime-apply-request" } : {}),
+            turnlessContinuationDeferred,
+            turnlessContinuationStalled,
+            ...continuationRecommendation,
           },
-          approvalReadyToResume
-            ? `Runtime apply ${receipt.operationId}: exact approval granted via ${String(approvalRequest?.approvedVia)}; retry the exact same runtime_apply_local request to resume activation.`
-            : `Runtime apply ${receipt.operationId}: ${receipt.state}.`,
+          turnlessContinuationDeferred
+            ? `Runtime apply ${receipt.operationId}: approved turnless continuation is draining active operations; poll status only.`
+            : turnlessContinuationStalled
+              ? `Runtime apply ${receipt.operationId}: approved turnless continuation did not start; do not replay runtime_apply_local. Start a new request after the blocker is clear.`
+              : approvalReadyToResume
+                ? `Runtime apply ${receipt.operationId}: exact menu-bar approval granted; retry the exact same runtime_apply_local request to resume activation.`
+                : `Runtime apply ${receipt.operationId}: ${receipt.state}.`,
         );
       });
     },
@@ -3886,7 +4878,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Request safe local runtime apply",
       description:
-        "Validate and request an idempotent runtime-only replacement. Exact approval is required: trusted host-native authorization may be accepted when available; remote ChatGPT sessions otherwise use the session-bound Critical Approval Card, while local/admin callers retain the installed menu-bar approval fallback. Conversational answers, generic local-control approval, and Computer Use confirmations cannot authorize this operation. After approval is granted, call runtime_apply_local again with the exact same requestId and unchanged target parameters to resume the same transaction; runtime_apply_status reports whether that exact request is ready to resume. The fixed worker preserves the supervisor, app, connector, cloudflared/Tailscale topology, and rolls back on failed health checks.",
+        "Validate and request an idempotent runtime-only replacement. Exact approval is required: trusted host-native authorization may be accepted when available; remote ChatGPT sessions otherwise use the session-bound Critical Approval Card, while local/admin callers retain the installed menu-bar approval fallback. Conversational answers, generic local-control approval, and Computer Use confirmations cannot authorize this operation. The exact runtime approval also covers one bounded post-apply ChatGPT C2CT catalog refresh plus scan-tools attempt when the target changes the tool schema or widget resource revision. For an eligible remote ChatGPT Critical Approval Card, Allow consumes the exact bound approval and continues the already-bound runtime operation server-side. If other operations are active, the callback acquires the runtime drain barrier, returns promptly, and starts the exact worker automatically when the system becomes idle. Any automatic follow-up is status-only and must never call runtime_apply_local again. Local menu-bar approvals retain their explicit exact-request resume contract before worker start. Once the fixed worker starts, never replay the mutation: use the persisted reconnectPlan to wait, then poll runtime_apply_status only within its bounded window. The worker preserves the supervisor, app, connector, cloudflared/Tailscale topology, records non-secret reconnect timing for future wait prediction, rolls back on failed runtime health checks, and never rolls back a healthy runtime merely because host catalog refresh failed.",
       annotations: EXACT_APPROVAL_GATED_ANNOTATIONS,
       _meta: chatGptToolMeta("Preparing safe runtime replacement...", "Runtime replacement request recorded"),
       inputSchema: {
@@ -3916,7 +4908,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           approvalRequests
             .filter((request) =>
               request.tool === "runtime_apply_local"
-              && (request.status === "pending" || request.status === "approved"),
+              && (request.status === "pending"
+                || (request.status === "approved" && request.approvedVia === "menu-bar-ui")),
             )
             .map((request) => request.requestId),
         );
@@ -3925,6 +4918,10 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
 
         const existing = await getRuntimeApplyReceipt(ctx.stateDir, { requestId: input.requestId });
         const gate = await runtimeApplyGateSnapshot(ctx, entry, existing?.approvalRequestId);
+        const deferActiveOperationsUntilApproval = ctx.remote === true && Boolean(ctx.sessionScope);
+        const prepareGate = deferActiveOperationsUntilApproval
+          ? { ...gate, activeOperationCount: 0 }
+          : gate;
         const prepared = await prepareRuntimeApply({
           stateDir: ctx.stateDir,
           projectId: entry.projectId,
@@ -3934,10 +4931,11 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           targetRuntimeRoot: input.targetRuntimeRoot,
           targetFingerprint: input.targetFingerprint,
           preserveConnector: true,
-          ...gate,
+          ...prepareGate,
         });
 
         if (prepared.conflict) {
+          await autoFinalizeSerialAdminLease(ctx, entry.projectId, lease.leaseId, "runtime-apply-request-conflict").catch(() => false);
           return makeResult<Record<string, unknown>>(
             {
               ...runtimeApplyPublicReceipt(prepared.receipt),
@@ -3951,6 +4949,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         }
 
         if (prepared.receipt.state !== "APPROVAL_REQUIRED") {
+          await autoFinalizeSerialAdminLease(ctx, entry.projectId, lease.leaseId, `runtime-apply-terminal-${prepared.receipt.state.toLowerCase()}`).catch(() => false);
           return makeResult(
             runtimeApplyPublicReceipt(prepared.receipt),
             `Runtime apply ${prepared.receipt.operationId}: ${prepared.receipt.state}.`,
@@ -3958,12 +4957,39 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           );
         }
 
-        const preApprovalGate = await runtimeApplyGateSnapshot(ctx, entry);
-        if (preApprovalGate.activeOperationCount > 0 || preApprovalGate.unrelatedPendingApprovalCount > 0) {
+        if (ctx.remote === true && ctx.activity) {
+          const wakeTitleState = ctx.activity.tracker.conversationTitleState(ctx.activity.session);
+          if (wakeTitleState.displayTitleSource === "host" && wakeTitleState.displayTitle) {
+            await registerChatGptRecoveryWakeTarget(ctx.stateDir, {
+              operationId: prepared.receipt.operationId,
+              projectId: entry.projectId,
+              chatTitle: wakeTitleState.displayTitle,
+            }).catch(() => false);
+          }
+        }
+
+        if (prepared.receipt.approvalRequestId) {
+          await receiptApprovalForCaller(ctx, entry.projectId, prepared.receipt.approvalRequestId);
+        }
+
+        // On exact replay after the user has already acted on this runtime
+        // approval, the persisted approval record may still be `pending` until
+        // ensureOperationAuthorized consumes the widget decision below. Do not
+        // let that same approval deadlock its own replay as an "unrelated"
+        // pending approval.
+        const preApprovalGate = await runtimeApplyGateSnapshot(
+          ctx,
+          entry,
+          prepared.receipt.approvalRequestId,
+        );
+        const activeOperationBlocksPreApproval =
+          preApprovalGate.activeOperationCount > 0 && !deferActiveOperationsUntilApproval;
+        if (activeOperationBlocksPreApproval || preApprovalGate.unrelatedPendingApprovalCount > 0) {
           const blocked = await markRuntimeApplyBlocked(ctx.stateDir, prepared.receipt.operationId);
+          await autoFinalizeSerialAdminLease(ctx, entry.projectId, lease.leaseId, "runtime-apply-preapproval-blocked").catch(() => false);
           return makeResult(
             runtimeApplyPublicReceipt(blocked),
-            `Runtime apply ${blocked.operationId} is blocked before approval until other operations and approvals are clear.`,
+            `Runtime apply ${blocked.operationId} is blocked before approval until conflicting operations and approvals are clear.`,
             true,
           );
         }
@@ -3974,6 +5000,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           expectedCurrentFingerprint: input.expectedCurrentFingerprint,
           targetFingerprint: input.targetFingerprint,
           preserveConnector: true,
+          postApplyHostCatalogRefresh: "when-schema-or-ui-changes",
         };
         let authorization: {
           requestId: string;
@@ -3997,8 +5024,11 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               tool: "runtime_apply_local",
               risk: "destructive",
               operation: approvalOperation,
-              preview: `CRITICAL: replace the live C2CT runtime from ${input.expectedCurrentFingerprint.slice(0, 12)} to ${input.targetFingerprint.slice(0, 12)}; preserve connector/tunnel; automatic rollback on failed health checks`,
+              preview: `CRITICAL: replace the live C2CT runtime from ${input.expectedCurrentFingerprint.slice(0, 12)} to ${input.targetFingerprint.slice(0, 12)}; preserve connector/tunnel; automatic rollback on failed runtime health checks; after a healthy schema/UI-changing apply, automatically run only the fixed C2CT catalog-refresh and scan-tools actions`,
+              originOperationId: prepared.receipt.operationId,
               approvalSurface: "chatgpt-widget-critical",
+              resumeRequestId: prepared.receipt.approvalRequestId,
+              resumeSessionScope: ctx.sessionScope,
               requiredApprovalVia: "chatgpt-widget-critical",
             });
             authorization = { ...criticalAuthorization, approvalProvider: "chatgpt-widget-critical" };
@@ -4010,16 +5040,17 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               return chatGptOperationApprovalPending(ctx, {
                 requestId: approvalRequestId,
                 tool: "runtime_apply_local",
-                allowFollowUpPrompt: `Critical runtime approval granted for ${input.requestId}. Replay the exact same runtime_apply_local request and continue verification.`,
+                allowFollowUpPrompt: `Critical runtime approval granted for ${input.requestId}. The exact runtime operation continues from the approval callback. Do not replay runtime_apply_local; use runtime_apply_status only until the operation reaches a terminal state.`,
                 denyFollowUpPrompt: `Critical runtime approval denied for ${input.requestId}. Do not apply the runtime.`,
                 extra: {
                   ...runtimeApplyPublicReceipt(receipt),
                   approvalProvider: "chatgpt-widget-critical",
                   criticalBadge: "Mac 시스템 변경",
-                  criticalWarning: "이 승인은 ChatGPT 안의 답변이 아니라 Mac에서 실행 중인 C2CT 런타임을 실제로 교체합니다. 연결이 잠시 끊길 수 있습니다.",
+                  criticalWarning: "Mac C2CT runtime 실제 교체 · 성공 후 schema 변경 시 ChatGPT catalog 자동 갱신 시도",
                   criticalIdentityBefore: input.expectedCurrentFingerprint.slice(0, 12),
                   criticalIdentityAfter: input.targetFingerprint.slice(0, 12),
-                  criticalRollback: "새 runtime health check가 실패하면 기존 runtime으로 자동 롤백합니다.",
+                  criticalRollback: "새 runtime health check 실패 시 기존 runtime 자동 롤백",
+                  criticalPostApply: "정상 적용 후 고정 catalog-refresh + scan-tools만 자동 실행 · 실패 시 설정의 강제 갱신 사용",
                 },
               });
             }
@@ -4044,6 +5075,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               risk: "destructive",
               operation: approvalOperation,
               preview: `Apply verified runtime ${input.targetFingerprint.slice(0, 12)} for ${entry.projectId}; preserve connector/tunnel`,
+              resumeRequestId: prepared.receipt.approvalRequestId,
+              resumeSessionScope: ctx.sessionScope,
               providerOrder: RUNTIME_APPLY_PROVIDER_ORDER,
             });
           } catch (error) {
@@ -4072,6 +5105,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         const postApprovalGate = await runtimeApplyGateSnapshot(ctx, entry, authorization.requestId);
         if (postApprovalGate.activeOperationCount > 0 || postApprovalGate.unrelatedPendingApprovalCount > 0) {
           const blocked = await markRuntimeApplyBlocked(ctx.stateDir, prepared.receipt.operationId);
+          await autoFinalizeSerialAdminLease(ctx, entry.projectId, lease.leaseId, "runtime-apply-postapproval-blocked").catch(() => false);
           return makeResult(
             runtimeApplyPublicReceipt(blocked),
             `Runtime apply ${blocked.operationId} is blocked until other operations and approvals are clear.`,
@@ -4089,6 +5123,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         if (barrierGate.activeOperationCount > 0 || barrierGate.unrelatedPendingApprovalCount > 0) {
           await releaseRuntimeUpdateBarrier(ctx.stateDir, prepared.receipt.operationId);
           const blocked = await markRuntimeApplyBlocked(ctx.stateDir, prepared.receipt.operationId);
+          await autoFinalizeSerialAdminLease(ctx, entry.projectId, lease.leaseId, "runtime-apply-drain-blocked").catch(() => false);
           return makeResult(
             runtimeApplyPublicReceipt(blocked),
             `Runtime apply ${blocked.operationId} entered drain mode but found another operation; retry after it completes.`,
@@ -4101,6 +5136,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           activation = await markRuntimeApplyActivationRequested(ctx.stateDir, prepared.receipt.operationId);
         } catch (error) {
           await releaseRuntimeUpdateBarrier(ctx.stateDir, prepared.receipt.operationId).catch(() => false);
+          await autoFinalizeSerialAdminLease(ctx, entry.projectId, lease.leaseId, "runtime-apply-activation-error").catch(() => false);
           throw error;
         }
         try {
@@ -4114,13 +5150,15 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             expectedCurrentFingerprint: started.expectedCurrentFingerprint,
             targetFingerprint: started.targetFingerprint,
           });
+          await autoFinalizeSerialAdminLease(ctx, entry.projectId, lease.leaseId, "runtime-apply-worker-started").catch(() => false);
           return makeResult(
             runtimeApplyPublicReceipt(started),
-            `Runtime apply ${started.operationId} was accepted by the fixed local worker; poll runtime_apply_status after reconnect.`,
+            `Runtime apply ${started.operationId} was accepted by the fixed local worker; follow reconnectPlan, then poll runtime_apply_status only. Do not replay runtime_apply_local after worker start.`,
           );
         } catch {
           await releaseRuntimeUpdateBarrier(ctx.stateDir, activation.operationId).catch(() => false);
           const failed = await markRuntimeApplyStartFailed(ctx.stateDir, activation.operationId);
+          await autoFinalizeSerialAdminLease(ctx, entry.projectId, lease.leaseId, "runtime-apply-worker-start-failed").catch(() => false);
           return makeResult(
             runtimeApplyPublicReceipt(failed),
             `Runtime apply ${failed.operationId} could not start the fixed local worker; the live runtime was not changed.`,
@@ -4136,7 +5174,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Get macOS app apply status",
       description:
-        "Read the persisted result of one macOS menu-bar app replacement by exact requestId. This read-only tool does not change the app, runtime, supervisor, connector, or tunnel.",
+        "Read the persisted result of one macOS menu-bar app replacement by exact requestId. Active receipts include a bounded reconnectPlan: wait predictedWaitMs, then use status-only polls within maxAttempts/maxWindowMs. This read-only tool does not change the app, runtime, supervisor, connector, or tunnel and never authorizes mutation replay.",
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: chatGptToolMeta("Checking macOS app replacement...", "macOS app replacement status loaded"),
       inputSchema: {
@@ -4145,13 +5183,13 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       },
     },
     async (input) => withErrorMapping(ctx, "macos_app_apply_status", input, async () => {
-      await requireProjectLease(ctx, input.projectId, "read");
       const receipt = await getMacosAppApplyReceipt(ctx.stateDir, input.requestId);
       if (!receipt || receipt.projectId !== input.projectId) {
         throw new DomainError(ErrorCode.OPERATION_NOT_FOUND, "macOS app apply receipt not found", {
           projectId: input.projectId,
         });
       }
+      await receiptApprovalForCaller(ctx, input.projectId, receipt.approvalRequestId);
       return makeResult(
         macosAppApplyPublicReceipt(receipt),
         `macOS app apply ${receipt.operationId}: ${receipt.state}.`,
@@ -4164,7 +5202,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Install verified macOS menu-bar app",
       description:
-        "Request an idempotent out-of-process install of the project's verified build/macos/ChatGPT To Codex.app into the fixed /Applications destination. Requires stable signing, a full-write lease, and exact destructive approval: remote ChatGPT uses the session-bound Critical Approval Card while local/admin callers retain the local approval boundary. The fixed worker gracefully hands off an app-owned supervisor/runtime, preserves external topology, verifies health, persists a receipt, and rolls back on failure.",
+        "Request an idempotent out-of-process install of the project's verified build/macos/ChatGPT To Codex.app into the fixed /Applications destination. Requires stable signing, a full-write lease, and exact destructive approval: remote ChatGPT uses the session-bound Critical Approval Card while local/admin callers retain the local approval boundary. For an eligible remote ChatGPT Critical Approval Card, Allow consumes the exact bound approval and starts the already-bound macOS app operation server-side; any automatic follow-up is status-only and must not call macos_app_apply_local again. Only when the approval callback explicitly reports fallbackRequiresExactReplay=true before continuation starts may the exact same requestId be replayed as the migration fallback. Once the fixed worker starts, use the persisted reconnectPlan and macos_app_apply_status only; never replay the install mutation. Other approval providers follow the exact approval/receipt contract returned by this tool. The worker gracefully hands off an app-owned supervisor/runtime, records non-secret reconnect timing for future wait prediction, preserves external topology, verifies health, persists a receipt, and rolls back on failure.",
       annotations: EXACT_APPROVAL_GATED_ANNOTATIONS,
       _meta: chatGptToolMeta("Preparing verified macOS app install...", "macOS app install checked"),
       inputSchema: {
@@ -4193,6 +5231,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         preflight,
       });
       if (prepared.conflict) {
+        await autoFinalizeSerialAdminLease(ctx, entry.projectId, lease.leaseId, "macos-app-apply-request-conflict").catch(() => false);
         return makeResult<Record<string, unknown>>(
           {
             ...macosAppApplyPublicReceipt(prepared.receipt),
@@ -4204,6 +5243,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         );
       }
       if (prepared.receipt.state !== "APPROVAL_REQUIRED") {
+        await autoFinalizeSerialAdminLease(ctx, entry.projectId, lease.leaseId, `macos-app-apply-terminal-${prepared.receipt.state.toLowerCase()}`).catch(() => false);
         return makeResult(
           macosAppApplyPublicReceipt(prepared.receipt),
           `macOS app apply ${prepared.receipt.operationId}: ${prepared.receipt.state}.`,
@@ -4211,8 +5251,13 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         );
       }
 
-      const preApprovalGate = await runtimeApplyGateSnapshot(ctx, entry);
+      if (prepared.receipt.approvalRequestId) {
+        await receiptApprovalForCaller(ctx, entry.projectId, prepared.receipt.approvalRequestId);
+      }
+
+      const preApprovalGate = await runtimeApplyGateSnapshot(ctx, entry, prepared.receipt.approvalRequestId);
       if (preApprovalGate.activeOperationCount > 0 || preApprovalGate.unrelatedPendingApprovalCount > 0) {
+        await autoFinalizeSerialAdminLease(ctx, entry.projectId, lease.leaseId, "macos-app-apply-preapproval-blocked").catch(() => false);
         throw new DomainError(ErrorCode.ACTIVE_OPERATION_IN_PROGRESS, "macOS app apply is blocked before approval until active commands and approvals finish", {
           activeOperationCount: preApprovalGate.activeOperationCount,
           unrelatedPendingApprovalCount: preApprovalGate.unrelatedPendingApprovalCount,
@@ -4243,7 +5288,10 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             risk: "destructive",
             operation: approvalOperation,
             preview: `Install verified ${preflight.source.bundleId} menu-bar app signed by team ${preflight.source.teamIdentifier}`,
+            originOperationId: prepared.receipt.operationId,
             approvalSurface: ctx.remote === true ? "chatgpt-widget-critical" : "local",
+            resumeRequestId: prepared.receipt.approvalRequestId,
+            resumeSessionScope: ctx.sessionScope,
             ...(ctx.remote === true
               ? { requiredApprovalVia: "chatgpt-widget-critical" as const }
               : {}),
@@ -4252,20 +5300,25 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           if (!(ctx.remote === true && error instanceof DomainError && error.code === ErrorCode.APPROVAL_REQUIRED)) throw error;
           const approvalRequestId = typeof error.details?.requestId === "string" ? error.details.requestId : null;
           if (!approvalRequestId) throw error;
+          const approvalReceipt = await bindMacosAppApplyApprovalRequest(
+            ctx.stateDir,
+            input.requestId,
+            approvalRequestId,
+          );
           return {
             pendingApprovalResult: await chatGptOperationApprovalPending(ctx, {
               requestId: approvalRequestId,
               tool: "macos_app_apply_local",
-              allowFollowUpPrompt: `Critical macOS app approval granted for ${input.requestId}. Replay the exact same macos_app_apply_local request and continue verification.`,
+              allowFollowUpPrompt: `Critical macOS app approval granted for ${input.requestId}. The exact macOS app operation should continue directly from the approval callback; only if the callback reports fallbackRequiresExactReplay=true should the exact macos_app_apply_local request be replayed.`,
               denyFollowUpPrompt: `Critical macOS app approval denied for ${input.requestId}. Do not replace the app.`,
               extra: {
-                ...macosAppApplyPublicReceipt(prepared.receipt),
+                ...macosAppApplyPublicReceipt(approvalReceipt),
                 approvalProvider: "chatgpt-widget-critical",
                 criticalBadge: "Mac 앱 교체",
-                criticalWarning: "이 승인은 /Applications의 ChatGPT To Codex 앱을 실제로 교체하고 앱·supervisor·runtime을 재기동할 수 있습니다. 연결이 잠시 끊길 수 있습니다.",
+                criticalWarning: "/Applications 앱 실제 교체 · app/supervisor/runtime 재기동 가능 · 연결 일시 중단 가능",
                 criticalIdentityBefore: preflight.installed?.mainExecutableSha256.slice(0, 12) ?? "not-installed",
                 criticalIdentityAfter: preflight.source.mainExecutableSha256.slice(0, 12),
-                criticalRollback: "설치 또는 health verification이 실패하면 기존 앱/실행 상태로 롤백합니다.",
+                criticalRollback: "설치/health verification 실패 시 기존 앱·실행 상태 롤백",
               },
             }),
           };
@@ -4275,6 +5328,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
 
       const preApplyGate = await runtimeApplyGateSnapshot(ctx, entry, authorization.requestId);
       if (preApplyGate.activeOperationCount > 0 || preApplyGate.unrelatedPendingApprovalCount > 0) {
+        await autoFinalizeSerialAdminLease(ctx, entry.projectId, lease.leaseId, "macos-app-apply-postapproval-blocked").catch(() => false);
         throw new DomainError(ErrorCode.ACTIVE_OPERATION_IN_PROGRESS, "macOS app apply is blocked until active commands and approvals finish", {
           activeOperationCount: preApplyGate.activeOperationCount,
           unrelatedPendingApprovalCount: preApplyGate.unrelatedPendingApprovalCount,
@@ -4291,6 +5345,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       const barrierGate = await runtimeApplyGateSnapshot(ctx, entry, authorization.requestId);
       if (barrierGate.activeOperationCount > 0 || barrierGate.unrelatedPendingApprovalCount > 0) {
         await releaseRuntimeUpdateBarrier(ctx.stateDir, barrierOperationId).catch(() => false);
+        await autoFinalizeSerialAdminLease(ctx, entry.projectId, lease.leaseId, "macos-app-apply-drain-blocked").catch(() => false);
         throw new DomainError(ErrorCode.ACTIVE_OPERATION_IN_PROGRESS, "macOS app apply entered drain mode but another operation is still active", {
           activeOperationCount: barrierGate.activeOperationCount,
           unrelatedPendingApprovalCount: barrierGate.unrelatedPendingApprovalCount,
@@ -4313,6 +5368,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         } catch {
           await releaseRuntimeUpdateBarrier(ctx.stateDir, barrierOperationId).catch(() => false);
           const failed = await markMacosAppApplyStartFailed(ctx.stateDir, input.requestId);
+          await autoFinalizeSerialAdminLease(ctx, entry.projectId, lease.leaseId, "macos-app-apply-worker-start-failed").catch(() => false);
           return makeResult(
             macosAppApplyPublicReceipt(failed),
             `macOS app apply ${failed.operationId} could not start the fixed worker; installed app and live runtime were not changed.`,
@@ -4326,13 +5382,15 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           ...activation,
           workerPid,
         }));
+        await autoFinalizeSerialAdminLease(ctx, entry.projectId, lease.leaseId, "macos-app-apply-worker-started").catch(() => false);
         return makeResult(
           macosAppApplyPublicReceipt(started),
-          `macOS app apply ${started.operationId} started in a fixed local worker; poll macos_app_apply_status with the same requestId.`,
+          `macOS app apply ${started.operationId} started in a fixed local worker; follow reconnectPlan, then poll macos_app_apply_status with the same requestId only. Do not replay macos_app_apply_local after worker start.`,
         );
       } catch {
         await releaseRuntimeUpdateBarrier(ctx.stateDir, barrierOperationId).catch(() => false);
         const failed = await markMacosAppApplyStartFailed(ctx.stateDir, input.requestId);
+        await autoFinalizeSerialAdminLease(ctx, entry.projectId, lease.leaseId, "macos-app-apply-start-failed").catch(() => false);
         return makeResult(
           macosAppApplyPublicReceipt(failed),
           `macOS app apply ${failed.operationId} could not start the fixed worker; installed app and live runtime were not changed.`,
@@ -4409,20 +5467,38 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       if (preApprovalGate.activeOperationCount > 0 || preApprovalGate.unrelatedPendingApprovalCount > 0) {
         throw new DomainError(ErrorCode.ACTIVE_OPERATION_IN_PROGRESS, "Runtime snapshot prune is blocked before approval until active operations and approvals finish", preApprovalGate);
       }
-      const authorization = await ensureOperationAuthorized({
-        stateDir: ctx.stateDir,
-        lease,
-        tool: "runtime_snapshot_prune_local",
-        risk: "destructive",
-        operation: {
-          requestId: input.requestId,
-          eligibleSnapshotIds: before.snapshots
-            .filter((snapshot) => snapshot.eligibleForPrune)
-            .map((snapshot) => snapshot.snapshotId),
-          policy: before.policy,
-        },
-        preview: `Delete ${before.eligibleCount} inactive runtime snapshot(s); preserve active/current/recent rollback snapshots`,
-      });
+      let authorization: Awaited<ReturnType<typeof ensureOperationAuthorized>>;
+      try {
+        authorization = await ensureOperationAuthorized({
+          stateDir: ctx.stateDir,
+          lease,
+          tool: "runtime_snapshot_prune_local",
+          risk: "destructive",
+          approvalSurface: ctx.remote === true ? "chatgpt-widget" : "local",
+          operation: {
+            requestId: input.requestId,
+            eligibleSnapshotIds: before.snapshots
+              .filter((snapshot) => snapshot.eligibleForPrune)
+              .map((snapshot) => snapshot.snapshotId),
+            policy: before.policy,
+          },
+          preview: `Delete ${before.eligibleCount} inactive runtime snapshot(s); preserve active/current/recent rollback snapshots`,
+        });
+      } catch (error) {
+        const approvalRequestId = error instanceof DomainError && error.code === ErrorCode.APPROVAL_REQUIRED && typeof error.details?.requestId === "string"
+          ? error.details.requestId
+          : undefined;
+        if (ctx.remote === true && approvalRequestId) {
+          return chatGptOperationApprovalPending(ctx, {
+            requestId: approvalRequestId,
+            tool: "runtime_snapshot_prune_local",
+            allowFollowUpPrompt: "C2CT runtime_snapshot_prune_local 승인을 허용했어. 방금과 정확히 같은 입력으로 runtime_snapshot_prune_local을 다시 호출해서 승인된 정리를 실행해줘.",
+            denyFollowUpPrompt: "C2CT runtime_snapshot_prune_local 승인을 거절했어. snapshot을 삭제하지 말고 거절 상태로 종료해줘.",
+            extra: { eligibleCount: before.eligibleCount },
+          });
+        }
+        throw error;
+      }
       const gate = await runtimeApplyGateSnapshot(ctx, entry, authorization.requestId);
       if (gate.activeOperationCount > 0 || gate.unrelatedPendingApprovalCount > 0) {
         throw new DomainError(ErrorCode.ACTIVE_OPERATION_IN_PROGRESS, "Runtime snapshot prune is blocked until active operations and approvals finish", gate);
@@ -4504,13 +5580,15 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           killed,
         ] = await Promise.all([
           ctx.diagnostics?.summary(compact && !includeDiagnostics ? 1 : input.recentEvents ?? 20),
-          listArmRequests(ctx.stateDir),
-          listActions(ctx.stateDir),
+          listPendingArmRequests(ctx.stateDir),
+          listPendingActions(ctx.stateDir),
           listOperationApprovalRequests(ctx.stateDir).catch(() => null),
-          getRgCapabilityStatus({
-            stateDir: ctx.stateDir,
-            projectId: session.activeProjectId,
-          }).catch(() => null),
+          compact
+            ? listPendingRgApprovalRequests(ctx.stateDir).then((pendingRequests) => ({ pendingRequests, binary: null })).catch(() => null)
+            : getRgCapabilityStatus({
+                stateDir: ctx.stateDir,
+                projectId: session.activeProjectId,
+              }).catch(() => null),
           isKilled(ctx.stateDir),
         ]);
         const publicDiagnostics = diagnostics
@@ -4550,9 +5628,9 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           ? operationApprovalRequests.filter((request) => request.status === "pending").length
           : null;
         const pendingRgApprovalCount = rgStatus ? rgStatus.pendingRequests.length : null;
-        const rgAvailable = rgStatus ? rgStatus.binary.available : null;
-        const rgTrusted = rgStatus ? rgStatus.binary.trusted : null;
-        const rgVersion = rgStatus && "version" in rgStatus.binary ? rgStatus.binary.version : null;
+        const rgAvailable = rgStatus?.binary ? rgStatus.binary.available : null;
+        const rgTrusted = rgStatus?.binary ? rgStatus.binary.trusted : null;
+        const rgVersion = rgStatus?.binary && "version" in rgStatus.binary ? rgStatus.binary.version : null;
         const currentLeaseHealth = session.lease ? leaseHealth(session.lease) : null;
         const leaseActive = Boolean(session.lease && !currentLeaseHealth?.leaseExpired);
         const controlLeaseGranted = Boolean(leaseActive && session.lease?.preset === "control");
@@ -4584,6 +5662,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             }));
         })();
         const runtimeManifest = getRuntimeManifest();
+        const postRuntimeBootstrap = noteBootstrapStage(ctx, "connection-status");
         const runtimeExternalIdentity = currentRuntimeExternalIdentity();
         const [
           activeBackgroundOperations,
@@ -4611,6 +5690,16 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           refreshNotificationsAttempted: refreshNotifications.attempted,
           refreshNotificationsSent: refreshNotifications.sent,
         };
+        const publicRuntimeUpdateBarrier = runtimeUpdateBarrier
+          ? {
+              ...runtimeUpdateBarrier,
+              maintenanceInProgress: true,
+              leaseAcquisitionBlocked: true,
+              leaseRenewalBlocked: true,
+              releaseOwnedLeasesAllowed: true,
+              recommendedAction: "release-owned-project-capabilities-and-retry-after-maintenance",
+            }
+          : null;
         const privilegedProjectBlockers = await inspectPrivilegedProjectBlockers(ctx);
         const runtimeIdentityWarnings = [
           ...(runtimeManifest.sourceRevision ? [] : ["sourceRevision-unavailable"]),
@@ -4657,6 +5746,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                 complete: runtimeIdentityWarnings.length === 0,
                 warnings: runtimeIdentityWarnings,
               },
+              postRuntimeBootstrap,
               schemaRecovery,
               finalHealthy: true,
               sessionStateAvailable: sessionAvailable,
@@ -4668,7 +5758,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               activeOperations: [...activeOperations, ...activeBackgroundOperations],
               privilegedProjectBlockers,
               authorizationPlan: projectAuthorizationPlan(ctx.config.multiProjectLanesEnabled === true),
-              runtimeUpdateBarrier,
+              runtimeUpdateBarrier: publicRuntimeUpdateBarrier,
               transportErrors: diagnostics?.lifecycle.transportErrors ?? 0,
               requestReachability: {
                 currentRequestReachedServer: true,
@@ -4794,7 +5884,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                 }
               : null,
             activeRuntimePointer,
-            runtimeUpdateBarrier,
+            runtimeUpdateBarrier: publicRuntimeUpdateBarrier,
             lastRuntimeApply: lastRuntimeApply
               ? {
                   requestId: lastRuntimeApply.requestId,
@@ -4894,6 +5984,40 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       });
     },
   );
+
+  // Intentionally stable, harmless schema marker for host-catalog refresh E2E.
+  // Its presence in the direct named host catalog proves that a post-runtime
+  // catalog refresh/rebind observed this runtime generation.
+  registerTool(
+    "chatgpt_catalog_refresh_marker_v1",
+    {
+      title: "C2CT catalog refresh marker v1",
+      description:
+        "Harmless marker used to verify that ChatGPT refreshed and rebound the C2CT named-tool catalog after a runtime/schema update. It changes no project files, leases, processes, runtime, app, connector, tunnel, or network state; it records only bounded non-secret recovery evidence.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: chatGptToolMeta("Checking catalog refresh marker...", "Catalog refresh marker ready"),
+      inputSchema: {},
+    },
+    async () => withErrorMapping<Record<string, unknown>>(ctx, "chatgpt_catalog_refresh_marker_v1", {}, async () => {
+      const manifest = getRuntimeManifest();
+      const expectedHostCatalogRevision = manifest.hostCatalogRevision;
+      const receipt = typeof expectedHostCatalogRevision === "string"
+        ? await recordHostCatalogRebind(ctx.stateDir, expectedHostCatalogRevision).catch(() => null)
+        : null;
+      return makeResult<Record<string, unknown>>(
+        {
+          marker: "c2ct-host-catalog-refresh-v1",
+          readOnly: true,
+          catalogRebindProof: true,
+          recoveryEvidenceRecorded: Boolean(receipt),
+          runtimeHostCatalogRevision: receipt?.runtimeHostCatalogRevision ?? null,
+          runtimeFingerprint: receipt?.runtimeFingerprint ?? null,
+        },
+        "C2CT host catalog refresh marker v1 is callable from this named-tool catalog.",
+      );
+    }),
+  );
+
 
   registerTool(
     "mobile_approval_status",
@@ -5454,22 +6578,38 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     "workspace_refresh_index",
     {
       title: "Refresh workspace index",
-      description: "Rescan the workspace root to refresh the project registry.",
+      description: "Rescan authorized workspace/project roots and refresh the project registry. The default depth is 1 (root plus direct child folders); use bounded depth up to 4 for nested projects. Git/package markers, .chatgpt2codex, AGENTS.md, and CLAUDE.md qualify a folder as a project root.",
       annotations: LOCAL_STATE_ANNOTATIONS,
       _meta: chatGptToolMeta("Refreshing workspace index...", "Workspace index refreshed"),
       inputSchema: {
-        depth: z.number().int().optional(),
+        depth: z.number().int().min(0).max(4).optional(),
         includeHidden: z.boolean().optional(),
       },
     },
     async (input) => {
       return withErrorMapping(ctx, "workspace_refresh_index", input, async () => {
-        const scanned = await scanWorkspaces(ctx.workspaceRoots ?? [ctx.workspaceRoot]);
+        const previousProjectIds = new Set(ctx.registry.map((entry) => entry.projectId));
+        const scanned = await scanWorkspaces(ctx.workspaceRoots ?? [ctx.workspaceRoot], {
+          depth: input.depth,
+          includeHidden: input.includeHidden,
+        });
+        const nextProjectIds = new Set(scanned.map((entry) => entry.projectId));
+        const addedProjectIds = scanned
+          .map((entry) => entry.projectId)
+          .filter((projectId) => !previousProjectIds.has(projectId));
+        const removedProjectIds = [...previousProjectIds].filter((projectId) => !nextProjectIds.has(projectId));
         ctx.registry.splice(0, ctx.registry.length, ...scanned);
         await ctx.store.saveProjects(scanned);
         const updatedAt = Date.now();
         return makeResult(
-          { count: scanned.length, updatedAt },
+          {
+            count: scanned.length,
+            updatedAt,
+            depth: input.depth ?? 1,
+            includeHidden: input.includeHidden ?? false,
+            addedProjectIds,
+            removedProjectIds,
+          },
           `Refreshed workspace index: ${scanned.length} project(s).`,
         );
       });
@@ -5485,7 +6625,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Select active project",
       description:
-        "Serial-only project lease acquisition. When multi-project lanes are enabled, DO NOT use this for normal coding: use project_lane_open then project_lane_status instead. Remote serial admin requires purpose=legacy-admin. Desktop control requires preset=control, purpose=control, and local approval. confirmSwitch never replaces purpose or workLaneId.",
+        "Serial-only project lease acquisition. When multi-project lanes are enabled, DO NOT use this for normal coding: use project_lane_open then project_lane_status instead. Remote serial admin requires purpose=legacy-admin; when the same session owns an idle work lane for the same project, that lane is safely auto-finalized inside project_select before the serial lease is acquired, so a separate project_lane_release call is not required for this transition. Desktop control requires preset=control, purpose=control, and local approval. confirmSwitch never replaces purpose or workLaneId.",
       annotations: LOCAL_STATE_ANNOTATIONS,
       _meta: chatGptToolMeta("Selecting active project...", "Active project selected"),
       inputSchema: {
@@ -5516,7 +6656,9 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         }
         const entry = result.entry;
 
-        const session = await loadSession(ctx);
+        await assertRuntimeMaintenanceAllowsLeaseAcquisition(ctx.stateDir);
+
+        let session = await loadSession(ctx);
         const now = Date.now();
         const preset: LeasePreset = input.preset ?? "read-only";
         if (ctx.remote === true && ctx.config.multiProjectLanesEnabled === true) {
@@ -5546,6 +6688,10 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               "This remote session is already bound to another project",
               { projectId: entry.projectId, boundProjectId: session.boundProjectId },
             );
+          }
+          if (preset !== "control" && effectivePurpose === "legacy-admin") {
+            const autoFinalizedLane = await autoFinalizeOwnedWorkLaneForSerialAdmin(ctx, entry, now);
+            if (autoFinalizedLane) session = await loadSession(ctx);
           }
         }
         if (ctx.config.multiProjectLanesEnabled === true) {
@@ -5791,7 +6937,13 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         },
       },
       async (input) => withErrorMapping(ctx, "project_lane_open", input, async () => {
+        await assertRuntimeMaintenanceAllowsLeaseAcquisition(ctx.stateDir);
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const bootstrapSession = await loadSession(ctx);
+        const bootstrapState = bootstrapSnapshot(ctx, entry.projectId);
+        if (bootstrapSession.boundProjectId === entry.projectId && !bootstrapState.laneReadyAt) {
+          requireBootstrapStage(ctx, "project", entry.projectId);
+        }
         if (input.preset !== "read-only") {
           await selfHealStalePrivilegeBeforeLaneOpen(ctx, entry);
         }
@@ -5841,10 +6993,12 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           preset: opened.lease.preset,
           reason: summarizePrivateText(input.reason),
         });
+        const postRuntimeBootstrap = noteBootstrapStage(ctx, "lane-ready", entry.projectId);
         return makeResult(
           {
             workLaneId: opened.workLaneId,
             boundProjectId: opened.session.boundProjectId ?? null,
+            postRuntimeBootstrap,
             lease: {
               projectId: opened.lease.projectId,
               leaseId: opened.lease.leaseId,
@@ -5921,6 +7075,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         },
       },
       async (input) => withErrorMapping(ctx, "project_lane_renew", input, async () => {
+        await assertRuntimeMaintenanceAllowsLeaseAcquisition(ctx.stateDir);
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
         let previousClaim: Lease | undefined;
         let replacementClaimed = false;
@@ -6003,12 +7158,12 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       {
         title: "Finalize a C2CT project work lane",
         description:
-          "Idempotently clear only the caller's exact temporary C2CT work-lane authorization after work completes. This does not modify project files, processes, runtime, app, connector, network, or another session, and fails closed while tracked work is still running.",
+          "Idempotently clear only the caller's temporary C2CT work-lane authorization after work completes. Remote callers should normally omit workLaneId and identify the current owned lane by exact projectId + leaseId so the raw bearer lane handle does not need to be retransmitted. Supplying workLaneId remains supported for exact-handle/native compatibility. This does not modify project files, processes, runtime, app, connector, network, or another session, and fails closed while tracked work is still running.",
         annotations: CAPABILITY_FINALIZATION_ANNOTATIONS,
         _meta: chatGptToolMeta("Finalizing C2CT work lane...", "C2CT work lane finalized"),
         inputSchema: {
           projectId: z.string(),
-          workLaneId: z.string().regex(/^lane_[0-9a-fA-F-]{36}$/),
+          workLaneId: z.string().regex(/^lane_[0-9a-fA-F-]{36}$/).optional(),
           leaseId: z.string().regex(/^lease_[0-9a-fA-F-]{36}$/),
           reason: LEASE_AUDIT_REASON_SCHEMA,
         },
@@ -6042,7 +7197,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           if (wasProjectLaneReleased({
             session,
             projectId: input.projectId,
-            workLaneId: input.workLaneId,
+            ...(input.workLaneId ? { workLaneId: input.workLaneId } : {}),
             leaseId: input.leaseId,
           })) {
             return {
@@ -6050,40 +7205,78 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               value: { leaseId: input.leaseId, preset: null, alreadyReleased: true },
             };
           }
-          const current = await requireProjectLane({
+          if (input.workLaneId) {
+            const current = await requireProjectLane({
+              session,
+              project: entry,
+              workLaneId: input.workLaneId,
+              ownerScope: backgroundOwnerScope(ctx),
+            });
+            if (current.leaseId !== input.leaseId) {
+              throw new DomainError(ErrorCode.LEASE_REQUIRED, "Lane lease identity changed; refresh status before releasing", {
+                projectId: input.projectId,
+                currentLeaseChanged: true,
+              });
+            }
+            if (remoteProjectIsolation(ctx) && current.preset !== "read-only") {
+              // De-escalate the global root lock before persisting the session
+              // removal. If the session write fails, only this session retains a
+              // stale lane record. A retry can finish session cleanup because
+              // releaseProjectPrivilege is idempotent when this exact lock is gone.
+              await releaseProjectPrivilege({
+                stateDir: ctx.stateDir,
+                project: entry,
+                ownerScope: ctx.sessionScope,
+                leaseId: current.leaseId,
+                kind: "lane",
+              });
+            }
+            const result = await releaseProjectLane({
+              session,
+              project: entry,
+              workLaneId: input.workLaneId,
+              ownerScope: backgroundOwnerScope(ctx),
+            });
+            return {
+              session: result.session,
+              value: { leaseId: result.releasedLeaseId, preset: current.preset, alreadyReleased: false },
+            };
+          }
+
+          const owned = await releaseOwnedProjectLane({
             session,
             project: entry,
-            workLaneId: input.workLaneId,
             ownerScope: backgroundOwnerScope(ctx),
+            includeReadOnly: true,
           });
-          if (current.leaseId !== input.leaseId) {
+          if (!owned) {
+            throw new DomainError(ErrorCode.LEASE_REQUIRED, "No active work lane owned by this session for the requested project", {
+              projectId: input.projectId,
+              currentLaneMissing: true,
+            });
+          }
+          if (owned.releasedLease.leaseId !== input.leaseId) {
             throw new DomainError(ErrorCode.LEASE_REQUIRED, "Lane lease identity changed; refresh status before releasing", {
               projectId: input.projectId,
               currentLeaseChanged: true,
             });
           }
-          if (remoteProjectIsolation(ctx) && current.preset !== "read-only") {
-            // De-escalate the global root lock before persisting the session
-            // removal. If the session write fails, only this session retains a
-            // stale lane record. A retry can finish session cleanup because
-            // releaseProjectPrivilege is idempotent when this exact lock is gone.
+          if (remoteProjectIsolation(ctx) && owned.releasedLease.preset !== "read-only") {
             await releaseProjectPrivilege({
               stateDir: ctx.stateDir,
               project: entry,
               ownerScope: ctx.sessionScope,
-              leaseId: current.leaseId,
+              leaseId: owned.releasedLease.leaseId,
               kind: "lane",
             });
           }
-          const result = await releaseProjectLane({
-            session,
-            project: entry,
-            workLaneId: input.workLaneId,
-            ownerScope: backgroundOwnerScope(ctx),
-          });
           return {
-            session: result.session,
-            value: { leaseId: result.releasedLeaseId, preset: current.preset, alreadyReleased: false },
+            session: owned.session,
+            value: {
+              leaseId: owned.releasedLease.leaseId,
+              preset: owned.releasedLease.preset,
+              alreadyReleased: false,
+            },
           };
         });
         if (!released.alreadyReleased) {
@@ -6241,12 +7434,22 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               };
             }));
           }
+          let persistedSerialLeaseCleared = false;
+          if (retired.kind === "serial" && ctx.store.clearSerialLeaseByIdentity) {
+            const cleanup = await ctx.store.clearSerialLeaseByIdentity({
+              projectId: retired.projectId,
+              leaseId: retired.leaseId,
+              preset: retired.preset,
+            }).catch(() => null);
+            persistedSerialLeaseCleared = cleanup?.cleared === true;
+          }
           await ctx.ledger.append({
             type: "project.root-lock.self-healed",
             projectId: entry.projectId,
             preset: retired.preset,
             kind: retired.kind,
             generation: target.generation,
+            ...(retired.kind === "serial" ? { persistedSerialLeaseCleared } : {}),
           });
           return makeResult<Record<string, unknown>>(
             {
@@ -6254,6 +7457,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               selfHealed: true,
               sessionLaneRemoved,
               rootLockReleased: true,
+              ...(retired.kind === "serial" ? { persistedSerialLeaseCleared } : {}),
               projectId: entry.projectId,
               retiredPreset: retired.preset,
               retiredLeaseExpiresAt: retired.expiresAt,
@@ -6599,6 +7803,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     },
     async (input) => {
       return withErrorMapping(ctx, "project_renew_lease", input, async () => {
+        await assertRuntimeMaintenanceAllowsLeaseAcquisition(ctx.stateDir);
         const session = await loadSession(ctx);
         const current = session.lease;
         const noStart = {
@@ -6757,6 +7962,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         for (const candidate of ["AGENTS.md", "CLAUDE.md", ".codex/config.toml"]) {
           if (await pathExists(path.join(entry.root, candidate))) ruleFiles.push(candidate);
         }
+        noteBootstrapStage(ctx, "project-status", entry.projectId);
         return makeResult(
           {
             branch: status.branch,
@@ -6806,6 +8012,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           const summary = redacted.split("\n").slice(0, 20).join("\n").slice(0, 2000);
           rules.push({ file: candidate, summary });
         }
+        noteBootstrapStage(ctx, "project-rules", entry.projectId);
         return makeResult({ rules }, `Found ${rules.length} rule file(s) for ${entry.name}.`);
       });
     },
@@ -7528,12 +8735,13 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Read retained command output",
       description:
-        "Read a byte range from redacted command or local-shell output retained after summary truncation. Continue with nextOffset until eof=true.",
+        "Read a byte range from redacted command or local-shell output retained after summary truncation. Lane-bound output requires the matching workLaneId; turnless approved command output can instead use its exact same-session approvalRequestId. Continue with nextOffset until eof=true.",
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: chatGptToolMeta("Reading retained output...", "Retained output read"),
       inputSchema: {
         outputRef: z.string(),
         workLaneId: WORK_LANE_ID_SCHEMA.optional(),
+        approvalRequestId: z.string().regex(/^op_[0-9a-f-]{36}$/u).optional(),
         offset: z.number().int().nonnegative().optional(),
         maxBytes: z.number().int().min(1).max(OUTPUT_READ_MAX_BYTES).optional(),
       },
@@ -7541,10 +8749,23 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     async (input) => {
       return withErrorMapping(ctx, "output_read", input, async () => {
         const metadata = await readOutputMetadata(ctx.stateDir, input.outputRef);
-        await requireProjectLease(ctx, metadata.projectId, "read", input.workLaneId);
-        const requestedLaneDigest = input.workLaneId ? projectLaneDigest(input.workLaneId) : undefined;
-        if (metadata.laneDigest !== requestedLaneDigest) {
-          throw new DomainError(ErrorCode.PERMISSION_DENIED, "Output artifact does not belong to this project lane");
+        if (metadata.approvalRequestId) {
+          if (input.approvalRequestId !== metadata.approvalRequestId) {
+            throw new DomainError(ErrorCode.PERMISSION_DENIED, "Turnless output requires its exact approvalRequestId");
+          }
+          const approval = await receiptApprovalForCaller(ctx, metadata.projectId, input.approvalRequestId);
+          if (!approval || approval.requestId !== metadata.approvalRequestId || approval.tool !== metadata.tool) {
+            throw new DomainError(ErrorCode.OPERATION_NOT_FOUND, "Turnless output approval binding was not found");
+          }
+          if (!outputArtifactMatchesOwner(metadata, backgroundOwnerScope(ctx))) {
+            throw new DomainError(ErrorCode.PERMISSION_DENIED, "Turnless output belongs to another ChatGPT session");
+          }
+        } else {
+          await requireProjectLease(ctx, metadata.projectId, "read", input.workLaneId);
+          const requestedLaneDigest = input.workLaneId ? projectLaneDigest(input.workLaneId) : undefined;
+          if (metadata.laneDigest !== requestedLaneDigest) {
+            throw new DomainError(ErrorCode.PERMISSION_DENIED, "Output artifact does not belong to this project lane");
+          }
         }
         const result = await readOutputArtifact(
           ctx.stateDir,
@@ -7552,9 +8773,18 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           input.offset ?? 0,
           input.maxBytes ?? OUTPUT_READ_DEFAULT_BYTES,
         );
-        const { laneDigest: _laneDigest, ...publicResult } = result;
+        const {
+          laneDigest: _laneDigest,
+          approvalRequestId: _approvalRequestId,
+          ownerScopeDigest: _ownerScopeDigest,
+          ...publicResult
+        } = result;
         return makeResult(
-          { ...publicResult, laneBound: metadata.laneDigest !== undefined },
+          {
+            ...publicResult,
+            laneBound: metadata.laneDigest !== undefined,
+            approvalBound: metadata.approvalRequestId !== undefined,
+          },
           `Read retained output ${result.outputRef} bytes ${result.offset}-${result.nextOffset} of ${result.totalBytes}.`,
         );
       });
@@ -7829,6 +9059,114 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             ? commandForPolicy.riskTier as OperationRisk
             : "destructive" as OperationRisk
           : null;
+        const backgroundCommandExecute = (turnlessApprovalRequestId?: string): BackgroundExecute =>
+          async (backgroundOperationId, signal, update, registerTimeoutControl) => {
+            await ctx.ledger.append({
+              type: "process.started",
+              projectId: input.projectId,
+              commandId: input.commandId,
+              executionMode: "background",
+            });
+            const result = await runCommand(
+              entry.root,
+              input.commandId,
+              input.args,
+              input.intent?.expectedDurationSec,
+              { granted: operationRisk !== null },
+              (event) => {
+                void update({
+                  state: event.phase === "running" ? "running" : event.phase === "cleanup" ? "cleanup" : undefined,
+                  phase: event.phase === "completed" ? "serialize" : event.phase,
+                  subprocessStarted: event.subprocessStarted,
+                  subprocessStillRunning: event.subprocessStillRunning,
+                  cleanupStarted: event.cleanupStarted,
+                  cleanupCompleted: event.cleanupCompleted,
+                });
+                void ctx.diagnostics?.record({
+                  event: "command.lifecycle",
+                  outcome: "info",
+                  tool: "command_run",
+                  operationId: backgroundOperationId,
+                  phase: event.phase,
+                  actionStarted: true,
+                  subprocessStarted: event.subprocessStarted,
+                  subprocessStillRunning: event.subprocessStillRunning,
+                  cleanupStarted: event.cleanupStarted,
+                  cleanupCompleted: event.cleanupCompleted,
+                  ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
+                  ...(event.commandStatus ? { commandStatus: event.commandStatus } : {}),
+                  ...(event.cleanupStatus ? { cleanupStatus: event.cleanupStatus } : {}),
+                  safeInputs: lifecycleSafeInputs,
+                }).catch(() => undefined);
+              },
+              { signal, captureOutput: true, onTimeoutControl: registerTimeoutControl },
+            );
+            let outputArtifact: Awaited<ReturnType<typeof createOutputArtifact>> | undefined;
+            let artifactError: string | undefined;
+            if (result.capturedOutput) {
+              try {
+                outputArtifact = await createOutputArtifact({
+                  stateDir: ctx.stateDir,
+                  projectId: input.projectId,
+                  ...(turnlessApprovalRequestId
+                    ? {
+                        approvalRequestId: turnlessApprovalRequestId,
+                        ownerScope: backgroundOwnerScope(ctx),
+                      }
+                    : input.workLaneId
+                      ? { laneDigest: projectLaneDigest(input.workLaneId) }
+                      : {}),
+                  tool: "command_run",
+                  stdout: result.capturedOutput.stdout,
+                  stderr: result.capturedOutput.stderr,
+                  sourceTruncated: result.outputTruncated,
+                  artifactTruncated: result.capturedOutput.artifactTruncated,
+                  stdoutBytes: result.capturedOutput.stdoutBytes,
+                  stderrBytes: result.capturedOutput.stderrBytes,
+                });
+              } catch (error) {
+                artifactError = toArtifactError(error, ctx.remote === true);
+              }
+            }
+            const artifactStatus = artifactError
+              ? "FAILED" as const
+              : outputArtifact?.artifactTruncated
+                ? "TRUNCATED" as const
+                : outputArtifact
+                  ? "CREATED" as const
+                  : "FAILED" as const;
+            const domain = resolveDomainStatus(result, input.resultContract);
+            await ctx.ledger.append({
+              type: "process.output.redacted",
+              projectId: input.projectId,
+              commandId: input.commandId,
+              commandStatus: result.commandStatus,
+              exitCode: result.exitCode,
+              cleanupStatus: result.cleanupStatus,
+              artifactStatus,
+              executionMode: "background",
+            });
+            return {
+              state: backgroundTerminalState(result.commandStatus),
+              commandStatus: result.commandStatus,
+              exitCode: result.exitCode,
+              terminationSignal: result.terminationSignal,
+              cleanupStatus: result.cleanupStatus,
+              artifactStatus,
+              domainStatus: domain.domainStatus,
+              domainStatusSource: domain.domainStatusSource,
+              durationMs: result.durationMs,
+              ...(outputArtifact
+                ? {
+                    outputRef: outputArtifact.outputRef,
+                    resourceUri: outputArtifact.resourceUri,
+                    outputBytes: outputArtifact.stdoutBytes + outputArtifact.stderrBytes,
+                    artifactTruncated: outputArtifact.artifactTruncated,
+                  }
+                : {}),
+              ...(artifactError ? { errorCode: "OUTPUT_ARTIFACT_FAILED" } : {}),
+            };
+          };
         let approvedOperationFingerprint: string | undefined;
         if (operationRisk) {
           await progress?.update("approval", "Checking command approval");
@@ -7871,13 +9209,52 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               : undefined;
             if (!requestId) throw error;
             if (ctx.remote === true) {
+              const sessionScope = ctx.sessionScope;
+              const expiresAt = error instanceof DomainError && typeof error.details?.expiresAt === "number"
+                ? error.details.expiresAt
+                : undefined;
+              if (sessionScope && expiresAt) {
+                registerChatGptTurnlessContinuation({
+                  requestId,
+                  tool: "command_run",
+                  sessionScope,
+                  expiresAt,
+                  run: async () => {
+                    const authorization = await ensureOperationAuthorized({
+                      ...approvalInput,
+                      resumeRequestId: requestId,
+                      resumeSessionScope: sessionScope,
+                      requiredApprovalVia: "chatgpt-widget",
+                    });
+                    const snapshot = await startTurnlessApprovedBackgroundOperation({
+                      ctx,
+                      entry,
+                      lease,
+                      approvalRequestId: requestId,
+                      commandId: input.commandId,
+                      operationFingerprint: authorization.operationFingerprint,
+                      execute: backgroundCommandExecute(requestId),
+                    });
+                    return {
+                      turnlessContinuation: true,
+                      continuationStarted: true,
+                      fallbackRequiresExactReplay: false,
+                      actionStarted: true,
+                      subprocessStarted: snapshot.subprocessStarted,
+                      operationId: snapshot.operationId,
+                      approvalRequestId: requestId,
+                      sideEffects: "background-operation-started",
+                    };
+                  },
+                });
+              }
               await progress?.update("approval", "Operation-bound ChatGPT approval requested; returning inline handoff");
               return chatGptOperationApprovalPending(ctx, {
                 requestId,
                 tool: "command_run",
-                allowFollowUpPrompt: "C2CT command_run 승인을 허용했어. 방금과 정확히 같은 입력으로 command_run을 다시 호출해서 승인된 1회 작업을 이어서 실행해줘.",
+                allowFollowUpPrompt: "C2CT command_run 승인을 허용했어. command_run은 재호출하지 말고 operation_status를 approvalRequestId로 status-only 확인해줘.",
                 denyFollowUpPrompt: "C2CT command_run 승인을 거절했어. 이 작업은 실행하지 말고 거절 상태로 종료해줘.",
-                extra: { commandId: input.commandId },
+                extra: { commandId: input.commandId, projectId: input.projectId },
               });
             }
             await progress?.update("approval", "Waiting for local approval; this operation will resume automatically");
@@ -7936,106 +9313,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             leasePreset: lease.preset,
             commandId: input.commandId,
             operationFingerprint,
-            execute: async (backgroundOperationId, signal, update, registerTimeoutControl) => {
-              await ctx.ledger.append({
-                type: "process.started",
-                projectId: input.projectId,
-                commandId: input.commandId,
-                executionMode: "background",
-              });
-              const result = await runCommand(
-                entry.root,
-                input.commandId,
-                input.args,
-                input.intent?.expectedDurationSec,
-                { granted: operationRisk !== null },
-                (event) => {
-                  void update({
-                    state: event.phase === "running" ? "running" : event.phase === "cleanup" ? "cleanup" : undefined,
-                    phase: event.phase === "completed" ? "serialize" : event.phase,
-                    subprocessStarted: event.subprocessStarted,
-                    subprocessStillRunning: event.subprocessStillRunning,
-                    cleanupStarted: event.cleanupStarted,
-                    cleanupCompleted: event.cleanupCompleted,
-                  });
-                  void ctx.diagnostics?.record({
-                    event: "command.lifecycle",
-                    outcome: "info",
-                    tool: "command_run",
-                    operationId: backgroundOperationId,
-                    phase: event.phase,
-                    actionStarted: true,
-                    subprocessStarted: event.subprocessStarted,
-                    subprocessStillRunning: event.subprocessStillRunning,
-                    cleanupStarted: event.cleanupStarted,
-                    cleanupCompleted: event.cleanupCompleted,
-                    ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
-                    ...(event.commandStatus ? { commandStatus: event.commandStatus } : {}),
-                    ...(event.cleanupStatus ? { cleanupStatus: event.cleanupStatus } : {}),
-                    safeInputs: lifecycleSafeInputs,
-                  }).catch(() => undefined);
-                },
-                { signal, captureOutput: true, onTimeoutControl: registerTimeoutControl },
-              );
-              let outputArtifact: Awaited<ReturnType<typeof createOutputArtifact>> | undefined;
-              let artifactError: string | undefined;
-              if (result.capturedOutput) {
-                try {
-                  outputArtifact = await createOutputArtifact({
-                    stateDir: ctx.stateDir,
-                    projectId: input.projectId,
-                    ...(input.workLaneId ? { laneDigest: projectLaneDigest(input.workLaneId) } : {}),
-                    tool: "command_run",
-                    stdout: result.capturedOutput.stdout,
-                    stderr: result.capturedOutput.stderr,
-                    sourceTruncated: result.outputTruncated,
-                    artifactTruncated: result.capturedOutput.artifactTruncated,
-                    stdoutBytes: result.capturedOutput.stdoutBytes,
-                    stderrBytes: result.capturedOutput.stderrBytes,
-                  });
-                } catch (error) {
-                  artifactError = toArtifactError(error, ctx.remote === true);
-                }
-              }
-              const artifactStatus = artifactError
-                ? "FAILED" as const
-                : outputArtifact?.artifactTruncated
-                  ? "TRUNCATED" as const
-                  : outputArtifact
-                    ? "CREATED" as const
-                    : "FAILED" as const;
-              const domain = resolveDomainStatus(result, input.resultContract);
-              await ctx.ledger.append({
-                type: "process.output.redacted",
-                projectId: input.projectId,
-                commandId: input.commandId,
-                commandStatus: result.commandStatus,
-                exitCode: result.exitCode,
-                cleanupStatus: result.cleanupStatus,
-                artifactStatus,
-                executionMode: "background",
-              });
-              return {
-                state: backgroundTerminalState(result.commandStatus),
-                commandStatus: result.commandStatus,
-                exitCode: result.exitCode,
-                terminationSignal: result.terminationSignal,
-                cleanupStatus: result.cleanupStatus,
-                artifactStatus,
-                domainStatus: domain.domainStatus,
-                domainStatusSource: domain.domainStatusSource,
-                durationMs: result.durationMs,
-                ...(outputArtifact
-                  ? {
-                      outputRef: outputArtifact.outputRef,
-                      resourceUri: outputArtifact.resourceUri,
-                      outputBytes: outputArtifact.stdoutBytes + outputArtifact.stderrBytes,
-                      artifactTruncated: outputArtifact.artifactTruncated,
-                    }
-                  : {}),
-                ...(artifactError ? { errorCode: "OUTPUT_ARTIFACT_FAILED" } : {}),
-              };
-            },
+            execute: backgroundCommandExecute(),
           });
           await progress?.update("running", "Background command accepted; poll operation_status");
           return makeResult(
@@ -8185,25 +9463,43 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Check background operation",
       description:
-        "Check one bounded background command by exact operationId. Requires a matching selected project and at least a read-only lease. Never automatically retries the command.",
+        "Check one bounded background command by exact operationId, or a turnless approved command by its exact same-session approvalRequestId. operationId lookup keeps the existing project/lane read boundary; approvalRequestId lookup is status-only and requires the original ChatGPT session binding. Never automatically retries the command.",
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: chatGptToolMeta("Checking background operation...", "Background operation checked"),
       inputSchema: {
         projectId: z.string(),
         workLaneId: WORK_LANE_ID_SCHEMA.optional(),
-        operationId: z.string().regex(/^bg_[0-9a-f-]{36}$/u),
+        operationId: z.string().regex(/^bg_[0-9a-f-]{36}$/u).optional(),
+        approvalRequestId: z.string().regex(/^op_[0-9a-f-]{36}$/u).optional(),
       },
     },
     async (input) => withErrorMapping(ctx, "operation_status", input, async () => {
       const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
-      await requireProjectLease(ctx, entry.projectId, "read", input.workLaneId);
-      const snapshot = await backgroundOperationManager(ctx.stateDir).status({
-        ownerScope: backgroundOwnerScope(ctx),
-        projectId: entry.projectId,
-        projectRoot: entry.root,
-        ...(input.workLaneId ? { laneDigest: projectLaneDigest(input.workLaneId) } : {}),
-        operationId: input.operationId,
-      });
+      if ((input.operationId ? 1 : 0) + (input.approvalRequestId ? 1 : 0) !== 1) {
+        throw new DomainError(ErrorCode.INVALID_ARGUMENT, "Provide exactly one of operationId or approvalRequestId");
+      }
+      let snapshot;
+      if (input.approvalRequestId) {
+        const approval = await receiptApprovalForCaller(ctx, entry.projectId, input.approvalRequestId);
+        if (!approval || (approval.tool !== "command_run" && approval.tool !== "e2e_run_command")) {
+          throw new DomainError(ErrorCode.OPERATION_NOT_FOUND, "Turnless background approval was not found for this ChatGPT session");
+        }
+        snapshot = await backgroundOperationManager(ctx.stateDir).statusByApproval({
+          ownerScope: backgroundOwnerScope(ctx),
+          projectId: entry.projectId,
+          projectRoot: entry.root,
+          approvalRequestId: input.approvalRequestId,
+        });
+      } else {
+        await requireProjectLease(ctx, entry.projectId, "read", input.workLaneId);
+        snapshot = await backgroundOperationManager(ctx.stateDir).status({
+          ownerScope: backgroundOwnerScope(ctx),
+          projectId: entry.projectId,
+          projectRoot: entry.root,
+          ...(input.workLaneId ? { laneDigest: projectLaneDigest(input.workLaneId) } : {}),
+          operationId: input.operationId!,
+        });
+      }
       const operationActive = ["queued", "spawning", "running", "cleanup"].includes(snapshot.state);
       return makeResult(
         {
@@ -8343,14 +9639,31 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           input.workLaneId,
         );
         if (operationRisk) {
-          await ensureOperationAuthorized({
-            stateDir: ctx.stateDir,
-            lease,
-            tool: "local_shell_run",
-            risk: operationRisk,
-            operation: { command: input.command, cwd: input.cwd ?? null },
-            preview: redact(input.command),
-          });
+          try {
+            await ensureOperationAuthorized({
+              stateDir: ctx.stateDir,
+              lease,
+              tool: "local_shell_run",
+              risk: operationRisk,
+              approvalSurface: ctx.remote === true ? "chatgpt-widget" : "local",
+              operation: { command: input.command, cwd: input.cwd ?? null },
+              preview: redact(input.command),
+            });
+          } catch (error) {
+            const approvalRequestId = error instanceof DomainError && error.code === ErrorCode.APPROVAL_REQUIRED && typeof error.details?.requestId === "string"
+              ? error.details.requestId
+              : undefined;
+            if (ctx.remote === true && approvalRequestId) {
+              return chatGptOperationApprovalPending(ctx, {
+                requestId: approvalRequestId,
+                tool: "local_shell_run",
+                allowFollowUpPrompt: "C2CT local_shell_run 승인을 허용했어. 방금과 정확히 같은 입력으로 local_shell_run을 다시 호출해서 승인된 명령을 실행해줘.",
+                denyFollowUpPrompt: "C2CT local_shell_run 승인을 거절했어. 명령을 실행하지 말고 거절 상태로 종료해줘.",
+                extra: { risk: operationRisk },
+              });
+            }
+            throw error;
+          }
         }
         await assertRuntimeUpdateNotDraining(ctx.stateDir);
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
@@ -8639,7 +9952,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         : input.intent?.writesWorkspace
           ? "write"
           : "verify";
-      return withErrorMapping<Record<string, unknown>>(ctx, "e2e_run_command", { ...input, command: redact(input.command) }, async (progress) => {
+      return withErrorMapping<Record<string, unknown>>(ctx, "e2e_run_command", { ...input, command: redact(input.command) }, async (progress, operationId) => {
         requireNativeE2eSupport();
         const lease = await requireProjectLease(
           ctx,
@@ -8647,45 +9960,182 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           requiredCapability,
           input.workLaneId,
         );
+        const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const backgroundE2eExecute = (
+          approvedRiskForRun?: Extract<OperationRisk, "network" | "destructive">,
+          turnlessApprovalRequestId?: string,
+        ): BackgroundExecute => async (_backgroundOperationId, signal, update) => {
+          await ctx.ledger.append({
+            type: "e2e.command.started",
+            projectId: input.projectId,
+            command: summarizeCommandAudit(input.command),
+            executionMode: "background",
+          });
+          await update({
+            state: "running",
+            phase: "running",
+            subprocessStarted: true,
+            subprocessStillRunning: true,
+          });
+          const result = await runLocalShell(
+            entry.root,
+            input.command,
+            input.cwd,
+            input.timeoutSec,
+            approvedRiskForRun,
+            { signal, captureOutput: true },
+          );
+          await update({
+            phase: "serialize",
+            subprocessStarted: true,
+            subprocessStillRunning: false,
+            cleanupStarted: result.cleanupStatus !== "NOT_REQUIRED",
+            cleanupCompleted: result.cleanupStatus === "COMPLETED",
+          });
+          let outputArtifact: Awaited<ReturnType<typeof createOutputArtifact>> | undefined;
+          let artifactError: string | undefined;
+          if (result.capturedOutput) {
+            try {
+              outputArtifact = await createOutputArtifact({
+                stateDir: ctx.stateDir,
+                projectId: input.projectId,
+                ...(turnlessApprovalRequestId
+                  ? {
+                      approvalRequestId: turnlessApprovalRequestId,
+                      ownerScope: backgroundOwnerScope(ctx),
+                    }
+                  : input.workLaneId
+                    ? { laneDigest: projectLaneDigest(input.workLaneId) }
+                    : {}),
+                tool: "e2e_run_command",
+                stdout: result.capturedOutput.stdout,
+                stderr: result.capturedOutput.stderr,
+                sourceTruncated: result.outputTruncated,
+                artifactTruncated: result.capturedOutput.artifactTruncated,
+                stdoutBytes: result.capturedOutput.stdoutBytes,
+                stderrBytes: result.capturedOutput.stderrBytes,
+              });
+            } catch (error) {
+              artifactError = toArtifactError(error, true);
+            }
+          }
+          const artifactStatus = artifactError
+            ? "FAILED" as const
+            : outputArtifact?.artifactTruncated
+              ? "TRUNCATED" as const
+              : outputArtifact
+                ? "CREATED" as const
+                : "FAILED" as const;
+          await ctx.ledger.append({
+            type: "e2e.command.finished",
+            projectId: input.projectId,
+            command: summarizeCommandAudit(input.command),
+            exitCode: result.exitCode,
+            executionMode: "background",
+          });
+          return {
+            state: backgroundTerminalState(result.commandStatus),
+            commandStatus: result.commandStatus,
+            exitCode: result.exitCode,
+            terminationSignal: result.terminationSignal,
+            cleanupStatus: result.cleanupStatus,
+            artifactStatus,
+            domainStatus: null,
+            domainStatusSource: "not-provided" as const,
+            durationMs: result.durationMs,
+            ...(outputArtifact
+              ? {
+                  outputRef: outputArtifact.outputRef,
+                  resourceUri: outputArtifact.resourceUri,
+                  outputBytes: outputArtifact.stdoutBytes + outputArtifact.stderrBytes,
+                  artifactTruncated: outputArtifact.artifactTruncated,
+                }
+              : {}),
+            ...(artifactError ? { errorCode: "OUTPUT_ARTIFACT_FAILED" } : {}),
+          };
+        };
         let approvedRisk: Extract<OperationRisk, "network" | "destructive"> | undefined;
+        let approvedOperationFingerprint: string | undefined;
         if (operationRisk) {
+          const approvalInput = {
+            stateDir: ctx.stateDir,
+            lease,
+            tool: "e2e_run_command",
+            risk: operationRisk,
+            approvalSurface: (ctx.remote === true ? "chatgpt-widget" : "local") as OperationApprovalSurface,
+            operation: {
+              command: input.command,
+              cwd: input.cwd ?? null,
+              screenshotUrl: input.screenshotUrl ?? null,
+              captureScreenshot: input.captureScreenshot ?? false,
+            },
+            preview: redact(input.command),
+            ...(operationId ? { originOperationId: operationId } : {}),
+          };
           try {
-            await ensureOperationAuthorized({
-              stateDir: ctx.stateDir,
-              lease,
-              tool: "e2e_run_command",
-              risk: operationRisk,
-              approvalSurface: (ctx.remote === true ? "chatgpt-widget" : "local") as OperationApprovalSurface,
-              operation: {
-                command: input.command,
-                cwd: input.cwd ?? null,
-                screenshotUrl: input.screenshotUrl ?? null,
-                captureScreenshot: input.captureScreenshot ?? false,
-              },
-              preview: redact(input.command),
-            });
+            const authorization = await ensureOperationAuthorized(approvalInput);
             approvedRisk = operationRisk;
+            approvedOperationFingerprint = authorization.operationFingerprint;
           } catch (error) {
             const requestId = error instanceof DomainError && error.code === ErrorCode.APPROVAL_REQUIRED && typeof error.details?.requestId === "string"
               ? error.details.requestId
               : undefined;
             if (ctx.remote === true && requestId) {
+              const sessionScope = ctx.sessionScope;
+              const expiresAt = error instanceof DomainError && typeof error.details?.expiresAt === "number"
+                ? error.details.expiresAt
+                : undefined;
+              if (sessionScope && expiresAt) {
+                registerChatGptTurnlessContinuation({
+                  requestId,
+                  tool: "e2e_run_command",
+                  sessionScope,
+                  expiresAt,
+                  run: async () => {
+                    const authorization = await ensureOperationAuthorized({
+                      ...approvalInput,
+                      resumeRequestId: requestId,
+                      resumeSessionScope: sessionScope,
+                      requiredApprovalVia: "chatgpt-widget",
+                    });
+                    const snapshot = await startTurnlessApprovedBackgroundOperation({
+                      ctx,
+                      entry,
+                      lease,
+                      approvalRequestId: requestId,
+                      commandId: "e2e_run_command",
+                      operationFingerprint: authorization.operationFingerprint,
+                      execute: backgroundE2eExecute(operationRisk, requestId),
+                    });
+                    return {
+                      turnlessContinuation: true,
+                      continuationStarted: true,
+                      fallbackRequiresExactReplay: false,
+                      actionStarted: true,
+                      subprocessStarted: snapshot.subprocessStarted,
+                      operationId: snapshot.operationId,
+                      approvalRequestId: requestId,
+                      screenshotDeferred: input.captureScreenshot === true,
+                      sideEffects: "background-operation-started",
+                    };
+                  },
+                });
+              }
               return chatGptOperationApprovalPending(ctx, {
                 requestId,
                 tool: "e2e_run_command",
-                allowFollowUpPrompt: "C2CT e2e_run_command 승인을 허용했어. 방금과 정확히 같은 입력으로 e2e_run_command를 다시 호출해서 승인된 작업을 실행하고 operation_status를 폴링해줘.",
+                allowFollowUpPrompt: `C2CT e2e_run_command 승인을 허용했어. e2e_run_command는 재호출하지 말고 operation_status를 approvalRequestId로 status-only 확인해줘.${input.captureScreenshot === true ? " terminal 뒤 요청된 screenshot을 캡처해줘." : ""}`,
                 denyFollowUpPrompt: "C2CT e2e_run_command 승인을 거절했어. 이 명령은 실행하지 말고 거절 상태로 종료해줘.",
-                extra: { risk: operationRisk },
+                extra: { risk: operationRisk, projectId: input.projectId, captureScreenshot: input.captureScreenshot === true },
               });
             }
             throw error;
           }
         }
         await assertRuntimeUpdateNotDraining(ctx.stateDir);
-        const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
         if (ctx.remote === true) {
           const manager = backgroundOperationManager(ctx.stateDir);
-          const operationFingerprint = backgroundCommandFingerprint({
+          const operationFingerprint = approvedOperationFingerprint ?? backgroundCommandFingerprint({
             projectId: entry.projectId,
             projectRoot: entry.root,
             leaseId: lease.leaseId,
@@ -8708,89 +10158,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             leasePreset: lease.preset,
             commandId: "e2e_run_command",
             operationFingerprint,
-            execute: async (_backgroundOperationId, signal, update) => {
-              await ctx.ledger.append({
-                type: "e2e.command.started",
-                projectId: input.projectId,
-                command: summarizeCommandAudit(input.command),
-                executionMode: "background",
-              });
-              await update({
-                state: "running",
-                phase: "running",
-                subprocessStarted: true,
-                subprocessStillRunning: true,
-              });
-              const result = await runLocalShell(
-                entry.root,
-                input.command,
-                input.cwd,
-                input.timeoutSec,
-                approvedRisk,
-                { signal, captureOutput: true },
-              );
-              await update({
-                phase: "serialize",
-                subprocessStarted: true,
-                subprocessStillRunning: false,
-                cleanupStarted: result.cleanupStatus !== "NOT_REQUIRED",
-                cleanupCompleted: result.cleanupStatus === "COMPLETED",
-              });
-              let outputArtifact: Awaited<ReturnType<typeof createOutputArtifact>> | undefined;
-              let artifactError: string | undefined;
-              if (result.capturedOutput) {
-                try {
-                  outputArtifact = await createOutputArtifact({
-                    stateDir: ctx.stateDir,
-                    projectId: input.projectId,
-                    ...(input.workLaneId ? { laneDigest: projectLaneDigest(input.workLaneId) } : {}),
-                    tool: "e2e_run_command",
-                    stdout: result.capturedOutput.stdout,
-                    stderr: result.capturedOutput.stderr,
-                    sourceTruncated: result.outputTruncated,
-                    artifactTruncated: result.capturedOutput.artifactTruncated,
-                    stdoutBytes: result.capturedOutput.stdoutBytes,
-                    stderrBytes: result.capturedOutput.stderrBytes,
-                  });
-                } catch (error) {
-                  artifactError = toArtifactError(error, true);
-                }
-              }
-              const artifactStatus = artifactError
-                ? "FAILED" as const
-                : outputArtifact?.artifactTruncated
-                  ? "TRUNCATED" as const
-                  : outputArtifact
-                    ? "CREATED" as const
-                    : "FAILED" as const;
-              await ctx.ledger.append({
-                type: "e2e.command.finished",
-                projectId: input.projectId,
-                command: summarizeCommandAudit(input.command),
-                exitCode: result.exitCode,
-                executionMode: "background",
-              });
-              return {
-                state: backgroundTerminalState(result.commandStatus),
-                commandStatus: result.commandStatus,
-                exitCode: result.exitCode,
-                terminationSignal: result.terminationSignal,
-                cleanupStatus: result.cleanupStatus,
-                artifactStatus,
-                domainStatus: null,
-                domainStatusSource: "not-provided" as const,
-                durationMs: result.durationMs,
-                ...(outputArtifact
-                  ? {
-                      outputRef: outputArtifact.outputRef,
-                      resourceUri: outputArtifact.resourceUri,
-                      outputBytes: outputArtifact.stdoutBytes + outputArtifact.stderrBytes,
-                      artifactTruncated: outputArtifact.artifactTruncated,
-                    }
-                  : {}),
-                ...(artifactError ? { errorCode: "OUTPUT_ARTIFACT_FAILED" } : {}),
-              };
-            },
+            execute: backgroundE2eExecute(approvedRisk),
           });
           await progress?.update("running", "Remote E2E command handed off; poll operation_status");
           return makeResult(
@@ -10152,8 +11520,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       if (
         toolName === CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL ||
         toolName === "chatgpt_consent_probe" ||
-        toolName === "chatgpt_widget_lab_presenter" ||
-        toolName === "chatgpt_widget_shell"
+        toolName === "chatgpt_widget_lab_presenter"
       ) {
         return reject(
           "PERMISSION_DENIED",

@@ -28,6 +28,7 @@ export const MCP_TOOL_CAPABILITIES = {
 
 export const MCP_CORE_TOOL_NAMES = [
   "c2ct_invoke",
+  "chatgpt_catalog_refresh",
   CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL,
   "connection_status",
   "connection_audit",

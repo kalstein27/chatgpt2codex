@@ -15,11 +15,17 @@ import {
 } from "./operation-approval.js";
 import { listPendingRgApprovalRequests, type RgApprovalRequest } from "./rg-capability.js";
 import type { RuntimeActivityTracker } from "../runtime/activity.js";
+import type { ConnectionDiagnosticsSink } from "../runtime/connection-diagnostics.js";
+import { readExternalWatchdogStatus } from "../runtime/external-watchdog-status.js";
+import { getLatestRuntimeApplyReceipt } from "../runtime/runtime-apply.js";
+import { getLatestMacosAppApplyReceipt } from "../runtime/macos-app-apply-transaction.js";
 import {
   activityDashboardDocument,
   activityDashboardSnapshot,
   type ActivityDashboardApproval,
+  type ActivityDashboardDeployment,
 } from "../server/activity-dashboard.js";
+import { activityMcpHealth } from "../server/activity-mcp-health.js";
 import { DomainError } from "../types.js";
 
 const DIR_MODE = 0o700;
@@ -105,6 +111,7 @@ interface BridgeOptions {
   callbackPort?: number;
   fetchImpl?: typeof fetch;
   activityTracker?: RuntimeActivityTracker;
+  diagnostics?: ConnectionDiagnosticsSink;
   ledgerAppend?: (event: { type: string; [key: string]: unknown }) => Promise<void>;
 }
 
@@ -566,6 +573,7 @@ export class MobileApprovalBridge {
   private readonly callbackPort: number;
   private readonly fetchImpl: typeof fetch;
   private readonly activityTracker?: RuntimeActivityTracker;
+  private readonly diagnostics?: ConnectionDiagnosticsSink;
   private readonly ledgerAppend?: BridgeOptions["ledgerAppend"];
   private server: ReturnType<typeof createServer> | undefined;
   private timer: NodeJS.Timeout | undefined;
@@ -582,6 +590,7 @@ export class MobileApprovalBridge {
     this.callbackPort = options.callbackPort ?? MOBILE_APPROVAL_CALLBACK_PORT;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.activityTracker = options.activityTracker;
+    this.diagnostics = options.diagnostics;
     this.ledgerAppend = options.ledgerAppend;
     bridgeStates.set(this.stateDir, {
       listening: false,
@@ -923,16 +932,73 @@ export class MobileApprovalBridge {
         const now = Date.now();
         const dashboard = await activityDashboardDocument(this.stateDir);
         const config = await readMobileApprovalConfig(this.stateDir);
-        const approvalItems = await dashboardApprovalItems(
-          this.stateDir,
-          Boolean(config?.enabled && tailscaleIdentity(req)),
-          now,
-        );
-        sendJson(res, 200, activityDashboardSnapshot(this.activityTracker, approvalItems, now, dashboard.revision));
+        const [approvalItems, runtimeApply, macosAppApply, diagnostics, watchdog] = await Promise.all([
+          dashboardApprovalItems(
+            this.stateDir,
+            Boolean(config?.enabled && tailscaleIdentity(req)),
+            now,
+          ),
+          getLatestRuntimeApplyReceipt(this.stateDir).catch(() => null),
+          getLatestMacosAppApplyReceipt(this.stateDir).catch(() => null),
+          this.diagnostics?.summary(80).catch(() => null) ?? Promise.resolve(null),
+          readExternalWatchdogStatus().catch(() => null),
+        ]);
+        const deployments: ActivityDashboardDeployment[] = [];
+        if (runtimeApply) {
+          deployments.push({
+            kind: "runtime",
+            projectId: runtimeApply.projectId,
+            requestId: runtimeApply.requestId,
+            operationId: runtimeApply.operationId,
+            state: runtimeApply.state,
+            phase: runtimeApply.phase,
+            createdAt: Date.parse(runtimeApply.createdAt),
+            updatedAt: Date.parse(runtimeApply.updatedAt),
+            currentIdentity: runtimeApply.previousManifest.runtimeFingerprint ?? undefined,
+            targetIdentity: runtimeApply.targetFingerprint,
+            approvalRequestId: runtimeApply.approvalRequestId,
+            finalHealthy: runtimeApply.finalHealthy,
+            rollbackAttempted: runtimeApply.rollbackAttempted,
+            rollbackSucceeded: runtimeApply.rollbackSucceeded,
+            reconnectDurationMs: runtimeApply.reconnectDurationMs,
+            message: runtimeApply.recommendedAction,
+          });
+        }
+        if (macosAppApply) {
+          deployments.push({
+            kind: "macos-app",
+            projectId: macosAppApply.projectId,
+            requestId: macosAppApply.requestId,
+            operationId: macosAppApply.operationId,
+            state: macosAppApply.state,
+            createdAt: Date.parse(macosAppApply.createdAt),
+            updatedAt: Date.parse(macosAppApply.updatedAt),
+            currentIdentity: macosAppApply.installedBefore?.mainExecutableSha256,
+            targetIdentity: macosAppApply.source.mainExecutableSha256,
+            approvalRequestId: macosAppApply.approvalRequestId,
+            rollbackAttempted: macosAppApply.result?.rollbackAttempted,
+            rollbackSucceeded: macosAppApply.result?.rollbackSucceeded,
+            reconnectDurationMs: macosAppApply.reconnectDurationMs,
+            message: macosAppApply.failure ?? macosAppApply.recommendedAction,
+          });
+        }
+        const mcpHealth = activityMcpHealth(diagnostics, watchdog, now);
+        sendJson(res, 200, activityDashboardSnapshot(this.activityTracker, approvalItems, now, dashboard.revision, deployments, mcpHealth));
         return;
       }
       if (requestPath === "/activity/api/health") {
-        sendJson(res, 200, { ok: true, generatedAt: Date.now() });
+        const now = Date.now();
+        const [diagnostics, watchdog] = await Promise.all([
+          this.diagnostics?.summary(80).catch(() => null) ?? Promise.resolve(null),
+          readExternalWatchdogStatus().catch(() => null),
+        ]);
+        const health = activityMcpHealth(diagnostics, watchdog, now);
+        sendJson(res, health.state === "unhealthy" ? 503 : 200, {
+          ok: health.state !== "unhealthy",
+          state: health.state,
+          label: health.label,
+          generatedAt: now,
+        });
         return;
       }
       if (requestPath === "/activity" || requestPath === "/activity/") {

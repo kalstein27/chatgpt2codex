@@ -91,6 +91,27 @@ private let desktopLocalizationRows: [String: [String]] = [
     "restartAfterSaveInfo": ["Settings were saved, but the running MCP server keeps using the previous workspace, tunnel, port, and related options until it restarts.", "설정은 저장됐지만 실행 중인 MCP 서버는 재시작 전까지 이전 프로젝트 폴더, 터널, 포트 설정을 계속 사용합니다."],
     "selectProjectFolderMenu": ["Select Project Folder...", "프로젝트 폴더 선택...", "プロジェクトフォルダを選択...", "选择项目文件夹...", "選擇專案資料夾...", "Seleccionar carpeta del proyecto...", "Choisir le dossier du projet...", "Projektordner auswählen...", "Selecionar pasta do projeto...", "Seleziona cartella progetto...", "Projectmap kiezen...", "Wybierz folder projektu...", "Выбрать папку проекта...", "Proje klasörü seç...", "Chọn thư mục dự án...", "Pilih folder proyek...", "เลือกโฟลเดอร์โปรเจกต์...", "اختيار مجلد المشروع...", "प्रोजेक्ट फ़ोल्डर चुनें...", "Вибрати теку проєкту..."],
     "settingsMenu": ["Settings...", "설정...", "設定...", "设置...", "設定...", "Ajustes...", "Réglages...", "Einstellungen...", "Configurações...", "Impostazioni...", "Instellingen...", "Ustawienia...", "Настройки...", "Ayarlar...", "Cài đặt...", "Pengaturan...", "การตั้งค่า...", "الإعدادات...", "सेटिंग्स...", "Налаштування..."],
+    "catalogRecoveryTitle": ["Runtime update recovery", "런타임 갱신 복구"],
+    "catalogRecoveryInfo": ["Refresh ChatGPT's C2CT catalog when a runtime update succeeded but new tools or approval cards do not appear.", "런타임 갱신은 끝났는데 새 도구나 승인 카드가 보이지 않을 때 ChatGPT C2CT 카탈로그만 다시 갱신합니다."],
+    "catalogRecoveryRow": ["ChatGPT catalog", "ChatGPT 카탈로그"],
+    "catalogRecoveryButton": ["Force Refresh Catalog", "카탈로그 강제 갱신"],
+    "catalogRecoveryHint": ["Runs only the fixed catalog refresh and tool scan. It does not restart the runtime/app or change the connector or tunnel.", "고정 catalog refresh와 tool scan만 실행합니다. 런타임·앱을 재시작하거나 커넥터·터널을 바꾸지 않습니다."],
+    "catalogRecoveryIdle": ["ready", "대기"],
+    "catalogRecoveryRunning": ["refreshing...", "갱신 중..."],
+    "catalogRecoveryDone": ["refresh requested", "갱신 요청 완료"],
+    "catalogRecoveryManual": ["manual refresh needed", "수동 갱신 필요"],
+    "catalogRecoveryPermission": ["Accessibility permission needed", "손쉬운 사용 권한 필요"],
+    "catalogRecoveryPermissionInfo": ["ChatGPT catalog refresh needs Accessibility permission to click the ChatGPT plugin refresh control. Allow ChatGPT To Codex in System Settings, then try again.", "ChatGPT 플러그인의 새로고침 컨트롤을 누르려면 손쉬운 사용 권한이 필요합니다. 시스템 설정에서 ChatGPT To Codex를 허용한 뒤 다시 시도하세요."],
+    "catalogRecoveryMissing": ["chatgpt-send unavailable", "chatgpt-send 없음"],
+    "catalogRecoveryFailed": ["refresh failed", "갱신 실패"],
+    "catalogRecoveryReapplyRow": ["Runtime fallback", "런타임 백업"],
+    "catalogRecoveryReapplyButton": ["Reapply Runtime + Refresh", "런타임 재적용 + 갱신"],
+    "catalogRecoveryReapplyHint": ["Restarts only the current active runtime generation, verifies the same fingerprint and connector/tunnel topology, then refreshes the ChatGPT catalog. Use this only as a recovery fallback.", "현재 active runtime 세대만 다시 시작한 뒤 동일 fingerprint와 커넥터·터널 보존을 확인하고 ChatGPT 카탈로그를 갱신합니다. 복구용 백업으로만 사용하세요."],
+    "catalogRecoveryReapplyConfirmTitle": ["Reapply current runtime?", "현재 런타임을 재적용할까요?"],
+    "catalogRecoveryReapplyConfirmInfo": ["The current runtime process will restart once. The active runtime version, connector, and tunnel must remain unchanged. If verification fails, catalog refresh will not run.", "현재 런타임 프로세스를 한 번 재시작합니다. active runtime 버전·커넥터·터널은 그대로 유지되어야 하며, 검증에 실패하면 카탈로그 갱신은 실행하지 않습니다."],
+    "catalogRecoveryReapplyRunning": ["reapplying runtime + refreshing...", "런타임 재적용 + 갱신 중..."],
+    "catalogRecoveryReapplyDone": ["runtime reapplied + refresh requested", "런타임 재적용 + 갱신 요청 완료"],
+    "catalogRecoveryReapplyFailed": ["runtime reapply recovery failed", "런타임 재적용 복구 실패"],
     "rgPermissionMenu": ["External search tool (rg)", "외부 검색 도구 (rg)"],
     "rgAskEveryTime": ["Ask every time", "사용할 때마다 묻기"],
     "rgCodeSearchOnly": ["Use code_search only", "code_search만 사용"],
@@ -270,6 +291,13 @@ private final class ServiceController {
         case missing
         case checkFailed
     }
+    enum ChatGptCatalogRefreshOutcome: Equatable {
+        case refreshed(scanCompleted: Bool)
+        case manualActionRequired
+        case helperMissing
+        case failed
+    }
+
 
     private let environment = ProcessInfo.processInfo.environment
     private let defaults = UserDefaults.standard
@@ -670,7 +698,7 @@ private final class ServiceController {
         let createdAt: TimeInterval
         let expiresAt: TimeInterval
 
-        var canResolveLocally: Bool { approvalSurface == "local" }
+        var canResolveLocally: Bool { approvalSurface == "local" || tool == "runtime_apply_local" }
     }
 
     struct PendingOAuthApproval {
@@ -726,6 +754,7 @@ private final class ServiceController {
         let pendingActions: [PendingControlAction]
         let pendingArmRequests: [PendingArmRequest]
         let operationApprovals: [PendingOperationApproval]
+        let operationApprovalPendingRequestCount: Int
         let oauthApprovals: [PendingOAuthApproval]
         let autoEnabled: Bool
         let autoRemainingMs: Int
@@ -1065,6 +1094,7 @@ private final class ServiceController {
                     expiresAt: TimeInterval(entry["expiresAt"] as? Int ?? 0) / 1000.0
                 )
             }
+            let reportedPendingOperationApprovalCount = operationApprovalsRoot["pendingRequestCount"] as? Int ?? pendingOperationApprovals.count
             let oauthApprovalsRoot = root["oauthApprovals"] as? [String: Any] ?? [:]
             let pendingOAuthApprovals = (oauthApprovalsRoot["pendingRequests"] as? [[String: Any]] ?? []).compactMap { entry -> PendingOAuthApproval? in
                 guard entry["status"] as? String == "pending",
@@ -1207,6 +1237,7 @@ private final class ServiceController {
                 pendingActions: pending,
                 pendingArmRequests: pendingArmRequests,
                 operationApprovals: pendingOperationApprovals,
+                operationApprovalPendingRequestCount: reportedPendingOperationApprovalCount,
                 oauthApprovals: pendingOAuthApprovals,
                 autoEnabled: control["autoEnabled"] as? Bool ?? false,
                 autoRemainingMs: control["autoRemainingMs"] as? Int ?? 0,
@@ -1281,6 +1312,54 @@ private final class ServiceController {
         let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         return (process.terminationStatus, stdout, stderr)
+    }
+
+    func forceChatGptCatalogRefresh(completion: @escaping (ChatGptCatalogRefreshOutcome) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            guard let result = try? self.runCli(["chatgpt-catalog-refresh"]),
+                  let data = result.stdout.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                DispatchQueue.main.async { completion(.failed) }
+                return
+            }
+            let ok = result.status == 0 && json["ok"] as? Bool == true
+            if ok {
+                let scanCompleted = json["hostScanCompleted"] as? Bool == true
+                DispatchQueue.main.async { completion(.refreshed(scanCompleted: scanCompleted)) }
+                return
+            }
+            let errorCode = json["errorCode"] as? String
+            let status = json["status"] as? String
+            DispatchQueue.main.async {
+                if errorCode == "CHATGPT_SEND_NOT_FOUND" {
+                    completion(.helperMissing)
+                } else if status == "manual-action-required" {
+                    completion(.manualActionRequired)
+                } else {
+                    completion(.failed)
+                }
+            }
+        }
+    }
+
+    func reapplyCurrentRuntimeAndRefresh(completion: @escaping (Bool, String) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            guard let result = try? self.runCli(["runtime-reapply-refresh", "--port", "\(self.port)"]),
+                  let data = result.stdout.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                DispatchQueue.main.async { completion(false, "Runtime reapply recovery did not return a valid result.") }
+                return
+            }
+            let ok = result.status == 0 && json["ok"] as? Bool == true
+            let message = (json["message"] as? String)
+                ?? (json["status"] as? String)
+                ?? (ok ? "Runtime reapplied and catalog refresh requested." : "Runtime reapply recovery failed.")
+            DispatchQueue.main.async { completion(ok, message) }
+        }
     }
 
     func ownerTokenStatus() -> OwnerTokenStatus {
@@ -1884,6 +1963,22 @@ private final class ServiceController {
         }
     }
 
+    func applyRuntimeUpdateAndRefresh(
+        _ update: RuntimeUpdate,
+        completion: @escaping (Bool, String, ChatGptCatalogRefreshOutcome?) -> Void
+    ) {
+        applyRuntimeUpdate(update) { [weak self] ok, message in
+            guard let self else { return }
+            guard ok else {
+                completion(false, message, nil)
+                return
+            }
+            self.forceChatGptCatalogRefresh { outcome in
+                completion(true, message, outcome)
+            }
+        }
+    }
+
     func runDoctor(repair: Bool = true) -> String {
         let activeRoot = effectiveRuntimeRoot
         let direct = activeRoot.appendingPathComponent("macos-dependency-doctor.sh")
@@ -2217,6 +2312,9 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     private weak var settingsHostField: NSTextField?
     private weak var settingsPortField: NSTextField?
     private weak var settingsAdvancedContainer: NSStackView?
+    private weak var settingsCatalogRefreshStatus: NSTextField?
+    private weak var settingsCatalogRefreshButton: NSButton?
+    private weak var settingsRuntimeReapplyRefreshButton: NSButton?
 
     private func t(_ key: String) -> String {
         controller.localized(key)
@@ -3020,7 +3118,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         let armed = latestControlSnapshot?.armed == true
         let armCount = latestControlSnapshot?.pendingArmRequests.count ?? 0
         let actionCount = latestControlSnapshot?.pendingActions.count ?? 0
-        let approvalCount = latestControlSnapshot?.operationApprovals.count ?? 0
+        let approvalCount = max(latestControlSnapshot?.operationApprovals.count ?? 0, latestControlSnapshot?.operationApprovalPendingRequestCount ?? 0)
         let oauthCount = latestControlSnapshot?.oauthApprovals.count ?? 0
         let rgCount = latestControlSnapshot?.rg.pendingRequests.count ?? 0
         let totalApprovalCount = armCount + actionCount + approvalCount + oauthCount + rgCount
@@ -3761,6 +3859,14 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         return formatter.string(from: Date(timeIntervalSince1970: request.expiresAt))
     }
 
+    private func operationApprovalCreatedText(_ request: ServiceController.PendingOperationApproval) -> String {
+        guard request.createdAt > 0 else { return "알 수 없음" }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .medium
+        return formatter.string(from: Date(timeIntervalSince1970: request.createdAt))
+    }
+
     private func operationApprovalExpiryText(_ request: ServiceController.PendingOperationApproval) -> String {
         guard request.expiresAt > 0 else { return "알 수 없음" }
         let formatter = DateFormatter()
@@ -3877,6 +3983,10 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     private func presentOperationApproval(_ request: ServiceController.PendingOperationApproval) {
+        if !request.canResolveLocally {
+            presentChatGptBoundOperationApproval(request)
+            return
+        }
         let isRuntimeApply = request.tool == "runtime_apply_local"
         var details = [
             "작업: \(request.preview)",
@@ -3884,7 +3994,9 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             "",
             "프로젝트: \(request.projectId)",
             "도구: \(request.tool)",
+            "요청 ID: \(request.requestId)",
             "위험 유형: \(operationApprovalRiskText(request.risk))",
+            "생성: \(operationApprovalCreatedText(request))",
             "만료: \(operationApprovalExpiryText(request))",
             "",
             "승인은 현재 프로젝트·현재 lease·이 정확한 작업에만 묶이며 한 번 실행하면 즉시 소모됩니다."
@@ -3908,19 +4020,61 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         }
     }
 
+    private func presentChatGptBoundOperationApproval(_ request: ServiceController.PendingOperationApproval) {
+        let routeLabel = request.approvalSurface == "chatgpt-widget-critical"
+            ? (controller.effectiveLanguageCode == "ko" ? "ChatGPT 중요 승인 카드" : "ChatGPT critical approval card")
+            : (controller.effectiveLanguageCode == "ko" ? "ChatGPT 승인 카드" : "ChatGPT approval card")
+        let alert = NSAlert()
+        alert.messageText = controller.effectiveLanguageCode == "ko" ? "C2CT ChatGPT 승인 요청" : "C2CT ChatGPT approval request"
+        alert.informativeText = [
+            "작업: \(request.preview)",
+            "프로젝트: \(request.projectId)",
+            "도구: \(request.tool)",
+            "요청 ID: \(request.requestId)",
+            "생성: \(operationApprovalCreatedText(request))",
+            "만료: \(operationApprovalExpiryText(request))",
+            "승인 경로: \(routeLabel)",
+            "",
+            controller.effectiveLanguageCode == "ko"
+                ? "이 Mac에서는 이 요청을 승인할 수 없습니다. 카드가 깨졌거나 더 이상 필요하지 않은 요청은 여기서 거절만 할 수 있습니다."
+                : "This Mac cannot approve this request. If the ChatGPT card is broken or the request is no longer needed, you can only reject it here."
+        ].joined(separator: "\n")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: controller.effectiveLanguageCode == "ko" ? "이 요청 거절" : "Reject this request")
+        alert.addButton(withTitle: controller.effectiveLanguageCode == "ko" ? "닫기" : "Close")
+        if request.details != request.preview {
+            alert.accessoryView = ApprovalDetailsAccessory(details: request.details)
+        }
+        let response = runForegroundApprovalAlert(alert, expiresAt: request.expiresAt)
+        if response == .alertFirstButtonReturn {
+            resolveOperationApproval(request, decision: "reject")
+        }
+    }
+
     private func resolveOperationApproval(_ request: ServiceController.PendingOperationApproval, decision: String) {
         let path = request.tool == "runtime_apply_local" && decision == "approve"
             ? "/runtime-apply-approvals/\(request.requestId)/approve"
             : "/operation-approvals/\(request.requestId)/\(decision)"
-        controller.performLocalControl(path) { [weak self] _ in
-            self?.refreshStatus()
+        controller.performLocalControl(path) { [weak self] ok in
+            guard let self else { return }
+            if !ok {
+                self.presentedOperationApprovalIDs.remove(request.requestId)
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = self.controller.effectiveLanguageCode == "ko" ? "승인 처리 실패" : "Approval Failed"
+                alert.informativeText = self.controller.effectiveLanguageCode == "ko"
+                    ? "로컬 승인 요청이 서버에 반영되지 않았습니다. 요청이 아직 유효한지 확인한 뒤 다시 시도하세요."
+                    : "The local approval was not accepted by the server. Check that the request is still valid, then try again."
+                alert.addButton(withTitle: self.controller.effectiveLanguageCode == "ko" ? "확인" : "OK")
+                alert.runModal()
+            }
+            self.refreshStatus()
         }
     }
 
     @objc private func reviewPendingOperationApproval(_ sender: NSMenuItem) {
         guard let requestId = sender.representedObject as? String,
-              let request = latestControlSnapshot?.operationApprovals.first(where: { $0.requestId == requestId }),
-              request.canResolveLocally
+              let request = latestControlSnapshot?.operationApprovals.first(where: { $0.requestId == requestId })
         else { return }
         presentOperationApproval(request)
     }
@@ -4095,8 +4249,23 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         if menu === pendingOperationApprovalSubmenu {
             menu.removeAllItems()
             let requests = latestControlSnapshot?.operationApprovals ?? []
+            let reportedCount = latestControlSnapshot?.operationApprovalPendingRequestCount ?? requests.count
+            if reportedCount > requests.count {
+                let warning = NSMenuItem(
+                    title: controller.effectiveLanguageCode == "ko"
+                        ? "⚠︎ backend 승인 \(reportedCount)건 중 \(requests.count)건만 표시됨 · 상태 새로고침 필요"
+                        : "⚠︎ Showing \(requests.count) of \(reportedCount) backend approvals · refresh status",
+                    action: nil,
+                    keyEquivalent: ""
+                )
+                warning.isEnabled = false
+                menu.addItem(warning)
+            }
             if requests.isEmpty {
-                let empty = NSMenuItem(title: "대기 중인 작업 승인 요청 없음", action: nil, keyEquivalent: "")
+                let title = reportedCount > 0
+                    ? (controller.effectiveLanguageCode == "ko" ? "승인 상세 목록을 불러오지 못했습니다" : "Approval details could not be loaded")
+                    : (controller.effectiveLanguageCode == "ko" ? "대기 중인 작업 승인 요청 없음" : "No work approvals waiting")
+                let empty = NSMenuItem(title: title, action: nil, keyEquivalent: "")
                 empty.isEnabled = false
                 menu.addItem(empty)
                 return
@@ -4104,21 +4273,21 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             for request in requests {
                 let routeLabel: String
                 if request.canResolveLocally {
-                    routeLabel = controller.effectiveLanguageCode == "ko" ? "이 Mac에서 승인 가능" : "Approve on this Mac"
+                    routeLabel = controller.effectiveLanguageCode == "ko" ? "이 Mac에서 승인/거절 가능" : "Approve or reject on this Mac"
                 } else if request.approvalSurface == "chatgpt-widget-critical" {
-                    routeLabel = controller.effectiveLanguageCode == "ko" ? "ChatGPT 중요 승인 카드에서 승인 필요" : "Approve in the ChatGPT critical approval card"
+                    routeLabel = controller.effectiveLanguageCode == "ko" ? "승인은 ChatGPT 중요 카드 · Mac에서는 거절만 가능" : "Approve in ChatGPT critical card · reject only on Mac"
                 } else {
-                    routeLabel = controller.effectiveLanguageCode == "ko" ? "ChatGPT 승인 카드에서 승인 필요" : "Approve in the ChatGPT approval card"
+                    routeLabel = controller.effectiveLanguageCode == "ko" ? "승인은 ChatGPT 카드 · Mac에서는 거절만 가능" : "Approve in ChatGPT card · reject only on Mac"
                 }
                 let item = NSMenuItem(
-                    title: "\(request.tool) · \(operationApprovalRiskText(request.risk)) · \(routeLabel) · \(operationApprovalExpiryText(request))",
-                    action: request.canResolveLocally ? #selector(reviewPendingOperationApproval(_:)) : nil,
+                    title: "\(request.tool) · \(request.projectId) · 생성 \(operationApprovalCreatedText(request)) · 만료 \(operationApprovalExpiryText(request))",
+                    action: #selector(reviewPendingOperationApproval(_:)),
                     keyEquivalent: ""
                 )
                 item.target = self
                 item.representedObject = request.requestId
-                item.isEnabled = latestHealth && request.canResolveLocally
-                item.toolTip = "\(request.preview)\n\(routeLabel)"
+                item.isEnabled = latestHealth
+                item.toolTip = "\(request.preview)\n요청 ID: \(request.requestId)\n\(operationApprovalRiskText(request.risk)) · \(routeLabel)\n생성: \(operationApprovalCreatedText(request)) · 만료: \(operationApprovalExpiryText(request))"
                 menu.addItem(item)
             }
             return
@@ -4879,6 +5048,33 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         let publicHint = activityLabel(publicHintText, font: .systemFont(ofSize: 10), color: .secondaryLabelColor, lines: 2)
         addRow("", publicHint)
 
+        let recoveryCard = beginCard(t("catalogRecoveryTitle"), subtitle: t("catalogRecoveryInfo"))
+        let recoveryControls = NSStackView()
+        recoveryControls.orientation = .horizontal
+        recoveryControls.alignment = .centerY
+        recoveryControls.spacing = 8
+        let recoveryStatus = activityLabel(t("catalogRecoveryIdle"), font: .systemFont(ofSize: 11, weight: .medium), color: .secondaryLabelColor)
+        recoveryStatus.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        settingsCatalogRefreshStatus = recoveryStatus
+        recoveryControls.addArrangedSubview(recoveryStatus)
+        let recoveryButton = button(t("catalogRecoveryButton"), action: #selector(forceCatalogRefreshFromSettings), symbolName: "arrow.clockwise")
+        settingsCatalogRefreshButton = recoveryButton
+        recoveryControls.addArrangedSubview(recoveryButton)
+        addRow(t("catalogRecoveryRow"), recoveryControls, to: recoveryCard)
+        let recoveryHint = activityLabel(t("catalogRecoveryHint"), font: .systemFont(ofSize: 10), color: .secondaryLabelColor, lines: 2)
+        addRow("", recoveryHint, to: recoveryCard)
+        let runtimeRecoveryControls = NSStackView()
+        runtimeRecoveryControls.orientation = .horizontal
+        runtimeRecoveryControls.alignment = .centerY
+        runtimeRecoveryControls.spacing = 8
+        let runtimeRecoveryButton = button(t("catalogRecoveryReapplyButton"), action: #selector(reapplyRuntimeAndRefreshFromSettings), symbolName: "arrow.triangle.2.circlepath")
+        settingsRuntimeReapplyRefreshButton = runtimeRecoveryButton
+        runtimeRecoveryControls.addArrangedSubview(runtimeRecoveryButton)
+        addRow(t("catalogRecoveryReapplyRow"), runtimeRecoveryControls, to: recoveryCard)
+        let runtimeRecoveryHint = activityLabel(t("catalogRecoveryReapplyHint"), font: .systemFont(ofSize: 10), color: .secondaryLabelColor, lines: 3)
+        addRow("", runtimeRecoveryHint, to: recoveryCard)
+
+
         let advancedCard = beginCard(
             controller.effectiveLanguageCode == "ko" ? "고급 설정" : "Advanced",
             subtitle: controller.effectiveLanguageCode == "ko"
@@ -5021,6 +5217,90 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
 
     @objc private func cancelSettings() {
         showActivityDashboardSection()
+    }
+
+    @objc private func forceCatalogRefreshFromSettings() {
+        guard let button = settingsCatalogRefreshButton, let status = settingsCatalogRefreshStatus else { return }
+        if !controller.accessibilityTrusted {
+            _ = controller.requestAccessibilityPermission()
+            guard controller.accessibilityTrusted else {
+                status.stringValue = t("catalogRecoveryPermission")
+                status.textColor = .systemOrange
+                let alert = NSAlert()
+                alert.messageText = t("accessibilityPermissionTitle")
+                alert.informativeText = t("catalogRecoveryPermissionInfo")
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: t("openPrivacySettings"))
+                alert.addButton(withTitle: t("cancel"))
+                NSApp.activate(ignoringOtherApps: true)
+                if alert.runModal() == .alertFirstButtonReturn {
+                    controller.openAccessibilitySettings()
+                }
+                return
+            }
+        }
+
+        button.isEnabled = false
+        settingsRuntimeReapplyRefreshButton?.isEnabled = false
+        status.stringValue = t("catalogRecoveryRunning")
+        status.textColor = .secondaryLabelColor
+        controller.forceChatGptCatalogRefresh { [weak self] outcome in
+            guard let self else { return }
+            button.isEnabled = true
+            self.settingsRuntimeReapplyRefreshButton?.isEnabled = true
+            switch outcome {
+            case .refreshed:
+                status.stringValue = self.t("catalogRecoveryDone")
+                status.textColor = .systemGreen
+            case .manualActionRequired:
+                status.stringValue = self.t("catalogRecoveryManual")
+                status.textColor = .systemOrange
+                let alert = NSAlert()
+                alert.messageText = self.t("catalogRecoveryManual")
+                alert.informativeText = self.t("catalogRecoveryPermissionInfo")
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: self.t("openPrivacySettings"))
+                alert.addButton(withTitle: self.t("ok"))
+                NSApp.activate(ignoringOtherApps: true)
+                if alert.runModal() == .alertFirstButtonReturn {
+                    self.controller.openAccessibilitySettings()
+                }
+            case .helperMissing:
+                status.stringValue = self.t("catalogRecoveryMissing")
+                status.textColor = .systemRed
+            case .failed:
+                status.stringValue = self.t("catalogRecoveryFailed")
+                status.textColor = .systemRed
+            }
+        }
+    }
+
+    @objc private func reapplyRuntimeAndRefreshFromSettings() {
+        guard let button = settingsRuntimeReapplyRefreshButton, let status = settingsCatalogRefreshStatus else { return }
+        let alert = NSAlert()
+        alert.messageText = t("catalogRecoveryReapplyConfirmTitle")
+        alert.informativeText = t("catalogRecoveryReapplyConfirmInfo")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: t("catalogRecoveryReapplyButton"))
+        alert.addButton(withTitle: t("cancel"))
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        button.isEnabled = false
+        settingsCatalogRefreshButton?.isEnabled = false
+        status.stringValue = t("catalogRecoveryReapplyRunning")
+        status.textColor = .secondaryLabelColor
+        controller.reapplyCurrentRuntimeAndRefresh { [weak self] ok, message in
+            guard let self else { return }
+            button.isEnabled = true
+            self.settingsCatalogRefreshButton?.isEnabled = true
+            status.stringValue = self.t(ok ? "catalogRecoveryReapplyDone" : "catalogRecoveryReapplyFailed")
+            status.textColor = ok ? .systemGreen : .systemRed
+            if !ok {
+                self.showInfo(self.t("catalogRecoveryReapplyFailed"), message)
+            }
+            self.refreshStatus()
+        }
     }
 
     @objc private func toggleIntermediateCommentaryFromSettings(_ sender: NSButton) {
@@ -5293,11 +5573,24 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             let response = alert.runModal()
             if response == .alertFirstButtonReturn, let update {
                 self.statusMenuItem.title = self.t("updateDownloading")
-                self.controller.applyRuntimeUpdate(update) { [weak self] ok, result in
+                self.controller.applyRuntimeUpdateAndRefresh(update) { [weak self] ok, result, refreshOutcome in
                     guard let self else { return }
+                    var detail = result
+                    if let refreshOutcome {
+                        switch refreshOutcome {
+                        case .refreshed:
+                            detail += "\n\n\(self.t("catalogRecoveryDone"))"
+                        case .manualActionRequired:
+                            detail += "\n\n\(self.t("catalogRecoveryManual"))"
+                        case .helperMissing:
+                            detail += "\n\n\(self.t("catalogRecoveryMissing"))"
+                        case .failed:
+                            detail += "\n\n\(self.t("catalogRecoveryFailed"))"
+                        }
+                    }
                     self.showInfo(
                         ok ? self.t("updateApplyComplete") : self.t("updateApplyFailed"),
-                        result
+                        detail
                     )
                     self.refreshStatus()
                 }

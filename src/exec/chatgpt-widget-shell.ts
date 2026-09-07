@@ -17,6 +17,8 @@ export interface ChatGptWidgetChoiceCard {
   title: string;
   prompt: string;
   options: ChatGptWidgetChoiceOption[];
+  compact: boolean;
+  availableAt: number | null;
   createdAt: number;
   expiresAt: number;
   status: "pending" | "resolved";
@@ -66,6 +68,8 @@ function publicCard(card: StoredCard): ChatGptWidgetChoiceCard {
     title: card.title,
     prompt: card.prompt,
     options: card.options.map((option) => ({ ...option })),
+    compact: card.compact,
+    availableAt: card.availableAt,
     createdAt: card.createdAt,
     expiresAt: card.expiresAt,
     status: card.status,
@@ -90,7 +94,7 @@ function prune(now: number): void {
 }
 
 function validateOptions(options: ChatGptWidgetChoiceOption[]): void {
-  if (options.length < 2 || options.length > 5) throw invalid("Choice cards require between 2 and 5 options");
+  if (options.length < 1 || options.length > 5) throw invalid("Choice cards require between 1 and 5 options");
   const seen = new Set<string>();
   for (const option of options) {
     if (!/^[A-Za-z0-9._:-]{1,40}$/u.test(option.id)) throw invalid("Choice option id has an invalid format");
@@ -106,16 +110,23 @@ export function createChatGptWidgetChoiceCard(input: {
   title: string;
   prompt: string;
   options: ChatGptWidgetChoiceOption[];
+  compact?: boolean;
+  unlockAfterMs?: number;
   now?: number;
   ttlMs?: number;
 }): ChatGptWidgetChoiceCard {
   const now = input.now ?? Date.now();
   const ttlMs = input.ttlMs ?? DEFAULT_TTL_MS;
+  const unlockAfterMs = input.unlockAfterMs ?? 0;
   if (!input.sessionScope) throw invalid("ChatGPT session scope is required for a widget card");
   if (!input.title || input.title.length > 80) throw invalid("Choice card title must be 1-80 characters");
   if (!input.prompt || input.prompt.length > 240) throw invalid("Choice card prompt must be 1-240 characters");
   if (!Number.isFinite(ttlMs) || ttlMs < 1_000 || ttlMs > DEFAULT_TTL_MS) throw invalid("Choice card ttl is out of range");
+  if (!Number.isFinite(unlockAfterMs) || unlockAfterMs < 0 || unlockAfterMs >= ttlMs) {
+    throw invalid("Choice card unlock delay must be non-negative and shorter than its ttl");
+  }
   validateOptions(input.options);
+  if (input.compact === true && input.options.length !== 1) throw invalid("Compact choice cards require exactly one option");
   prune(now);
 
   const cardId = `wcc_${randomUUID()}`;
@@ -125,6 +136,8 @@ export function createChatGptWidgetChoiceCard(input: {
     title: input.title,
     prompt: input.prompt,
     options: input.options.map((option) => ({ ...option })),
+    compact: input.compact === true,
+    availableAt: unlockAfterMs > 0 ? now + unlockAfterMs : null,
     createdAt: now,
     expiresAt: now + ttlMs,
     status: "pending",
@@ -160,6 +173,7 @@ export function resolveChatGptWidgetChoice(input: {
   const card = cards.get(input.cardId);
   if (!card) throw invalid("Choice card was not found or expired");
   if (card.sessionScope !== input.sessionScope) throw forbidden("Choice card belongs to another ChatGPT session");
+  if (card.availableAt !== null && now < card.availableAt) throw invalid("Choice card action is not available yet");
   const option = card.options.find((candidate) => candidate.id === input.choiceId);
   if (!option) throw invalid("Choice is not part of this card");
 
@@ -181,12 +195,16 @@ export function resolveChatGptWidgetChoice(input: {
   return { ...result };
 }
 
+export type ChatGptWidgetChoiceLookupResult =
+  | { status: "pending"; cardId: string }
+  | ({ status: "resolved" } & ChatGptWidgetChoiceResult);
+
 export function getChatGptWidgetChoiceResult(input: {
   sessionScope: string;
   receiptId?: string;
   cardId?: string;
   now?: number;
-}): ChatGptWidgetChoiceResult {
+}): ChatGptWidgetChoiceLookupResult {
   const now = input.now ?? Date.now();
   prune(now);
   const receiptCardId = input.receiptId ? receiptToCard.get(input.receiptId) : undefined;
@@ -195,8 +213,9 @@ export function getChatGptWidgetChoiceResult(input: {
   const cardId = input.cardId ?? receiptCardId;
   if (!cardId) throw invalid("Choice result requires a receiptId or cardId");
   const card = cards.get(cardId);
-  if (!card || !card.result) throw invalid("Choice result was not found or expired");
+  if (!card) throw invalid("Choice result was not found or expired");
   if (card.sessionScope !== input.sessionScope) throw forbidden("Choice result belongs to another ChatGPT session");
+  if (!card.result) return { status: "pending", cardId: card.cardId };
   if (input.receiptId && card.result.receiptId !== input.receiptId) throw invalid("Choice result identifiers do not match");
-  return { ...card.result };
+  return { status: "resolved", ...card.result };
 }

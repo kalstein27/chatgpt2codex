@@ -3,6 +3,7 @@ import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import path from "node:path";
 import { getRuntimeManifest, type RuntimeManifest } from "./runtime-manifest.js";
 import { getLatestAppliedSchemaChangingRuntimeApplyReceipt, type RuntimeApplyReceipt } from "./runtime-apply.js";
+import { readHostCatalogRebind, type HostCatalogRebindReceipt } from "./host-catalog-rebind.js";
 
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -15,6 +16,7 @@ export interface ToolSchemaRevalidationReceipt {
   observedAt: string;
   schemaRevision: string;
   runtimeToolSchemaRevision: string | null;
+  runtimeHostCatalogRevision: string | null;
   runtimeFingerprint: string | null;
   clientSchemaRevision: string | null;
   staleClientRevision: boolean;
@@ -28,13 +30,15 @@ export interface ToolSchemaRecoveryPlan {
     | "no-applied-schema-change"
     | "latest-schema-change-is-not-current-runtime"
     | "runtime-schema-changed-awaiting-tools-list"
-    | "post-apply-tools-list-observed";
+    | "post-apply-tools-list-observed"
+    | "post-apply-host-catalog-rebind-observed";
   toolSchemaChanged: boolean;
   toolListRefreshObserved: boolean | null;
   preferredExecution: "named-tool" | "c2ct_invoke";
   liveSchemaTool: "tool_schema_get";
   stableDispatcherTool: "c2ct_invoke";
   runtimeToolSchemaRevision: string | null;
+  runtimeHostCatalogRevision: string | null;
   runtimeFingerprint: string | null;
   lastObservedCanonicalSchemaRevision: string | null;
   lastObservedAt: string | null;
@@ -53,6 +57,7 @@ export interface ToolSchemaRecoveryState {
   plan: ToolSchemaRecoveryPlan;
   lastRuntimeApply: RuntimeApplyReceipt | null;
   revalidation: ToolSchemaRevalidationReceipt | null;
+  hostCatalogRebind: HostCatalogRebindReceipt | null;
 }
 
 function receiptPath(stateDir: string): string {
@@ -74,6 +79,10 @@ function normalizeReceipt(value: unknown): ToolSchemaRevalidationReceipt | null 
   if (!validIsoTimestamp(record.observedAt) || !validRevision(record.schemaRevision)) return null;
   const runtimeToolSchemaRevision = record.runtimeToolSchemaRevision;
   if (runtimeToolSchemaRevision !== null && !validRevision(runtimeToolSchemaRevision)) return null;
+  const runtimeHostCatalogRevision = record.runtimeHostCatalogRevision;
+  if (runtimeHostCatalogRevision !== undefined && runtimeHostCatalogRevision !== null && !validRevision(runtimeHostCatalogRevision)) {
+    return null;
+  }
   const runtimeFingerprint = record.runtimeFingerprint;
   if (runtimeFingerprint !== null && (typeof runtimeFingerprint !== "string" || !/^[a-f0-9]{64}$/u.test(runtimeFingerprint))) {
     return null;
@@ -86,6 +95,7 @@ function normalizeReceipt(value: unknown): ToolSchemaRevalidationReceipt | null 
     observedAt: record.observedAt,
     schemaRevision: record.schemaRevision,
     runtimeToolSchemaRevision,
+    runtimeHostCatalogRevision: validRevision(runtimeHostCatalogRevision) ? runtimeHostCatalogRevision : null,
     runtimeFingerprint,
     clientSchemaRevision,
     staleClientRevision: record.staleClientRevision,
@@ -112,6 +122,9 @@ export async function recordToolSchemaRevalidation(
     schemaRevision: input.schemaRevision,
     runtimeToolSchemaRevision: validRevision(runtimeManifest.toolSchemaRevision)
       ? runtimeManifest.toolSchemaRevision
+      : null,
+    runtimeHostCatalogRevision: validRevision(runtimeManifest.hostCatalogRevision)
+      ? runtimeManifest.hostCatalogRevision
       : null,
     runtimeFingerprint: typeof runtimeManifest.runtimeFingerprint === "string"
       ? runtimeManifest.runtimeFingerprint
@@ -141,16 +154,35 @@ export async function readToolSchemaRevalidation(stateDir: string): Promise<Tool
   }
 }
 
+function manifestCatalogRevision(manifest: RuntimeManifest): string | null {
+  return validRevision(manifest.hostCatalogRevision)
+    ? manifest.hostCatalogRevision
+    : validRevision(manifest.toolSchemaRevision)
+      ? manifest.toolSchemaRevision
+      : null;
+}
+
 function appliedSchemaChange(receipt: RuntimeApplyReceipt | null): boolean {
+  const catalogChanged = receipt
+    ? manifestCatalogRevision(receipt.previousManifest) !== manifestCatalogRevision(receipt.targetManifest)
+    : false;
+  const uiResourceChanged = Boolean(
+    receipt
+    && typeof receipt.previousManifest.uiResourceRevision === "string"
+    && typeof receipt.targetManifest.uiResourceRevision === "string"
+    && receipt.previousManifest.uiResourceRevision !== receipt.targetManifest.uiResourceRevision,
+  );
   return Boolean(
     receipt
     && (receipt.state === "APPLIED" || receipt.state === "ALREADY_APPLIED")
-    && receipt.previousManifest.toolSchemaRevision !== receipt.targetManifest.toolSchemaRevision,
+    && (catalogChanged || uiResourceChanged),
   );
 }
 
 function applyTargetsCurrentRuntime(receipt: RuntimeApplyReceipt, runtimeManifest: RuntimeManifest): boolean {
-  if (receipt.targetManifest.toolSchemaRevision !== runtimeManifest.toolSchemaRevision) return false;
+  const targetCatalogRevision = manifestCatalogRevision(receipt.targetManifest);
+  const runtimeCatalogRevision = manifestCatalogRevision(runtimeManifest);
+  if (targetCatalogRevision && runtimeCatalogRevision && targetCatalogRevision !== runtimeCatalogRevision) return false;
   if (receipt.targetManifest.runtimeFingerprint && runtimeManifest.runtimeFingerprint) {
     return receipt.targetManifest.runtimeFingerprint === runtimeManifest.runtimeFingerprint;
   }
@@ -161,18 +193,40 @@ export function toolSchemaRecoveryPlan(input: {
   runtimeManifest: RuntimeManifest;
   lastRuntimeApply: RuntimeApplyReceipt | null;
   revalidation: ToolSchemaRevalidationReceipt | null;
+  hostCatalogRebind?: HostCatalogRebindReceipt | null;
 }): ToolSchemaRecoveryPlan {
-  const { runtimeManifest, lastRuntimeApply, revalidation } = input;
+  const { runtimeManifest, lastRuntimeApply, revalidation, hostCatalogRebind = null } = input;
   const toolSchemaChanged = appliedSchemaChange(lastRuntimeApply);
+  const applyAt = lastRuntimeApply ? Date.parse(lastRuntimeApply.updatedAt) : Number.NaN;
+  const rebindObservedAt = hostCatalogRebind ? Date.parse(hostCatalogRebind.observedAt) : Number.NaN;
+  const refreshCompletedAt = lastRuntimeApply?.hostCatalogRefreshCompletedAt
+    ? Date.parse(lastRuntimeApply.hostCatalogRefreshCompletedAt)
+    : Number.NaN;
+  const hostCatalogRebindVerified = hostCatalogRebind
+    ? Boolean(
+      lastRuntimeApply
+      && lastRuntimeApply.hostCatalogRefreshAttempted === true
+      && lastRuntimeApply.hostCatalogRefreshRequested === true
+      && lastRuntimeApply.hostCatalogScanCompleted === true
+      && Number.isFinite(applyAt)
+      && Number.isFinite(refreshCompletedAt)
+      && Number.isFinite(rebindObservedAt)
+      && refreshCompletedAt >= applyAt
+      && rebindObservedAt >= refreshCompletedAt
+      && hostCatalogRebind.runtimeHostCatalogRevision === runtimeManifest.hostCatalogRevision
+      && hostCatalogRebind.runtimeFingerprint === runtimeManifest.runtimeFingerprint,
+    )
+    : null;
   const base = {
     toolSchemaChanged,
     liveSchemaTool: "tool_schema_get" as const,
     stableDispatcherTool: "c2ct_invoke" as const,
     runtimeToolSchemaRevision: runtimeManifest.toolSchemaRevision,
+    runtimeHostCatalogRevision: runtimeManifest.hostCatalogRevision ?? null,
     runtimeFingerprint: runtimeManifest.runtimeFingerprint,
     lastObservedCanonicalSchemaRevision: revalidation?.schemaRevision ?? null,
     lastObservedAt: revalidation?.observedAt ?? null,
-    hostCatalogRebindVerified: null,
+    hostCatalogRebindVerified,
     hostCatalogRefresh: {
       surface: "host-app-server" as const,
       method: "app/installed" as const,
@@ -204,7 +258,17 @@ export function toolSchemaRecoveryPlan(input: {
     };
   }
 
-  const applyAt = Date.parse(lastRuntimeApply.updatedAt);
+  if (hostCatalogRebindVerified) {
+    return {
+      ...base,
+      mode: "named-tools-preferred",
+      reason: "post-apply-host-catalog-rebind-observed",
+      toolListRefreshObserved: false,
+      preferredExecution: "named-tool",
+      instruction: "The bounded post-apply host catalog refresh completed and a direct named catalog marker was then invoked against the same runtime fingerprint and host-catalog revision. Treat the current chat named-tool mount as rebound even if a separate tools/list observation has not been recorded. Keep c2ct_invoke only as a backend fallback if a later named call is rejected. Widget/approval presenters must continue to use their dedicated direct named surface.",
+    };
+  }
+
   const observedAt = revalidation ? Date.parse(revalidation.observedAt) : Number.NaN;
   const toolListRefreshObserved = Boolean(
     revalidation
@@ -213,6 +277,10 @@ export function toolSchemaRecoveryPlan(input: {
     && Number.isFinite(observedAt)
     && observedAt >= applyAt
     && revalidation.runtimeToolSchemaRevision === runtimeManifest.toolSchemaRevision
+    && (
+      !runtimeManifest.hostCatalogRevision
+      || revalidation.runtimeHostCatalogRevision === runtimeManifest.hostCatalogRevision
+    )
     && (
       !runtimeManifest.runtimeFingerprint
       || revalidation.runtimeFingerprint === runtimeManifest.runtimeFingerprint
@@ -244,13 +312,15 @@ export async function readToolSchemaRecoveryState(
   stateDir: string,
   runtimeManifest: RuntimeManifest = getRuntimeManifest(),
 ): Promise<ToolSchemaRecoveryState> {
-  const [lastRuntimeApply, revalidation] = await Promise.all([
+  const [lastRuntimeApply, revalidation, hostCatalogRebind] = await Promise.all([
     getLatestAppliedSchemaChangingRuntimeApplyReceipt(stateDir).catch(() => null),
     readToolSchemaRevalidation(stateDir),
+    readHostCatalogRebind(stateDir),
   ]);
   return {
-    plan: toolSchemaRecoveryPlan({ runtimeManifest, lastRuntimeApply, revalidation }),
+    plan: toolSchemaRecoveryPlan({ runtimeManifest, lastRuntimeApply, revalidation, hostCatalogRebind }),
     lastRuntimeApply,
     revalidation,
+    hostCatalogRebind,
   };
 }
