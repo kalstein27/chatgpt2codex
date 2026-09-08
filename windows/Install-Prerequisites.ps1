@@ -1,3 +1,7 @@
+param(
+    [switch]$RequireCloudflared
+)
+
 $ErrorActionPreference = "Stop"
 
 function Refresh-Path {
@@ -25,4 +29,6 @@ function Ensure-Command([string]$Command, [string]$WingetId) {
 }
 
 Ensure-Command node "OpenJS.NodeJS.LTS"
-Ensure-Command cloudflared "Cloudflare.cloudflared"
+if ($RequireCloudflared) {
+    Ensure-Command cloudflared "Cloudflare.cloudflared"
+}

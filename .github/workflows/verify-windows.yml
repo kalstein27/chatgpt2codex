@@ -93,6 +93,32 @@ jobs:
             }
           }
 
+      - name: Verify Windows PowerShell 5.1 compatibility
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $trayPath = (Resolve-Path -LiteralPath "windows/ChatGPTToCodexTray.ps1").Path
+          $bytes = [System.IO.File]::ReadAllBytes($trayPath)
+          if ($bytes.Length -lt 3 -or $bytes[0] -ne 0xEF -or $bytes[1] -ne 0xBB -or $bytes[2] -ne 0xBF) {
+            throw "windows/ChatGPTToCodexTray.ps1 must keep a UTF-8 BOM for Windows PowerShell 5.1."
+          }
+
+          $files = @(
+            "start-chatgpt.ps1",
+            "windows/ChatGPTToCodexTray.ps1",
+            "windows/Install-Prerequisites.ps1"
+          )
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            $path = (Resolve-Path -LiteralPath $file).Path
+            [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $details = ($errors | ForEach-Object { "${file}:$($_.Extent.StartLineNumber): $($_.Message)" }) -join "`n"
+              throw "Windows PowerShell 5.1 parse errors:`n$details"
+            }
+          }
+
       - name: Compile Windows launcher
         shell: powershell
         run: |
