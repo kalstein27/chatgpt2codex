@@ -96,7 +96,7 @@
       "approval-widget-e2e-20260830": {
         "source": {
           "projectRelativePath": "README.md",
-          "sha256": "9d64b852b2b00198b7f30b6dedc5bd96d31c37fbdbf2229764c2dfda226555ad"
+          "sha256": "309ceb106e3981f9dbe15fc225e8ef49825a9c74263af7f3857210b3541f4415"
         },
         "destination": {
           "class": "user-application-support-measurement",
