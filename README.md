@@ -143,17 +143,36 @@ macOS short version:
 
 The legacy macOS status item remains hidden; its command model is retained internally for compatibility, while user-facing controls live in the regular app window.
 
-Windows short version:
+Windows short version (recommended source checkout):
 
-1. When a Windows installer has passed its Windows runner checks and is
-   attached, download it from the
-   [official releases](https://github.com/ezBuilder/chatgpt2codex/releases).
-2. Double-click the installer.
-3. If Windows SmartScreen warns, choose **More info** -> **Run anyway** only if
-   the file came from this GitHub release.
-4. Launch **ChatGPT To Codex**.
-5. Open the tray settings. Project-folder selection is optional for first connection; the default workspace may contain zero projects. Enable the ChatGPT web connector if needed, then click **Start MCP**.
-6. Copy the `/mcp` Connector URL and approve it in ChatGPT with the Owner Token.
+1. Install Git for Windows and Node.js 22 or newer.
+2. Tailscale is optional, but signing the Windows PC and your phone into the same
+   tailnet is recommended for stable private operator access and future mobile
+   Activity/approval workflows.
+3. Clone and build the repository:
+
+```powershell
+git clone https://github.com/kalstein27/chatgpt2codex.git ChatGPT2Codex
+cd ChatGPT2Codex
+npm ci --ignore-scripts
+npm run typecheck
+npm test
+npm run build
+```
+
+4. Start the tray UI with `windows\Start-ChatGPTToCodexTray.cmd`. The launcher
+   helper can install missing Node.js and `cloudflared` through WinGet.
+5. Open **Settings...**, choose the project folder, and click **Start MCP**.
+6. Open local health, then open `http://127.0.0.1:7980/activity/` to verify the
+   Activity dashboard.
+7. For ChatGPT web, enable the web connector, copy its HTTPS `/mcp` URL, and
+   register that URL in ChatGPT Apps / Connectors.
+
+The runtime-only alternative is `npm run chatgpt:windows`. Administrator mode is
+not normally required for ChatGPT To Codex itself. See
+[windows/README.md](windows/README.md) for the full clone/build walkthrough,
+Tailscale recommendation, Activity page, first-run checks, and Windows/macOS
+parity notes.
 
 Keep the Owner Token private. Treat it like a password.
 
@@ -214,13 +233,18 @@ becoming public repository content.
 
 ## Windows status
 
-Windows has tray, portable-bundle, installer, and installer-E2E source paths.
-The shared workspace, file, patch, command, Git, image intake, OAuth, and
-session-status runtime is implemented, but a Windows release is not accepted
-until those paths run on a real Windows runner. Native Windows desktop
-screenshot/click/type control is not implemented, so the tray deliberately
-shows `Agent Arm: unavailable on Windows` instead of accepting a lease it
-cannot execute. See [windows/README.md](windows/README.md).
+Windows uses the same shared Node runtime for project discovery, work lanes,
+guarded file edits, commands, Git, image intake, OAuth/connectors, approval
+status, diagnostics, and the Activity dashboard. The recommended installation
+path is a Git clone plus local build, not a prebuilt Windows binary.
+
+While MCP is running, the Activity page is available locally at
+`http://127.0.0.1:7980/activity/`. Installing Tailscale on the Windows PC and
+mobile devices is recommended, but automatic Tailscale Serve + ntfy mobile
+approval setup is not yet Windows-parity. Native Windows desktop
+screenshot/click/type/UI-Automation control is also not implemented, so
+`Agent Arm` remains unavailable. See [windows/README.md](windows/README.md) for
+the source-build walkthrough and the exact macOS/Windows parity boundary.
 
 ## Command side-effect metadata
 
