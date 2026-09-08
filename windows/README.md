@@ -4,11 +4,10 @@ Windows has a WinForms/PowerShell launcher and the shared TypeScript/Node runtim
 Together they provide project, file, patch, command, Git, image intake, OAuth,
 connector, approval, and session-status features.
 
-The current public tree does **not** contain the installer/portable-package/
-installer-E2E builder automation referenced by older documentation. Treat an
-installer filename as a release convention, not proof that a current Windows
-artifact exists or passed acceptance. A successful TypeScript build or macOS
-test is also not Windows release evidence.
+The public tree now contains a source-driven portable-package builder. It creates
+an architecture-matched ZIP with the launcher, built runtime, production Node
+dependencies, and its own `runtime\node.exe`. This is build evidence, not proof
+of signing, SmartScreen acceptance, or installer-style release acceptance.
 
 Native Windows screenshot, click/type control, and UI Automation are not
 implemented yet, so `Agent Arm` remains unavailable by design.
@@ -116,8 +115,8 @@ For the closest Windows equivalent to the desktop app experience, launch:
 
 You can also double-click `windows\Start-ChatGPTToCodexTray.cmd` in Explorer.
 That entry point runs the prerequisite helper and then starts the PowerShell tray
-UI. The prerequisite helper can install Node.js and `cloudflared` through WinGet
-when either command is missing.
+UI. Node.js is the default prerequisite. `cloudflared` is checked/installed only
+when `CHATGPT2CODEX_TUNNEL_MODE` explicitly selects a Cloudflare tunnel mode.
 
 If you only want the runtime without the tray UI, use:
 
@@ -202,12 +201,17 @@ so do not expect the full Mac mobile-approval experience on Windows yet.
 
 ## Web connector and cloudflared
 
-The release workflow is not included in the minimal public source tree, and the
-installer-E2E automation remains local-only. Installer/portable packaging still
-needs to run on a real Windows runner before any artifact is treated as a release
-candidate. Release binaries belong in GitHub Releases, not in the Git tree.
+The portable builder is:
 
-## Web connector and cloudflared
+```powershell
+npm run build:windows-portable
+```
+
+It emits `build\windows-portable\chatgpt2codex-windows-<arch>.zip`. The archive
+includes its own Node executable and can run without a separately installed Node
+runtime after extraction. Build it on the same CPU architecture you intend to
+ship, and still perform real-Windows acceptance before treating it as a release.
+Release binaries belong in GitHub Releases, not in the Git tree.
 
 Starting MCP without the web connector is loopback-only. ChatGPT on the web needs
 an externally reachable HTTPS connector URL. The Windows launcher supports
@@ -225,6 +229,13 @@ winget install --id Cloudflare.cloudflared
 A Quick Tunnel `trycloudflare.com` URL can change after restart. Reconnect or
 update the ChatGPT connector when that happens. For regular use, prefer a stable
 HTTPS hostname that you control.
+
+For a `.ts.net` external HTTPS origin, keep the distinction explicit: Tailscale
+**Serve** is tailnet-private and is not enough for ChatGPT web. Tailscale
+**Funnel** is the public exposure mode. ChatGPT To Codex verifies public health
+before marking the connector Ready, but an externally managed Serve/Funnel
+configuration is not enabled or disabled by this app. Quitting the Windows app
+therefore warns that Funnel configuration may remain enabled separately.
 
 ## Runtime behavior
 

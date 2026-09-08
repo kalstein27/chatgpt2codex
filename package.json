@@ -17,6 +17,7 @@
     "activity-dashboard:apply": "tsx scripts/apply-activity-dashboard.ts",
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json && node dist/runtime/chatgpt-widget-check.js && node dist/runtime/chatgpt-widget-asset-build.js && node dist/runtime/runtime-manifest.js --seal",
     "build:macos-app": "bash scripts/build-macos-app.sh",
+    "build:windows-portable": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Build-Portable.ps1",
     "macos-app:bootstrap-local": "node dist/cli.js macos-app-bootstrap-local",
     "chatgpt": "bash start-chatgpt.sh",
     "chatgpt:c2ct:plugin-refresh": "node src/exec/chatgpt-c2ct-command.mjs plugin-refresh",

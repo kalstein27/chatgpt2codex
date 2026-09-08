@@ -305,7 +305,14 @@ function Stop-StaleRuntimeProcesses([int]$PortToStop, [string]$ResolvedTunnelMod
     }
 }
 
-Need-Command node
+$bundledNode = Join-Path $Root "runtime\node.exe"
+if (Test-Path -LiteralPath $bundledNode) {
+    $nodeExe = $bundledNode
+} else {
+    $nodeCommand = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $nodeCommand) { throw "Missing command: node" }
+    $nodeExe = $nodeCommand.Source
+}
 Set-Location $Root
 
 if (-not (Test-Path (Join-Path $Root "dist\cli.js"))) {
@@ -323,7 +330,7 @@ if (Test-PortBusy $Port) {
 $cli = Join-Path $Root "dist\cli.js"
 if ($RotateOwnerToken -or $env:CHATGPT2CODEX_ROTATE_OWNER_TOKEN -eq "1") {
     Write-Host "[chatgpt2codex] generating owner token..."
-    $tokenJsonText = node $cli owner-token --generate --workspace $Workspace
+    $tokenJsonText = & $nodeExe $cli owner-token --generate --workspace $Workspace
     if ($LASTEXITCODE -ne 0) {
         throw "Owner token generation failed."
     }
@@ -338,7 +345,7 @@ if ($RotateOwnerToken -or $env:CHATGPT2CODEX_ROTATE_OWNER_TOKEN -eq "1") {
     Write-Host ""
     Write-Host "Store this securely. It is required to approve ChatGPT/MCP connections."
 }
-$doctor = node $cli doctor 2>$null
+$doctor = & $nodeExe $cli doctor 2>$null
 if (($doctor -join "`n") -notmatch "owner token configured") {
     throw "Owner token is not configured. Open ChatGPT To Codex settings and generate or set an owner token first."
 }
@@ -352,6 +359,11 @@ try {
     if ($resolvedTunnelMode -eq "external") {
         $publicUrl = Resolve-ExternalPublicUrl
         Write-Host "[chatgpt2codex] 1/3 using externally managed HTTPS tunnel; no cloudflared process will be started."
+        if ($publicUrl -match '^https://[^/]+\.ts\.net$') {
+            Write-Host "[chatgpt2codex] Tailscale HTTPS origin detected."
+            Write-Host "[chatgpt2codex] Tailscale Serve is tailnet-private; ChatGPT web requires Funnel or another publicly reachable HTTPS origin."
+            Write-Host "[chatgpt2codex] This app does not enable or disable Serve/Funnel for an externally managed Tailscale URL."
+        }
     } elseif ($managesCloudflared) {
         if ($resolvedTunnelMode -eq "cloudflare-named") {
             if (-not $PublicHostname) {
@@ -388,7 +400,7 @@ try {
     if ($ActiveProjectRoot) {
         $serverArgs += @("--active-project-root", $ActiveProjectRoot, "--active-project-preset", $ActiveProjectPreset)
     }
-    $srvProc = Start-LoggedProcess "node" $serverArgs $srvOut $srvErr
+    $srvProc = Start-LoggedProcess $nodeExe $serverArgs $srvOut $srvErr
     Wait-HttpOk "http://127.0.0.1:$Port/healthz" 20 "local server"
 
     $connectorReady = -not $usePublicEndpoint

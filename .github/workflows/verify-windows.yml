@@ -149,6 +149,31 @@ jobs:
           if ($artifact.Length -le 0) { throw "Launcher artifact is empty." }
           Get-FileHash -LiteralPath $artifact.FullName -Algorithm SHA256
 
+      - name: Build portable Windows bundle
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          npm run build:windows-portable
+          $arch = (node -p "process.arch").Trim()
+          $root = Join-Path $env:GITHUB_WORKSPACE "build\windows-portable\chatgpt2codex-windows-$arch"
+          $required = @(
+            "ChatGPT To Codex.exe",
+            "runtime\node.exe",
+            "dist\cli.js",
+            "start-chatgpt.ps1",
+            "node_modules",
+            "portable-manifest.json",
+            "README.txt"
+          )
+          foreach ($relative in $required) {
+            if (-not (Test-Path -LiteralPath (Join-Path $root $relative))) {
+              throw "Portable bundle is missing: $relative"
+            }
+          }
+          $zip = Join-Path $env:GITHUB_WORKSPACE "build\windows-portable\chatgpt2codex-windows-$arch.zip"
+          if (-not (Test-Path -LiteralPath $zip)) { throw "Portable zip was not produced." }
+          Get-FileHash -LiteralPath $zip -Algorithm SHA256
+
       - name: Smoke-test Windows HTTP runtime
         shell: pwsh
         run: |

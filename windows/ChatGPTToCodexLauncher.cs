@@ -611,6 +611,14 @@ internal sealed class LauncherForm : Form
         return uri.GetLeftPart(UriPartial.Authority).TrimEnd('/');
     }
 
+    private bool IsTailscaleExternalOrigin()
+    {
+        var value = ResolveExternalPublicUrl();
+        Uri uri;
+        return !string.IsNullOrWhiteSpace(value) && Uri.TryCreate(value, UriKind.Absolute, out uri) &&
+            uri.Host.EndsWith(".ts.net", StringComparison.OrdinalIgnoreCase);
+    }
+
     private string LoadSelectedProjectPath()
     {
         try
@@ -2008,6 +2016,16 @@ internal sealed class LauncherForm : Form
     private void ExitApplication()
     {
         if (exitRequested) return;
+        if (IsTailscaleExternalOrigin() && process != null && !process.HasExited)
+        {
+            var answer = MessageBox.Show(
+                this,
+                "This app will stop the local MCP server, but it does not disable an externally managed Tailscale Serve/Funnel configuration.\r\n\r\nIf Funnel is enabled, disable it separately when you no longer want the public endpoint configured.\r\n\r\nQuit ChatGPT To Codex now?",
+                "Tailscale public exposure",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning);
+            if (answer != DialogResult.Yes) return;
+        }
         exitRequested = true;
         trayIcon.Visible = false;
         StopProcessTree();
@@ -2037,7 +2055,9 @@ internal sealed class LauncherForm : Form
         {
             urlBox.Text = "Checking public connector...";
             copyButton.Enabled = false;
-            statusLabel.Text = "Local runtime starting; public connector not verified yet";
+            statusLabel.Text = IsTailscaleExternalOrigin()
+                ? "Tailscale URL configured; verifying Funnel/public reachability (Serve-only is private)"
+                : "Local runtime starting; public connector not verified yet";
         }
         var script = Path.Combine(root, "start-chatgpt.ps1");
         if (!File.Exists(script))
@@ -2185,6 +2205,10 @@ internal sealed class LauncherForm : Form
             statusLabel.Text = string.IsNullOrEmpty(mcpUrl)
                 ? "Local server is running; waiting for public tunnel"
                 : "MCP URL ready; public tunnel is still warming up";
+        }
+        else if (line.IndexOf("Tailscale Serve is tailnet-private", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            statusLabel.Text = "Tailscale Serve is private; ChatGPT web needs Funnel/public HTTPS";
         }
         else if (line.IndexOf("chatgpt2codex is ready", StringComparison.OrdinalIgnoreCase) >= 0)
         {
