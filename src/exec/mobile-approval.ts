@@ -25,6 +25,7 @@ import {
   type ActivityDashboardApproval,
   type ActivityDashboardDeployment,
 } from "../server/activity-dashboard.js";
+import { patchDesktopSettings, readDesktopSettings } from "../runtime/desktop-settings.js";
 import { activityMcpHealth } from "../server/activity-mcp-health.js";
 import { DomainError } from "../types.js";
 
@@ -317,9 +318,56 @@ function sendJson(res: ServerResponse, status: number, body: Record<string, unkn
   res.end(`${JSON.stringify(body)}\n`);
 }
 
+async function readJsonBody(req: IncomingMessage, maxBytes = 16 * 1024): Promise<Record<string, unknown>> {
+  return await new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    req.on("data", (chunk: Buffer | string) => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buffer.length;
+      if (bytes > maxBytes) {
+        reject(new Error("request_body_too_large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(buffer);
+    });
+    req.on("end", () => {
+      try {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          reject(new Error("invalid_json_object"));
+          return;
+        }
+        resolve(parsed as Record<string, unknown>);
+      } catch (error) {
+        reject(error);
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
 function isLoopbackRequest(req: IncomingMessage): boolean {
   const address = req.socket.remoteAddress;
   return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
+}
+
+function localActivityOriginMatches(req: IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  const host = req.headers.host;
+  if (typeof origin !== "string" || typeof host !== "string") return false;
+  try {
+    const parsed = new URL(origin);
+    if (parsed.protocol !== "http:") return false;
+    if (parsed.host !== host) return false;
+    return parsed.hostname === "localhost" ||
+      parsed.hostname === "127.0.0.1" ||
+      parsed.hostname === "::1" ||
+      parsed.hostname === "[::1]";
+  } catch {
+    return false;
+  }
 }
 
 function setDashboardHeaders(res: ServerResponse): void {
@@ -928,6 +976,15 @@ export class MobileApprovalBridge {
         return;
       }
       setDashboardHeaders(res);
+      if (requestPath === "/activity/api/settings") {
+        if (!isLoopbackRequest(req)) {
+          sendJson(res, 403, { ok: false, error: "settings_loopback_only" });
+          return;
+        }
+        const settings = await readDesktopSettings(this.stateDir);
+        sendJson(res, 200, { ok: true, platform: process.platform, settings });
+        return;
+      }
       if (requestPath === "/activity/api/activity") {
         const now = Date.now();
         const dashboard = await activityDashboardDocument(this.stateDir);
@@ -1009,6 +1066,40 @@ export class MobileApprovalBridge {
         return;
       }
       sendJson(res, 404, { ok: false });
+      return;
+    }
+
+    if (req.method === "POST" && requestPath === "/activity/api/settings") {
+      if (!this.activityTracker) {
+        sendJson(res, 404, { ok: false });
+        return;
+      }
+      setDashboardHeaders(res);
+      if (!isLoopbackRequest(req)) {
+        sendJson(res, 403, { ok: false, error: "settings_loopback_only" });
+        return;
+      }
+      if (!localActivityOriginMatches(req)) {
+        sendJson(res, 403, { ok: false, error: "settings_same_origin_required" });
+        return;
+      }
+      const contentType = req.headers["content-type"];
+      if (typeof contentType !== "string" || !contentType.toLowerCase().startsWith("application/json")) {
+        sendJson(res, 415, { ok: false, error: "settings_json_required" });
+        return;
+      }
+      try {
+        const body = await readJsonBody(req);
+        const settings = await patchDesktopSettings(this.stateDir, body);
+        sendJson(res, 200, {
+          ok: true,
+          platform: process.platform,
+          settings,
+          nativeApplyRequired: true,
+        });
+      } catch {
+        sendJson(res, 400, { ok: false, error: "invalid_desktop_settings" });
+      }
       return;
     }
 

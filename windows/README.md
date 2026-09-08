@@ -173,17 +173,22 @@ helper still resolves only the approved macOS Tailscale CLI locations. Therefore
 the fully automatic Mac-style Tailscale/mobile-approval setup is **not yet Windows
 parity** and should not be described as automatic on Windows.
 
-## Activity page
+## Shared desktop UI
 
-The Activity dashboard is part of the shared runtime and starts on Windows too.
-While MCP is running, open this on the Windows PC:
+The Activity dashboard and desktop settings are one shared web UI used by both
+macOS and Windows. While MCP is running, the Windows launcher opens the same UI
+in Microsoft Edge app mode and hides the legacy launcher/log window to the tray.
+Double-clicking the tray icon, or choosing **Open ChatGPT To Codex**, opens it
+again. The direct loopback URL remains:
 
 `http://127.0.0.1:7980/activity/`
 
-The page shows the current conversation/activity model, operation history,
-pending approvals, deployment/runtime state, widget-load information, and MCP
-health diagnostics. It is the best place to answer "is ChatGPT actually still
-working?" without reading raw logs.
+The UI shows the current conversation/activity model, operation history, pending
+approvals, deployment/runtime state, widget-load information, MCP health, and a
+shared **Settings** tab. Those settings are persisted in the common desktop
+settings document and then applied by the platform-native launcher. If Edge is
+not available, Windows falls back to the system browser. The old WinForms window
+remains a startup/recovery/log surface rather than the normal daily UI.
 
 Local loopback viewing works cross-platform. Remote viewing is accepted only from
 loopback or a request carrying a Tailscale identity. If you manually expose the
@@ -265,21 +270,18 @@ project discovery, work lanes, file read/write/patching, guarded commands, Git,
 image intake, OAuth/connector sessions, approvals/status, connection diagnostics,
 and the Activity dashboard are shared.
 
-It is **not yet identical** to macOS in three important areas:
+It is **not yet identical** to macOS in two important areas:
 
-1. The macOS app has a native embedded Activity window; Windows currently uses
-   the browser-hosted `http://127.0.0.1:7980/activity/` page.
-2. The automatic Tailscale Serve + ntfy mobile-approval setup currently resolves
+1. The automatic Tailscale Serve + ntfy mobile-approval setup currently resolves
    macOS Tailscale CLI paths only. Windows can run Tailscale and Tailscale Serve,
    but C2CT does not yet automate that setup on Windows.
-3. Native desktop screenshot/click/type/UI-Automation control is not implemented
+2. Native desktop screenshot/click/type/UI-Automation control is not implemented
    on Windows, so `Agent Arm` remains unavailable.
 
 If your normal Mac usage is ChatGPT asking C2CT to inspect/edit/test/build Git
 projects, Windows should exercise the same shared runtime path. If your workflow
-depends on Mac desktop control, the embedded Activity window, or one-tap mobile
-approval over the automatically configured Tailscale bridge, Windows is not yet
-feature-identical.
+depends on Mac desktop control or one-tap mobile approval over the automatically
+configured Tailscale bridge, Windows is not yet feature-identical.
 
 ## First-run verification on the Windows PC
 

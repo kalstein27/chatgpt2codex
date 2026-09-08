@@ -63,6 +63,21 @@ internal sealed class LocalControlOperation
     public long elapsedMs { get; set; }
 }
 
+internal sealed class DesktopSettings
+{
+    public int schemaVersion { get; set; }
+    public string language { get; set; }
+    public string projectFolder { get; set; }
+    public bool launchAtStartup { get; set; }
+    public bool startMcpOnOpen { get; set; }
+    public bool autoCheckUpdates { get; set; }
+    public bool multiProjectLanesEnabled { get; set; }
+    public bool enablePublicTunnel { get; set; }
+    public string publicHostname { get; set; }
+    public int port { get; set; }
+    public string[] controlAllowlist { get; set; }
+}
+
 internal sealed class LauncherForm : Form
 {
     private const int MaxLauncherLogFiles = 20;
@@ -164,6 +179,7 @@ internal sealed class LauncherForm : Form
     private readonly string connectionDiagnosticsFile;
     private readonly string selectedProjectFile;
     private readonly string settingsFile;
+    private readonly string sharedSettingsFile;
     private readonly string defaultWorkspace;
     private string configuredPublicHost;
     private string lastConnectorUrl;
@@ -174,6 +190,9 @@ internal sealed class LauncherForm : Form
     private bool launchAtStartup;
     private bool startMcpOnOpen;
     private bool autoCheckUpdates;
+    private bool multiProjectLanesEnabled = true;
+    private string[] controlAllowlist = new[] { "Finder" };
+    private DateTime sharedSettingsLastWriteUtc = DateTime.MinValue;
     private readonly TextBox logBox;
     private readonly TextBox urlBox;
     private readonly TextBox ownerTokenBox;
@@ -195,6 +214,7 @@ internal sealed class LauncherForm : Form
     private readonly ToolStripMenuItem toggleTrayItem;
     private readonly ToolStripMenuItem restartTrayItem;
     private readonly ToolStripMenuItem connectionDiagnosticsTrayItem;
+    private readonly ToolStripMenuItem activityTrayItem;
     private readonly ToolStripMenuItem settingsTrayItem;
     private readonly ToolStripMenuItem quitTrayItem;
     private readonly System.Windows.Forms.Timer controlStatusTimer;
@@ -206,6 +226,7 @@ internal sealed class LauncherForm : Form
     private bool stopping;
     private bool exitRequested;
     private bool trayNoticeShown;
+    private bool unifiedDashboardShown;
     private bool autoGenerateOwnerTokenOnNextStart;
     private bool controlStatusRefreshInFlight;
     private LocalControlSnapshot latestControlSnapshot;
@@ -218,6 +239,12 @@ internal sealed class LauncherForm : Form
         logDir = Path.Combine(appDataDir, "logs");
         selectedProjectFile = Path.Combine(appDataDir, "selected-project.txt");
         settingsFile = Path.Combine(appDataDir, "settings.ini");
+        sharedSettingsFile = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".local",
+            "share",
+            "chatgpt2codex",
+            "desktop-settings.json");
         defaultWorkspace = ResolveDefaultWorkspace();
         configuredPublicHost = ResolveConfiguredPublicHost();
         port = ResolvePort();
@@ -226,6 +253,7 @@ internal sealed class LauncherForm : Form
         if (string.IsNullOrWhiteSpace(githubRepoUrl)) githubRepoUrl = "https://github.com/ezBuilder/chatgpt2codex";
         LoadSettings();
         if (string.IsNullOrEmpty(selectedProjectPath)) selectedProjectPath = LoadSelectedProjectPath();
+        SeedOrLoadSharedSettings();
         Directory.CreateDirectory(logDir);
         PruneLauncherLogs(logDir);
         logFile = Path.Combine(logDir, "launcher-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".log");
@@ -350,7 +378,12 @@ internal sealed class LauncherForm : Form
             L("connectionDiagnosticsMenu"),
             null,
             delegate { ShowConnectionDiagnostics(); });
-        settingsTrayItem = new ToolStripMenuItem(L("settingsMenu"), null, delegate { ShowSettings(); });
+        activityTrayItem = new ToolStripMenuItem("Open ChatGPT To Codex", null, delegate
+        {
+            if (IsManagedProcessRunning()) OpenUnifiedDashboard(null);
+            else ShowFromTray();
+        });
+        settingsTrayItem = new ToolStripMenuItem(L("settingsMenu"), null, delegate { OpenSettingsExperience(); });
         quitTrayItem = new ToolStripMenuItem(L("quit"), null, delegate { ExitApplication(); });
         trayMenu.Items.Add(statusTrayItem);
         trayMenu.Items.Add(projectTrayItem);
@@ -363,6 +396,7 @@ internal sealed class LauncherForm : Form
         trayMenu.Items.Add(new ToolStripSeparator());
         trayMenu.Items.Add(toggleTrayItem);
         trayMenu.Items.Add(restartTrayItem);
+        trayMenu.Items.Add(activityTrayItem);
         trayMenu.Items.Add(connectionDiagnosticsTrayItem);
         trayMenu.Items.Add(settingsTrayItem);
         trayMenu.Items.Add(new ToolStripSeparator());
@@ -374,11 +408,19 @@ internal sealed class LauncherForm : Form
         trayIcon.Icon = Icon == null ? System.Drawing.SystemIcons.Application : Icon;
         trayIcon.ContextMenuStrip = trayMenu;
         trayIcon.Visible = true;
-        trayIcon.DoubleClick += delegate { ShowFromTray(); };
+        trayIcon.DoubleClick += delegate
+        {
+            if (IsManagedProcessRunning()) OpenUnifiedDashboard(null);
+            else ShowFromTray();
+        };
 
         controlStatusTimer = new System.Windows.Forms.Timer();
         controlStatusTimer.Interval = 2000;
-        controlStatusTimer.Tick += delegate { RequestLocalControlRefresh(); };
+        controlStatusTimer.Tick += delegate
+        {
+            RequestLocalControlRefresh();
+            RefreshSharedSettingsIfChanged();
+        };
         controlStatusTimer.Start();
         RefreshTrayState();
 
@@ -629,6 +671,8 @@ internal sealed class LauncherForm : Form
                 else if (key == "LaunchAtStartup") launchAtStartup = ParseBool(value);
                 else if (key == "StartMcpOnOpen") startMcpOnOpen = ParseBool(value);
                 else if (key == "AutoCheckUpdates") autoCheckUpdates = ParseBool(value);
+                else if (key == "MultiProjectLanesEnabled") multiProjectLanesEnabled = ParseBool(value);
+                else if (key == "ControlAllowlist") controlAllowlist = NormalizeControlAllowlist(value.Split(','));
                 else if (key == "GitHubRepoUrl" && !string.IsNullOrWhiteSpace(value)) githubRepoUrl = value.Trim();
                 else if (key == "Language" && !string.IsNullOrWhiteSpace(value)) preferredLanguage = value.Trim();
                 else if (key == "LastConnectorUrl" && !string.IsNullOrWhiteSpace(value)) lastConnectorUrl = value.Trim();
@@ -658,6 +702,8 @@ internal sealed class LauncherForm : Form
             "LaunchAtStartup=" + EncodeSetting(launchAtStartup ? "true" : "false"),
             "StartMcpOnOpen=" + EncodeSetting(startMcpOnOpen ? "true" : "false"),
             "AutoCheckUpdates=" + EncodeSetting(autoCheckUpdates ? "true" : "false"),
+            "MultiProjectLanesEnabled=" + EncodeSetting(multiProjectLanesEnabled ? "true" : "false"),
+            "ControlAllowlist=" + EncodeSetting(string.Join(",", controlAllowlist ?? new string[0])),
             "GitHubRepoUrl=" + EncodeSetting(githubRepoUrl ?? string.Empty),
             "Language=" + EncodeSetting(preferredLanguage ?? "auto"),
             "LastConnectorUrl=" + EncodeSetting(lastConnectorUrl ?? string.Empty)
@@ -665,6 +711,171 @@ internal sealed class LauncherForm : Form
         File.WriteAllLines(settingsFile, lines, Encoding.UTF8);
         SaveSelectedProjectPath();
         SetLaunchAtStartup(launchAtStartup);
+        SaveSharedSettings();
+    }
+
+    private static string[] NormalizeControlAllowlist(IEnumerable<string> values)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new List<string>();
+        foreach (var raw in values ?? Enumerable.Empty<string>())
+        {
+            var value = (raw ?? string.Empty).Trim();
+            if (value.Length == 0) continue;
+            if (value.Length > 120) value = value.Substring(0, 120);
+            if (!seen.Add(value)) continue;
+            result.Add(value);
+            if (result.Count >= 64) break;
+        }
+        return result.ToArray();
+    }
+
+    private DesktopSettings CurrentDesktopSettings()
+    {
+        return new DesktopSettings
+        {
+            schemaVersion = 1,
+            language = string.IsNullOrWhiteSpace(preferredLanguage) ? "auto" : preferredLanguage,
+            projectFolder = selectedProjectPath,
+            launchAtStartup = launchAtStartup,
+            startMcpOnOpen = startMcpOnOpen,
+            autoCheckUpdates = autoCheckUpdates,
+            multiProjectLanesEnabled = multiProjectLanesEnabled,
+            enablePublicTunnel = publicTunnelEnabled,
+            publicHostname = configuredPublicHost,
+            port = port,
+            controlAllowlist = controlAllowlist ?? new string[0]
+        };
+    }
+
+    private void SaveSharedSettings()
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(sharedSettingsFile);
+            if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+            var json = new JavaScriptSerializer().Serialize(CurrentDesktopSettings());
+            var temporary = sharedSettingsFile + ".tmp-" + Process.GetCurrentProcess().Id;
+            File.WriteAllText(temporary, json + Environment.NewLine, new UTF8Encoding(false));
+            if (File.Exists(sharedSettingsFile))
+            {
+                try
+                {
+                    File.Replace(temporary, sharedSettingsFile, null);
+                }
+                catch
+                {
+                    File.Copy(temporary, sharedSettingsFile, true);
+                    File.Delete(temporary);
+                }
+            }
+            else
+            {
+                File.Move(temporary, sharedSettingsFile);
+            }
+            sharedSettingsLastWriteUtc = File.GetLastWriteTimeUtc(sharedSettingsFile);
+        }
+        catch
+        {
+            // Legacy settings remain usable if the shared settings mirror cannot be written.
+        }
+    }
+
+    private bool LoadSharedSettings(bool promptForRestart)
+    {
+        try
+        {
+            if (!File.Exists(sharedSettingsFile)) return false;
+            var json = File.ReadAllText(sharedSettingsFile, Encoding.UTF8);
+            var settings = new JavaScriptSerializer().Deserialize<DesktopSettings>(json);
+            if (settings == null || settings.schemaVersion != 1) return false;
+
+            var previousProject = selectedProjectPath ?? string.Empty;
+            var previousHost = configuredPublicHost ?? string.Empty;
+            var previousPort = port;
+            var previousTunnel = publicTunnelEnabled;
+            var previousLanes = multiProjectLanesEnabled;
+
+            if (!string.IsNullOrWhiteSpace(settings.language) &&
+                (settings.language == "auto" || LanguageOptionCodes.Contains(settings.language)))
+            {
+                preferredLanguage = settings.language;
+            }
+            if (string.IsNullOrWhiteSpace(settings.projectFolder))
+            {
+                selectedProjectPath = null;
+            }
+            else
+            {
+                try
+                {
+                    var projectPath = Path.GetFullPath(settings.projectFolder.Trim());
+                    Directory.CreateDirectory(projectPath);
+                    selectedProjectPath = projectPath;
+                }
+                catch
+                {
+                    // Keep the previous project if the new path is invalid or inaccessible.
+                }
+            }
+            launchAtStartup = settings.launchAtStartup;
+            startMcpOnOpen = settings.startMcpOnOpen;
+            autoCheckUpdates = settings.autoCheckUpdates;
+            multiProjectLanesEnabled = settings.multiProjectLanesEnabled;
+            publicTunnelEnabled = settings.enablePublicTunnel;
+            configuredPublicHost = string.IsNullOrWhiteSpace(settings.publicHostname) ? null : settings.publicHostname.Trim();
+            if (settings.port > 0 && settings.port <= 65535) port = settings.port;
+            controlAllowlist = NormalizeControlAllowlist(settings.controlAllowlist ?? new string[0]);
+
+            var runtimeChanged = previousProject != (selectedProjectPath ?? string.Empty) ||
+                previousHost != (configuredPublicHost ?? string.Empty) ||
+                previousPort != port ||
+                previousTunnel != publicTunnelEnabled ||
+                previousLanes != multiProjectLanesEnabled;
+
+            SaveSettings();
+            RefreshTrayState();
+            if (promptForRestart && runtimeChanged && IsManagedProcessRunning())
+            {
+                var result = MessageBox.Show(
+                    this,
+                    "Settings were saved. Restart MCP now to apply project, tunnel, port, and runtime options?",
+                    "Restart MCP?",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Information);
+                if (result == DialogResult.Yes) RestartServer();
+            }
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void SeedOrLoadSharedSettings()
+    {
+        if (File.Exists(sharedSettingsFile))
+        {
+            LoadSharedSettings(false);
+            return;
+        }
+        SaveSharedSettings();
+    }
+
+    private void RefreshSharedSettingsIfChanged()
+    {
+        try
+        {
+            if (!File.Exists(sharedSettingsFile)) return;
+            var changedAt = File.GetLastWriteTimeUtc(sharedSettingsFile);
+            if (changedAt == sharedSettingsLastWriteUtc) return;
+            LoadSharedSettings(true);
+        }
+        catch
+        {
+            // Polling must never destabilize the tray app.
+        }
     }
 
     private void SaveSelectedProjectPath()
@@ -784,6 +995,52 @@ internal sealed class LauncherForm : Form
             FileName = url,
             UseShellExecute = true
         });
+    }
+
+    private string UnifiedDashboardUrl(string view)
+    {
+        var url = "http://127.0.0.1:7980/activity/?embedded=windows";
+        if (!string.IsNullOrWhiteSpace(view)) url += "&view=" + Uri.EscapeDataString(view);
+        return url;
+    }
+
+    private void OpenUnifiedDashboard(string view)
+    {
+        var url = UnifiedDashboardUrl(view);
+        var candidates = new[]
+        {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Microsoft", "Edge", "Application", "msedge.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Microsoft", "Edge", "Application", "msedge.exe")
+        };
+        foreach (var candidate in candidates)
+        {
+            if (!File.Exists(candidate)) continue;
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = candidate,
+                    Arguments = "--app=" + Quote(url),
+                    UseShellExecute = false
+                });
+                return;
+            }
+            catch
+            {
+                // Fall through to the system browser.
+            }
+        }
+        OpenUrl(url);
+    }
+
+    private void OpenSettingsExperience()
+    {
+        if (IsManagedProcessRunning())
+        {
+            OpenUnifiedDashboard("settings");
+            return;
+        }
+        ShowSettings();
     }
 
     private void OpenLocalHealth()
@@ -1267,6 +1524,15 @@ internal sealed class LauncherForm : Form
     private void ApplyLocalControlSnapshot()
     {
         var snapshot = latestControlSnapshot;
+        if (snapshot != null && IsManagedProcessRunning() && !unifiedDashboardShown && Visible)
+        {
+            unifiedDashboardShown = true;
+            BeginInvoke((MethodInvoker)delegate
+            {
+                OpenUnifiedDashboard(null);
+                HideToTray();
+            });
+        }
         var sessions = snapshot != null && snapshot.sessions != null
             ? snapshot.sessions
             : new LocalControlSession[0];
@@ -1401,6 +1667,7 @@ internal sealed class LauncherForm : Form
         autoGenerateOwnerTokenButton.Enabled = !exitRequested && !autoGenerateOwnerTokenOnNextStart;
         openLogButton.Text = L("showLogs");
         connectionDiagnosticsTrayItem.Text = L("connectionDiagnosticsMenu");
+        activityTrayItem.Text = ResolveLanguageCode(preferredLanguage) == "ko" ? "ChatGPT To Codex 열기" : "Open ChatGPT To Codex";
         settingsTrayItem.Text = L("settingsMenu");
         quitTrayItem.Text = L("quit");
         if (!running)
@@ -1696,6 +1963,7 @@ internal sealed class LauncherForm : Form
     private void StartLauncher()
     {
         stopping = false;
+        unifiedDashboardShown = false;
         if (ResolveTunnelMode() == "cloudflare-quick")
         {
             mcpUrl = null;
@@ -1746,6 +2014,8 @@ internal sealed class LauncherForm : Form
             RedirectStandardOutput = true,
             RedirectStandardError = true
         };
+        process.StartInfo.EnvironmentVariables["CHATGPT2CODEX_MULTI_PROJECT_LANES"] = multiProjectLanesEnabled ? "1" : "0";
+        process.StartInfo.EnvironmentVariables["CHATGPT2CODEX_CONTROL_ALLOWLIST"] = string.Join(",", controlAllowlist ?? new string[0]);
         if (autoGenerateOwnerTokenOnNextStart)
         {
             process.StartInfo.EnvironmentVariables["CHATGPT2CODEX_ROTATE_OWNER_TOKEN"] = "1";

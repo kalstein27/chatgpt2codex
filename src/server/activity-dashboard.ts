@@ -246,6 +246,27 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     .view-tab { appearance: none; border: 0; border-radius: 8px; padding: 6px 10px; background: transparent; color: var(--muted); font-size: 11px; font-weight: 730; }
     .view-tab.active { background: var(--panel); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.06); }
     .view-panel[hidden] { display: none !important; }
+    .settings-stack { display: grid; gap: 10px; }
+    .settings-card { border: 1px solid var(--line); border-radius: 14px; padding: 15px 16px; background: var(--panel); box-shadow: var(--shadow); }
+    .settings-card h2 { margin: 0; font-size: 14px; }
+    .settings-card > p { margin: 5px 0 13px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+    .settings-row { display: grid; grid-template-columns: 160px minmax(0,1fr); align-items: center; gap: 12px; min-height: 40px; }
+    .settings-row + .settings-row { border-top: 1px solid var(--line); }
+    .settings-label { color: var(--muted); font-size: 11px; line-height: 1.4; }
+    .settings-control { min-width: 0; }
+    .settings-control input[type="text"], .settings-control input[type="number"], .settings-control select {
+      width: 100%; min-height: 32px; border: 1px solid var(--line); border-radius: 9px; padding: 6px 9px;
+      background: var(--panel2); color: var(--text); font: inherit; font-size: 12px; outline: none;
+    }
+    .settings-control input:focus, .settings-control select:focus { border-color: color-mix(in srgb, var(--blue) 60%, var(--line)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--blue) 12%, transparent); }
+    .settings-check { display: flex; align-items: center; gap: 8px; min-height: 32px; color: var(--text); font-size: 12px; }
+    .settings-check input { width: 16px; height: 16px; accent-color: var(--blue); }
+    .settings-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; margin-top: 12px; }
+    .settings-status { margin-right: auto; color: var(--muted); font-size: 11px; line-height: 1.4; }
+    .settings-status.success { color: var(--green); }
+    .settings-status.error { color: var(--red); }
+    .settings-save { appearance: none; min-height: 36px; border: 1px solid color-mix(in srgb, var(--blue) 45%, var(--line)); border-radius: 10px; padding: 7px 14px; background: color-mix(in srgb, var(--blue) 7%, var(--panel)); color: var(--blue); font-size: 12px; font-weight: 750; }
+    .settings-save:disabled { opacity: .5; }
     .gallery-note { margin-bottom: 14px; border: 1px solid color-mix(in srgb, var(--blue) 24%, var(--line)); border-radius: 12px; padding: 11px 12px; background: color-mix(in srgb, var(--blue) 4%, var(--panel)); color: var(--muted); font-size: 12px; line-height: 1.5; }
     .gallery-note b { color: var(--text); }
     .gallery-section + .gallery-section { margin-top: 16px; }
@@ -410,8 +431,8 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
     }
-    html.embedded-mac main { width: 100%; max-width: none; padding-top: 10px; }
-    html.embedded-mac .footer { margin-bottom: 4px; }
+    html.embedded-mac main, html.embedded-windows main { width: 100%; max-width: none; padding-top: 10px; }
+    html.embedded-mac .footer, html.embedded-windows .footer { margin-bottom: 4px; }
     @media (max-width: 720px) {
       main { padding-left: 12px; padding-right: 12px; padding-bottom: max(92px, calc(env(safe-area-inset-bottom) + 72px)); }
       header { gap: 10px; min-height: 50px; margin-bottom: 14px; }
@@ -422,7 +443,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       .metric { min-height: 30px; padding: 4px 8px; gap: 5px; }
       .metric b { font-size: 15px; }
       .metric span { font-size: 13px; }
-      .view-switch { display: grid; grid-template-columns: 1fr 1fr; width: 100%; margin-bottom: 16px; padding: 4px; border-radius: 12px; }
+      .view-switch { display: grid; grid-template-columns: repeat(3,1fr); width: 100%; margin-bottom: 16px; padding: 4px; border-radius: 12px; }
       .view-tab { min-height: 44px; padding: 9px 12px; border-radius: 9px; font-size: 15px; }
       .gallery-note { margin-bottom: 17px; padding: 12px 13px; border-radius: 13px; font-size: 14px; line-height: 1.55; }
       .gallery-section + .gallery-section { margin-top: 22px; }
@@ -462,6 +483,15 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       .activity-time { flex-basis: 46px; font-size: 12px; }
       .activity-detail { margin-left: 54px; font-size: 12.5px; }
       .footer { font-size: 12px; }
+      .settings-card { padding: 15px; border-radius: 16px; }
+      .settings-card h2 { font-size: 18px; }
+      .settings-card > p { font-size: 13px; }
+      .settings-row { grid-template-columns: 1fr; gap: 5px; padding: 9px 0; }
+      .settings-label { font-size: 13px; }
+      .settings-control input[type="text"], .settings-control input[type="number"], .settings-control select { min-height: 42px; font-size: 15px; }
+      .settings-check { min-height: 40px; font-size: 15px; }
+      .settings-save { min-height: 44px; font-size: 15px; }
+      .settings-status { font-size: 13px; }
     }
   </style>
 </head>
@@ -500,6 +530,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   <nav class="view-switch" aria-label="대시보드 보기">
     <button id="view-activity" class="view-tab active" type="button">작업 현황</button>
     <button id="view-gallery" class="view-tab" type="button">카드 보기</button>
+    <button id="view-settings" class="view-tab" type="button">설정</button>
   </nav>
   <section id="activity-view" class="view-panel">
     <section id="approval-box" class="approval-box hidden">
@@ -522,6 +553,33 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     </section>
     <nav id="filters" class="toolbar"></nav>
     <section id="cards"></section>
+  </section>
+  <section id="settings-view" class="view-panel" hidden>
+    <div class="settings-stack">
+      <section class="settings-card">
+        <h2>일반</h2>
+        <p>Mac과 Windows가 함께 사용하는 데스크톱 설정입니다. 플랫폼별 동작은 각 네이티브 셸이 같은 값을 적용합니다.</p>
+        <div class="settings-row"><div class="settings-label">언어</div><div class="settings-control"><select id="setting-language"><option value="auto">자동</option><option value="ko">한국어</option><option value="en">English</option><option value="ja">日本語</option><option value="zh-Hans">简体中文</option><option value="zh-Hant">繁體中文</option></select></div></div>
+        <div class="settings-row"><div class="settings-label">기본 프로젝트</div><div class="settings-control"><input id="setting-project" type="text" autocomplete="off" placeholder="프로젝트 폴더 경로"></div></div>
+        <div class="settings-row"><div class="settings-label">시작 동작</div><div class="settings-control"><label class="settings-check"><input id="setting-launch" type="checkbox">로그인 시 ChatGPT To Codex 실행</label></div></div>
+        <div class="settings-row"><div class="settings-label"></div><div class="settings-control"><label class="settings-check"><input id="setting-start-mcp" type="checkbox">앱 실행 시 MCP 시작</label></div></div>
+        <div class="settings-row"><div class="settings-label"></div><div class="settings-control"><label class="settings-check"><input id="setting-updates" type="checkbox">업데이트 자동 확인</label></div></div>
+        <div class="settings-row"><div class="settings-label">프로젝트 작업</div><div class="settings-control"><label class="settings-check"><input id="setting-lanes" type="checkbox">멀티 프로젝트 작업 레인 사용</label></div></div>
+      </section>
+      <section class="settings-card">
+        <h2>연결</h2>
+        <p>로컬 MCP와 ChatGPT에서 접근할 공개 주소를 관리합니다. 터널 종류에 따른 실제 연결은 플랫폼 셸이 적용합니다.</p>
+        <div class="settings-row"><div class="settings-label">공개 연결</div><div class="settings-control"><label class="settings-check"><input id="setting-tunnel" type="checkbox">공개 터널 사용</label></div></div>
+        <div class="settings-row"><div class="settings-label">공개 주소</div><div class="settings-control"><input id="setting-host" type="text" autocomplete="off" placeholder="host.example.com 또는 https://..."></div></div>
+        <div class="settings-row"><div class="settings-label">MCP 포트</div><div class="settings-control"><input id="setting-port" type="number" min="1" max="65535" inputmode="numeric"></div></div>
+      </section>
+      <section class="settings-card">
+        <h2>데스크톱 제어</h2>
+        <p>ChatGPT가 제어할 수 있는 앱 이름입니다. 실행 중 앱을 + 버튼으로 고르는 UX는 후속 네이티브 브리지 단계에서 연결합니다.</p>
+        <div class="settings-row"><div class="settings-label">허용 앱</div><div class="settings-control"><input id="setting-allowlist" type="text" autocomplete="off" placeholder="Finder, UTM"></div></div>
+        <div class="settings-actions"><span id="settings-status" class="settings-status">이 PC의 설정을 불러오는 중…</span><button id="settings-save" class="settings-save" type="button">저장</button></div>
+      </section>
+    </div>
   </section>
   <section id="gallery-view" class="view-panel" hidden>
     <div class="gallery-note"><b>미리보기 전용</b> · 실제 승인 카드의 정보 구조를 보여줍니다. 아래 버튼과 선택지는 작동하지 않습니다.</div>
@@ -620,7 +678,8 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
 (function () {
   var pageDashboardRevision = "__C2CT_ACTIVITY_DASHBOARD_REVISION__";
   var initialParams = new URLSearchParams(window.location.search);
-  var selectedView = initialParams.get("view") === "cards" ? "cards" : "activity";
+  var initialView = initialParams.get("view");
+  var selectedView = initialView === "cards" ? "cards" : initialView === "settings" ? "settings" : "activity";
   var selectedProject = "all";
   var latest = [];
   var latestApprovals = [];
@@ -631,8 +690,10 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   var expandedOperationDetails = new Set();
   var lastFilterSignature = "";
   var reducedMotion = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
-  var embeddedHint = initialParams.get("embedded") === "mac";
-  if (embeddedHint) document.documentElement.classList.add("embedded-mac");
+  var embeddedPlatform = initialParams.get("embedded");
+  if (embeddedPlatform === "mac" || embeddedPlatform === "windows") {
+    document.documentElement.classList.add("embedded-" + embeddedPlatform);
+  }
   var macBridge = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.c2ctMacApp
     ? window.webkit.messageHandlers.c2ctMacApp
     : null;
@@ -656,27 +717,106 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   var liveText = document.getElementById("live-text");
   var activityView = document.getElementById("activity-view");
   var galleryView = document.getElementById("gallery-view");
+  var settingsView = document.getElementById("settings-view");
   var activityViewButton = document.getElementById("view-activity");
   var galleryViewButton = document.getElementById("view-gallery");
+  var settingsViewButton = document.getElementById("view-settings");
+  var settingsLoaded = false;
 
   function setDashboardView(nextView, updateLocation) {
-    selectedView = nextView === "cards" ? "cards" : "activity";
+    selectedView = nextView === "cards" ? "cards" : nextView === "settings" ? "settings" : "activity";
     activityView.hidden = selectedView !== "activity";
     galleryView.hidden = selectedView !== "cards";
+    settingsView.hidden = selectedView !== "settings";
     activityViewButton.classList.toggle("active", selectedView === "activity");
     galleryViewButton.classList.toggle("active", selectedView === "cards");
+    settingsViewButton.classList.toggle("active", selectedView === "settings");
     activityViewButton.setAttribute("aria-pressed", selectedView === "activity" ? "true" : "false");
     galleryViewButton.setAttribute("aria-pressed", selectedView === "cards" ? "true" : "false");
+    settingsViewButton.setAttribute("aria-pressed", selectedView === "settings" ? "true" : "false");
     if (updateLocation && window.history && window.history.replaceState) {
       var url = new URL(window.location.href);
       if (selectedView === "cards") url.searchParams.set("view", "cards");
+      else if (selectedView === "settings") url.searchParams.set("view", "settings");
       else url.searchParams.delete("view");
       window.history.replaceState(null, "", url);
     }
+    if (selectedView === "settings" && !settingsLoaded) loadSettings();
   }
   activityViewButton.addEventListener("click", function () { setDashboardView("activity", true); });
   galleryViewButton.addEventListener("click", function () { setDashboardView("cards", true); });
+  settingsViewButton.addEventListener("click", function () { setDashboardView("settings", true); });
   setDashboardView(selectedView, false);
+
+  function setting(id) { return document.getElementById(id); }
+  function settingsStatus(text, kind) {
+    var node = setting("settings-status");
+    node.textContent = text;
+    node.classList.toggle("success", kind === "success");
+    node.classList.toggle("error", kind === "error");
+  }
+  function applySettingsForm(value) {
+    value = value || {};
+    setting("setting-language").value = value.language || "auto";
+    setting("setting-project").value = value.projectFolder || "";
+    setting("setting-launch").checked = Boolean(value.launchAtStartup);
+    setting("setting-start-mcp").checked = Boolean(value.startMcpOnOpen);
+    setting("setting-updates").checked = Boolean(value.autoCheckUpdates);
+    setting("setting-lanes").checked = value.multiProjectLanesEnabled !== false;
+    setting("setting-tunnel").checked = Boolean(value.enablePublicTunnel);
+    setting("setting-host").value = value.publicHostname || "";
+    setting("setting-port").value = String(value.port || 7979);
+    setting("setting-allowlist").value = Array.isArray(value.controlAllowlist) ? value.controlAllowlist.join(", ") : "";
+  }
+  async function loadSettings() {
+    settingsStatus("이 PC의 설정을 불러오는 중…");
+    try {
+      var response = await fetch("/activity/api/settings", { cache: "no-store" });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      var payload = await response.json();
+      applySettingsForm(payload.settings);
+      settingsLoaded = true;
+      settingsStatus((payload.platform || "desktop") + " 설정과 연결됨", "success");
+    } catch (error) {
+      settingsStatus("설정 변경은 ChatGPT To Codex가 실행 중인 PC에서만 사용할 수 있습니다.", "error");
+    }
+  }
+  async function saveSettings() {
+    var button = setting("settings-save");
+    var parsedPort = Number(setting("setting-port").value);
+    var body = {
+      language: setting("setting-language").value,
+      projectFolder: setting("setting-project").value.trim() || null,
+      launchAtStartup: setting("setting-launch").checked,
+      startMcpOnOpen: setting("setting-start-mcp").checked,
+      autoCheckUpdates: setting("setting-updates").checked,
+      multiProjectLanesEnabled: setting("setting-lanes").checked,
+      enablePublicTunnel: setting("setting-tunnel").checked,
+      publicHostname: setting("setting-host").value.trim() || null,
+      port: Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535 ? parsedPort : 7979,
+      controlAllowlist: setting("setting-allowlist").value.split(",").map(function (item) { return item.trim(); }).filter(Boolean)
+    };
+    button.disabled = true;
+    settingsStatus("저장 중…");
+    try {
+      var response = await fetch("/activity/api/settings", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      var payload = await response.json();
+      applySettingsForm(payload.settings);
+      settingsLoaded = true;
+      settingsStatus("저장됨 · 네이티브 적용 중", "success");
+      if (macBridge) macBridge.postMessage({ action: "settingsSaved" });
+    } catch (error) {
+      settingsStatus("설정을 저장하지 못했습니다.", "error");
+    } finally {
+      button.disabled = false;
+    }
+  }
+  setting("settings-save").addEventListener("click", saveSettings);
 
   function el(tag, cls, text) {
     var node = document.createElement(tag);

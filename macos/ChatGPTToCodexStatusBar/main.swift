@@ -376,6 +376,82 @@ private final class ServiceController {
             .appendingPathComponent("share")
             .appendingPathComponent("chatgpt2codex")
             .appendingPathComponent("connection-events.jsonl")
+        seedSharedDesktopSettingsIfNeeded()
+    }
+
+    private var sharedDesktopSettingsURL: URL {
+        connectionDiagnosticsFile.deletingLastPathComponent().appendingPathComponent("desktop-settings.json")
+    }
+
+    private func sharedDesktopSettingsDictionary() -> [String: Any] {
+        [
+            "schemaVersion": 1,
+            "language": preferredLanguage,
+            "projectFolder": selectedProjectFolder.map { $0.path as Any } ?? NSNull(),
+            "launchAtStartup": launchAtLogin,
+            "startMcpOnOpen": startMCPOnLaunch,
+            "autoCheckUpdates": autoCheckUpdates,
+            "multiProjectLanesEnabled": multiProjectLanesEnabled,
+            "enablePublicTunnel": enablePublicTunnel,
+            "publicHostname": savedPublicHost.map { $0 as Any } ?? NSNull(),
+            "port": port,
+            "controlAllowlist": controlAllowlist,
+        ]
+    }
+
+    func syncSharedDesktopSettings() {
+        let directory = sharedDesktopSettingsURL.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let data = try JSONSerialization.data(withJSONObject: sharedDesktopSettingsDictionary(), options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: sharedDesktopSettingsURL, options: .atomic)
+        } catch {
+            NSLog("[chatgpt2codex] shared desktop settings write failed: %@", String(describing: error))
+        }
+    }
+
+    private func seedSharedDesktopSettingsIfNeeded() {
+        guard !FileManager.default.fileExists(atPath: sharedDesktopSettingsURL.path) else { return }
+        syncSharedDesktopSettings()
+    }
+
+    func applySharedDesktopSettings() -> Bool {
+        guard let data = try? Data(contentsOf: sharedDesktopSettingsURL),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return false }
+
+        let previousProject = selectedProjectFolder?.path ?? ""
+        let previousLanes = multiProjectLanesEnabled
+        let previousTunnel = enablePublicTunnel
+        let previousHost = savedPublicHost ?? ""
+        let previousPort = port
+
+        if let value = json["language"] as? String, !value.isEmpty { setPreferredLanguage(value) }
+        if let value = json["projectFolder"] as? String, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let url = URL(fileURLWithPath: value).standardizedFileURL
+            if ensureWorkspaceDirectory(url) { setSelectedProjectFolder(url) }
+        } else if json["projectFolder"] is NSNull {
+            clearSelectedProjectFolder()
+        }
+        if let value = json["launchAtStartup"] as? Bool, value != launchAtLogin { setLaunchAtLogin(value) }
+        if let value = json["startMcpOnOpen"] as? Bool { setStartMCPOnLaunch(value) }
+        if let value = json["autoCheckUpdates"] as? Bool { setAutoCheckUpdates(value) }
+        if let value = json["multiProjectLanesEnabled"] as? Bool { setMultiProjectLanesEnabled(value) }
+        if let value = json["enablePublicTunnel"] as? Bool { setEnablePublicTunnel(value) }
+        if let value = json["publicHostname"] as? String {
+            setPublicHostname(value)
+        } else if json["publicHostname"] is NSNull {
+            setPublicHostname("")
+        }
+        if let value = json["port"] as? Int, (1...65535).contains(value) { setPort(value) }
+        if let value = json["controlAllowlist"] as? [String] { setControlAllowlist(value) }
+
+        syncSharedDesktopSettings()
+        return previousProject != (selectedProjectFolder?.path ?? "") ||
+            previousLanes != multiProjectLanesEnabled ||
+            previousTunnel != enablePublicTunnel ||
+            previousHost != (savedPublicHost ?? "") ||
+            previousPort != port
     }
 
     var port: Int {
@@ -3592,6 +3668,21 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             return
         }
 
+        if action == "settingsSaved" {
+            let runtimeSettingsChanged = controller.applySharedDesktopSettings()
+            rebuildMenu()
+            if runtimeSettingsChanged && (latestHealth || controller.isManagedProcessRunning) {
+                if confirmRestartAfterSettingsSave() {
+                    restartServer()
+                } else {
+                    refreshStatus()
+                }
+            } else {
+                refreshStatus()
+            }
+            return
+        }
+
         guard action == "decideApproval",
               let requestId = body["requestId"] as? String,
               let decision = body["decision"] as? String,
@@ -5381,6 +5472,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         controller.setEnablePublicTunnel(publicTunnel.state == .on)
         controller.setPublicHostname(requestedHost)
         controller.setPort(requestedPort)
+        controller.syncSharedDesktopSettings()
         let shouldRestart = (latestHealth || controller.isManagedProcessRunning) && runtimeSettingsChanged
         rebuildMenu()
         restartAfterSavedSettingsIfConfirmed(shouldRestart)
