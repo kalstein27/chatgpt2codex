@@ -235,7 +235,9 @@ internal sealed class LauncherForm : Form
     {
         this.args = args;
         root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        appDataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ChatGPT To Codex");
+        var localAppData = Environment.GetEnvironmentVariable("LOCALAPPDATA");
+        if (string.IsNullOrWhiteSpace(localAppData)) localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        appDataDir = Path.Combine(localAppData, "ChatGPT To Codex");
         logDir = Path.Combine(appDataDir, "logs");
         selectedProjectFile = Path.Combine(appDataDir, "selected-project.txt");
         settingsFile = Path.Combine(appDataDir, "settings.ini");

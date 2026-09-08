@@ -14,9 +14,11 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $machinePath = [System.Environment]::GetEnvironmentVariable("PATH", "Machine")
 $userPath = [System.Environment]::GetEnvironmentVariable("PATH", "User")
-$nodePath = Join-Path $env:ProgramFiles "nodejs"
-$cloudflaredPath = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages\Cloudflare.cloudflared_Microsoft.Winget.Source_8wekyb3d8bbwe"
-$env:PATH = "$Root\bin;$nodePath;$cloudflaredPath;$env:USERPROFILE\.local\bin;$machinePath;$userPath;$env:PATH"
+$nodePath = if ($env:ProgramFiles) { Join-Path $env:ProgramFiles "nodejs" } else { $null }
+$cloudflaredPath = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages\Cloudflare.cloudflared_Microsoft.Winget.Source_8wekyb3d8bbwe" } else { $null }
+$userLocalBin = if ($env:USERPROFILE) { Join-Path $env:USERPROFILE ".local\bin" } else { $null }
+$pathParts = @("$Root\bin", $nodePath, $cloudflaredPath, $userLocalBin, $machinePath, $userPath, $env:PATH) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+$env:PATH = ($pathParts -join ";")
 
 if (-not $Workspace) {
     $Workspace = Join-Path $HOME "workspace"
