@@ -391,41 +391,48 @@ try {
     $srvProc = Start-LoggedProcess "node" $serverArgs $srvOut $srvErr
     Wait-HttpOk "http://127.0.0.1:$Port/healthz" 20 "local server"
 
-    Write-Host ""
-    Write-Host "[chatgpt2codex] connector URL ready:"
-    Write-Host "   $publicUrl/mcp"
-    Write-Host ""
+    $connectorReady = -not $usePublicEndpoint
+    $announceConnectorReady = {
+        Write-Host ""
+        Write-Host "[chatgpt2codex] connector URL ready:"
+        Write-Host "   $publicUrl/mcp"
+        Write-Host ""
+        Write-Host "============================================================"
+        Write-Host " ChatGPT To Codex is ready"
+        Write-Host "============================================================"
+        Write-Host " MCP URL:"
+        Write-Host ""
+        Write-Host "   $publicUrl/mcp"
+        Write-Host ""
+        Write-Host " Notes:"
+        Write-Host "   - Keep this window or tray app running."
+        Write-Host "   - Default mode is loopback-only and is not reachable from ChatGPT web."
+        Write-Host "   - Enable ChatGPT web tunnel only while a public URL is needed."
+        Write-Host "   - Web mode stays running unless CHATGPT2CODEX_IDLE_SHUTDOWN_MINUTES is set."
+        if ($resolvedTunnelMode -eq "cloudflare-quick") {
+            Write-Host "   - This trycloudflare.com URL is temporary and changes when the tunnel restarts."
+            Write-Host "   - For a ChatGPT app you keep using, configure PUBLIC_HOSTNAME with a named tunnel."
+        }
+        Write-Host "   - If the owner token appeared in a chat/screenshot, rotate it."
+        Write-Host "============================================================"
+    }
 
     if ($usePublicEndpoint) {
         Write-Host "[chatgpt2codex] 3/3 checking public health..."
         try {
             Wait-PublicHttpOk "$publicUrl/healthz" 60 "public endpoint" $managesCloudflared
+            $connectorReady = $true
         } catch {
-            Write-Host "[chatgpt2codex] public health check is still warming up: $($_.Exception.Message)"
+            Write-Host "[chatgpt2codex] public tunnel did not become ready; endpoint is not reachable yet: $($_.Exception.Message)"
             Write-Host "[chatgpt2codex] keeping the server and tunnel alive; retry health from the app or ChatGPT."
         }
     }
 
-    Write-Host ""
-    Write-Host "============================================================"
-    Write-Host " ChatGPT To Codex is ready"
-    Write-Host "============================================================"
-    Write-Host " MCP URL:"
-    Write-Host ""
-    Write-Host "   $publicUrl/mcp"
-    Write-Host ""
-    Write-Host " Notes:"
-    Write-Host "   - Keep this window or tray app running."
-    Write-Host "   - Default mode is loopback-only and is not reachable from ChatGPT web."
-    Write-Host "   - Enable ChatGPT web tunnel only while a public URL is needed."
-    Write-Host "   - Web mode stays running unless CHATGPT2CODEX_IDLE_SHUTDOWN_MINUTES is set."
-    if ($resolvedTunnelMode -eq "cloudflare-quick") {
-        Write-Host "   - This trycloudflare.com URL is temporary and changes when the tunnel restarts."
-        Write-Host "   - For a ChatGPT app you keep using, configure PUBLIC_HOSTNAME with a named tunnel."
+    if ($connectorReady) {
+        & $announceConnectorReady
     }
-    Write-Host "   - If the owner token appeared in a chat/screenshot, rotate it."
-    Write-Host "============================================================"
 
+    $nextPublicHealthCheck = [DateTime]::UtcNow.AddSeconds(10)
     while ($true) {
         if ($srvProc.HasExited) {
             if ($srvProc.ExitCode -eq 0) {
@@ -435,6 +442,17 @@ try {
             throw "server exited. See $srvOut and $srvErr"
         }
         if ($managesCloudflared -and $cfProc -and $cfProc.HasExited) { throw "cloudflared exited. See $cfOut and $cfErr" }
+        if ($usePublicEndpoint -and -not $connectorReady -and [DateTime]::UtcNow -ge $nextPublicHealthCheck) {
+            try {
+                Wait-PublicHttpOk "$publicUrl/healthz" 1 "public endpoint" $managesCloudflared
+                $connectorReady = $true
+                Write-Host "[chatgpt2codex] public health verified."
+                & $announceConnectorReady
+            } catch {
+                Write-Host "[chatgpt2codex] public endpoint is still not reachable; connector remains not ready."
+                $nextPublicHealthCheck = [DateTime]::UtcNow.AddSeconds(15)
+            }
+        }
         Start-Sleep -Seconds 1
     }
 } finally {

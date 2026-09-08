@@ -958,14 +958,23 @@ internal sealed class LauncherForm : Form
     {
         if (!string.IsNullOrEmpty(mcpUrl)) return mcpUrl;
         var tunnelMode = ResolveTunnelMode();
+        return tunnelMode == "loopback" ? "http://127.0.0.1:" + port + "/mcp" : null;
+    }
+
+    private string ConfiguredPublicConnectorUrl()
+    {
+        if (!string.IsNullOrEmpty(mcpUrl)) return mcpUrl;
+        var tunnelMode = ResolveTunnelMode();
         if (tunnelMode == "external")
         {
             var externalUrl = ResolveExternalPublicUrl();
             return string.IsNullOrEmpty(externalUrl) ? null : externalUrl + "/mcp";
         }
-        if (tunnelMode == "cloudflare-named" && !string.IsNullOrEmpty(configuredPublicHost)) return "https://" + configuredPublicHost + "/mcp";
-        if (tunnelMode == "cloudflare-quick") return null;
-        return "http://127.0.0.1:" + port + "/mcp";
+        if (tunnelMode == "cloudflare-named" && !string.IsNullOrEmpty(configuredPublicHost))
+        {
+            return "https://" + configuredPublicHost + "/mcp";
+        }
+        return null;
     }
 
     private static bool IsTemporaryTunnelUrl(string url)
@@ -977,7 +986,7 @@ internal sealed class LauncherForm : Form
 
     private string PublicHealthUrl()
     {
-        var connector = ConnectorUrl();
+        var connector = ConnectorUrl() ?? ConfiguredPublicConnectorUrl();
         if (string.IsNullOrEmpty(connector)) return null;
         return Regex.Replace(connector, @"/mcp/?$", "/healthz", RegexOptions.IgnoreCase);
     }
@@ -1868,29 +1877,88 @@ internal sealed class LauncherForm : Form
 
     private void AutoGenerateOwnerToken()
     {
-        if (exitRequested || autoGenerateOwnerTokenOnNextStart) return;
+        if (exitRequested) return;
 
-        autoGenerateOwnerTokenOnNextStart = true;
         ownerToken = null;
         ownerTokenBox.UseSystemPasswordChar = false;
         ownerTokenBox.Text = L("ownerTokenGenerating");
         copyOwnerTokenButton.Enabled = false;
         autoGenerateOwnerTokenButton.Enabled = false;
-        AppendLog("[chatgpt2codex] Auto-generating owner token and restarting runtime...");
-        StopProcessTree();
+        statusLabel.Text = L("ownerTokenGenerating");
+        AppendLog("[chatgpt2codex] Generating owner token before runtime restart...");
 
-        var timer = new Timer();
-        timer.Interval = 1200;
-        timer.Tick += delegate
+        var workspace = string.IsNullOrEmpty(selectedProjectPath) ? defaultWorkspace : selectedProjectPath;
+        var cliPath = Path.Combine(root, "dist", "cli.js");
+        System.Threading.ThreadPool.QueueUserWorkItem(delegate
         {
-            timer.Stop();
-            timer.Dispose();
-            stopping = false;
-            stopButton.Enabled = true;
-            autoGenerateOwnerTokenButton.Enabled = true;
-            StartLauncher();
-        };
-        timer.Start();
+            string generatedToken = null;
+            string generationError = null;
+            try
+            {
+                var generation = new Process();
+                generation.StartInfo = new ProcessStartInfo
+                {
+                    FileName = "node",
+                    Arguments = Quote(cliPath) + " owner-token --generate --workspace " + Quote(workspace),
+                    WorkingDirectory = root,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+                generation.Start();
+                var stdout = generation.StandardOutput.ReadToEnd();
+                generation.StandardError.ReadToEnd();
+                generation.WaitForExit();
+                if (generation.ExitCode != 0)
+                {
+                    generationError = "owner-token command exited with code " + generation.ExitCode;
+                }
+                else
+                {
+                    var payload = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(stdout);
+                    object tokenValue;
+                    if (payload != null && payload.TryGetValue("ownerToken", out tokenValue))
+                    {
+                        generatedToken = Convert.ToString(tokenValue);
+                    }
+                    if (string.IsNullOrWhiteSpace(generatedToken) || generatedToken.Length < 40)
+                    {
+                        generatedToken = null;
+                        generationError = "owner-token command did not return a valid token";
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                generationError = ex.GetType().Name;
+            }
+
+            if (IsDisposed || !IsHandleCreated) return;
+            try
+            {
+                BeginInvoke((Action)delegate
+                {
+                    if (string.IsNullOrEmpty(generatedToken))
+                    {
+                        ownerTokenBox.Text = "Owner token generation failed";
+                        autoGenerateOwnerTokenButton.Enabled = true;
+                        statusLabel.Text = "Owner token generation failed";
+                        AppendLog("[chatgpt2codex] Owner token generation failed: " + (generationError ?? "unknown error"));
+                        RefreshTrayState();
+                        return;
+                    }
+
+                    SetOwnerToken(generatedToken);
+                    AppendLog("[chatgpt2codex] Owner token generated. Restarting MCP runtime...");
+                    RestartServer();
+                });
+            }
+            catch (InvalidOperationException)
+            {
+                // The form is already closing.
+            }
+        });
     }
 
     private void SetOwnerToken(string value)
@@ -1964,11 +2032,12 @@ internal sealed class LauncherForm : Form
     {
         stopping = false;
         unifiedDashboardShown = false;
-        if (ResolveTunnelMode() == "cloudflare-quick")
+        mcpUrl = null;
+        if (ResolveTunnelMode() != "loopback")
         {
-            mcpUrl = null;
-            urlBox.Text = "Waiting for Cloudflare connector URL...";
+            urlBox.Text = "Checking public connector...";
             copyButton.Enabled = false;
+            statusLabel.Text = "Local runtime starting; public connector not verified yet";
         }
         var script = Path.Combine(root, "start-chatgpt.ps1");
         if (!File.Exists(script))
