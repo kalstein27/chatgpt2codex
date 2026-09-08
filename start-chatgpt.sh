@@ -505,14 +505,27 @@ cloudflare_doh_ips() {
 
 http_ok_with_curl_resolve() {
   local url="$1"
+  local require_instance_match="${2:-0}"
   local host
   host="$(node -e 'console.log(new URL(process.argv[1]).hostname)' "$url" 2>/dev/null || true)"
   [[ -z "$host" ]] && return 1
   local ip
   while IFS= read -r ip; do
     [[ -z "$ip" ]] && continue
-    if curl -fsS --resolve "$host:443:$ip" --max-time 20 "$url" >/dev/null 2>&1; then
-      return 0
+    local body
+    if body="$(curl -fsS --resolve "$host:443:$ip" --max-time 20 "$url" 2>/dev/null)"; then
+      if [[ "$require_instance_match" != "1" ]] || printf '%s' "$body" | node -e '
+        let input = "";
+        process.stdin.on("data", (chunk) => { input += chunk; });
+        process.stdin.on("end", () => {
+          try {
+            const json = JSON.parse(input);
+            process.exit(json.ok === true && json.instanceMatch === true ? 0 : 1);
+          } catch { process.exit(1); }
+        });
+      '; then
+        return 0
+      fi
     fi
   done < <(cloudflare_doh_ips "$host")
   return 1
@@ -523,12 +536,25 @@ wait_public_http_ok() {
   local tries="$2"
   local label="$3"
   local allow_cloudflare_fallback="${4:-0}"
+  local require_instance_match="${5:-0}"
   local i
   for i in $(seq 1 "$tries"); do
-    if curl -fsS "$url" >/dev/null 2>&1; then
-      return 0
+    local body
+    if body="$(curl -fsS "$url" 2>/dev/null)"; then
+      if [[ "$require_instance_match" != "1" ]] || printf '%s' "$body" | node -e '
+        let input = "";
+        process.stdin.on("data", (chunk) => { input += chunk; });
+        process.stdin.on("end", () => {
+          try {
+            const json = JSON.parse(input);
+            process.exit(json.ok === true && json.instanceMatch === true ? 0 : 1);
+          } catch { process.exit(1); }
+        });
+      '; then
+        return 0
+      fi
     fi
-    if [[ "$allow_cloudflare_fallback" == "1" ]] && http_ok_with_curl_resolve "$url"; then
+    if [[ "$allow_cloudflare_fallback" == "1" ]] && http_ok_with_curl_resolve "$url" "$require_instance_match"; then
       return 0
     fi
     sleep_1s
@@ -771,12 +797,26 @@ if ! wait_http_ok "http://127.0.0.1:$PORT/healthz" 20 "local server"; then
   cat "$SRVLOG" >&2
   exit 1
 fi
+HEALTH_INSTANCE_ID="$(curl -fsS --max-time 3 "http://127.0.0.1:$PORT/healthz" 2>/dev/null | node -e '
+  let input = "";
+  process.stdin.on("data", (chunk) => { input += chunk; });
+  process.stdin.on("end", () => {
+    try {
+      const value = JSON.parse(input).healthInstanceId;
+      if (typeof value === "string" && /^[a-f0-9]{32}$/u.test(value)) process.stdout.write(value);
+    } catch {}
+  });
+')"
+if [[ ! "$HEALTH_INSTANCE_ID" =~ ^[a-f0-9]{32}$ ]]; then
+  echo "[chatgpt2codex] local server health did not expose a valid instance proof." >&2
+  exit 1
+fi
 
 if [[ "$USE_PUBLIC_ENDPOINT" == "1" ]]; then
   echo "[chatgpt2codex] 3/3 checking public health..."
   cloudflare_fallback=0
   [[ "$TUNNEL_MODE" == cloudflare-* ]] && cloudflare_fallback=1
-  if ! wait_public_http_ok "$PUBLIC_URL/healthz" 60 "public endpoint" "$cloudflare_fallback"; then
+  if ! wait_public_http_ok "$PUBLIC_URL/healthz?instance=$HEALTH_INSTANCE_ID" 60 "public endpoint" "$cloudflare_fallback" 1; then
     [[ "$MANAGES_CLOUDFLARED" == "1" ]] && echo "[chatgpt2codex] cloudflared log: $CFLOG" >&2
     echo "[chatgpt2codex] server log: $SRVLOG" >&2
     exit 1

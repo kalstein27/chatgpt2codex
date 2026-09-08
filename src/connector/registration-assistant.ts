@@ -59,6 +59,7 @@ export interface ConnectorRegistrationAssistantOptions {
 interface LocalHealthPayload {
   ok?: unknown;
   runtimePid?: unknown;
+  healthInstanceId?: unknown;
   runtimeManifest?: {
     toolSchemaRevision?: unknown;
     hostCatalogRevision?: unknown;
@@ -126,6 +127,10 @@ function safeFingerprint(value: unknown): string | null {
   return typeof value === "string" && /^[a-f0-9]{64}$/u.test(value) ? value : null;
 }
 
+function safeHealthInstanceId(value: unknown): string | null {
+  return typeof value === "string" && /^[a-f0-9]{32}$/u.test(value) ? value : null;
+}
+
 async function fetchJson(
   url: URL,
   fetchImpl: typeof fetch,
@@ -184,10 +189,13 @@ function oauthMetadataValid(value: unknown, origin: string): boolean {
     sameOriginEndpoint(record.registration_endpoint, origin, "/register");
 }
 
-function publicHealthValid(value: unknown): boolean {
+function publicHealthValid(value: unknown, requireInstanceMatch = false): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
-  return record.ok === true && record.name === "chatgpt2codex" && record.transport === "http";
+  return record.ok === true &&
+    record.name === "chatgpt2codex" &&
+    record.transport === "http" &&
+    (!requireInstanceMatch || record.instanceMatch === true);
 }
 
 function acceptancePrompt(candidateName: string, revision: string | null): string {
@@ -231,6 +239,7 @@ export async function inspectConnectorRegistration(
   const fingerprint = safeFingerprint(runtimeManifest?.runtimeFingerprint) ??
     safeFingerprint(runtimeManifest?.buildFingerprint);
   const runtimePid = safePositiveInteger(localPayload.runtimePid);
+  const healthInstanceId = safeHealthInstanceId(localPayload.healthInstanceId);
 
   let publicOrigin: string | null = null;
   const configuredOrigin = options.publicOrigin ?? localPayload.runtimeExternalIdentity?.connectorPublicOrigin;
@@ -241,10 +250,14 @@ export async function inspectConnectorRegistration(
   let publicHealth = notRun();
   let oauthMetadata = notRun();
   if (publicOrigin) {
-    const healthResult = await fetchJson(new URL("/healthz", publicOrigin), fetchImpl, timeoutMs);
-    publicHealth = publicHealthValid(healthResult.body)
-      ? healthResult.probe
-      : { ...healthResult.probe, ok: false, category: healthResult.probe.ok ? "invalid-response" : healthResult.probe.category };
+    if (healthInstanceId) {
+      const publicHealthUrl = new URL("/healthz", publicOrigin);
+      publicHealthUrl.searchParams.set("instance", healthInstanceId);
+      const healthResult = await fetchJson(publicHealthUrl, fetchImpl, timeoutMs);
+      publicHealth = publicHealthValid(healthResult.body, true)
+        ? healthResult.probe
+        : { ...healthResult.probe, ok: false, category: healthResult.probe.ok ? "invalid-response" : healthResult.probe.category };
+    }
 
     const metadataResult = await fetchJson(new URL("/.well-known/openid-configuration", publicOrigin), fetchImpl, timeoutMs);
     oauthMetadata = oauthMetadataValid(metadataResult.body, publicOrigin)
@@ -255,6 +268,7 @@ export async function inspectConnectorRegistration(
   const blockers: string[] = [];
   if (!local.probe.ok) blockers.push("local runtime health is not ready");
   if (!publicOrigin) blockers.push("public connector origin is unavailable; pass --public-url or enable the web connector");
+  if (publicOrigin && !healthInstanceId) blockers.push("local runtime health does not expose public instance proof");
   if (publicOrigin && !publicHealth.ok) blockers.push(`public health probe failed (${publicHealth.category})`);
   if (publicOrigin && !oauthMetadata.ok) blockers.push(`OAuth metadata probe failed (${oauthMetadata.category})`);
   if (!schemaRevision) blockers.push("live runtime did not expose a valid tool schema revision");

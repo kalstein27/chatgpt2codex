@@ -62,6 +62,8 @@ $profile = Join-Path $tempRoot "profile"
 $localAppData = Join-Path $tempRoot "localappdata"
 $appData = Join-Path $tempRoot "appdata"
 New-Item -ItemType Directory -Force -Path $stateDir, $workspace, $profile, $localAppData, $appData | Out-Null
+$previousLocalAppData = $env:LOCALAPPDATA
+$env:LOCALAPPDATA = $localAppData
 
 $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
 $listener.Start()
@@ -76,6 +78,18 @@ $csc = $cscCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Obje
 if (-not $csc) { throw "Microsoft .NET Framework csc.exe was not found." }
 
 $launcherSource = (Resolve-Path "windows\ChatGPTToCodexLauncher.cs").Path
+$launcherSourceText = Get-Content -Raw -LiteralPath $launcherSource
+$oauthWiringMarkers = @(
+    'public LocalOAuthApprovalsInfo oauthApprovals',
+    'ApplyOAuthApprovals(snapshot);',
+    '"/oauth-approvals/" + Uri.EscapeDataString(request.requestId)',
+    'pendingOAuthApprovalsMenu'
+)
+foreach ($marker in $oauthWiringMarkers) {
+    if ($launcherSourceText.IndexOf($marker, [System.StringComparison]::Ordinal) -lt 0) {
+        throw "Windows OAuth local-approval UI wiring is missing marker: $marker"
+    }
+}
 $icon = (Resolve-Path "assets\chatgpt2codex-icon.ico").Path
 $launcher = Join-Path $repoRoot "ChatGPT To Codex.e2e.exe"
 Remove-Item -Force -ErrorAction SilentlyContinue $launcher
@@ -178,6 +192,7 @@ try {
     Write-Host "token-hash-only=true"
     Write-Host "runtime-health=true"
     Write-Host "plaintext-token-log=false"
+    Write-Host "oauth-local-approval-ui-wired=true"
     Write-Host "isolated-port=$port"
 }
 finally {
@@ -191,4 +206,9 @@ finally {
     } catch {}
     Remove-Item -Force -ErrorAction SilentlyContinue $launcher
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tempRoot
+    if ([string]::IsNullOrEmpty($previousLocalAppData)) {
+        Remove-Item Env:LOCALAPPDATA -ErrorAction SilentlyContinue
+    } else {
+        $env:LOCALAPPDATA = $previousLocalAppData
+    }
 }

@@ -24,7 +24,26 @@ internal static class ChatGPTToCodexLauncher
 internal sealed class LocalControlSnapshot
 {
     public LocalControlInfo control { get; set; }
+    public LocalOAuthApprovalsInfo oauthApprovals { get; set; }
     public LocalControlSession[] sessions { get; set; }
+}
+
+internal sealed class LocalOAuthApprovalsInfo
+{
+    public int pendingRequestCount { get; set; }
+    public LocalPendingOAuthApproval[] pendingRequests { get; set; }
+}
+
+internal sealed class LocalPendingOAuthApproval
+{
+    public string requestId { get; set; }
+    public string status { get; set; }
+    public string clientName { get; set; }
+    public string[] scopes { get; set; }
+    public string resource { get; set; }
+    public string redirectHost { get; set; }
+    public long createdAt { get; set; }
+    public long expiresAt { get; set; }
 }
 
 internal sealed class LocalControlInfo
@@ -161,6 +180,10 @@ internal sealed class LauncherForm : Form
         {"controlNoPendingActions", new[] {"No pending actions", "대기 중인 작업 없음"}},
         {"controlApprove", new[] {"Approve", "승인"}},
         {"controlReject", new[] {"Reject", "거부"}},
+        {"pendingOAuthApprovalsMenu", new[] {"Pending OAuth connections", "대기 중인 OAuth 연결"}},
+        {"oauthNoPendingApprovals", new[] {"No pending OAuth connections", "대기 중인 OAuth 연결 없음"}},
+        {"oauthApprovalTitle", new[] {"ChatGPT OAuth connection", "ChatGPT OAuth 연결"}},
+        {"oauthApprovalPrompt", new[] {"Approve this one OAuth connection request?\r\n\r\nClient: {0}\r\nScopes: {1}\r\nConnector: {2}\r\nReturn host: {3}\r\n\r\nYes = approve, No = reject, Cancel = later.\r\nOwner Token and OAuth access/refresh tokens are never shown here.", "이 OAuth 연결 요청 한 건을 승인할까요?\r\n\r\n클라이언트: {0}\r\n권한: {1}\r\n커넥터: {2}\r\n돌아갈 호스트: {3}\r\n\r\n예 = 승인, 아니요 = 거부, 취소 = 나중에.\r\nOwner Token과 OAuth access/refresh token은 여기에 표시되지 않습니다."}},
         {"approveAllControlMenu", new[] {"Approve all pending", "대기 중인 작업 모두 승인"}},
         {"autoApproveOnMenu", new[] {"Turn on auto-approve (10 min)", "자동 승인 켜기 (10분)"}},
         {"autoApproveOffMenu", new[] {"Turn off auto-approve", "자동 승인 끄기"}},
@@ -208,6 +231,7 @@ internal sealed class LauncherForm : Form
     private readonly ToolStripMenuItem projectTrayItem;
     private readonly ToolStripMenuItem portTrayItem;
     private readonly ToolStripMenuItem sessionsTrayItem;
+    private readonly ToolStripMenuItem oauthApprovalsTrayItem;
     private readonly ToolStripMenuItem armTrayItem;
     private readonly ToolStripMenuItem killTrayItem;
     private readonly ToolStripMenuItem pendingTrayItem;
@@ -230,6 +254,8 @@ internal sealed class LauncherForm : Form
     private bool autoGenerateOwnerTokenOnNextStart;
     private bool controlStatusRefreshInFlight;
     private LocalControlSnapshot latestControlSnapshot;
+    private readonly HashSet<string> presentedOAuthApprovalIds = new HashSet<string>(StringComparer.Ordinal);
+    private bool oauthApprovalDialogOpen;
 
     internal LauncherForm(string[] args)
     {
@@ -241,8 +267,9 @@ internal sealed class LauncherForm : Form
         logDir = Path.Combine(appDataDir, "logs");
         selectedProjectFile = Path.Combine(appDataDir, "selected-project.txt");
         settingsFile = Path.Combine(appDataDir, "settings.ini");
+        var userProfile = ResolveUserProfileDirectory();
         sharedSettingsFile = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            userProfile,
             ".local",
             "share",
             "chatgpt2codex",
@@ -260,7 +287,7 @@ internal sealed class LauncherForm : Form
         PruneLauncherLogs(logDir);
         logFile = Path.Combine(logDir, "launcher-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".log");
         connectionDiagnosticsFile = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            userProfile,
             ".local",
             "share",
             "chatgpt2codex",
@@ -368,6 +395,8 @@ internal sealed class LauncherForm : Form
         portTrayItem.Enabled = false;
         sessionsTrayItem = new ToolStripMenuItem(L("activeSessionsMenu"));
         sessionsTrayItem.DropDownItems.Add(new ToolStripMenuItem(L("sessionNoActive")) { Enabled = false });
+        oauthApprovalsTrayItem = new ToolStripMenuItem(L("pendingOAuthApprovalsMenu"));
+        oauthApprovalsTrayItem.DropDownItems.Add(new ToolStripMenuItem(L("oauthNoPendingApprovals")) { Enabled = false });
         armTrayItem = new ToolStripMenuItem(L("agentArmOffMenu"), null, delegate { ToggleAgentArm(); });
         armTrayItem.Enabled = false;
         killTrayItem = new ToolStripMenuItem(L("killControlMenu"), null, delegate { KillControl(); });
@@ -391,6 +420,7 @@ internal sealed class LauncherForm : Form
         trayMenu.Items.Add(projectTrayItem);
         trayMenu.Items.Add(portTrayItem);
         trayMenu.Items.Add(sessionsTrayItem);
+        trayMenu.Items.Add(oauthApprovalsTrayItem);
         trayMenu.Items.Add(new ToolStripSeparator());
         trayMenu.Items.Add(armTrayItem);
         trayMenu.Items.Add(killTrayItem);
@@ -538,6 +568,14 @@ internal sealed class LauncherForm : Form
         return null;
     }
 
+    private static string ResolveUserProfileDirectory()
+    {
+        var value = Environment.GetEnvironmentVariable("USERPROFILE");
+        if (string.IsNullOrWhiteSpace(value)) value = Environment.GetEnvironmentVariable("HOME");
+        if (string.IsNullOrWhiteSpace(value)) value = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        return Path.GetFullPath(value);
+    }
+
     private string ResolveDefaultWorkspace()
     {
         var value = GetArgValue("-Workspace");
@@ -545,7 +583,7 @@ internal sealed class LauncherForm : Form
         if (string.IsNullOrWhiteSpace(value)) value = Environment.GetEnvironmentVariable("CHATGPT2CODEX_WORKSPACE");
         if (string.IsNullOrWhiteSpace(value))
         {
-            value = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "workspace");
+            value = Path.Combine(ResolveUserProfileDirectory(), "workspace");
         }
         return Path.GetFullPath(value);
     }
@@ -1396,7 +1434,7 @@ internal sealed class LauncherForm : Form
     private string LocalControlTokenPath()
     {
         return Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ResolveUserProfileDirectory(),
             ".local",
             "share",
             "chatgpt2codex",
@@ -1513,6 +1551,92 @@ internal sealed class LauncherForm : Form
         });
     }
 
+    private void ResolveOAuthApproval(LocalPendingOAuthApproval request, string decision)
+    {
+        if (request == null || string.IsNullOrWhiteSpace(request.requestId)) return;
+        PerformLocalControl(
+            "/oauth-approvals/" + Uri.EscapeDataString(request.requestId) + "/" + decision);
+    }
+
+    private void PresentOAuthApproval(LocalPendingOAuthApproval request)
+    {
+        if (request == null || string.IsNullOrWhiteSpace(request.requestId)) return;
+        if (!string.Equals(request.status, "pending", StringComparison.OrdinalIgnoreCase)) return;
+
+        var scopeText = request.scopes != null && request.scopes.Length > 0
+            ? string.Join(", ", request.scopes)
+            : "chatgpt2codex";
+        var answer = MessageBox.Show(
+            LFormat(
+                "oauthApprovalPrompt",
+                string.IsNullOrWhiteSpace(request.clientName) ? "ChatGPT" : request.clientName,
+                scopeText,
+                string.IsNullOrWhiteSpace(request.resource) ? "C2CT" : request.resource,
+                string.IsNullOrWhiteSpace(request.redirectHost) ? "chatgpt.com" : request.redirectHost),
+            L("oauthApprovalTitle"),
+            MessageBoxButtons.YesNoCancel,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button1);
+        if (answer == DialogResult.Yes) ResolveOAuthApproval(request, "approve");
+        else if (answer == DialogResult.No) ResolveOAuthApproval(request, "reject");
+    }
+
+    private void ApplyOAuthApprovals(LocalControlSnapshot snapshot)
+    {
+        var approvals = snapshot != null && snapshot.oauthApprovals != null && snapshot.oauthApprovals.pendingRequests != null
+            ? snapshot.oauthApprovals.pendingRequests
+            : new LocalPendingOAuthApproval[0];
+        var pending = approvals
+            .Where(request => request != null && string.Equals(request.status, "pending", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+
+        oauthApprovalsTrayItem.Text = L("pendingOAuthApprovalsMenu") + " (" + pending.Length + ")";
+        oauthApprovalsTrayItem.DropDownItems.Clear();
+        if (pending.Length == 0)
+        {
+            oauthApprovalsTrayItem.DropDownItems.Add(new ToolStripMenuItem(L("oauthNoPendingApprovals")) { Enabled = false });
+            return;
+        }
+
+        foreach (var request in pending)
+        {
+            var scopeText = request.scopes != null && request.scopes.Length > 0
+                ? string.Join(", ", request.scopes)
+                : "chatgpt2codex";
+            var summary = (string.IsNullOrWhiteSpace(request.clientName) ? "ChatGPT" : request.clientName) +
+                " · " + scopeText;
+            var requestItem = new ToolStripMenuItem(summary);
+            var captured = request;
+            requestItem.DropDownItems.Add(new ToolStripMenuItem(
+                L("controlApprove"),
+                null,
+                delegate { ResolveOAuthApproval(captured, "approve"); }));
+            requestItem.DropDownItems.Add(new ToolStripMenuItem(
+                L("controlReject"),
+                null,
+                delegate { ResolveOAuthApproval(captured, "reject"); }));
+            requestItem.DropDownItems.Add(new ToolStripMenuItem(
+                L("oauthApprovalTitle"),
+                null,
+                delegate { PresentOAuthApproval(captured); }));
+            oauthApprovalsTrayItem.DropDownItems.Add(requestItem);
+        }
+
+        if (oauthApprovalDialogOpen) return;
+        var firstUnseen = pending.FirstOrDefault(request => !presentedOAuthApprovalIds.Contains(request.requestId));
+        if (firstUnseen == null) return;
+        presentedOAuthApprovalIds.Add(firstUnseen.requestId);
+        oauthApprovalDialogOpen = true;
+        try
+        {
+            PresentOAuthApproval(firstUnseen);
+        }
+        finally
+        {
+            oauthApprovalDialogOpen = false;
+        }
+    }
+
     private void ToggleAgentArm()
     {
         var control = latestControlSnapshot == null ? null : latestControlSnapshot.control;
@@ -1543,6 +1667,7 @@ internal sealed class LauncherForm : Form
     private void ApplyLocalControlSnapshot()
     {
         var snapshot = latestControlSnapshot;
+        ApplyOAuthApprovals(snapshot);
         if (snapshot != null && IsManagedProcessRunning() && !unifiedDashboardShown && Visible)
         {
             unifiedDashboardShown = true;

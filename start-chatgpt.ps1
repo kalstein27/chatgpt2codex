@@ -114,7 +114,7 @@ function Resolve-HostWithCloudflareDoh([string]$HostName) {
     }
 }
 
-function Test-HttpOkWithCurlResolve([string]$Url) {
+function Test-HttpOkWithCurlResolve([string]$Url, [string]$ExpectedInstance = "") {
     $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
     if (-not $curl) { return $false }
 
@@ -129,7 +129,12 @@ function Test-HttpOkWithCurlResolve([string]$Url) {
             $statusMatch = [regex]::Match($text, "HTTP_STATUS:(\d+)")
             $status = if ($statusMatch.Success) { [int]$statusMatch.Groups[1].Value } else { 0 }
             if ($LASTEXITCODE -eq 0 -and $status -ge 200 -and $status -lt 300) {
-                return $true
+                if (-not $ExpectedInstance) { return $true }
+                try {
+                    $bodyText = [regex]::Replace($text, "`r?`nHTTP_STATUS:\d+\s*$", "")
+                    $body = $bodyText | ConvertFrom-Json
+                    if ($body.ok -eq $true -and $body.instanceMatch -eq $true) { return $true }
+                } catch {}
             }
         }
     } catch {
@@ -137,19 +142,23 @@ function Test-HttpOkWithCurlResolve([string]$Url) {
     return $false
 }
 
-function Wait-PublicHttpOk([string]$Url, [int]$Tries, [string]$Label, [bool]$AllowCloudflareFallback = $false) {
+function Wait-PublicHttpOk([string]$Url, [int]$Tries, [string]$Label, [bool]$AllowCloudflareFallback = $false, [string]$ExpectedInstance = "") {
     for ($i = 0; $i -lt $Tries; $i++) {
         $standardError = $null
         try {
             $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Uri $Url
             if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
-                return
+                if (-not $ExpectedInstance) { return }
+                try {
+                    $body = $response.Content | ConvertFrom-Json
+                    if ($body.ok -eq $true -and $body.instanceMatch -eq $true) { return }
+                } catch {}
             }
         } catch {
             $standardError = $_.Exception.Message
         }
         if ($AllowCloudflareFallback -and $standardError -and ($i % 5 -eq 0) -and
-            (Test-HttpOkWithCurlResolve $Url)) {
+            (Test-HttpOkWithCurlResolve $Url $ExpectedInstance)) {
             return
         }
         Start-Sleep -Seconds 1
@@ -404,6 +413,11 @@ try {
     }
     $srvProc = Start-LoggedProcess $nodeExe $serverArgs $srvOut $srvErr
     Wait-HttpOk "http://127.0.0.1:$Port/healthz" 20 "local server"
+    $localHealth = Invoke-RestMethod -UseBasicParsing -TimeoutSec 3 -Uri "http://127.0.0.1:$Port/healthz"
+    $healthInstanceId = [string]$localHealth.healthInstanceId
+    if ($healthInstanceId -notmatch '^[a-f0-9]{32}$') {
+        throw "local server health did not expose a valid instance proof"
+    }
 
     $connectorReady = -not $usePublicEndpoint
     $announceConnectorReady = {
@@ -434,7 +448,7 @@ try {
     if ($usePublicEndpoint) {
         Write-Host "[chatgpt2codex] 3/3 checking public health..."
         try {
-            Wait-PublicHttpOk "$publicUrl/healthz" 60 "public endpoint" $managesCloudflared
+            Wait-PublicHttpOk "$publicUrl/healthz?instance=$healthInstanceId" 60 "public endpoint" $managesCloudflared $healthInstanceId
             $connectorReady = $true
         } catch {
             Write-Host "[chatgpt2codex] public tunnel did not become ready; endpoint is not reachable yet: $($_.Exception.Message)"
@@ -458,7 +472,7 @@ try {
         if ($managesCloudflared -and $cfProc -and $cfProc.HasExited) { throw "cloudflared exited. See $cfOut and $cfErr" }
         if ($usePublicEndpoint -and -not $connectorReady -and [DateTime]::UtcNow -ge $nextPublicHealthCheck) {
             try {
-                Wait-PublicHttpOk "$publicUrl/healthz" 1 "public endpoint" $managesCloudflared
+                Wait-PublicHttpOk "$publicUrl/healthz?instance=$healthInstanceId" 1 "public endpoint" $managesCloudflared $healthInstanceId
                 $connectorReady = $true
                 Write-Host "[chatgpt2codex] public health verified."
                 & $announceConnectorReady

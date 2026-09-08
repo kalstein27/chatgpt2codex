@@ -351,6 +351,7 @@ export interface RunningHttpServer {
 
 export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): RunningHttpServer {
   const startedAt = Date.now();
+  const healthInstanceId = randomBytes(16).toString("hex");
   const activityTracker = new RuntimeActivityTracker();
   const diagnostics = new FileConnectionDiagnostics(ctx.stateDir);
   ctx.diagnostics = diagnostics;
@@ -560,10 +561,19 @@ export function createHttpServer(ctx: ToolContext, config: HttpServerConfig): Ru
       schemaVersion: 2,
       transport: "http",
     };
+    const requestedInstance = typeof req.query.instance === "string"
+      ? req.query.instance.trim().toLowerCase()
+      : "";
+    if (requestedInstance) {
+      const instanceMatch = /^[a-f0-9]{32}$/u.test(requestedInstance) && requestedInstance === healthInstanceId;
+      payload.instanceMatch = instanceMatch;
+      if (!instanceMatch) payload.ok = false;
+    }
     // Keep public health checks useful without disclosing process start time,
     // runtime build labels, or host platform. Loopback callers (the updater,
     // local diagnostics, and CI smoke checks) retain the detailed payload.
     if (loopbackClient && localHealthHosts.has(host)) {
+      payload.healthInstanceId = healthInstanceId;
       payload.startedAt = startedAt;
       payload.runtimeVersion = process.env.CHATGPT2CODEX_RUNTIME_VERSION ?? "development";
       payload.runtimeManifest = getRuntimeManifest();
