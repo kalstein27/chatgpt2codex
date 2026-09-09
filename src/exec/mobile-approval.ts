@@ -41,13 +41,10 @@ export const MOBILE_APPROVAL_TAILSCALE_HTTPS_PORT = 8443;
 const POLL_INTERVAL_MS = 1_000;
 const RETRY_INTERVAL_MS = 15_000;
 const PUBLISH_TIMEOUT_MS = 5_000;
-const APP_FAVICON_FILE = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "..",
-  "..",
-  "assets",
-  "chatgpt2codex-icon.ico",
-);
+const ACTIVITY_APP_ASSET_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "assets");
+const ACTIVITY_APP_ICON_ICO_FILE = path.join(ACTIVITY_APP_ASSET_DIR, "chatgpt2codex-icon.ico");
+const ACTIVITY_APP_ICON_PNG_FILE = path.join(ACTIVITY_APP_ASSET_DIR, "chatgpt2codex-icon.png");
+const ACTIVITY_APP_ICON_SVG_FILE = path.join(ACTIVITY_APP_ASSET_DIR, "chatgpt2codex-icon.svg");
 const POLL_ERROR_BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 15_000] as const;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
 const TOPIC_PATTERN = /^c2ct-[A-Za-z0-9_-]{43}$/u;
@@ -985,6 +982,49 @@ export class MobileApprovalBridge {
         return;
       }
       setDashboardHeaders(res);
+      if (requestPath === "/activity/favicon.ico" || requestPath === "/activity/app-icon.png" || requestPath === "/activity/app-icon.svg") {
+        const iconFile = requestPath.endsWith(".ico")
+          ? ACTIVITY_APP_ICON_ICO_FILE
+          : requestPath.endsWith(".png")
+            ? ACTIVITY_APP_ICON_PNG_FILE
+            : ACTIVITY_APP_ICON_SVG_FILE;
+        const contentType = requestPath.endsWith(".ico")
+          ? "image/x-icon"
+          : requestPath.endsWith(".png")
+            ? "image/png"
+            : "image/svg+xml";
+        try {
+          const icon = await fs.readFile(iconFile);
+          res.statusCode = 200;
+          res.setHeader("content-type", contentType);
+          res.setHeader("cache-control", "no-cache, no-store, must-revalidate");
+          res.setHeader("x-content-type-options", "nosniff");
+          res.end(icon);
+        } catch {
+          sendJson(res, 404, { ok: false, error: "activity_icon_missing" });
+        }
+        return;
+      }
+      if (requestPath === "/activity/manifest.webmanifest") {
+        res.statusCode = 200;
+        res.setHeader("content-type", "application/manifest+json; charset=utf-8");
+        res.setHeader("cache-control", "no-cache, no-store, must-revalidate");
+        res.end(JSON.stringify({
+          id: "/activity/",
+          name: "ChatGPT To Codex",
+          short_name: "C2CT",
+          start_url: "/activity/",
+          scope: "/activity/",
+          display: "standalone",
+          background_color: "#087E78",
+          theme_color: "#087E78",
+          icons: [
+            { src: "/activity/app-icon.svg?brand=20260910", sizes: "any", type: "image/svg+xml", purpose: "any maskable" },
+            { src: "/activity/app-icon.png?brand=20260910", sizes: "1024x1024", type: "image/png", purpose: "any maskable" },
+          ],
+        }));
+        return;
+      }
       if (requestPath === "/activity/api/settings") {
         if (!isLoopbackRequest(req)) {
           sendJson(res, 403, { ok: false, error: "settings_loopback_only" });
@@ -1066,20 +1106,6 @@ export class MobileApprovalBridge {
           label: health.label,
           generatedAt: now,
         });
-        return;
-      }
-      if (requestPath === "/favicon.ico") {
-        try {
-          const icon = await fs.readFile(APP_FAVICON_FILE);
-          res.statusCode = 200;
-          res.setHeader("content-type", "image/x-icon");
-          res.setHeader("cache-control", "no-cache");
-          res.setHeader("x-content-type-options", "nosniff");
-          res.end(icon);
-        } catch {
-          res.statusCode = 404;
-          res.end();
-        }
         return;
       }
       if (requestPath === "/activity" || requestPath === "/activity/") {

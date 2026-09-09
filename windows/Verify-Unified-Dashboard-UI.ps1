@@ -75,6 +75,20 @@ foreach ($requiredId in @("view-activity", "view-approvals", "view-connection", 
     if ($html -notmatch ('id="' + [regex]::Escape($requiredId) + '"')) { throw "Activity dashboard is missing #$requiredId." }
 }
 if ($html -notmatch 'class="desktop-shell"') { throw "Shared desktop shell is missing." }
+if ($html -notmatch '/activity/manifest\.webmanifest\?brand=20260910') { throw "Dashboard web app manifest link is missing." }
+if ($html -notmatch '/activity/app-icon\.png\?brand=20260910') { throw "Dashboard PNG app icon link is missing." }
+if ($html -notmatch '/activity/favicon\.ico\?brand=20260910') { throw "Dashboard ICO favicon link is missing." }
+
+$faviconResponse = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Uri ($activityBase + "favicon.ico?brand=20260910")
+if ($faviconResponse.StatusCode -ne 200 -or $faviconResponse.RawContentLength -lt 1024) { throw "Dashboard favicon route is missing or unexpectedly small." }
+$iconResponse = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Uri ($activityBase + "app-icon.png?brand=20260910")
+if ($iconResponse.StatusCode -ne 200 -or $iconResponse.RawContentLength -lt 4096) { throw "Dashboard PNG app icon route is missing or unexpectedly small." }
+$manifestResponse = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Uri ($activityBase + "manifest.webmanifest?brand=20260910")
+if ($manifestResponse.StatusCode -ne 200) { throw "Dashboard web app manifest HTTP status was $($manifestResponse.StatusCode)." }
+$manifest = $manifestResponse.Content | ConvertFrom-Json
+if ($manifest.name -ne "ChatGPT To Codex" -or $manifest.display -ne "standalone" -or $manifest.icons.Count -lt 2) {
+    throw "Dashboard web app manifest does not satisfy the desktop branding contract."
+}
 
 $activityApi = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Uri ($activityBase + "api/activity")
 if ($activityApi.StatusCode -ne 200) { throw "Activity API HTTP status was $($activityApi.StatusCode)." }
@@ -139,6 +153,8 @@ Write-Host "windows-unified-dashboard-ui=PASS"
 Write-Host "dashboard-http=200"
 Write-Host "activity-api=200"
 Write-Host "chromium-app-mode=true"
+Write-Host "chromium-app-brand-icon=true"
+Write-Host "web-app-manifest=true"
 Write-Host "render-browser=$([System.IO.Path]::GetFileName($edge))"
 Write-Host "activity-view=true"
 Write-Host "approvals-view=true"
