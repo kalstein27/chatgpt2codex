@@ -629,7 +629,8 @@ function Make-Item([string]$Text, [scriptblock]$Action) {
 
 $notify = [System.Windows.Forms.NotifyIcon]::new()
 $notify.Text = $AppName
-$iconIco = Join-Path $RuntimeRoot "assets\chatgpt2codex-icon.ico"
+$generatedIconIco = Join-Path $RuntimeRoot "build\windows-brand-icon\chatgpt2codex-icon.ico"
+$iconIco = if (Test-Path $generatedIconIco) { $generatedIconIco } else { Join-Path $RuntimeRoot "assets\chatgpt2codex-icon.ico" }
 $iconPath = Join-Path $RuntimeRoot "assets\chatgpt2codex-icon.png"
 if (Test-Path $iconIco) {
     $notify.Icon = [System.Drawing.Icon]::new($iconIco)

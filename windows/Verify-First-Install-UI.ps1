@@ -90,7 +90,12 @@ foreach ($marker in $oauthWiringMarkers) {
         throw "Windows OAuth local-approval UI wiring is missing marker: $marker"
     }
 }
-$icon = (Resolve-Path "assets\chatgpt2codex-icon.ico").Path
+$brandDir = Join-Path $repoRoot "build\windows-brand-icon-e2e"
+New-Item -ItemType Directory -Force -Path $brandDir | Out-Null
+$icon = Join-Path $brandDir "chatgpt2codex-icon.ico"
+$iconPng = Join-Path $brandDir "chatgpt2codex-icon.png"
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File "windows\Generate-BrandIcon.ps1" -SourceSvg "assets\chatgpt2codex-icon.svg" -OutputIco $icon -OutputPng $iconPng
+if ($LASTEXITCODE -ne 0) { throw "Brand icon generation failed with exit code $LASTEXITCODE." }
 $launcher = Join-Path $repoRoot "ChatGPT To Codex.e2e.exe"
 Remove-Item -Force -ErrorAction SilentlyContinue $launcher
 & $csc /nologo /target:winexe "/win32icon:$icon" /reference:System.dll /reference:System.Core.dll /reference:System.Web.Extensions.dll /reference:System.Windows.Forms.dll /reference:System.Drawing.dll "/out:$launcher" $launcherSource

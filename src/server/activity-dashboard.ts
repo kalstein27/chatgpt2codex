@@ -13,6 +13,8 @@ export const ACTIVITY_DASHBOARD_OVERRIDE_FILE = "activity-dashboard.html";
 export const ACTIVITY_DASHBOARD_CONTRACT_VERSION = 1;
 const ACTIVITY_DASHBOARD_MAX_OVERRIDE_BYTES = 512 * 1024;
 const ACTIVITY_DASHBOARD_CONTRACT_MARKER = `<meta name="c2ct-activity-dashboard-contract" content="${ACTIVITY_DASHBOARD_CONTRACT_VERSION}">`;
+const ACTIVITY_DASHBOARD_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024"><defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#087E78"/><stop offset="0.55" stop-color="#119B93"/><stop offset="1" stop-color="#20B6AD"/></linearGradient><linearGradient id="shield" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FF9C14"/><stop offset="1" stop-color="#FF7A00"/></linearGradient></defs><rect x="28" y="28" width="968" height="968" rx="210" fill="url(#bg)"/><g fill="none" stroke="#fff" stroke-width="64" stroke-linecap="round" stroke-linejoin="round"><path d="M514 171 C321 171 176 308 176 491 C176 594 225 684 306 744 L286 842 L405 777 C440 786 476 791 514 791 C705 791 852 655 852 476 C852 299 706 171 514 171 Z"/><path d="M426 388 L334 480 L426 572"/><path d="M602 388 L694 480 L602 572"/><path d="M552 349 L476 611"/></g><path d="M720 596 C789 620 850 618 905 596 L919 610 V738 C919 833 858 895 812 919 C766 895 705 833 705 738 V610 Z" fill="url(#shield)" stroke="#FFD13A" stroke-width="26" stroke-linejoin="round"/><path d="M755 758 L799 802 L873 718" fill="none" stroke="#fff" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+const ACTIVITY_DASHBOARD_ICON_DATA_URI = `data:image/svg+xml,${encodeURIComponent(ACTIVITY_DASHBOARD_ICON_SVG)}`;
 
 export interface ActivityDashboardApproval {
   id: string;
@@ -188,6 +190,9 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
   <meta name="c2ct-activity-dashboard-contract" content="1">
+  <meta name="application-name" content="ChatGPT To Codex">
+  <link rel="icon" type="image/svg+xml" href="${ACTIVITY_DASHBOARD_ICON_DATA_URI}">
+  <link rel="shortcut icon" href="${ACTIVITY_DASHBOARD_ICON_DATA_URI}">
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
   <title>ChatGPT To Codex</title>
   <style>
