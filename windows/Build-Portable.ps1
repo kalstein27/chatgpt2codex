@@ -47,6 +47,8 @@ New-Item -ItemType Directory -Force -Path $stage, (Join-Path $stage "runtime") |
 Copy-Item -Recurse -Force "dist" (Join-Path $stage "dist")
 Copy-Item -Recurse -Force "node_modules" (Join-Path $stage "node_modules")
 Copy-Item -Force "package.json", "package-lock.json", "start-chatgpt.ps1", "start-chatgpt.cmd" $stage
+New-Item -ItemType Directory -Force -Path (Join-Path $stage "assets") | Out-Null
+Copy-Item -Force "assets\chatgpt2codex-icon.svg", "assets\chatgpt2codex-icon.png", "assets\chatgpt2codex-icon.ico" (Join-Path $stage "assets")
 Copy-Item -Force "windows\Portable-README.txt" (Join-Path $stage "README.txt")
 Copy-Item -Force $nodeExe (Join-Path $stage "runtime\node.exe")
 

@@ -4,6 +4,7 @@ import { constants as fsConstants } from "node:fs";
 import { promises as fs } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { listArmRequests, type ArmRequestRecord } from "../control/arm-requests.js";
 import {
@@ -40,6 +41,13 @@ export const MOBILE_APPROVAL_TAILSCALE_HTTPS_PORT = 8443;
 const POLL_INTERVAL_MS = 1_000;
 const RETRY_INTERVAL_MS = 15_000;
 const PUBLISH_TIMEOUT_MS = 5_000;
+const APP_FAVICON_FILE = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "..",
+  "assets",
+  "chatgpt2codex-icon.ico",
+);
 const POLL_ERROR_BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 15_000] as const;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
 const TOPIC_PATTERN = /^c2ct-[A-Za-z0-9_-]{43}$/u;
@@ -1058,6 +1066,20 @@ export class MobileApprovalBridge {
           label: health.label,
           generatedAt: now,
         });
+        return;
+      }
+      if (requestPath === "/favicon.ico") {
+        try {
+          const icon = await fs.readFile(APP_FAVICON_FILE);
+          res.statusCode = 200;
+          res.setHeader("content-type", "image/x-icon");
+          res.setHeader("cache-control", "no-cache");
+          res.setHeader("x-content-type-options", "nosniff");
+          res.end(icon);
+        } catch {
+          res.statusCode = 404;
+          res.end();
+        }
         return;
       }
       if (requestPath === "/activity" || requestPath === "/activity/") {

@@ -3051,27 +3051,15 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     @objc private func showApprovalsSection() {
-        showIntegratedMenuSection(
-            id: "approvals",
-            title: controller.effectiveLanguageCode == "ko" ? "승인" : "Approvals",
-            menu: makeNativeApprovalMenu()
-        )
+        showSharedDashboardSection(id: "approvals", view: "approvals")
     }
 
     @objc private func showServiceSection() {
-        showIntegratedMenuSection(
-            id: "service",
-            title: controller.effectiveLanguageCode == "ko" ? "MCP / 연결" : "MCP & Connection",
-            menu: makeServiceMenu()
-        )
+        showSharedDashboardSection(id: "service", view: "connection")
     }
 
     @objc private func showDiagnosticsSection() {
-        showIntegratedMenuSection(
-            id: "diagnostics",
-            title: controller.effectiveLanguageCode == "ko" ? "진단" : "Diagnostics",
-            menu: makeDiagnosticsMenu()
-        )
+        showSharedDashboardSection(id: "diagnostics", view: "diagnostics")
     }
 
     @objc private func showPermissionsSection() {
@@ -3264,15 +3252,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     @objc private func showActivityDashboardSection() {
-        showActivityWindow()
-        activeAppSection = "activity"
-        refreshSidebarSelection()
-        integratedMenuActions.removeAll()
-        guard let webView = activityWebView else { return }
-        installActivityContent(webView)
-        if webView.url == nil {
-            loadActivityDashboard()
-        }
+        showSharedDashboardSection(id: "activity", view: nil)
     }
 
     private func showActivityFallback() {
@@ -3546,15 +3526,32 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         loadActivityDashboard()
     }
 
-    private func loadActivityDashboard() {
+    private func loadActivityDashboard(view: String? = nil) {
         guard let webView = activityWebView else { return }
         installActivityContent(webView)
+        var components = URLComponents(url: activityDashboardURL, resolvingAgainstBaseURL: false)
+        var queryItems = components?.queryItems ?? []
+        queryItems.removeAll { $0.name == "view" }
+        if let view, !view.isEmpty {
+            queryItems.append(URLQueryItem(name: "view", value: view))
+        }
+        components?.queryItems = queryItems
         let request = URLRequest(
-            url: activityDashboardURL,
+            url: components?.url ?? activityDashboardURL,
             cachePolicy: .reloadIgnoringLocalCacheData,
             timeoutInterval: 5
         )
         webView.load(request)
+    }
+
+    private func showSharedDashboardSection(id: String, view: String?) {
+        showActivityWindow()
+        activeAppSection = id
+        refreshSidebarSelection()
+        integratedMenuActions.removeAll()
+        guard let webView = activityWebView else { return }
+        installActivityContent(webView)
+        loadActivityDashboard(view: view)
     }
 
     @objc private func showActivityWindow() {
@@ -3574,14 +3571,14 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         }
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 540),
+            contentRect: NSRect(x: 0, y: 0, width: 920, height: 640),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = t("activityWindowTitle")
         window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 700, height: 500)
+        window.minSize = NSSize(width: 760, height: 540)
         window.setFrameAutosaveName("ChatGPTToCodexActivityWindowSidebarV2")
         window.collectionBehavior = [.moveToActiveSpace]
 
@@ -3600,13 +3597,6 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         root.blendingMode = .behindWindow
         root.state = .active
         root.translatesAutoresizingMaskIntoConstraints = false
-        let splitView = NSSplitView()
-        splitView.isVertical = true
-        splitView.dividerStyle = .thin
-        splitView.translatesAutoresizingMaskIntoConstraints = false
-        let sidebar = makeSidebar()
-        let mainPane = NSView()
-        mainPane.translatesAutoresizingMaskIntoConstraints = false
         let contentHost = NSView()
         contentHost.translatesAutoresizingMaskIntoConstraints = false
         let fallback = makeActivityFallbackView()
@@ -3615,21 +3605,12 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         detailHost.blendingMode = .withinWindow
         detailHost.state = .active
 
-        splitView.addArrangedSubview(sidebar)
-        splitView.addArrangedSubview(mainPane)
-        root.addSubview(splitView)
-        mainPane.addSubview(contentHost)
+        root.addSubview(contentHost)
         NSLayoutConstraint.activate([
-            splitView.topAnchor.constraint(equalTo: root.topAnchor),
-            splitView.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            splitView.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            splitView.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            sidebar.widthAnchor.constraint(equalToConstant: 210),
-            mainPane.widthAnchor.constraint(greaterThanOrEqualToConstant: 490),
-            contentHost.topAnchor.constraint(equalTo: mainPane.topAnchor),
-            contentHost.leadingAnchor.constraint(equalTo: mainPane.leadingAnchor),
-            contentHost.trailingAnchor.constraint(equalTo: mainPane.trailingAnchor),
-            contentHost.bottomAnchor.constraint(equalTo: mainPane.bottomAnchor),
+            contentHost.topAnchor.constraint(equalTo: root.topAnchor),
+            contentHost.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            contentHost.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            contentHost.bottomAnchor.constraint(equalTo: root.bottomAnchor),
         ])
 
         window.contentView = root
@@ -4906,19 +4887,11 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         case "service":
             showServiceSection()
         case "settings":
-            showSettings()
+            showSharedDashboardSection(id: "settings", view: "settings")
         case "approvals":
-            showIntegratedMenuSection(
-                id: "approvals",
-                title: controller.effectiveLanguageCode == "ko" ? "승인" : "Approvals",
-                menu: makeNativeApprovalMenu()
-            )
+            showApprovalsSection()
         case "diagnostics":
-            showIntegratedMenuSection(
-                id: "diagnostics",
-                title: controller.effectiveLanguageCode == "ko" ? "진단" : "Diagnostics",
-                menu: makeDiagnosticsMenu()
-            )
+            showDiagnosticsSection()
         case "permissions":
             showPermissionsSection()
         default:
@@ -4935,14 +4908,14 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             failUISmokeTest("content-host-count expected=1 actual=\(activityContentHost?.subviews.count ?? -1)")
             return
         }
-        if expected == "activity" {
-            guard contentHost.subviews.first === activityWebView else {
-                failUISmokeTest("activity-webview-not-installed")
+        if expected == "permissions" {
+            guard contentHost.subviews.first === activityDetailHost else {
+                failUISmokeTest("detail-host-not-installed section=\(expected)")
                 return
             }
         } else {
-            guard contentHost.subviews.first === activityDetailHost else {
-                failUISmokeTest("detail-host-not-installed section=\(expected)")
+            guard contentHost.subviews.first === activityWebView else {
+                failUISmokeTest("shared-webview-not-installed section=\(expected)")
                 return
             }
         }
@@ -4973,6 +4946,14 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     @objc private func showSettings() {
+        if latestHealth || controller.isManagedProcessRunning {
+            showSharedDashboardSection(id: "settings", view: "settings")
+            return
+        }
+        showNativeSettings()
+    }
+
+    private func showNativeSettings() {
         let scrollView = NSScrollView()
         scrollView.hasVerticalScroller = true
         scrollView.drawsBackground = false

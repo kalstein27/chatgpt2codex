@@ -188,6 +188,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
   <meta name="c2ct-activity-dashboard-contract" content="1">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
   <title>ChatGPT To Codex</title>
   <style>
     :root {
@@ -226,7 +227,17 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     }
     * { box-sizing: border-box; }
     body { margin: 0; background: var(--bg); color: var(--text); }
-    main { width: min(1120px, 100%); margin: 0 auto; padding: max(12px, env(safe-area-inset-top)) 14px max(28px, env(safe-area-inset-bottom)); }
+    .desktop-shell { min-height: 100vh; display: grid; grid-template-columns: 220px minmax(0,1fr); }
+    .app-sidebar { position: sticky; top: 0; height: 100vh; padding: 18px 12px 14px; border-right: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 94%, var(--bg)); }
+    .sidebar-brand { padding: 2px 8px 16px; }
+    .sidebar-eyebrow { color: var(--muted); font-size: 9px; font-weight: 780; letter-spacing: .12em; }
+    .sidebar-title { margin-top: 4px; font-size: 19px; font-weight: 790; letter-spacing: -.02em; }
+    .sidebar-nav { display: grid; gap: 4px; }
+    .sidebar-nav .view-tab { width: 100%; min-height: 40px; display: flex; align-items: center; justify-content: flex-start; border: 1px solid transparent; border-radius: 10px; padding: 8px 10px; background: transparent; color: var(--muted); font-size: 12px; font-weight: 690; text-align: left; }
+    .sidebar-nav .view-tab.active { background: color-mix(in srgb, var(--blue) 9%, var(--panel)); border-color: color-mix(in srgb, var(--blue) 18%, var(--line)); color: var(--blue); box-shadow: none; }
+    .sidebar-meta { position: absolute; left: 20px; right: 20px; bottom: 15px; color: var(--muted); font-size: 9.5px; line-height: 1.45; }
+    .app-main { min-width: 0; }
+    main { width: min(1120px, 100%); margin: 0 auto; padding: max(12px, env(safe-area-inset-top)) 18px max(28px, env(safe-area-inset-bottom)); }
     header { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 44px; margin: 0 2px 11px; }
     .header-main { display: flex; align-items: center; gap: 11px; min-width: 0; }
     .app-mark { width: 38px; height: 38px; flex: 0 0 auto; filter: drop-shadow(0 3px 9px rgba(0,0,0,.1)); }
@@ -242,9 +253,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     .metric.attention.has-value { color: var(--orange); }
     .metric.approval.has-value { color: var(--blue); }
     .metric.attention.has-value span, .metric.approval.has-value span { color: currentColor; opacity: .78; }
-    .view-switch { display: inline-flex; gap: 3px; margin: 0 1px 10px; padding: 3px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel2); }
-    .view-tab { appearance: none; border: 0; border-radius: 8px; padding: 6px 10px; background: transparent; color: var(--muted); font-size: 11px; font-weight: 730; }
-    .view-tab.active { background: var(--panel); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+    .view-tab { appearance: none; cursor: pointer; }
     .view-panel[hidden] { display: none !important; }
     .settings-stack { display: grid; gap: 10px; }
     .settings-card { border: 1px solid var(--line); border-radius: 14px; padding: 15px 16px; background: var(--panel); box-shadow: var(--shadow); }
@@ -434,6 +443,12 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     html.embedded-mac main, html.embedded-windows main { width: 100%; max-width: none; padding-top: 10px; }
     html.embedded-mac .footer, html.embedded-windows .footer { margin-bottom: 4px; }
     @media (max-width: 720px) {
+      .desktop-shell { display: block; }
+      .app-sidebar { position: sticky; z-index: 10; height: auto; padding: max(8px, env(safe-area-inset-top)) 10px 8px; border-right: 0; border-bottom: 1px solid var(--line); }
+      .sidebar-brand, .sidebar-meta { display: none; }
+      .sidebar-nav { display: flex; gap: 5px; overflow-x: auto; scrollbar-width: none; }
+      .sidebar-nav::-webkit-scrollbar { display: none; }
+      .sidebar-nav .view-tab { flex: 0 0 auto; width: auto; min-height: 40px; padding: 8px 12px; font-size: 14px; }
       main { padding-left: 12px; padding-right: 12px; padding-bottom: max(92px, calc(env(safe-area-inset-bottom) + 72px)); }
       header { gap: 10px; min-height: 50px; margin-bottom: 14px; }
       .header-main { gap: 9px; }
@@ -443,8 +458,6 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       .metric { min-height: 30px; padding: 4px 8px; gap: 5px; }
       .metric b { font-size: 15px; }
       .metric span { font-size: 13px; }
-      .view-switch { display: grid; grid-template-columns: repeat(3,1fr); width: 100%; margin-bottom: 16px; padding: 4px; border-radius: 12px; }
-      .view-tab { min-height: 44px; padding: 9px 12px; border-radius: 9px; font-size: 15px; }
       .gallery-note { margin-bottom: 17px; padding: 12px 13px; border-radius: 13px; font-size: 14px; line-height: 1.55; }
       .gallery-section + .gallery-section { margin-top: 22px; }
       .section-head { align-items: flex-start; flex-wrap: wrap; margin-bottom: 11px; }
@@ -497,6 +510,22 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
 </head>
 <body>
 <!-- activity-dashboard-hot-override-enabled -->
+<div class="desktop-shell">
+<aside class="app-sidebar" aria-label="ChatGPT To Codex 탐색">
+  <div class="sidebar-brand">
+    <div class="sidebar-eyebrow">CHATGPT TO CODEX</div>
+    <div class="sidebar-title">Local Agent</div>
+  </div>
+  <nav class="sidebar-nav" aria-label="데스크톱 보기">
+    <button id="view-activity" class="view-tab active" type="button">작업 현황</button>
+    <button id="view-approvals" class="view-tab" type="button">승인</button>
+    <button id="view-connection" class="view-tab" type="button">MCP / 연결</button>
+    <button id="view-settings" class="view-tab" type="button">설정</button>
+    <button id="view-diagnostics" class="view-tab" type="button">진단</button>
+  </nav>
+  <div class="sidebar-meta">Mac · Windows 공통 데스크톱 UI</div>
+</aside>
+<div class="app-main">
 <main>
   <header>
     <div class="header-main">
@@ -527,32 +556,36 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     </div>
     <div class="live"><span id="live-dot" class="dot"></span><span id="live-text">연결 중</span></div>
   </header>
-  <nav class="view-switch" aria-label="대시보드 보기">
-    <button id="view-activity" class="view-tab active" type="button">작업 현황</button>
-    <button id="view-gallery" class="view-tab" type="button">카드 보기</button>
-    <button id="view-settings" class="view-tab" type="button">설정</button>
-  </nav>
   <section id="activity-view" class="view-panel">
+    <nav id="filters" class="toolbar"></nav>
+    <section id="cards"></section>
+  </section>
+  <section id="approvals-view" class="view-panel" hidden>
     <section id="approval-box" class="approval-box hidden">
       <div class="section-head"><h2>승인 필요</h2><span id="approval-label">0건</span></div>
       <div id="approvals" class="approval-list"></div>
     </section>
-    <section id="deployment-box" class="deployment-box hidden">
-      <div class="section-head"><h2>배포 상태</h2><span id="deployment-label">0건</span></div>
-      <div id="deployments" class="deployment-list"></div>
-    </section>
+    <div id="approvals-empty" class="empty">현재 대기 중인 승인이 없습니다.</div>
+  </section>
+  <section id="connection-view" class="view-panel" hidden>
+    <div class="section-head"><h2>MCP / 연결</h2><span>공통 연결 상태</span></div>
     <section id="mcp-health-box" class="mcp-health-box">
       <div class="section-head"><h2>C2CT MCP Health</h2><span id="mcp-health-state" class="mcp-health-state healthy">확인 중</span></div>
       <div id="mcp-health-reason" class="mcp-health-reason">내부 진단 상태를 확인하는 중입니다.</div>
       <div id="mcp-health-meta" class="mcp-health-meta"></div>
       <div id="mcp-health-events" class="mcp-health-events"></div>
     </section>
+  </section>
+  <section id="diagnostics-view" class="view-panel" hidden>
+    <section id="deployment-box" class="deployment-box hidden">
+      <div class="section-head"><h2>배포 상태</h2><span id="deployment-label">0건</span></div>
+      <div id="deployments" class="deployment-list"></div>
+    </section>
     <section id="widget-load-box" class="widget-load-box hidden">
       <div class="section-head"><h2>카드 로딩</h2><span id="widget-load-label">0건</span></div>
       <div id="widget-loads" class="widget-load-list"></div>
     </section>
-    <nav id="filters" class="toolbar"></nav>
-    <section id="cards"></section>
+    <div id="diagnostics-empty" class="empty">표시할 배포 또는 카드 로딩 진단이 없습니다.</div>
   </section>
   <section id="settings-view" class="view-panel" hidden>
     <div class="settings-stack">
@@ -674,12 +707,27 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     </section>
   </section>
 </main>
+</div>
+</div>
 <script>
 (function () {
   var pageDashboardRevision = "__C2CT_ACTIVITY_DASHBOARD_REVISION__";
   var initialParams = new URLSearchParams(window.location.search);
+  var dashboardHostname = String(window.location.hostname || "").toLowerCase();
+  var isLocalDashboard = dashboardHostname === "127.0.0.1"
+    || dashboardHostname === "localhost"
+    || dashboardHostname === "::1"
+    || dashboardHostname === "[::1]";
+  var settingsEnabled = isLocalDashboard;
+  var devCardsEnabled = isLocalDashboard && initialParams.get("devCards") === "1";
   var initialView = initialParams.get("view");
-  var selectedView = initialView === "cards" ? "cards" : initialView === "settings" ? "settings" : "activity";
+  function normalizedView(value) {
+    if (value === "cards" && devCardsEnabled) return "cards";
+    if (value === "settings" && settingsEnabled) return "settings";
+    if (["activity", "approvals", "connection", "diagnostics"].indexOf(value) >= 0) return value;
+    return "activity";
+  }
+  var selectedView = normalizedView(initialView);
   var selectedProject = "all";
   var latest = [];
   var latestApprovals = [];
@@ -716,36 +764,52 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   var liveDot = document.getElementById("live-dot");
   var liveText = document.getElementById("live-text");
   var activityView = document.getElementById("activity-view");
+  var approvalsView = document.getElementById("approvals-view");
+  var connectionView = document.getElementById("connection-view");
+  var diagnosticsView = document.getElementById("diagnostics-view");
   var galleryView = document.getElementById("gallery-view");
   var settingsView = document.getElementById("settings-view");
   var activityViewButton = document.getElementById("view-activity");
-  var galleryViewButton = document.getElementById("view-gallery");
+  var approvalsViewButton = document.getElementById("view-approvals");
+  var connectionViewButton = document.getElementById("view-connection");
   var settingsViewButton = document.getElementById("view-settings");
+  var diagnosticsViewButton = document.getElementById("view-diagnostics");
+  var approvalsEmpty = document.getElementById("approvals-empty");
+  var diagnosticsEmpty = document.getElementById("diagnostics-empty");
   var settingsLoaded = false;
+  settingsViewButton.hidden = !settingsEnabled;
 
   function setDashboardView(nextView, updateLocation) {
-    selectedView = nextView === "cards" ? "cards" : nextView === "settings" ? "settings" : "activity";
+    selectedView = normalizedView(nextView);
     activityView.hidden = selectedView !== "activity";
+    approvalsView.hidden = selectedView !== "approvals";
+    connectionView.hidden = selectedView !== "connection";
+    diagnosticsView.hidden = selectedView !== "diagnostics";
     galleryView.hidden = selectedView !== "cards";
     settingsView.hidden = selectedView !== "settings";
     activityViewButton.classList.toggle("active", selectedView === "activity");
-    galleryViewButton.classList.toggle("active", selectedView === "cards");
+    approvalsViewButton.classList.toggle("active", selectedView === "approvals");
+    connectionViewButton.classList.toggle("active", selectedView === "connection");
     settingsViewButton.classList.toggle("active", selectedView === "settings");
+    diagnosticsViewButton.classList.toggle("active", selectedView === "diagnostics");
     activityViewButton.setAttribute("aria-pressed", selectedView === "activity" ? "true" : "false");
-    galleryViewButton.setAttribute("aria-pressed", selectedView === "cards" ? "true" : "false");
+    approvalsViewButton.setAttribute("aria-pressed", selectedView === "approvals" ? "true" : "false");
+    connectionViewButton.setAttribute("aria-pressed", selectedView === "connection" ? "true" : "false");
     settingsViewButton.setAttribute("aria-pressed", selectedView === "settings" ? "true" : "false");
+    diagnosticsViewButton.setAttribute("aria-pressed", selectedView === "diagnostics" ? "true" : "false");
     if (updateLocation && window.history && window.history.replaceState) {
       var url = new URL(window.location.href);
-      if (selectedView === "cards") url.searchParams.set("view", "cards");
-      else if (selectedView === "settings") url.searchParams.set("view", "settings");
-      else url.searchParams.delete("view");
+      if (selectedView === "activity") url.searchParams.delete("view");
+      else url.searchParams.set("view", selectedView);
       window.history.replaceState(null, "", url);
     }
     if (selectedView === "settings" && !settingsLoaded) loadSettings();
   }
   activityViewButton.addEventListener("click", function () { setDashboardView("activity", true); });
-  galleryViewButton.addEventListener("click", function () { setDashboardView("cards", true); });
+  approvalsViewButton.addEventListener("click", function () { setDashboardView("approvals", true); });
+  connectionViewButton.addEventListener("click", function () { setDashboardView("connection", true); });
   settingsViewButton.addEventListener("click", function () { setDashboardView("settings", true); });
+  diagnosticsViewButton.addEventListener("click", function () { setDashboardView("diagnostics", true); });
   setDashboardView(selectedView, false);
 
   function setting(id) { return document.getElementById(id); }
@@ -1084,6 +1148,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   }
   function renderApprovals(items, now) {
     approvalLabel.textContent = items.length + "건";
+    approvalsEmpty.hidden = items.length > 0;
     if (!items.length) {
       approvalBox.classList.add("hidden");
       window.setTimeout(function () {
@@ -1100,7 +1165,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       var macCanDecide = Boolean(macBridge && item.channel === "mac" && item.kind === "operation");
       var channelText = item.channel === "mobile"
         ? (item.canDecide ? "iPhone 승인 가능" : "Tailscale에서 승인")
-        : (macCanDecide ? "Mac에서 바로 승인 가능" : "Mac에서 승인 필요");
+        : (macCanDecide ? "이 앱에서 바로 승인 가능" : "로컬 앱에서 승인 필요");
       top.appendChild(el("div", "approval-channel " + (item.channel === "mobile" ? "mobile" : "mac"), channelText));
       row.appendChild(top);
       row.appendChild(el("div", "approval-summary", item.summary || "보호 작업 승인 요청"));
@@ -1111,7 +1176,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       meta.appendChild(el("span", "", "만료까지 " + Math.max(0, Math.ceil((item.expiresAt - now) / 1000)) + "초"));
       row.appendChild(meta);
       if (item.canDecide || macCanDecide) {
-        var detail = el("div", "approval-meta", macCanDecide ? "이 Mac에서 바로 처리 가능" : "이 화면에서 바로 처리 가능");
+        var detail = el("div", "approval-meta", macCanDecide ? "이 앱에서 바로 처리 가능" : "이 화면에서 바로 처리 가능");
         row.appendChild(detail);
         var actions = el("div", "approval-actions");
         var approve = el("button", "approve", item.tool === "runtime_apply_local" ? "런타임 교체 허용" : "승인");
@@ -1133,7 +1198,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       }
       if (macBridge) {
         var nativeActions = el("div", "approval-actions");
-        var nativeButton = el("button", "native", "Mac 승인창 열기");
+        var nativeButton = el("button", "native", "로컬 승인창 열기");
         nativeButton.type = "button";
         nativeButton.onclick = openNativeApprovalInbox;
         nativeActions.appendChild(nativeButton);
@@ -1398,6 +1463,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     renderDeployments(latestDeployments, now);
     renderMcpHealth(latestMcpHealth, now);
     renderWidgetLoads(latestWidgetLoads);
+    diagnosticsEmpty.hidden = latestDeployments.length > 0 || latestWidgetLoads.length > 0;
     renderFilters(retained);
     var visible = retained.filter(function (chat) {
       return selectedProject === "all" || projectSet(chat).indexOf(selectedProject) >= 0;

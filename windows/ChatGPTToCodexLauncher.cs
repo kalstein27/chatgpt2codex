@@ -1077,7 +1077,7 @@ internal sealed class LauncherForm : Form
                 Process.Start(new ProcessStartInfo
                 {
                     FileName = candidate,
-                    Arguments = "--app=" + Quote(url),
+                    Arguments = "--app=" + Quote(url) + " --window-size=920,640",
                     UseShellExecute = false
                 });
                 return;
