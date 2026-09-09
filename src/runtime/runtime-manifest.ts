@@ -365,7 +365,7 @@ function freshRuntimeManifestForRoot(runtimeRoot: string, timestamp: string | nu
   };
 }
 
-export function sealRuntimeBuildManifest(runtimeRootValue = inferredRuntimeRoot()): RuntimeManifest {
+export function sealRuntimeBuildManifest(runtimeRootValue = process.cwd()): RuntimeManifest {
   const runtimeRoot = path.resolve(runtimeRootValue);
   const manifest = freshRuntimeManifestForRoot(runtimeRoot, buildTimestampForSeal());
   if (!manifest.sourceRevision || !manifest.sourceFingerprint || !manifest.buildFingerprint ||
@@ -443,6 +443,17 @@ export function getRuntimeManifestForRoot(runtimeRootValue: string): RuntimeMani
 
 const invokedDirectly = process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (invokedDirectly && process.argv.includes("--seal")) {
-  const sealed = sealRuntimeBuildManifest();
+  const rootIndex = process.argv.indexOf("--root");
+  const rootArg = rootIndex >= 0 ? process.argv[rootIndex + 1]?.trim() : undefined;
+  if (rootIndex >= 0 && !rootArg) {
+    throw new Error("--root requires a path when sealing a runtime build manifest");
+  }
+  // A source build can be launched from a live C2CT runtime whose environment
+  // contains CHATGPT2CODEX_RUNTIME_ROOT. Never let that runtime identity redirect
+  // the build seal into the currently executing portable tree. Direct build
+  // sealing is rooted at the caller's source working directory unless an
+  // explicit --root is supplied.
+  const sealRoot = path.resolve(rootArg ?? process.cwd());
+  const sealed = sealRuntimeBuildManifest(sealRoot);
   process.stdout.write(`sealed runtime manifest ${sealed.runtimeSnapshotId}\n`);
 }

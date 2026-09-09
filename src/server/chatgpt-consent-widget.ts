@@ -463,13 +463,6 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
   async function callServerTool(name, args, options) {
     var a = api();
     var allowCrossBridgeFallback = options && options.allowCrossBridgeFallback === true;
-    var preferOpenAi = options && options.preferOpenAi === true;
-    if (preferOpenAi && a.callTool) {
-      // Mutating approval decisions use exactly one host bridge. Prefer the
-      // native OpenAI app bridge when present; if that attempted call rejects,
-      // do not replay the mutation over MCP Apps.
-      return await a.callTool(name, args || {});
-    }
     var mcpState = "initialize-not-attempted";
     var mcpError = null;
     try {
@@ -536,14 +529,26 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
       return new Date(milliseconds + 9 * 60 * 60 * 1000).toISOString().replace("T", " ").replace("Z", " KST");
     }
   }
-  function approvalExpiredByClock(now) {
+  function monotonicNow() {
+    return typeof performance !== "undefined" && typeof performance.now === "function"
+      ? performance.now()
+      : 0;
+  }
+  function approvalExpiredByClock() {
     if (!entry) return false;
     var expiresAt = Number(entry.expiresAt || 0);
-    return Number.isFinite(expiresAt) && expiresAt > 0 && now >= expiresAt;
+    var serverNow = Number(entry.serverNow || 0);
+    var serverNowMonotonic = Number(entry.serverNowMonotonic || 0);
+    if (!Number.isFinite(expiresAt) || expiresAt <= 0 || !Number.isFinite(serverNow) || serverNow <= 0) return false;
+    var ttlMs = expiresAt - serverNow;
+    if (ttlMs <= 0) return true;
+    var currentMonotonic = monotonicNow();
+    if (!Number.isFinite(currentMonotonic) || currentMonotonic < serverNowMonotonic) return false;
+    return currentMonotonic - serverNowMonotonic >= ttlMs;
   }
-  function expirePendingEntryLocally(now) {
+  function expirePendingEntryLocally() {
     if (!entry || (entry.status !== "checking" && entry.status !== "pending" && entry.status !== "error")) return false;
-    if (!approvalExpiredByClock(now)) return false;
+    if (!approvalExpiredByClock()) return false;
     entry.status = "expired";
     entry.token = null;
     entry.message = "승인 만료 · 새 승인 필요";
@@ -817,6 +822,8 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
         details: out.details || "",
         createdAt: out.createdAt || null,
         expiresAt: out.expiresAt || null,
+        serverNow: out.serverNow || null,
+        serverNowMonotonic: monotonicNow(),
         approvalSeverity: out.approvalSeverity || "standard",
         criticalBadge: out.criticalBadge || "Mac 시스템 변경",
         criticalWarning: out.criticalWarning || "",
@@ -845,7 +852,7 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
         entry.token = null;
         return;
       }
-      if (expirePendingEntryLocally(Date.now())) return;
+      if (expirePendingEntryLocally()) return;
       scheduleInitialStatusRefresh(out.requestId);
       return;
     }
@@ -890,8 +897,12 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
       entry.allowFollowUpPrompt = out.allowFollowUpPrompt || entry.allowFollowUpPrompt;
       entry.denyFollowUpPrompt = out.denyFollowUpPrompt || entry.denyFollowUpPrompt;
       entry.token = sec.token;
+      if (out.serverNow && out.serverNow !== entry.serverNow) {
+        entry.serverNow = out.serverNow;
+        entry.serverNowMonotonic = monotonicNow();
+      }
       if (entry.status === "error") entry.status = "checking";
-      if (expirePendingEntryLocally(Date.now())) return;
+      if (expirePendingEntryLocally()) return;
       maybeRefreshPersistedStatus();
     }
   }
@@ -1043,8 +1054,8 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
     // event is delivered. A visible loading state plus bounded polling makes that
     // race recoverable and gives us observable evidence when hydration fails.
     document.body.style.display = "block";
-    var expiredByClock = Boolean(entry && approvalExpiredByClock(Date.now()));
-    if (expiredByClock) expirePendingEntryLocally(Date.now());
+    var expiredByClock = Boolean(entry && approvalExpiredByClock());
+    if (expiredByClock) expirePendingEntryLocally();
     var approvalStillNeeded = Boolean(entry && !expiredByClock && (
       entry.status === "checking" || entry.status === "pending" || entry.status === "working" || entry.status === "error"
     ));
@@ -1336,11 +1347,11 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
   }
   function beginDecision(entry, decision) {
     var args = { requestId: entry.requestId, token: entry.token, decision: decision };
-    // Mutating approval decisions must use exactly one host bridge. Prefer the
-    // native OpenAI bridge when available; callServerTool refuses cross-bridge
-    // replay after a dispatched mutation and uses MCP Apps only when no native
-    // bridge is available.
-    return callServerTool(entry.decisionTool, args, { preferOpenAi: true });
+    // Mutating approval decisions use MCP Apps serverTools when available.
+    // callServerTool never replays a mutation over a second bridge after
+    // tools/call dispatch; the native OpenAI bridge is only a pre-dispatch
+    // fallback when MCP Apps serverTools are unavailable.
+    return callServerTool(entry.decisionTool, args);
   }
   async function decide(entry, decision) {
     if (entry.status !== "pending") return;

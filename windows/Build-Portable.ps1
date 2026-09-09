@@ -6,6 +6,23 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $RepoRoot
 
+function Get-C2ctSha256Hex([string]$Path) {
+    $stream = [System.IO.File]::OpenRead($Path)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hashBytes = $sha256.ComputeHash($stream)
+        return ([System.BitConverter]::ToString($hashBytes)).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $stream.Dispose()
+        $sha256.Dispose()
+    }
+}
+
+$hostExe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+Write-Host "portable-powershell-version=$($PSVersionTable.PSVersion)"
+Write-Host "portable-powershell-host=$hostExe"
+
 if (-not (Test-Path "dist\cli.js")) {
     throw "dist/cli.js is missing. Run npm run build first."
 }
@@ -53,14 +70,14 @@ $manifest = [ordered]@{
     schemaVersion = 1
     architecture = $nodeArch
     nodeVersion = (& $nodeExe --version).Trim()
-    launcherSha256 = (Get-FileHash -LiteralPath $launcher -Algorithm SHA256).Hash.ToLowerInvariant()
-    nodeSha256 = (Get-FileHash -LiteralPath (Join-Path $stage "runtime\node.exe") -Algorithm SHA256).Hash.ToLowerInvariant()
+    launcherSha256 = Get-C2ctSha256Hex $launcher
+    nodeSha256 = Get-C2ctSha256Hex (Join-Path $stage "runtime\node.exe")
     builtAtUtc = [DateTime]::UtcNow.ToString("o")
 }
 $manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage "portable-manifest.json") -Encoding UTF8
 
 Compress-Archive -LiteralPath $stage -DestinationPath $zip -CompressionLevel Optimal
-$zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+$zipHash = Get-C2ctSha256Hex $zip
 Write-Host "portable-bundle=$zip"
 Write-Host "portable-arch=$nodeArch"
 Write-Host "portable-sha256=$zipHash"

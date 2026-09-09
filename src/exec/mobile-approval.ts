@@ -969,7 +969,8 @@ export class MobileApprovalBridge {
   }
 
   private async handleCallback(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const requestPath = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+    const requestUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+    const requestPath = requestUrl.pathname;
     if (req.method === "GET" && requestPath.startsWith("/activity")) {
       if (!this.activityTracker || (!isLoopbackRequest(req) && !tailscaleIdentity(req))) {
         sendJson(res, this.activityTracker ? 403 : 404, { ok: false });
@@ -989,6 +990,7 @@ export class MobileApprovalBridge {
         const now = Date.now();
         const dashboard = await activityDashboardDocument(this.stateDir);
         const config = await readMobileApprovalConfig(this.stateDir);
+        const devHealthEnabled = isLoopbackRequest(req) && requestUrl.searchParams.get("devHealth") === "1";
         const [approvalItems, runtimeApply, macosAppApply, diagnostics, watchdog] = await Promise.all([
           dashboardApprovalItems(
             this.stateDir,
@@ -998,7 +1000,7 @@ export class MobileApprovalBridge {
           getLatestRuntimeApplyReceipt(this.stateDir).catch(() => null),
           getLatestMacosAppApplyReceipt(this.stateDir).catch(() => null),
           this.diagnostics?.summary(80).catch(() => null) ?? Promise.resolve(null),
-          readExternalWatchdogStatus().catch(() => null),
+          devHealthEnabled ? readExternalWatchdogStatus().catch(() => null) : Promise.resolve(null),
         ]);
         const deployments: ActivityDashboardDeployment[] = [];
         if (runtimeApply) {

@@ -17,7 +17,8 @@ implemented yet, so `Agent Arm` remains unavailable by design.
 | Area | Windows status |
 | --- | --- |
 | Windows 10 / 11 desktop | Intended source-run target; a release still needs real-Windows acceptance |
-| Node runtime | Node.js 22 or newer is required for the public source-run path |
+| Node runtime | Node.js 22 or newer is required; Windows CI pins Node 24 and the latest ARM64 acceptance used Node 24.20.0 |
+| npm | `packageManager` records npm 11.19.0 as the validated release-tooling version; npm 10/11 remain suitable for the Node 22+ source path |
 | PowerShell | Required; launch scripts use `powershell.exe -NoProfile -ExecutionPolicy Bypass` |
 | Core local coding workflow | Supported through the shared runtime |
 | Local loopback MCP | Supported without a public tunnel |
@@ -97,13 +98,24 @@ a checkout that contains work you want to keep.
 ```powershell
 npm ci --ignore-scripts
 npm run typecheck
-npm test
+npm run test:publication
 npm run build
 ```
 
 `npm run build` produces the shared Node runtime in `dist/`. If `dist/cli.js` is
 missing when the launcher starts, `start-chatgpt.ps1` also attempts a build, but
 running the explicit build above gives a much clearer first-install failure point.
+
+The public branch intentionally excludes development-only `*.test.ts` files.
+`npm test` therefore stays strict for development checkouts that contain tests,
+while `npm run test:publication` is the publication-checkout command and permits
+an empty Vitest set. Real Windows CI still performs typecheck, build, launcher
+compilation, portable packaging, and a live HTTP health smoke test.
+
+Use the same normal Windows user for `git clone`, `npm ci`, build, and runtime
+launch. Do not clone as Administrator and then build as a different user. If Git
+reports dubious ownership, prefer a fresh clone owned by the intended user; do
+not silence the boundary globally with `safe.directory=*`.
 
 ### 4. Start the Windows tray UI
 
@@ -212,6 +224,36 @@ includes its own Node executable and can run without a separately installed Node
 runtime after extraction. Build it on the same CPU architecture you intend to
 ship, and still perform real-Windows acceptance before treating it as a release.
 Release binaries belong in GitHub Releases, not in the Git tree.
+
+The portable builder calculates SHA-256 with .NET cryptography rather than the
+`Get-FileHash` cmdlet, so npm-launched Windows PowerShell does not depend on
+PowerShell module auto-loading. It also prints the PowerShell version and host
+executable used for the build.
+
+Supported non-interactive Windows verification commands are:
+
+```powershell
+npm run verify:windows-oauth-wiring
+npm run verify:windows-portable
+```
+
+The first verifies the server/local-control and Windows launcher OAuth approval
+wiring without clicking UI. The second validates the built portable manifest,
+bundled Node architecture/version, launcher hash, Node hash, and ZIP hash.
+`npm run verify:windows-owner-token-ui` remains an interactive Win32 UI E2E test
+and is intentionally separate from unattended automation.
+
+For source verification and CI, prefer `npm ci --ignore-scripts`. If a newer npm
+reports an `allowScripts` warning for `esbuild`, do not globally enable package
+scripts merely to silence the warning. The verified source flow installs with
+scripts disabled, then runs typecheck/build explicitly. Review dependency state
+with `npm run audit:prod` for production exposure and `npm run audit:moderate`
+when reviewing development-tooling advisories.
+
+`npm run publication:check` now builds the shared runtime first and executes the
+publication guard with plain Node rather than `tsx`. This keeps the check usable
+in restricted Windows user/sandbox contexts where TypeScript-loader startup can
+fail during OS account discovery.
 
 Starting MCP without the web connector is loopback-only. ChatGPT on the web needs
 an externally reachable HTTPS connector URL. The Windows launcher supports

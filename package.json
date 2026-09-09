@@ -5,6 +5,7 @@
   "author": "ezBuilder",
   "copyright": "Copyright 2026 ezBuilder. All rights reserved.",
   "type": "module",
+  "packageManager": "npm@11.19.0",
   "bin": {
     "chatgpt2codex": "dist/cli.js"
   },
@@ -15,10 +16,18 @@
     "audit:moderate": "npm audit --audit-level=moderate",
     "audit:prod": "npm audit --omit=dev --audit-level=moderate",
     "activity-dashboard:apply": "tsx scripts/apply-activity-dashboard.ts",
-    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json && node dist/runtime/chatgpt-widget-check.js && node dist/runtime/chatgpt-widget-asset-build.js && node dist/runtime/runtime-manifest.js --seal",
+    "activity:remote:enable": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Configure-Activity-Remote.ps1 -Action Enable",
+    "activity:remote:disable": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Configure-Activity-Remote.ps1 -Action Disable",
+    "activity:remote:status": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Configure-Activity-Remote.ps1 -Action Status",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json && node dist/runtime/chatgpt-widget-check.js && node dist/runtime/chatgpt-widget-asset-build.js && node dist/runtime/runtime-manifest.js --seal --root .",
     "build:macos-app": "bash scripts/build-macos-app.sh",
     "build:windows-portable": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Build-Portable.ps1",
     "verify:windows-owner-token-ui": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Verify-First-Install-UI.ps1",
+    "verify:windows-oauth-wiring": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Verify-OAuth-Approval-Wiring.ps1",
+    "verify:windows-portable": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Verify-Portable.ps1",
+    "verify:windows-portable-first-install-ui": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Verify-Portable-First-Install-UI.ps1",
+    "verify:windows-tailscale-path": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Verify-Tailscale-Path.ps1",
+    "verify:windows-unified-dashboard-ui": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Verify-Unified-Dashboard-UI.ps1",
     "macos-app:bootstrap-local": "node dist/cli.js macos-app-bootstrap-local",
     "chatgpt": "bash start-chatgpt.sh",
     "chatgpt:c2ct:plugin-refresh": "node src/exec/chatgpt-c2ct-command.mjs plugin-refresh",
@@ -28,11 +37,13 @@
     "connector:assistant": "tsx src/cli.ts connector-assistant",
     "start": "node dist/cli.js",
     "test": "vitest run",
+    "test:publication": "vitest run --passWithNoTests",
     "widget:check": "tsx src/runtime/chatgpt-widget-check.ts",
     "widget:test": "vitest run src/runtime/chatgpt-widget-validation.test.ts src/runtime/chatgpt-widget-fault-injection.test.ts src/runtime/chatgpt-widget-preapply.test.ts src/runtime/chatgpt-widget-assets.test.ts src/exec/chatgpt-widget-approval.test.ts src/exec/chatgpt-widget-shell.test.ts src/server/chatgpt-consent-widget.test.ts src/server/chatgpt-consent-widget-timeline.test.ts src/server/chatgpt-consent-probe-tool.test.ts src/server/chatgpt-operation-approval-tool.test.ts src/server/chatgpt-widget-capability-lab.test.ts src/server/chatgpt-widget-hot-loader.test.ts src/server/chatgpt-widget-shell-regression.test.ts src/runtime/runtime-reapply-refresh.test.ts",
-    "widget:preapply": "npm run widget:check && npm run widget:test && npm run typecheck && npm test && npm run build && npm run diff:check && node dist/runtime/chatgpt-widget-preapply-seal.js",
+    "widget:preapply": "npm run widget:check && npm run widget:test && npm run typecheck && npm run test:publication && npm run build && npm run diff:check && node dist/runtime/chatgpt-widget-preapply-seal.js",
     "diff:check": "git diff --check",
-    "publication:check": "tsx scripts/check-publication-boundary.ts",
+    "lock:refresh": "npm install --package-lock-only --ignore-scripts",
+    "publication:check": "npm run build --silent && node scripts/check-publication-boundary.mjs",
     "runtime:bootstrap-local": "node dist/cli.js runtime-bootstrap-local",
     "typecheck": "tsc --noEmit"
   },
@@ -69,6 +80,61 @@
           "destructive": false,
           "fixedDestination": true,
           "localApproval": "once"
+        }
+      },
+      "activity:remote:enable": {
+        "sideEffects": {
+          "needsNetwork": true,
+          "writesWorkspace": false,
+          "writesExternalLocalPath": true,
+          "launchesProcess": true,
+          "destructive": true,
+          "fixedDestination": true,
+          "localApproval": "once"
+        }
+      },
+      "activity:remote:disable": {
+        "sideEffects": {
+          "needsNetwork": true,
+          "writesWorkspace": false,
+          "writesExternalLocalPath": true,
+          "launchesProcess": true,
+          "destructive": true,
+          "fixedDestination": true,
+          "localApproval": "once"
+        }
+      },
+      "activity:remote:status": {
+        "sideEffects": {
+          "needsNetwork": true,
+          "writesWorkspace": false,
+          "writesExternalLocalPath": false,
+          "launchesProcess": true,
+          "destructive": false,
+          "fixedDestination": true,
+          "localApproval": "none"
+        }
+      },
+      "verify:windows-tailscale-path": {
+        "sideEffects": {
+          "needsNetwork": false,
+          "writesWorkspace": false,
+          "writesExternalLocalPath": false,
+          "launchesProcess": true,
+          "destructive": false,
+          "fixedDestination": true,
+          "localApproval": "none"
+        }
+      },
+      "verify:windows-unified-dashboard-ui": {
+        "sideEffects": {
+          "needsNetwork": false,
+          "writesWorkspace": false,
+          "writesExternalLocalPath": true,
+          "launchesProcess": true,
+          "destructive": false,
+          "fixedDestination": true,
+          "localApproval": "none"
         }
       },
       "macos-app:bootstrap-local": {
@@ -119,7 +185,7 @@
   "overrides": {
     "@hono/node-server": "2.0.12",
     "fast-uri": "3.1.6",
-    "hono": "4.12.34",
+    "hono": "4.13.7",
     "ip-address": "10.3.1",
     "nanoid": "3.3.18",
     "qs": "6.16.0"

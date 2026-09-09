@@ -10,10 +10,14 @@ on:
       - "package.json"
       - "package-lock.json"
       - "tsconfig.json"
+      - "scripts/check-publication-boundary.mjs"
       - "src/**"
+      - "windows/Build-Portable.ps1"
       - "windows/ChatGPTToCodexLauncher.cs"
       - "windows/ChatGPTToCodexTray.ps1"
       - "windows/Install-Prerequisites.ps1"
+      - "windows/Verify-OAuth-Approval-Wiring.ps1"
+      - "windows/Verify-Portable.ps1"
       - "windows/Start-ChatGPTToCodexTray.cmd"
       - "start-chatgpt.ps1"
       - "start-chatgpt.cmd"
@@ -24,10 +28,14 @@ on:
       - "package.json"
       - "package-lock.json"
       - "tsconfig.json"
+      - "scripts/check-publication-boundary.mjs"
       - "src/**"
+      - "windows/Build-Portable.ps1"
       - "windows/ChatGPTToCodexLauncher.cs"
       - "windows/ChatGPTToCodexTray.ps1"
       - "windows/Install-Prerequisites.ps1"
+      - "windows/Verify-OAuth-Approval-Wiring.ps1"
+      - "windows/Verify-Portable.ps1"
       - "windows/Start-ChatGPTToCodexTray.cmd"
       - "start-chatgpt.ps1"
       - "start-chatgpt.cmd"
@@ -72,15 +80,23 @@ jobs:
         shell: pwsh
         run: |
           npm run typecheck
+          npm run test:publication
           npm run build
+
+      - name: Verify Windows OAuth approval wiring
+        shell: powershell
+        run: npm run verify:windows-oauth-wiring
 
       - name: Parse public PowerShell sources
         shell: pwsh
         run: |
           $files = @(
             "start-chatgpt.ps1",
+            "windows/Build-Portable.ps1",
             "windows/ChatGPTToCodexTray.ps1",
-            "windows/Install-Prerequisites.ps1"
+            "windows/Install-Prerequisites.ps1",
+            "windows/Verify-OAuth-Approval-Wiring.ps1",
+            "windows/Verify-Portable.ps1"
           )
           foreach ($file in $files) {
             $tokens = $null
@@ -105,8 +121,11 @@ jobs:
 
           $files = @(
             "start-chatgpt.ps1",
+            "windows/Build-Portable.ps1",
             "windows/ChatGPTToCodexTray.ps1",
-            "windows/Install-Prerequisites.ps1"
+            "windows/Install-Prerequisites.ps1",
+            "windows/Verify-OAuth-Approval-Wiring.ps1",
+            "windows/Verify-Portable.ps1"
           )
           foreach ($file in $files) {
             $tokens = $null
@@ -154,6 +173,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           npm run build:windows-portable
+          npm run verify:windows-portable
           $arch = (node -p "process.arch").Trim()
           $root = Join-Path $env:GITHUB_WORKSPACE "build\windows-portable\chatgpt2codex-windows-$arch"
           $required = @(

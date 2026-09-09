@@ -132,12 +132,41 @@ export function resolveNpmInvocation(
     }
   }
 
+  if (platform === "win32") {
+    // npm.cmd can disappear from PATH or be temporarily unavailable while the
+    // Node installation itself remains healthy. Prefer the npm CLI package next
+    // to a PATH-visible system Node before asking the operator to reinstall
+    // Node. Execute the CLI with the already-running verified runtime Node so no
+    // machine-wide node.exe replacement is required.
+    const shellNode = resolveCommandOnPath("node.exe", { env, execPath, platform });
+    if (shellNode) {
+      const npmCli = join(dirname(shellNode), "node_modules", "npm", "bin", "npm-cli.js");
+      if (existsSync(npmCli)) {
+        return {
+          argvPrefix: [execPath, npmCli],
+          source: "shell-path",
+          resolvedPath: safeRealpath(npmCli),
+        };
+      }
+    }
+  }
+
   const shellNpm = resolveCommandOnPath(platform === "win32" ? "npm.cmd" : "npm", {
     env,
     execPath,
     platform,
   });
   if (shellNpm) {
+    if (platform === "win32") {
+      const npmCli = join(dirname(shellNpm), "node_modules", "npm", "bin", "npm-cli.js");
+      if (existsSync(npmCli)) {
+        return {
+          argvPrefix: [execPath, npmCli],
+          source: "shell-path",
+          resolvedPath: safeRealpath(npmCli),
+        };
+      }
+    }
     return {
       argvPrefix: [shellNpm],
       source: "shell-path",
