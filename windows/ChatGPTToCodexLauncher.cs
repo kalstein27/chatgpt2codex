@@ -106,8 +106,54 @@ internal static class DashboardWindowBranding
     private const uint ImageIcon = 1;
     private const uint LrLoadFromFile = 0x0010;
     private const uint LrDefaultSize = 0x0040;
+    private const ushort VtLpwstr = 31;
+    private static readonly Guid PropertyStoreGuid = new Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99");
+    private static readonly PropertyKey AppUserModelIdKey = new PropertyKey(
+        new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), 5);
+    private static readonly PropertyKey RelaunchIconResourceKey = new PropertyKey(
+        new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), 3);
 
     private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    private struct PropertyKey
+    {
+        public Guid formatId;
+        public uint propertyId;
+
+        public PropertyKey(Guid formatId, uint propertyId)
+        {
+            this.formatId = formatId;
+            this.propertyId = propertyId;
+        }
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    private struct PropVariant
+    {
+        [FieldOffset(0)] public ushort valueType;
+        [FieldOffset(8)] public IntPtr pointerValue;
+
+        public static PropVariant FromString(string value)
+        {
+            var result = new PropVariant();
+            result.valueType = VtLpwstr;
+            result.pointerValue = Marshal.StringToCoTaskMemUni(value);
+            return result;
+        }
+    }
+
+    [ComImport]
+    [Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IPropertyStore
+    {
+        [PreserveSig] int GetCount(out uint propertyCount);
+        [PreserveSig] int GetAt(uint propertyIndex, out PropertyKey key);
+        [PreserveSig] int GetValue(ref PropertyKey key, out PropVariant value);
+        [PreserveSig] int SetValue(ref PropertyKey key, ref PropVariant value);
+        [PreserveSig] int Commit();
+    }
 
     [DllImport("user32.dll")]
     private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
@@ -127,6 +173,57 @@ internal static class DashboardWindowBranding
     [DllImport("user32.dll")]
     private static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
+    [DllImport("shell32.dll")]
+    private static extern int SHGetPropertyStoreForWindow(
+        IntPtr hWnd,
+        ref Guid interfaceId,
+        [MarshalAs(UnmanagedType.Interface)] out IPropertyStore propertyStore);
+
+    [DllImport("ole32.dll")]
+    private static extern int PropVariantClear(ref PropVariant value);
+
+    private static void ApplyTaskbarIdentity(IntPtr hWnd, string iconPath)
+    {
+        IPropertyStore store = null;
+        try
+        {
+            var interfaceId = PropertyStoreGuid;
+            if (SHGetPropertyStoreForWindow(hWnd, ref interfaceId, out store) != 0 || store == null) return;
+
+            var appId = PropVariant.FromString("ChatGPTToCodex.Dashboard");
+            try
+            {
+                var key = AppUserModelIdKey;
+                store.SetValue(ref key, ref appId);
+            }
+            finally
+            {
+                PropVariantClear(ref appId);
+            }
+
+            var iconResource = PropVariant.FromString(iconPath + ",0");
+            try
+            {
+                var key = RelaunchIconResourceKey;
+                store.SetValue(ref key, ref iconResource);
+            }
+            finally
+            {
+                PropVariantClear(ref iconResource);
+            }
+
+            store.Commit();
+        }
+        catch
+        {
+            // WM_SETICON remains the fallback when a browser rejects shell properties.
+        }
+        finally
+        {
+            if (store != null && Marshal.IsComObject(store)) Marshal.FinalReleaseComObject(store);
+        }
+    }
+
     public static void ApplyAsync()
     {
         System.Threading.ThreadPool.QueueUserWorkItem(_ =>
@@ -137,9 +234,12 @@ internal static class DashboardWindowBranding
             var icon = LoadImage(IntPtr.Zero, iconPath, ImageIcon, 0, 0, LrLoadFromFile | LrDefaultSize);
             if (icon == IntPtr.Zero) return;
 
-            for (var attempt = 0; attempt < 50; attempt++)
+            // Chromium may replace the window icon again as the page finishes loading.
+            // Re-apply for a bounded settling period and also assign a per-window
+            // AppUserModelID/icon resource so the Windows taskbar does not keep the
+            // browser's generic globe/group icon.
+            for (var attempt = 0; attempt < 120; attempt++)
             {
-                var applied = false;
                 EnumWindows((hWnd, lParam) =>
                 {
                     if (!IsWindowVisible(hWnd)) return true;
@@ -151,12 +251,11 @@ internal static class DashboardWindowBranding
 
                     SendMessage(hWnd, WmSetIcon, IconBig, icon);
                     SendMessage(hWnd, WmSetIcon, IconSmall, icon);
-                    applied = true;
+                    ApplyTaskbarIdentity(hWnd, iconPath);
                     return true;
                 }, IntPtr.Zero);
 
-                if (applied) return;
-                System.Threading.Thread.Sleep(100);
+                System.Threading.Thread.Sleep(125);
             }
         });
     }
