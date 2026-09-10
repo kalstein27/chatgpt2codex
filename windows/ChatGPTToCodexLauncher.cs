@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Web.Script.Serialization;
@@ -95,6 +96,70 @@ internal sealed class DesktopSettings
     public string publicHostname { get; set; }
     public int port { get; set; }
     public string[] controlAllowlist { get; set; }
+}
+
+internal static class DashboardWindowBranding
+{
+    private const uint WmSetIcon = 0x0080;
+    private static readonly IntPtr IconSmall = IntPtr.Zero;
+    private static readonly IntPtr IconBig = new IntPtr(1);
+    private const uint ImageIcon = 1;
+    private const uint LrLoadFromFile = 0x0010;
+    private const uint LrDefaultSize = 0x0040;
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowTextLength(IntPtr hWnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr LoadImage(IntPtr hInst, string name, uint type, int cx, int cy, uint fuLoad);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    public static void ApplyAsync()
+    {
+        System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+        {
+            var iconPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "assets", "chatgpt2codex-icon.ico");
+            if (!File.Exists(iconPath)) return;
+
+            var icon = LoadImage(IntPtr.Zero, iconPath, ImageIcon, 0, 0, LrLoadFromFile | LrDefaultSize);
+            if (icon == IntPtr.Zero) return;
+
+            for (var attempt = 0; attempt < 50; attempt++)
+            {
+                var applied = false;
+                EnumWindows((hWnd, lParam) =>
+                {
+                    if (!IsWindowVisible(hWnd)) return true;
+                    var length = GetWindowTextLength(hWnd);
+                    if (length <= 0 || length > 256) return true;
+                    var title = new StringBuilder(length + 1);
+                    GetWindowText(hWnd, title, title.Capacity);
+                    if (!string.Equals(title.ToString(), "ChatGPT To Codex", StringComparison.Ordinal)) return true;
+
+                    SendMessage(hWnd, WmSetIcon, IconBig, icon);
+                    SendMessage(hWnd, WmSetIcon, IconSmall, icon);
+                    applied = true;
+                    return true;
+                }, IntPtr.Zero);
+
+                if (applied) return;
+                System.Threading.Thread.Sleep(100);
+            }
+        });
+    }
 }
 
 internal sealed class LauncherForm : Form
@@ -1084,6 +1149,7 @@ internal sealed class LauncherForm : Form
                     Arguments = "--app=" + Quote(url) + " --window-size=920,640",
                     UseShellExecute = false
                 });
+                DashboardWindowBranding.ApplyAsync();
                 return;
             }
             catch
