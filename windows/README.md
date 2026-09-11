@@ -59,6 +59,64 @@ by the verified Windows build/release flow. Extract the whole folder and launch
 CLI, so rebooting the PC or losing a machine-wide Node/npm installation does not
 break the app's package-script execution path.
 
+### Codex / coding-agent clean-install guide
+
+This is the public one-pass path for a coding agent installing ChatGPT To Codex
+on a clean Windows PC. The portable path must not install machine-wide Node, npm,
+Git, or other developer tooling unless the user explicitly chooses the source
+build path instead.
+
+1. Detect the Windows CPU architecture and choose the exact matching Release
+   asset: `chatgpt2codex-windows-arm64.zip` or
+   `chatgpt2codex-windows-x64.zip`. End users should prefer a GitHub Release
+   asset. GitHub Actions artifacts are short-lived verification candidates, not
+   a substitute for a published Release.
+2. If the matching `.zip.sha256` file is published, calculate the ZIP SHA-256
+   with `Get-FileHash -Algorithm SHA256` and require an exact match before
+   extraction.
+3. Extract the entire archive to
+   `%LOCALAPPDATA%\Programs\ChatGPT To Codex`. Do not run the EXE from inside the
+   ZIP and do not copy only the EXE.
+4. Before launch, verify at least these bundle members exist:
+   `ChatGPT To Codex.exe`, `runtime\node.exe`, `npm\bin\npm-cli.js`,
+   `dist\cli.js`, `start-chatgpt.ps1`, `portable-manifest.json`, `README.txt`,
+   and `assets\chatgpt2codex-plugin-icon.png`. Confirm the manifest architecture
+   matches the current PC.
+5. Launch `ChatGPT To Codex.exe`, start MCP, and require local health to become
+   healthy before continuing. If a step requires a human UI decision, stop and
+   tell the user exactly what to click rather than guessing or bypassing it.
+6. For ChatGPT web, enable the web connector and copy the externally reachable
+   HTTPS connector URL. Register the bare `/mcp` endpoint in ChatGPT Apps /
+   Plugins / Connectors under the name `C2CT`; do not append schema hashes or
+   ad-hoc query parameters.
+7. Complete OAuth interactively when offered. Keep Owner Token values private
+   and use them only as a fallback. Never ask the user to paste credentials into
+   an agent transcript.
+8. If the ChatGPT connector registration UI exposes a custom-icon control, use
+   `%LOCALAPPDATA%\Programs\ChatGPT To Codex\assets\chatgpt2codex-plugin-icon.png`.
+   If the UI has no such control, report that fact instead of inventing one.
+9. Final connection proof is a new ChatGPT conversation calling
+   `connection_status` and immediately `agent_guide`. Treat the install as
+   complete only when connection status reports `ok=true`, `finalHealthy=true`,
+   and `transportErrors=0`.
+
+One-shot prompt for Codex or another local coding agent:
+
+```text
+Install ChatGPT To Codex on this clean Windows PC using the latest verified
+architecture-matched portable ZIP from the project's GitHub Release. Do not
+install machine-wide Node/npm/Git for the portable path. Verify the published
+SHA-256 when available, extract the whole bundle to
+%LOCALAPPDATA%\Programs\ChatGPT To Codex, validate portable-manifest.json and the
+required bundled files, then launch ChatGPT To Codex.exe. Guide me through only
+the human steps needed to start MCP, confirm local health, enable the web
+connector, and register the HTTPS bare /mcp endpoint in ChatGPT as C2CT. Use the
+bundled assets\chatgpt2codex-plugin-icon.png only if the registration UI supports
+a custom icon. Prefer OAuth; never expose Owner Token or OAuth credentials. Stop
+on any architecture/hash/health mismatch and report the exact evidence.
+```
+
+
 ## Developer/source install: clone and build the repository
 
 Clone/build is the development path. It requires a machine-wide Node/npm toolchain

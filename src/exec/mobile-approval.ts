@@ -34,6 +34,7 @@ const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 const CONFIG_SCHEMA_VERSION = 1;
 const CONFIG_FILE = "mobile-approval.json";
+const DESKTOP_COMMAND_FILE = "desktop-command.json";
 const NTFY_BASE_URL = "https://ntfy.sh";
 const CALLBACK_HOST = "127.0.0.1";
 export const MOBILE_APPROVAL_CALLBACK_PORT = 7980;
@@ -146,6 +147,21 @@ function configPath(stateDir: string): string {
 async function ensureStateDir(stateDir: string): Promise<void> {
   await fs.mkdir(stateDir, { recursive: true, mode: DIR_MODE });
   await fs.chmod(stateDir, DIR_MODE).catch(() => undefined);
+}
+
+async function queueDesktopRestartCommand(stateDir: string): Promise<{ requestId: string }> {
+  await ensureStateDir(stateDir);
+  const requestId = randomUUID();
+  const destination = path.join(stateDir, DESKTOP_COMMAND_FILE);
+  const command = {
+    schemaVersion: 1,
+    requestId,
+    action: "restart-mcp",
+    createdAt: Date.now(),
+  } as const;
+  await fs.writeFile(destination, `${JSON.stringify(command)}\n`, { mode: FILE_MODE, flag: "wx" });
+  await fs.chmod(destination, FILE_MODE).catch(() => undefined);
+  return { requestId };
 }
 
 function validConfig(value: unknown): value is MobileApprovalConfig {
@@ -1149,6 +1165,40 @@ export class MobileApprovalBridge {
         });
       } catch {
         sendJson(res, 400, { ok: false, error: "invalid_desktop_settings" });
+      }
+      return;
+    }
+
+    if (req.method === "POST" && requestPath === "/activity/api/native/restart-mcp") {
+      if (!this.activityTracker) {
+        sendJson(res, 404, { ok: false });
+        return;
+      }
+      setDashboardHeaders(res);
+      if (!isLoopbackRequest(req)) {
+        sendJson(res, 403, { ok: false, error: "restart_loopback_only" });
+        return;
+      }
+      if (!localActivityOriginMatches(req)) {
+        sendJson(res, 403, { ok: false, error: "restart_same_origin_required" });
+        return;
+      }
+      if (process.platform !== "win32") {
+        sendJson(res, 409, { ok: false, error: "restart_native_bridge_unavailable" });
+        return;
+      }
+      try {
+        const queued = await queueDesktopRestartCommand(this.stateDir);
+        sendJson(res, 202, { ok: true, requestId: queued.requestId });
+      } catch (error) {
+        const code = error && typeof error === "object" && "code" in error
+          ? String((error as { code?: unknown }).code ?? "")
+          : "";
+        if (code === "EEXIST") {
+          sendJson(res, 409, { ok: false, error: "restart_already_queued" });
+        } else {
+          sendJson(res, 500, { ok: false, error: "restart_queue_failed" });
+        }
       }
       return;
     }

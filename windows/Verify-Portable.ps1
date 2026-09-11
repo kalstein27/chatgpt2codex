@@ -48,7 +48,8 @@ $required = @(
     "README.txt",
     "assets\chatgpt2codex-icon.ico",
     "assets\chatgpt2codex-icon.png",
-    "assets\chatgpt2codex-icon.svg"
+    "assets\chatgpt2codex-icon.svg",
+    "assets\chatgpt2codex-plugin-icon.png"
 )
 foreach ($relative in $required) {
     if (-not (Test-Path -LiteralPath (Join-Path $bundle $relative))) {
@@ -62,12 +63,21 @@ $npmCliPath = Join-Path $bundle "npm\bin\npm-cli.js"
 $iconIcoPath = Join-Path $bundle "assets\chatgpt2codex-icon.ico"
 $iconPngPath = Join-Path $bundle "assets\chatgpt2codex-icon.png"
 $iconSvgPath = Join-Path $bundle "assets\chatgpt2codex-icon.svg"
+$pluginIconPath = Join-Path $bundle "assets\chatgpt2codex-plugin-icon.png"
 $iconSvg = Get-Content -Raw -LiteralPath $iconSvgPath
 if ($iconSvg -notmatch '#087E78' -or $iconSvg -notmatch '#FF9C14' -or $iconSvg -notmatch 'M755 758') {
     throw "Portable bundle brand SVG does not match the current ChatGPT To Codex icon contract."
 }
 if ((Get-Item -LiteralPath $iconIcoPath).Length -lt 1024 -or (Get-Item -LiteralPath $iconPngPath).Length -lt 4096) {
     throw "Portable bundle generated icon assets are unexpectedly small."
+}
+$pluginIconInfo = Get-Item -LiteralPath $pluginIconPath
+$pluginIconHash = Get-C2ctSha256Hex $pluginIconPath
+if ($pluginIconInfo.Length -ne 9844 -or $pluginIconHash -ne "2e39efd2b66200a5482f9ebac59f6dcdf4baac20c5774162258816231d73924c") {
+    throw "Portable plugin icon does not match the approved 96px plugin asset."
+}
+if ([string]$manifest.pluginIconSha256 -ne $pluginIconHash) {
+    throw "Plugin icon SHA-256 does not match portable-manifest.json."
 }
 $launcherHash = Get-C2ctSha256Hex $launcherPath
 $nodeHash = Get-C2ctSha256Hex $nodePath
@@ -110,4 +120,5 @@ Write-Host "portable-launcher-sha256=$launcherHash"
 Write-Host "portable-node-sha256=$nodeHash"
 Write-Host "portable-npm-cli-sha256=$npmCliHash"
 Write-Host "portable-brand-icon=true"
+Write-Host "portable-plugin-icon-sha256=$pluginIconHash"
 Write-Host "portable-zip-sha256=$zipHash"

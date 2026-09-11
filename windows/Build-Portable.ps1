@@ -129,11 +129,13 @@ New-Item -ItemType Directory -Force -Path $brandDir | Out-Null
 $icon = Join-Path $brandDir "chatgpt2codex-icon.ico"
 $iconPng = Join-Path $brandDir "chatgpt2codex-icon.png"
 $iconSvg = (Resolve-Path "assets\chatgpt2codex-icon.svg").Path
+$pluginIcon = (Resolve-Path "assets\chatgpt2codex-plugin-icon.png").Path
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Generate-BrandIcon.ps1") -SourceSvg $iconSvg -OutputIco $icon -OutputPng $iconPng
 if ($LASTEXITCODE -ne 0) { throw "Windows brand icon generation failed with exit code $LASTEXITCODE." }
 Copy-Item -Force $icon (Join-Path $stage "assets\chatgpt2codex-icon.ico")
 Copy-Item -Force $iconPng (Join-Path $stage "assets\chatgpt2codex-icon.png")
 Copy-Item -Force $iconSvg (Join-Path $stage "assets\chatgpt2codex-icon.svg")
+Copy-Item -Force $pluginIcon (Join-Path $stage "assets\chatgpt2codex-plugin-icon.png")
 $launcher = Join-Path $stage "ChatGPT To Codex.exe"
 & $csc /nologo /target:winexe "/win32icon:$icon" /reference:System.dll /reference:System.Core.dll /reference:System.Web.Extensions.dll /reference:System.Windows.Forms.dll /reference:System.Drawing.dll "/out:$launcher" $source
 if ($LASTEXITCODE -ne 0) { throw "Windows launcher compilation failed with exit code $LASTEXITCODE." }
@@ -146,6 +148,7 @@ $manifest = [ordered]@{
     launcherSha256 = Get-C2ctSha256Hex $launcher
     nodeSha256 = Get-C2ctSha256Hex (Join-Path $stage "runtime\node.exe")
     npmCliSha256 = Get-C2ctSha256Hex (Join-Path $stage "npm\bin\npm-cli.js")
+    pluginIconSha256 = Get-C2ctSha256Hex (Join-Path $stage "assets\chatgpt2codex-plugin-icon.png")
     builtAtUtc = [DateTime]::UtcNow.ToString("o")
 }
 $manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage "portable-manifest.json") -Encoding UTF8

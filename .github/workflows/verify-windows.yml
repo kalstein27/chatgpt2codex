@@ -37,6 +37,7 @@ on:
       - "start-chatgpt.cmd"
       - "assets/chatgpt2codex-icon.ico"
       - "assets/chatgpt2codex-icon.svg"
+      - "assets/chatgpt2codex-plugin-icon.png"
   pull_request:
     paths:
       - ".github/workflows/verify-windows.yml"
@@ -70,6 +71,7 @@ on:
       - "start-chatgpt.cmd"
       - "assets/chatgpt2codex-icon.ico"
       - "assets/chatgpt2codex-icon.svg"
+      - "assets/chatgpt2codex-plugin-icon.png"
 
 permissions:
   contents: read
@@ -252,7 +254,8 @@ jobs:
             "README.txt",
             "assets\chatgpt2codex-icon.ico",
             "assets\chatgpt2codex-icon.png",
-            "assets\chatgpt2codex-icon.svg"
+            "assets\chatgpt2codex-icon.svg",
+            "assets\chatgpt2codex-plugin-icon.png"
           )
           foreach ($relative in $required) {
             if (-not (Test-Path -LiteralPath (Join-Path $root $relative))) {
@@ -273,7 +276,9 @@ jobs:
           }
           $zip = Join-Path $env:GITHUB_WORKSPACE "build\windows-portable\chatgpt2codex-windows-$arch.zip"
           if (-not (Test-Path -LiteralPath $zip)) { throw "Portable zip was not produced." }
-          Get-FileHash -LiteralPath $zip -Algorithm SHA256
+          $zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "portable-zip-sha256=$zipHash"
+          "$zipHash  chatgpt2codex-windows-$arch.zip" | Set-Content -LiteralPath "$zip.sha256" -Encoding ASCII
 
       - name: Verify portable first-install isolation
         shell: powershell
@@ -322,3 +327,13 @@ jobs:
               Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
             }
           }
+
+      - name: Upload verified portable candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: chatgpt2codex-windows-${{ matrix.arch }}
+          path: |
+            build/windows-portable/chatgpt2codex-windows-${{ matrix.arch }}.zip
+            build/windows-portable/chatgpt2codex-windows-${{ matrix.arch }}.zip.sha256
+          if-no-files-found: error
+          retention-days: 7

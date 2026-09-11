@@ -367,6 +367,7 @@ internal sealed class LauncherForm : Form
     private readonly string selectedProjectFile;
     private readonly string settingsFile;
     private readonly string sharedSettingsFile;
+    private readonly string sharedDesktopCommandFile;
     private readonly string defaultWorkspace;
     private string configuredPublicHost;
     private string lastConnectorUrl;
@@ -432,12 +433,10 @@ internal sealed class LauncherForm : Form
         selectedProjectFile = Path.Combine(appDataDir, "selected-project.txt");
         settingsFile = Path.Combine(appDataDir, "settings.ini");
         var userProfile = ResolveUserProfileDirectory();
-        sharedSettingsFile = Path.Combine(
-            userProfile,
-            ".local",
-            "share",
-            "chatgpt2codex",
-            "desktop-settings.json");
+        var sharedStateDir = Path.Combine(userProfile, ".local", "share", "chatgpt2codex");
+        sharedSettingsFile = Path.Combine(sharedStateDir, "desktop-settings.json");
+        sharedDesktopCommandFile = Path.Combine(sharedStateDir, "desktop-command.json");
+        TryDelete(new FileInfo(sharedDesktopCommandFile));
         defaultWorkspace = ResolveDefaultWorkspace();
         configuredPublicHost = ResolveConfiguredPublicHost();
         port = ResolvePort();
@@ -616,6 +615,7 @@ internal sealed class LauncherForm : Form
         {
             RequestLocalControlRefresh();
             RefreshSharedSettingsIfChanged();
+            HandleSharedDesktopCommand();
         };
         controlStatusTimer.Start();
         RefreshTrayState();
@@ -1267,6 +1267,44 @@ internal sealed class LauncherForm : Form
             return;
         }
         ShowSettings();
+    }
+
+    private void HandleSharedDesktopCommand()
+    {
+        if (!File.Exists(sharedDesktopCommandFile)) return;
+        string requestId = null;
+        string action = null;
+        var valid = false;
+        try
+        {
+            var json = File.ReadAllText(sharedDesktopCommandFile, Encoding.UTF8);
+            var serializer = new JavaScriptSerializer();
+            var command = serializer.Deserialize<Dictionary<string, object>>(json);
+            object schemaValue;
+            object requestValue;
+            object actionValue;
+            int schemaVersion;
+            valid = command != null &&
+                command.TryGetValue("schemaVersion", out schemaValue) &&
+                int.TryParse(Convert.ToString(schemaValue), out schemaVersion) && schemaVersion == 1 &&
+                command.TryGetValue("requestId", out requestValue) &&
+                !string.IsNullOrWhiteSpace(requestId = Convert.ToString(requestValue)) &&
+                command.TryGetValue("action", out actionValue) &&
+                string.Equals(action = Convert.ToString(actionValue), "restart-mcp", StringComparison.Ordinal);
+        }
+        catch (Exception error)
+        {
+            AppendLog("[chatgpt2codex] Ignoring malformed desktop command: " + error.GetType().Name);
+        }
+
+        TryDelete(new FileInfo(sharedDesktopCommandFile));
+        if (!valid)
+        {
+            AppendLog("[chatgpt2codex] Ignored invalid desktop command.");
+            return;
+        }
+        AppendLog("[chatgpt2codex] Desktop command accepted: " + action + " request=" + requestId);
+        RestartServer();
     }
 
     private void OpenLocalHealth()

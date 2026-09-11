@@ -23,13 +23,20 @@ function Invoke-EdgeDom([string]$Edge, [string]$Url, [string]$ProfileDir) {
         "--dump-dom",
         $Url
     )
-    $lines = & $Edge @args 2>$null
-    if ($LASTEXITCODE -ne 0) {
+    $stdout = Join-Path $ProfileDir ("dom-" + [Guid]::NewGuid().ToString("N") + ".out")
+    $stderr = Join-Path $ProfileDir ("dom-" + [Guid]::NewGuid().ToString("N") + ".err")
+    $process = Start-Process -FilePath $Edge -ArgumentList $args -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    if ($process.ExitCode -ne 0) {
         $args[0] = "--headless"
-        $lines = & $Edge @args 2>$null
+        Remove-Item -Force -ErrorAction SilentlyContinue $stdout, $stderr
+        $process = Start-Process -FilePath $Edge -ArgumentList $args -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
     }
-    if ($LASTEXITCODE -ne 0) { throw "Microsoft Edge headless DOM capture failed." }
-    return ($lines -join "`n")
+    $stderrText = (Get-Content -LiteralPath $stderr -ErrorAction SilentlyContinue | Out-String).Trim()
+    if ($process.ExitCode -ne 0) { throw "Microsoft Edge headless DOM capture failed (exit=$($process.ExitCode), stderr=$stderrText)." }
+    $dom = (Get-Content -Raw -LiteralPath $stdout -ErrorAction SilentlyContinue)
+    if ([string]::IsNullOrWhiteSpace($dom)) { throw "Microsoft Edge headless DOM capture returned empty stdout (stderr=$stderrText)." }
+    Remove-Item -Force -ErrorAction SilentlyContinue $stdout, $stderr
+    return $dom
 }
 
 function Assert-View([string]$Dom, [string]$ExpectedView) {
@@ -143,8 +150,14 @@ $screenshotArgs = @(
     "--screenshot=$screenshot",
     $windowsUrl
 )
-& $edge @screenshotArgs 2>$null | Out-Null
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $screenshot)) { throw "Chromium headless screenshot capture failed." }
+$screenshotStdout = Join-Path $proofRoot "screenshot.out"
+$screenshotStderr = Join-Path $proofRoot "screenshot.err"
+Remove-Item -Force -ErrorAction SilentlyContinue $screenshotStdout, $screenshotStderr
+$screenshotProcess = Start-Process -FilePath $edge -ArgumentList $screenshotArgs -Wait -PassThru -RedirectStandardOutput $screenshotStdout -RedirectStandardError $screenshotStderr
+$screenshotError = (Get-Content -LiteralPath $screenshotStderr -ErrorAction SilentlyContinue | Out-String).Trim()
+if ($screenshotProcess.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $screenshot)) {
+    throw "Chromium headless screenshot capture failed (exit=$($screenshotProcess.ExitCode), stderr=$screenshotError)."
+}
 $screenshotInfo = Get-Item -LiteralPath $screenshot
 if ($screenshotInfo.Length -lt 10000) { throw "Dashboard screenshot is unexpectedly small ($($screenshotInfo.Length) bytes)." }
 $screenshotSha = (Get-FileHash -Algorithm SHA256 -LiteralPath $screenshot).Hash.ToLowerInvariant()

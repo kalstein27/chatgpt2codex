@@ -3649,6 +3649,15 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             return
         }
 
+        if action == "restartMcp" {
+            if latestHealth || controller.isManagedProcessRunning {
+                restartServer()
+            } else {
+                refreshStatus()
+            }
+            return
+        }
+
         if action == "settingsSaved" {
             let runtimeSettingsChanged = controller.applySharedDesktopSettings()
             rebuildMenu()

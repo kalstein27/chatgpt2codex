@@ -612,6 +612,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
         <div class="settings-row"><div class="settings-label">공개 연결</div><div class="settings-control"><label class="settings-check"><input id="setting-tunnel" type="checkbox">공개 터널 사용</label></div></div>
         <div class="settings-row"><div class="settings-label">공개 주소</div><div class="settings-control"><input id="setting-host" type="text" autocomplete="off" placeholder="host.example.com 또는 https://..."></div></div>
         <div class="settings-row"><div class="settings-label">MCP 포트</div><div class="settings-control"><input id="setting-port" type="number" min="1" max="65535" inputmode="numeric"></div></div>
+        <div class="settings-row"><div class="settings-label">MCP 서비스</div><div class="settings-control"><button id="settings-restart-mcp" class="settings-save" type="button">MCP 재시작</button></div></div>
       </section>
       <section class="settings-card">
         <h2>데스크톱 제어</h2>
@@ -784,6 +785,10 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   var approvalsEmpty = document.getElementById("approvals-empty");
   var diagnosticsEmpty = document.getElementById("diagnostics-empty");
   var settingsLoaded = false;
+  var mutableControlsAvailable = false;
+  var restartPending = false;
+  var restartRequestedAt = 0;
+  var restartSawDisconnect = false;
   settingsViewButton.hidden = !settingsEnabled;
 
   function setDashboardView(nextView, updateLocation) {
@@ -826,6 +831,17 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     node.classList.toggle("success", kind === "success");
     node.classList.toggle("error", kind === "error");
   }
+  function setMutableControlsAvailable(available) {
+    mutableControlsAvailable = Boolean(available);
+    var disabled = !mutableControlsAvailable || restartPending;
+    ["setting-language", "setting-project", "setting-launch", "setting-start-mcp", "setting-updates", "setting-lanes", "setting-tunnel", "setting-host", "setting-port", "setting-allowlist", "settings-save", "settings-restart-mcp"].forEach(function (id) {
+      var node = setting(id);
+      if (node) node.disabled = disabled;
+    });
+    document.querySelectorAll(".approval-actions button").forEach(function (button) {
+      button.disabled = disabled;
+    });
+  }
   function applySettingsForm(value) {
     value = value || {};
     setting("setting-language").value = value.language || "auto";
@@ -853,6 +869,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     }
   }
   async function saveSettings() {
+    if (!mutableControlsAvailable || restartPending) return;
     var button = setting("settings-save");
     var parsedPort = Number(setting("setting-port").value);
     var body = {
@@ -884,10 +901,33 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     } catch (error) {
       settingsStatus("설정을 저장하지 못했습니다.", "error");
     } finally {
-      button.disabled = false;
+      setMutableControlsAvailable(mutableControlsAvailable);
     }
   }
   setting("settings-save").addEventListener("click", saveSettings);
+  async function restartMcp() {
+    if (!mutableControlsAvailable || restartPending) return;
+    restartPending = true;
+    restartRequestedAt = Date.now();
+    restartSawDisconnect = false;
+    setMutableControlsAvailable(mutableControlsAvailable);
+    settingsStatus("MCP 재시작 요청 중…");
+    try {
+      if (macBridge) {
+        macBridge.postMessage({ action: "restartMcp" });
+      } else {
+        var response = await fetch("/activity/api/native/restart-mcp", { method: "POST" });
+        if (!response.ok) throw new Error("HTTP " + response.status);
+      }
+      settingsStatus("MCP 재시작 중 · 재연결을 기다리는 중…");
+    } catch (error) {
+      restartPending = false;
+      settingsStatus("MCP 재시작 요청을 전달하지 못했습니다.", "error");
+      setMutableControlsAvailable(Boolean(latestMcpHealth && latestMcpHealth.state !== "unhealthy"));
+    }
+  }
+  setting("settings-restart-mcp").addEventListener("click", restartMcp);
+  setMutableControlsAvailable(false);
 
   function el(tag, cls, text) {
     var node = document.createElement(tag);
@@ -1190,6 +1230,8 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
         var reject = el("button", "reject", "거절");
         approve.type = "button";
         reject.type = "button";
+        approve.disabled = !mutableControlsAvailable || restartPending;
+        reject.disabled = !mutableControlsAvailable || restartPending;
         var buttons = [approve, reject];
         approve.onclick = function () {
           if (macCanDecide) decideMacApproval(item, "approve", buttons, detail);
@@ -1207,6 +1249,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
         var nativeActions = el("div", "approval-actions");
         var nativeButton = el("button", "native", "로컬 승인창 열기");
         nativeButton.type = "button";
+        nativeButton.disabled = !mutableControlsAvailable || restartPending;
         nativeButton.onclick = openNativeApprovalInbox;
         nativeActions.appendChild(nativeButton);
         row.appendChild(nativeActions);
@@ -1497,10 +1540,22 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       liveText.textContent = latestMcpHealth
         ? "MCP " + (latestMcpHealth.label || latestMcpHealth.state) + " · " + age(payload.generatedAt || Date.now(), Date.now())
         : "갱신 " + age(payload.generatedAt || Date.now(), Date.now());
+      var connected = Boolean(latestMcpHealth && latestMcpHealth.state !== "unhealthy");
+      if (restartPending) {
+        if (!connected) restartSawDisconnect = true;
+        if (connected && (restartSawDisconnect || Date.now() - restartRequestedAt >= 3000)) {
+          restartPending = false;
+          restartSawDisconnect = false;
+          if (settingsLoaded) settingsStatus("MCP 재연결 완료", "success");
+        }
+      }
+      setMutableControlsAvailable(connected);
       render();
     } catch (error) {
       liveDot.classList.add("offline");
       liveText.textContent = "연결 끊김";
+      if (restartPending) restartSawDisconnect = true;
+      setMutableControlsAvailable(false);
     }
   }
   refresh();
