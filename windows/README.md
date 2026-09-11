@@ -61,6 +61,13 @@ break the app's package-script execution path.
 
 ### Codex / coding-agent clean-install guide
 
+If the user supplies only the GitHub repository URL and says **"install this"**,
+do not ask them to locate a ZIP manually and do not default to a source build.
+Use the repository's latest official GitHub Release as the discovery point, then
+follow this section end to end. If no matching verified Release asset exists,
+stop and report that release packaging is not ready instead of silently switching
+to an Actions artifact, source build, or unverified download.
+
 This is the public one-pass path for a coding agent installing ChatGPT To Codex
 on a clean Windows PC. The portable path must not install machine-wide Node, npm,
 Git, or other developer tooling unless the user explicitly chooses the source

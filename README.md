@@ -20,6 +20,33 @@ edited.
 
 [Official releases](https://github.com/ezBuilder/chatgpt2codex/releases)
 
+## Windows agent install entry point
+
+If a user gives a coding agent only this repository link and says **"install this"**,
+treat that as a request for the verified Windows **portable end-user install**, not
+a source/developer build. Read and follow the public
+[Codex / coding-agent clean-install guide](windows/README.md#codex--coding-agent-clean-install-guide)
+before taking installation actions.
+
+The short contract is: detect `arm64` vs `x64`, obtain the matching ZIP and
+`.zip.sha256` from the latest official GitHub Release, require the SHA-256 to
+match, extract the **entire** bundle to `%LOCALAPPDATA%\Programs\ChatGPT To Codex`,
+verify the portable manifest and required bundled files, then launch
+`ChatGPT To Codex.exe`. Do not install machine-wide Node/npm/Git for this
+portable path. Stop rather than substituting a source build, Actions artifact,
+architecture mismatch, missing hash, or unverified binary unless the user
+explicitly asks for that different path.
+
+After launch, guide only the human UI steps needed to start MCP, confirm local
+health, enable the web connector, and register the externally reachable HTTPS
+bare `/mcp` endpoint in ChatGPT as `C2CT`. Prefer OAuth and never expose Owner
+Token or OAuth credentials. If ChatGPT offers a custom connector icon, use the
+bundled `assets\chatgpt2codex-plugin-icon.png`; otherwise do not invent that UI.
+Finish by asking for a new ChatGPT conversation to call `@C2CT connection_status`
+and immediately `agent_guide`, and require `finalHealthy=true` with
+`transportErrors=0`.
+
+
 > Help us get this in front of more builders: star the repo if you want
 > ChatGPT to stop talking about code and start safely doing the repo loop.
 
