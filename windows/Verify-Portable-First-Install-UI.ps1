@@ -80,7 +80,16 @@ function Wait-LauncherWindow([System.Diagnostics.Process]$Process, [int]$Seconds
     if ($Process.MainWindowHandle -eq 0) { throw "Portable launcher window did not appear." }
 }
 
-function Wait-Health([int]$Port, [int]$Seconds = 40) {
+function Get-LauncherLogTail([string]$LogDir, [int]$Lines = 80) {
+    if (-not (Test-Path -LiteralPath $LogDir)) { return "<launcher log directory missing>" }
+    $recent = Get-ChildItem -LiteralPath $LogDir -Filter "launcher-*.log" -File |
+        Sort-Object LastWriteTimeUtc -Descending |
+        Select-Object -First 1
+    if (-not $recent) { return "<no launcher log found>" }
+    return ((Get-Content -LiteralPath $recent.FullName -Tail $Lines) -join "`n")
+}
+
+function Wait-Health([int]$Port, [int]$Seconds = 60, [string]$LogDir = "") {
     $url = "http://127.0.0.1:$Port/healthz"
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
     do {
@@ -90,7 +99,8 @@ function Wait-Health([int]$Port, [int]$Seconds = 40) {
         } catch {}
         Start-Sleep -Milliseconds 300
     } while ([DateTime]::UtcNow -lt $deadline)
-    throw "Portable runtime did not become healthy on port $Port."
+    $diagnostic = if ($LogDir) { Get-LauncherLogTail $LogDir } else { "<launcher log unavailable>" }
+    throw "Portable runtime did not become healthy on port $Port after $Seconds second(s).`nLauncher tail:`n$diagnostic"
 }
 
 function Get-ListenerEvidence([int]$Port, [string]$ExpectedNode) {
@@ -166,6 +176,8 @@ $portableNpmSha256 = (Get-FileHash -LiteralPath $portableNpmCli -Algorithm SHA25
 if ([string]$manifest.npmCliSha256 -ne $portableNpmSha256) { throw "Portable manifest npmCliSha256 does not match bundled npm CLI." }
 $port = Get-FreePort
 $tokenPath = Join-Path $stateDir "owner-token.json"
+$logDir = Join-Path $localAppData "ChatGPT To Codex\logs"
+$healthWaitSeconds = if ($expectedArch -eq "arm64") { 90 } else { 60 }
 $safePath = @(
     (Join-Path $env:WINDIR "System32"),
     $env:WINDIR,
@@ -245,14 +257,13 @@ try {
     if (-not $tokenDoc1.tokenHash) { throw "Seeded token state has no tokenHash." }
     if ($tokenDoc1.PSObject.Properties.Name -contains "ownerToken") { throw "Seeded token state persisted plaintext ownerToken." }
     $tokenHash1 = [string]$tokenDoc1.tokenHash
-    $health1 = Wait-Health $port
+    $health1 = Wait-Health $port $healthWaitSeconds $logDir
     $listener1 = Get-ListenerEvidence $port $portableNode
 
     # The cold-boot window is intentionally log-only. Connector/status controls
     # live in the tray/dashboard/settings surfaces and must not be required here.
     $firstUi = [C2ctPortableFirstInstallUi]::DescribeChildren($first.MainWindowHandle)
 
-    $logDir = Join-Path $localAppData "ChatGPT To Codex\logs"
     $firstLog = Get-ChildItem -LiteralPath $logDir -Filter "launcher-*.log" -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
     if (-not $firstLog) { throw "First-run launcher log was not created." }
     $firstLogText = Get-Content -Raw -LiteralPath $firstLog.FullName
@@ -267,7 +278,7 @@ try {
     Wait-LauncherWindow $second
     $secondButtonCount = [C2ctPortableFirstInstallUi]::CountClass($second.MainWindowHandle, "BUTTON")
     if ($secondButtonCount -ne 0) { throw "Restarted portable cold-boot window exposed actionable buttons." }
-    $health2 = Wait-Health $port
+    $health2 = Wait-Health $port $healthWaitSeconds $logDir
     $listener2 = Get-ListenerEvidence $port $portableNode
     $tokenDoc2 = Get-Content -Raw -LiteralPath $tokenPath | ConvertFrom-Json
     if ([string]$tokenDoc2.tokenHash -ne $tokenHash1) { throw "Owner token hash changed across launcher restart." }

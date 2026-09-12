@@ -360,6 +360,7 @@ $doctor = & $nodeExe $cli doctor 2>$null
 if (($doctor -join "`n") -notmatch "owner token configured") {
     throw "Owner token is not configured. Open ChatGPT To Codex settings and generate or set an owner token first."
 }
+Write-Host "chatgpt2codex init: owner token already set (configured state verified)."
 
 $cfProc = $null
 $srvProc = $null
@@ -412,7 +413,11 @@ try {
         $serverArgs += @("--active-project-root", $ActiveProjectRoot, "--active-project-preset", $ActiveProjectPreset)
     }
     $srvProc = Start-LoggedProcess $nodeExe $serverArgs $srvOut $srvErr
-    Wait-HttpOk "http://127.0.0.1:$Port/healthz" 20 "local server"
+    # Native Windows ARM64 startup can be noticeably slower on first launch
+    # (Defender/JIT/native-module warmup), while a healthy server still follows
+    # the exact same readiness contract. Keep the check strict but allow enough
+    # time for slow first boots instead of failing after the old 20-try window.
+    Wait-HttpOk "http://127.0.0.1:$Port/healthz" 45 "local server"
     $localHealth = Invoke-RestMethod -UseBasicParsing -TimeoutSec 3 -Uri "http://127.0.0.1:$Port/healthz"
     $healthInstanceId = [string]$localHealth.healthInstanceId
     if ($healthInstanceId -notmatch '^[a-f0-9]{32}$') {
