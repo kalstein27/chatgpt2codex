@@ -836,6 +836,7 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
         turnlessContinuationAfterApproval: out.turnlessContinuationAfterApproval === true,
         allowFollowUpPrompt: out.allowFollowUpPrompt,
         denyFollowUpPrompt: out.denyFollowUpPrompt,
+        projectScopeAllowed: out.projectScopeAllowed === true,
         token: restored ? null : sec.token,
         status: restored || interaction || "checking",
         message: restored
@@ -1012,13 +1013,13 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
       action: "secret-relay",
       secretValue: "${CHATGPT_WIDGET_SHELL_COMPAT_PREFIX}" + card.cardId + "|" + choiceId
     });
-    var continuationTask = typeof card.prompt === "string" && card.prompt.trim()
-      ? card.prompt.trim()
-      : "직전 작업의 다음 단계를 이어서 진행";
-    var continuationPrompt = card.compact === true && Array.isArray(card.options) && card.options.length === 1
-      ? "C2CT 계속 진행 버튼을 눌렀어. cardId: " + card.cardId + ". 서버 receipt 저장 요청은 이 버튼 클릭과 동시에 먼저 시작됐어. 이어갈 실제 작업: " + continuationTask + ". 이 follow-up 턴의 첫 C2CT 호출은 반드시 chatgpt_widget_shell_result(cardId)여야 해. 첫 조회가 pending/not-found면 작업 mutation을 재호출하지 말고 같은 턴에서 최대 3회 status-only로 재확인해. resolved 되면 확인 문장이나 최종 답변을 먼저 보내지 말고 같은 assistant 턴에서 실제 작업을 즉시 시작해. 실제 작업을 진행하지 못하고 턴을 끝내야 한다면 반드시 새 계속 진행 카드를 생성하고 presenter까지 렌더링한 뒤 종료해. 사용자에게 추가 '고고'를 요구하지 마."
-      : "C2CT Widget Shell 선택 버튼을 눌렀어. cardId: " + card.cardId + ", choiceId: " + choiceId + ". 서버 receipt 저장 요청은 이 버튼 클릭과 동시에 먼저 시작됐어. 이어갈 실제 작업: " + continuationTask + ". 이 follow-up 턴의 첫 C2CT 호출은 반드시 chatgpt_widget_shell_result(cardId)여야 해. 첫 조회가 pending/not-found면 작업 mutation을 재호출하지 말고 같은 턴에서 최대 3회 status-only로 재확인해. resolved 되면 확인 문장이나 최종 답변을 먼저 보내지 말고 같은 assistant 턴에서 실제 작업을 즉시 시작해. 실제 작업을 진행하지 못하고 턴을 끝내야 한다면 반드시 새 계속 진행 카드를 생성하고 presenter까지 렌더링한 뒤 종료해. 사용자에게 추가 '고고'를 요구하지 마.";
-    var followUpPromise = beginFollowUpTurn(card.cardId, continuationPrompt);
+    var selectedOption = (Array.isArray(card.options) ? card.options : []).find(function (option) { return option.id === choiceId; });
+    var compactContinuation = card.compact === true && Array.isArray(card.options) && card.options.length === 1 && choiceId === "continue";
+    var compactContinuationLabel = selectedOption && selectedOption.label === "고고" ? "고고" : "계속 진행";
+    var userFollowUpPrompt = compactContinuation
+      ? compactContinuationLabel
+      : ((selectedOption && selectedOption.label) || "선택 완료");
+    var followUpPromise = beginFollowUpTurn(card.cardId, userFollowUpPrompt);
     var result = null;
     try {
       result = structured(await receiptPromise);
@@ -1208,14 +1209,20 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
       var deny = document.createElement("button");
       deny.textContent = "거절";
       var allow = document.createElement("button");
-      allow.textContent = criticalMode ? "위험을 이해하고 승인" : "허용";
+      allow.textContent = entry.projectScopeAllowed ? "이번만 허용" : (criticalMode ? "위험을 이해하고 승인" : "허용");
       if (criticalMode) allow.className = "critical-allow";
+      var allowProject = entry.projectScopeAllowed ? document.createElement("button") : null;
+      if (allowProject) allowProject.textContent = "이 프로젝트에서 허용";
       var disabled = entry.status !== "pending";
       deny.disabled = disabled;
       allow.disabled = disabled;
+      if (allowProject) allowProject.disabled = disabled;
       deny.addEventListener("click", function () { void decide(entry, "deny"); });
       allow.addEventListener("click", function () { void decide(entry, "allow"); });
-      actions.append(deny, allow);
+      if (allowProject) allowProject.addEventListener("click", function () { void decide(entry, "allow-project"); });
+      if (allowProject) actions.append(deny, allow, allowProject);
+      else actions.append(deny, allow);
+      approval.appendChild(actions);
       approval.appendChild(actions);
     }
     if (entry.message) {
@@ -1365,52 +1372,39 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
     entry.message = "";
     render();
     persistApprovalInteraction(entry.requestId, "working");
-    var followUpPrompt = decision === "allow"
-      ? (entry.allowFollowUpPrompt || "C2CT 인라인 확인에서 허용을 눌렀어. 다음 단계를 진행해줘.")
-      : (entry.denyFollowUpPrompt || "C2CT 인라인 확인에서 거절을 눌렀어. 결과를 반영해줘.");
+    var isAllowDecision = decision === "allow" || decision === "allow-project";
+    var userFollowUpPrompt = decision === "allow-project" ? "이 프로젝트에서 허용 완료" : (decision === "allow" ? "허용 완료" : "거절 완료");
     try {
-      // Keep the existing FIFO tools/call -> ui/message ordering on the original
-      // click stack so transient user activation is preserved. Eligible turnless
-      // approvals start the exact worker inside the decision callback; their
-      // follow-up is status-only and must never replay the mutation.
+      // Keep tools/call -> ui/message on the original click stack so transient
+      // user activation is preserved. User-visible follow-up text stays minimal;
+      // continuation and receipt/status mechanics live in C2CT tool/output contracts.
       var orderedDecision = !!(mcpHostCapabilities && mcpHostCapabilities.serverTools);
       var turnlessApproval = entry.turnlessContinuationAfterApproval === true;
       var decisionPromise = beginDecision(entry, decision);
-      var shouldOpenFollowUp = orderedDecision && (!turnlessApproval || decision === "allow");
+      var shouldOpenFollowUp = orderedDecision;
       var followUpAttempted = shouldOpenFollowUp;
-      var exactRuntimeStatusTarget = entry.projectId && entry.originOperationId
-        ? " projectId=" + entry.projectId + ", operationId=" + entry.originOperationId + "로"
-        : "";
-      var turnlessFollowUpPrompt = entry.operationTool === "macos_app_apply_local"
-        ? "C2CT turnless macOS app 승인 카드에서 허용을 눌렀어. 이 follow-up은 상태 확인용이고 실행 권한이 아니야. macos_app_apply_local은 절대 재호출하지 마. 방금 승인 카드와 연결된 exact macOS app apply request id는 직전 C2CT 결과에서 가져와 macos_app_apply_status로 status-only 확인해. 서버 approval callback이 exact operation을 자동 시작한다. 아직 APPROVAL_REQUIRED면 mutation을 재호출하지 말고 status-only로 다시 확인하고, ACTIVATION_REQUESTED 이후에는 reconnectPlan을 따라 terminal 상태까지 확인해줘."
-        : "C2CT turnless runtime 승인 카드에서 허용을 눌렀어. 이 follow-up은 상태 확인용이고 실행 권한이 아니야. runtime_apply_local은 절대 재호출하지 마. 이 턴에서는 설명/요약/최종 답변을 먼저 하지 말고 첫 C2CT 호출로 runtime_apply_status를" + exactRuntimeStatusTarget + " 즉시 실행해. 서버 approval callback이 exact operation을 자동 시작한다. 아직 APPROVAL_REQUIRED면 같은 exact operation을 mutation 재호출 없이 status-only로 다시 확인하고, ACTIVATION_REQUESTED 이후에는 reconnectPlan을 따라 terminal 상태까지 확인해. APPLIED가 되면 새 runtime에서 connection_status -> agent_guide -> project_rules/project_status -> 새 lane 검증 -> 실제 읽기 도구 1회까지 자동으로 이어가. 사용자에게 추가 '고고'를 요구하지 마.";
       var followUpPromise = shouldOpenFollowUp
-        ? beginFollowUpTurn(
-            entry.requestId,
-            turnlessApproval && decision === "allow"
-              ? turnlessFollowUpPrompt
-              : "C2CT 승인 카드 버튼 입력이 발생했어. 서버에 저장된 승인 상태를 최종 기준으로 확인하고 approved/allowed일 때만 이어서 진행해줘. pending/denied/error면 실행하지 마. " + followUpPrompt
-          )
+        ? beginFollowUpTurn(entry.requestId, userFollowUpPrompt)
         : Promise.resolve(true);
       var decisionResult = structured(await decisionPromise);
-      if (turnlessApproval && decision === "allow" && decisionResult.continuationDeferred === true) {
+      if (turnlessApproval && isAllowDecision && decisionResult.continuationDeferred === true) {
         entry.status = "consumed";
         entry.message = followUpAttempted
           ? "승인 완료 · 기존 작업 종료 대기 중"
           : "승인 완료 · 기존 작업 종료 대기 중 · 자동 후속 대화 미지원 · 채팅에 ‘상태 확인해줘’를 보내세요";
-      } else if (turnlessApproval && decision === "allow" && decisionResult.continuationStarted === true) {
+      } else if (turnlessApproval && isAllowDecision && decisionResult.continuationStarted === true) {
         entry.status = "consumed";
         entry.message = followUpAttempted
           ? "승인 완료 · 작업 시작됨"
           : "승인 완료 · 작업 시작됨 · 자동 후속 대화 미지원 · 채팅에 ‘상태 확인해줘’를 보내세요";
       } else {
-        entry.status = decision === "allow" ? "allowed" : "denied";
+        entry.status = isAllowDecision ? "allowed" : "denied";
         entry.message = "";
       }
       entry.token = null;
       persistWidgetDecision(entry.requestId, entry.status);
       render();
-      if (turnlessApproval && decision === "allow" && decisionResult.fallbackRequiresExactReplay === true) {
+      if (turnlessApproval && isAllowDecision && decisionResult.fallbackRequiresExactReplay === true) {
         if (!followUpAttempted) {
           entry.message = "승인 완료 · 자동 실행 실패 · 자동 후속 대화 미지원 · 채팅에 ‘계속 진행해줘’를 보내세요";
           render();
@@ -1425,7 +1419,7 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
       }
       var followUpFailed = !(await followUpPromise);
       if (followUpFailed) {
-        entry.message = turnlessApproval && decision === "allow"
+        entry.message = turnlessApproval && isAllowDecision
           ? "후속 대화 자동 열기 실패 · 채팅에 ‘상태 확인해줘’를 보내세요"
           : "후속 대화 자동 열기 실패";
         render();

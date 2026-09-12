@@ -31,6 +31,7 @@ export const MCP_CORE_TOOL_NAMES = [
   "chatgpt_catalog_refresh",
   CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL,
   "connection_status",
+  "chatgpt_continuation_resume",
   "connection_audit",
   "session_context_update",
   "project_lane_open",

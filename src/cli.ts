@@ -41,6 +41,7 @@ import {
 import { MobileApprovalBridge } from "./exec/mobile-approval.js";
 import { refreshChatGptHostCatalog } from "./exec/chatgpt-host-catalog-refresh.js";
 import { reapplyCurrentRuntimeAndRefresh } from "./runtime/runtime-reapply-refresh.js";
+import { recoverStalledRuntimeApply } from "./runtime/runtime-apply.js";
 import { loadLocalRuntimeBootstrapPlan } from "./runtime/local-runtime-bootstrap.js";
 import { runLocalRuntimeBootstrap, type LocalRuntimeBootstrapPhase } from "./runtime/local-runtime-bootstrap-runner.js";
 import { runLocalMacosAppBootstrap, type LocalMacosAppBootstrapPhase } from "./runtime/local-macos-app-bootstrap-runner.js";
@@ -681,6 +682,22 @@ async function cmdRuntimeReapplyRefresh(flags: Record<string, string | boolean>)
   if (!result.ok) process.exitCode = 4;
 }
 
+async function cmdRuntimeApplyRecoverStalledLocal(flags: Record<string, string | boolean>): Promise<void> {
+  const projectId = typeof flags["project-id"] === "string" ? flags["project-id"].trim() : "";
+  const operationId = typeof flags["operation-id"] === "string" ? flags["operation-id"].trim() : "";
+  if (!projectId) throw new Error("runtime-apply-recover-stalled-local requires --project-id <projectId>");
+  if (!/^rt_[0-9a-f-]{36}$/.test(operationId)) {
+    throw new Error("runtime-apply-recover-stalled-local requires --operation-id <rt_uuid>");
+  }
+  const result = await recoverStalledRuntimeApply({
+    stateDir: defaultStateDir(),
+    projectId,
+    operationId,
+  });
+  console.log(JSON.stringify(result));
+  if (!result.recovered && result.receipt.state === "ACTIVATION_REQUESTED") process.exitCode = 5;
+}
+
 async function cmdRuntimeBootstrapLocal(flags: Record<string, string | boolean>): Promise<void> {
   const prepareRequestId = typeof flags["prepare-request"] === "string" ? flags["prepare-request"].trim() : "";
   const prepareOperationId = typeof flags["prepare-operation"] === "string" ? flags["prepare-operation"].trim() : "";
@@ -777,6 +794,9 @@ async function main(): Promise<void> {
     case "runtime-reapply-refresh":
       await cmdRuntimeReapplyRefresh(flags);
       break;
+    case "runtime-apply-recover-stalled-local":
+      await cmdRuntimeApplyRecoverStalledLocal(flags);
+      break;
     case "runtime-bootstrap-local":
       await cmdRuntimeBootstrapLocal(flags);
       break;
@@ -794,7 +814,7 @@ async function main(): Promise<void> {
       break;
     default:
       console.error(
-        "usage: chatgpt2codex <serve|init|doctor|connector-assistant|chatgpt-catalog-refresh|runtime-reapply-refresh|runtime-bootstrap-local|macos-app-bootstrap-local|owner-token|control|workspace-root> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
+        "usage: chatgpt2codex <serve|init|doctor|connector-assistant|chatgpt-catalog-refresh|runtime-reapply-refresh|runtime-apply-recover-stalled-local|runtime-bootstrap-local|macos-app-bootstrap-local|owner-token|control|workspace-root> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
       );
       process.exitCode = 1;
   }

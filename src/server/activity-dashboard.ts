@@ -283,6 +283,14 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     .settings-status.error { color: var(--red); }
     .settings-save { appearance: none; min-height: 36px; border: 1px solid color-mix(in srgb, var(--blue) 45%, var(--line)); border-radius: 10px; padding: 7px 14px; background: color-mix(in srgb, var(--blue) 7%, var(--panel)); color: var(--blue); font-size: 12px; font-weight: 750; }
     .settings-save:disabled { opacity: .5; }
+    .command-grant-list { display: grid; gap: 8px; }
+    .command-grant-item { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 10px; align-items: center; border: 1px solid var(--line); border-radius: 10px; padding: 10px 11px; background: var(--panel2); }
+    .command-grant-main { min-width: 0; }
+    .command-grant-command { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+    .command-grant-meta { margin-top: 5px; color: var(--muted); font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
+    .command-grant-revoke { appearance: none; min-height: 34px; border: 1px solid color-mix(in srgb, var(--red) 45%, var(--line)); border-radius: 9px; padding: 6px 11px; background: color-mix(in srgb, var(--red) 5%, var(--panel)); color: var(--red); font-size: 11px; font-weight: 750; }
+    .command-grant-revoke:disabled { opacity: .5; }
+    .command-grant-empty { color: var(--muted); font-size: 11px; line-height: 1.45; }
     .gallery-note { margin-bottom: 14px; border: 1px solid color-mix(in srgb, var(--blue) 24%, var(--line)); border-radius: 12px; padding: 11px 12px; background: color-mix(in srgb, var(--blue) 4%, var(--panel)); color: var(--muted); font-size: 12px; line-height: 1.5; }
     .gallery-note b { color: var(--text); }
     .gallery-section + .gallery-section { margin-top: 16px; }
@@ -620,6 +628,11 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
         <div class="settings-row"><div class="settings-label">허용 앱</div><div class="settings-control"><input id="setting-allowlist" type="text" autocomplete="off" placeholder="Finder, UTM"></div></div>
         <div class="settings-actions"><span id="settings-status" class="settings-status">이 PC의 설정을 불러오는 중…</span><button id="settings-save" class="settings-save" type="button">저장</button></div>
       </section>
+      <section class="settings-card">
+        <h2>프로젝트 명령 승인</h2>
+        <p>“이 프로젝트에서 허용”으로 저장한 exact executable + argv 승인입니다. 회수하면 해당 프로필은 즉시 프로젝트 명령 승격에서 빠집니다.</p>
+        <div id="command-grants" class="command-grant-list"><div class="command-grant-empty">승인 목록을 불러오는 중…</div></div>
+      </section>
     </div>
   </section>
   <section id="gallery-view" class="view-panel" hidden>
@@ -841,6 +854,9 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     document.querySelectorAll(".approval-actions button").forEach(function (button) {
       button.disabled = disabled;
     });
+    document.querySelectorAll(".command-grant-revoke").forEach(function (button) {
+      button.disabled = disabled;
+    });
   }
   function applySettingsForm(value) {
     value = value || {};
@@ -855,8 +871,69 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     setting("setting-port").value = String(value.port || 7979);
     setting("setting-allowlist").value = Array.isArray(value.controlAllowlist) ? value.controlAllowlist.join(", ") : "";
   }
+  function renderCommandGrants(grants) {
+    var container = setting("command-grants");
+    if (!container) return;
+    container.textContent = "";
+    if (!Array.isArray(grants) || grants.length === 0) {
+      container.appendChild(el("div", "command-grant-empty", "저장된 프로젝트 명령 승인이 없습니다."));
+      return;
+    }
+    grants.forEach(function (grant) {
+      var item = el("div", "command-grant-item");
+      var main = el("div", "command-grant-main");
+      var argv = Array.isArray(grant.argv) ? grant.argv.map(function (value) { return JSON.stringify(String(value)); }) : [];
+      var command = [String(grant.resolvedExecutable || "")].concat(argv).filter(Boolean).join(" ");
+      main.appendChild(el("div", "command-grant-command", command || String(grant.commandId || grant.grantId || "승인된 명령")));
+      var metaParts = [String(grant.projectId || "프로젝트 미상"), String(grant.risk || "risk 미상")];
+      if (grant.cwd) metaParts.push("cwd " + String(grant.cwd));
+      if (grant.createdAt) metaParts.push("승인 " + new Date(grant.createdAt).toLocaleString("ko-KR"));
+      main.appendChild(el("div", "command-grant-meta", metaParts.join(" · ")));
+      var button = el("button", "command-grant-revoke", "회수");
+      button.type = "button";
+      button.disabled = !mutableControlsAvailable || restartPending;
+      button.addEventListener("click", function () { revokeCommandGrant(grant, button); });
+      item.appendChild(main);
+      item.appendChild(button);
+      container.appendChild(item);
+    });
+  }
+  async function loadCommandGrants() {
+    try {
+      var response = await fetch("/activity/api/command-grants", { cache: "no-store" });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      var payload = await response.json();
+      renderCommandGrants(payload.grants);
+    } catch (error) {
+      var container = setting("command-grants");
+      if (container) {
+        container.textContent = "";
+        container.appendChild(el("div", "command-grant-empty", "프로젝트 명령 승인 목록을 불러오지 못했습니다."));
+      }
+    }
+  }
+  async function revokeCommandGrant(grant, button) {
+    if (!mutableControlsAvailable || restartPending || !grant || !grant.projectId || !grant.grantId) return;
+    button.disabled = true;
+    button.textContent = "회수 중…";
+    try {
+      var response = await fetch("/activity/api/command-grants/revoke", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ projectId: grant.projectId, grantId: grant.grantId })
+      });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      await loadCommandGrants();
+      settingsStatus("프로젝트 명령 승인을 회수했습니다.", "success");
+    } catch (error) {
+      button.textContent = "회수";
+      button.disabled = !mutableControlsAvailable || restartPending;
+      settingsStatus("프로젝트 명령 승인을 회수하지 못했습니다.", "error");
+    }
+  }
   async function loadSettings() {
     settingsStatus("이 PC의 설정을 불러오는 중…");
+    loadCommandGrants();
     try {
       var response = await fetch("/activity/api/settings", { cache: "no-store" });
       if (!response.ok) throw new Error("HTTP " + response.status);

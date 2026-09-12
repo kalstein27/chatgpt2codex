@@ -80,7 +80,21 @@ import { listImages, retrieveImage, saveImage, writeVersionedImage } from "../as
 import { intakeFromClipboard, intakeFromDownload, intakeFromPath, readClipboardText } from "../assets/image-intake.js";
 import { fetchImageFromUrl } from "../assets/image-url.js";
 import { prepareChatGptImagesApp } from "../assets/chatgpt-images-app.js";
-import { commandCatalogVersion, listCommands, resolveCommandPolicy, runCommand } from "../exec/command-runner.js";
+import { commandCatalogVersion, listCommands, resolveCommandPolicy, runCommand, type CommandLifecycleEvent } from "../exec/command-runner.js";
+import {
+  approvedGrantAsListedCommand,
+  commandRequestApprovalDetails,
+  hasCommandRequestContinuation,
+  listApprovedCommandGrants,
+  persistApprovedCommandGrant,
+  registerCommandRequestContinuation,
+  resolveApprovedCommandGrant,
+  riskDisplayName,
+  runCommandRequestContinuation,
+  runRequestedCommand,
+  validateCommandRequest,
+  type ValidatedCommandRequest,
+} from "../exec/command-request.js";
 import {
   applyVerifiedLocalFileOperation,
   resolveVerifiedLocalFileOperation,
@@ -104,6 +118,7 @@ import { chatGptWidgetApprovalMode } from "../exec/chatgpt-widget-approval.js";
 import { validateChatGptWidgetApprovalToken } from "../exec/chatgpt-widget-approval.js";
 import { RUNTIME_APPLY_PROVIDER_ORDER, approvalBrokerPlan, ensureBrokeredOperationAuthorized } from "../exec/approval-broker.js";
 import { authorizeDedicatedConsequentialAction } from "../exec/consequential-action-authorization.js";
+import { authorizeConsequentialGptAction } from "../exec/consequential-action-authorization.js";
 import {
   consumeChatGptWidgetApprovalToken,
   mintChatGptWidgetApprovalToken,
@@ -158,6 +173,13 @@ import {
   getCurrentChatGptWidgetChoiceCard,
   resolveChatGptWidgetChoice,
 } from "../exec/chatgpt-widget-shell.js";
+import {
+  getChatGptContinuation,
+  rememberChatGptApprovalContinuation,
+  rememberChatGptShellContinuation,
+  resolveChatGptApprovalContinuation,
+  resolveChatGptShellContinuation,
+} from "../exec/chatgpt-continuation.js";
 import { disableMobileApproval, enableMobileApproval, mobileApprovalStatus } from "../exec/mobile-approval.js";
 import { installManagedRipgrep } from "../exec/managed-rg-installer.js";
 import { refreshChatGptHostCatalog } from "../exec/chatgpt-host-catalog-refresh.js";
@@ -226,6 +248,7 @@ import {
   runtimeApplyPublicReceipt,
   startAuthorizedRuntimeApplyWorker,
 } from "../runtime/runtime-apply.js";
+import { recoverStalledRuntimeApply, runtimeApplyWorkerStatus } from "../runtime/runtime-apply.js";
 import { reconcileRuntimeApplyApprovalReceipts } from "../runtime/runtime-apply.js";
 import { attachRuntimeApplyApprovalRequest } from "../runtime/runtime-apply.js";
 import {
@@ -1014,6 +1037,7 @@ async function runtimeApplyGateSnapshot(
 
 function runtimeApprovalSupportsTurnlessContinuation(request: OperationApprovalRequest): boolean {
   return hasChatGptTurnlessContinuation({ requestId: request.requestId, tool: request.tool })
+    || hasCommandRequestContinuation({ requestId: request.requestId, tool: request.tool })
     || (request.approvalSurface === "chatgpt-widget-critical"
       && request.leasePreset === "full-write"
       && typeof request.originOperationId === "string"
@@ -2098,7 +2122,9 @@ async function chatGptOperationApprovalPending(
     extra?: Record<string, unknown>;
   },
 ) {
-  const approvalMode = chatGptWidgetApprovalMode(input.tool);
+  const approvalRequest = (await listOperationApprovalRequests(ctx.stateDir))
+    .find((candidate) => candidate.requestId === input.requestId);
+  const approvalMode = chatGptWidgetApprovalMode(input.tool, approvalRequest?.risk);
   if (!approvalMode) {
     throw new DomainError(ErrorCode.PERMISSION_DENIED, `${input.tool} is not eligible for ChatGPT widget approval`, {
       requestId: input.requestId,
@@ -2108,8 +2134,6 @@ async function chatGptOperationApprovalPending(
   const expectedApprovalSurface = approvalMode === "critical"
     ? "chatgpt-widget-critical"
     : "chatgpt-widget";
-  const approvalRequest = (await listOperationApprovalRequests(ctx.stateDir))
-    .find((candidate) => candidate.requestId === input.requestId);
   if (!approvalRequest ||
       approvalRequest.tool !== input.tool ||
       approvalRequest.status !== "pending" ||
@@ -2131,6 +2155,18 @@ async function chatGptOperationApprovalPending(
     stateDir: ctx.stateDir,
     requestId: input.requestId,
     sessionScope: ctx.sessionScope,
+  });
+  rememberChatGptApprovalContinuation({
+    sessionScope: ctx.sessionScope,
+    requestId: input.requestId,
+    operationTool: input.tool,
+    objective: approvalRequest.summary ?? approvalRequest.preview,
+    allowInstruction: input.allowFollowUpPrompt,
+    denyInstruction: input.denyFollowUpPrompt,
+    createdAt: approvalRequest.createdAt,
+    expiresAt: approvalRequest.expiresAt,
+    projectId: approvalRequest.projectId,
+    originOperationId: approvalRequest.originOperationId,
   });
   rememberChatGptPendingOperation(ctx, input);
   if (ctx.sessionScope) {
@@ -2169,14 +2205,24 @@ async function chatGptOperationApprovalPending(
   return pending;
 }
 
-function defaultChatGptApprovalPrompts(tool: string): {
+export function defaultChatGptApprovalPrompts(tool: string): {
   allowFollowUpPrompt: string;
   denyFollowUpPrompt: string;
 } {
+  if (tool === "command_request") {
+    return {
+      allowFollowUpPrompt: "C2CT command_request 승인을 허용했어. command_request를 재호출하지 말고 승인에 묶인 exact operation의 operation_status를 approvalRequestId로 확인해서 이어가줘.",
+      denyFollowUpPrompt: "C2CT command_request 승인을 거절했어. 이 exact operation은 실행하지 말고 종료해줘.",
+    };
+  }
   return {
     allowFollowUpPrompt: `C2CT ${tool} 승인을 허용했어. 방금과 정확히 같은 입력으로 ${tool}을 다시 호출해서 승인된 1회 작업을 이어서 실행해줘.`,
     denyFollowUpPrompt: `C2CT ${tool} 승인을 거절했어. 이 작업은 실행하지 말고 거절 상태로 종료해줘.`,
   };
+}
+
+export function isTurnlessBackgroundApprovalTool(tool: string): boolean {
+  return tool === "command_run" || tool === "e2e_run_command" || tool === "command_request";
 }
 
 async function persistedChatGptPendingOperation(
@@ -2200,14 +2246,14 @@ async function persistedChatGptPendingOperation(
     .filter((candidate) => !requestId || candidate.requestId === requestId)
     .filter((candidate) => operationApprovalBelongsToChatGptSession(candidate, ctx.sessionScope!))
     .filter((candidate) => {
-      const mode = chatGptWidgetApprovalMode(candidate.tool);
+      const mode = chatGptWidgetApprovalMode(candidate.tool, candidate.risk);
       if (!mode) return false;
       const expectedSurface = mode === "critical" ? "chatgpt-widget-critical" : "chatgpt-widget";
       return candidate.approvalSurface === expectedSurface;
     })
     .sort((left, right) => right.createdAt - left.createdAt)[0];
   if (!approvalRequest) return undefined;
-  const approvalMode = chatGptWidgetApprovalMode(approvalRequest.tool);
+  const approvalMode = chatGptWidgetApprovalMode(approvalRequest.tool, approvalRequest.risk);
   if (!approvalMode) return undefined;
   return {
     approvalRequest,
@@ -3550,6 +3596,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           summary: approvalRequest.summary ?? approvalRequest.preview,
           impact: approvalRequest.impact,
           details: approvalRequest.details,
+          projectScopeAllowed: approvalRequest.projectScopeAllowed === true,
+          operationRisk: approvalRequest.risk,
           createdAt: approvalRequest.createdAt,
           expiresAt: approvalRequest.expiresAt,
           serverNow: Date.now(),
@@ -3703,6 +3751,14 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           cardId: shellChoice.cardId,
           choiceId: shellChoice.choiceId,
         });
+        resolveChatGptShellContinuation({
+          sessionScope: ctx.sessionScope,
+          cardId: result.cardId,
+          receiptId: result.receiptId,
+          choiceId: result.choiceId,
+          choiceLabel: result.choiceLabel,
+          resolvedAt: result.resolvedAt,
+        });
         return makeResult<Record<string, unknown>>(
           {
             ok: true,
@@ -3741,6 +3797,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         kind: z.literal("choice").default("choice"),
         title: z.string().min(1).max(80),
         prompt: z.string().min(1).max(240),
+        continuationObjective: z.string().min(1).max(2_000).optional(),
         compact: z.boolean().default(false),
         unlockAfterMs: z.number().int().min(0).max(30 * 60_000 - 1_000).optional(),
         options: z.array(z.object({
@@ -3759,6 +3816,13 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         options: input.options,
         compact: input.compact,
         unlockAfterMs: input.unlockAfterMs,
+      });
+      rememberChatGptShellContinuation({
+        sessionScope: ctx.sessionScope,
+        cardId: card.cardId,
+        objective: input.continuationObjective ?? input.prompt,
+        createdAt: card.createdAt,
+        expiresAt: card.expiresAt,
       });
       rememberChatGptShellPresenter(ctx, card);
       const result = makeResult<Record<string, unknown>>(
@@ -3802,6 +3866,14 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         cardId: input.cardId,
         choiceId: input.choiceId,
       });
+      resolveChatGptShellContinuation({
+        sessionScope: ctx.sessionScope,
+        cardId: result.cardId,
+        receiptId: result.receiptId,
+        choiceId: result.choiceId,
+        choiceLabel: result.choiceLabel,
+        resolvedAt: result.resolvedAt,
+      });
       return makeResult<Record<string, unknown>>(
         {
           ok: true,
@@ -3837,6 +3909,55 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     }),
   );
 
+  registerTool(
+    "chatgpt_continuation_resume",
+    {
+      title: "Restore C2CT internal continuation",
+      description: "Read the current session-bound internal continuation after a C2CT card generated a short user message such as ‘계속 진행’, ‘고고’, ‘허용 완료’, or ‘거절 완료’. Call this before acting on that short message. If status is pending, perform no mutation and re-read this tool status-only within its bounded retry policy. If state is missing, ambiguous, or expired, stop safely instead of guessing the prior task.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: chatGptToolMeta("Restoring C2CT continuation...", "C2CT continuation restored"),
+      inputSchema: {},
+    },
+    async () => withErrorMapping(ctx, "chatgpt_continuation_resume", {}, async () => {
+      if (!ctx.sessionScope) {
+        throw new DomainError(ErrorCode.PERMISSION_DENIED, "Continuation restore requires a ChatGPT session scope");
+      }
+      const continuation = getChatGptContinuation({ sessionScope: ctx.sessionScope });
+      if (!continuation) {
+        return makeResult<Record<string, unknown>>(
+          {
+            ok: false,
+            status: "missing",
+            safeAction: "stop",
+            sideEffects: "none",
+          },
+          "No unambiguous C2CT continuation state exists for this ChatGPT session. Stop safely and do not infer or replay a prior mutation.",
+        );
+      }
+      const text = continuation.status === "pending"
+        ? "Internal continuation is still pending. Do not run or replay any mutation; use this same read-only continuation status within the bounded retry policy."
+        : continuation.status === "denied"
+          ? "Internal continuation restored as denied. Follow the stored stop instruction and do not execute the protected operation."
+          : continuation.recovery.mode === "status-only"
+            ? "Internal continuation restored. Follow the stored status-only recovery instruction now; do not replay the protected mutation."
+            : "Internal continuation restored. Resume the stored objective immediately in this assistant turn instead of replying with an acknowledgement only.";
+      return makeResult<Record<string, unknown>>(
+        {
+          ok: true,
+          ...continuation,
+          safeAction: continuation.status === "denied"
+            ? "stop"
+            : continuation.status === "pending" || continuation.recovery.mode === "status-only"
+              ? "status-only"
+              : "resume",
+          sideEffects: "none",
+        },
+        text,
+      );
+    }),
+  );
+
+
 
   registerTool(
     "chatgpt_catalog_refresh",
@@ -3871,9 +3992,18 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         recommendedAction: result.recommendedAction,
       });
       return makeResult<Record<string, unknown>>(
-        result,
+        {
+          ...result,
+          ...(result.ok
+            ? {
+                turnContinuationRequired: true,
+                assistantMayFinalize: false,
+                turnContinuationAction: "requery-current-chat-direct-named-mount-then-continue-goal",
+              }
+            : {}),
+        },
         result.ok
-          ? "ChatGPT C2CT catalog refresh requested. Re-query the direct named tool in this chat before treating host catalog rebind as verified."
+          ? "ChatGPT C2CT catalog refresh requested. Keep this assistant turn active: re-query the direct named tool in this chat, then continue the already-known goal or render a continuation card before finalizing."
           : `ChatGPT C2CT catalog refresh not completed: ${result.status}.`,
         !result.ok,
       );
@@ -4102,7 +4232,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       inputSchema: {
         requestId: z.string().regex(/^op_[0-9a-fA-F-]{36}$/),
         token: z.string().min(20).max(200),
-        decision: z.enum(["allow", "deny", "status"]),
+        decision: z.enum(["allow", "allow-project", "deny", "status"]),
         paintTelemetry: z.object({
           version: z.literal(1),
           timeOriginMs: z.number().finite().min(0).max(1_000_000_000_000_000).optional(),
@@ -4130,7 +4260,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       if (!request) {
         throw new DomainError(ErrorCode.OPERATION_NOT_FOUND, "C2CT operation approval request not found", { requestId: input.requestId });
       }
-      const approvalMode = chatGptWidgetApprovalMode(request.tool);
+      const approvalMode = chatGptWidgetApprovalMode(request.tool, request.risk);
       if (!approvalMode) {
         throw new DomainError(ErrorCode.PERMISSION_DENIED, "ChatGPT operation approval widget cannot authorize this tool", {
           requestId: input.requestId,
@@ -4154,6 +4284,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           `C2CT operation approval is ${request.status}.`,
         );
       }
+      const approvalScope = input.decision === "allow-project" ? "project" : "once";
+      if (input.decision === "allow-project") input.decision = "allow";
       consumeChatGptWidgetApprovalToken({
         requestId: input.requestId,
         token: input.token,
@@ -4163,6 +4295,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         stateDir: ctx.stateDir,
         requestId: input.requestId,
         decision: input.decision === "allow" ? "approve" : "reject",
+        approvalScope,
         approvedVia: approvalMode === "critical" ? "chatgpt-widget-critical" : "chatgpt-widget",
       });
       const exactCriticalSerialLeaseDecision =
@@ -4190,9 +4323,24 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           operationId: resolved.originOperationId,
         }).catch(() => undefined);
       }
+      const commandRequestContinuation = input.decision === "allow" && resolved.tool === "command_request" && ctx.sessionScope
+        ? await runCommandRequestContinuation({ requestId: resolved.requestId, sessionScope: ctx.sessionScope })
+        : undefined;
       const continuation = input.decision === "allow" && runtimeApprovalSupportsTurnlessContinuation(resolved)
         ? await continueApprovedRuntimeApplyFromWidget(ctx, resolved)
         : null;
+      const effectiveContinuation: Record<string, unknown> | null | undefined = commandRequestContinuation
+        ? { ...commandRequestContinuation }
+        : continuation;
+      if (ctx.sessionScope) {
+        resolveChatGptApprovalContinuation({
+          sessionScope: ctx.sessionScope,
+          requestId: resolved.requestId,
+          decision: input.decision === "allow" ? "allow" : "deny",
+          resolvedAt: Date.now(),
+          continuation: effectiveContinuation,
+        });
+      }
       forgetChatGptPendingOperation(ctx, input.requestId);
       if (ctx.sessionScope) chatGptSharedApprovalPresenterRequests.delete(ctx.sessionScope);
       return makeResult<Record<string, unknown>>(
@@ -4201,10 +4349,11 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           status: resolved.status,
           tool: resolved.tool,
           approvedVia: resolved.approvedVia ?? null,
-          ...(continuation ?? {}),
-          sideEffects: continuation?.sideEffects ?? "approval-state-only",
+          approvalScope: resolved.approvalScope ?? null,
+          ...(effectiveContinuation ?? {}),
+          sideEffects: effectiveContinuation?.sideEffects ?? "approval-state-only",
         },
-        continuation?.continuationStarted === true
+        effectiveContinuation?.continuationStarted === true
           ? `C2CT operation approval consumed and exact ${resolved.tool} continuation started without a new ChatGPT turn.`
           : `C2CT operation approval ${resolved.status}.`,
       );
@@ -4829,6 +4978,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           receipt.approvalRequestId,
         );
         const runtimeBarrier = await getRuntimeUpdateBarrier(ctx.stateDir);
+        const workerStatus = runtimeApplyWorkerStatus(receipt);
+        const activationWorkerStalled = workerStatus.activationStalled;
         const criticalTurnlessApproved = receipt.state === "APPROVAL_REQUIRED"
           && approvalRequest?.status === "approved"
           && approvalRequest.approvedVia === "chatgpt-widget-critical";
@@ -4841,11 +4992,23 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           && approvalRequest.approvedVia === "menu-bar-ui";
         const publicReceipt = runtimeApplyPublicReceipt(receipt);
         const approvalPlan = approvalBrokerPlan(RUNTIME_APPLY_PROVIDER_ORDER);
-        const approvalProvider = approvalRequest?.approvalSurface === "chatgpt-widget-critical"
+        const criticalWidgetRoute = approvalRequest?.approvalSurface === "chatgpt-widget-critical";
+        const effectiveApprovalPlan = criticalWidgetRoute
+          ? {
+              ...approvalPlan,
+              providerOrder: ["chatgpt-widget-critical"],
+              selectedProvider: "chatgpt-widget-critical",
+              selectedTrustedVia: "chatgpt-widget-critical",
+              approvalFallbackActive: false,
+            }
+          : approvalPlan;
+        const approvalProvider = criticalWidgetRoute
           ? "chatgpt-widget-critical"
-          : approvalPlan.selectedProvider;
-        const continuationRecommendation = turnlessContinuationDeferred
-          ? { recommendedAction: "wait-then-poll-runtime-apply-status", pollAfterMs: 1_000 }
+          : effectiveApprovalPlan.selectedProvider;
+        const continuationRecommendation = activationWorkerStalled
+          ? { recommendedAction: "recover-stalled-runtime-apply-after-verifying-live-runtime" }
+          : turnlessContinuationDeferred
+            ? { recommendedAction: "wait-then-poll-runtime-apply-status", pollAfterMs: 1_000 }
           : turnlessContinuationStalled
             ? { recommendedAction: "start-new-runtime-apply-request-after-turnless-continuation-stall" }
             : approvalReadyToResume
@@ -4854,17 +5017,20 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         return makeResult(
           {
             ...publicReceipt,
-            ...approvalPlan,
+            ...effectiveApprovalPlan,
             approvalProvider,
             approvalStatus: approvalRequest?.status ?? (receipt.approvalRequestId ? "missing" : "not-requested"),
             approvalApprovedVia: approvalRequest?.approvedVia ?? null,
             approvalReadyToResume,
             turnlessContinuationDeferred,
             turnlessContinuationStalled,
+            activationWorkerStalled,
             ...continuationRecommendation,
           },
-          turnlessContinuationDeferred
-            ? `Runtime apply ${receipt.operationId}: approved turnless continuation is draining active operations; poll status only.`
+          activationWorkerStalled
+            ? `Runtime apply ${receipt.operationId}: activation worker is no longer alive; verify the live runtime before terminalizing the stale receipt.`
+            : turnlessContinuationDeferred
+              ? `Runtime apply ${receipt.operationId}: approved turnless continuation is draining active operations; poll status only.`
             : turnlessContinuationStalled
               ? `Runtime apply ${receipt.operationId}: approved turnless continuation did not start; do not replay runtime_apply_local. Start a new request after the blocker is clear.`
               : approvalReadyToResume
@@ -4874,6 +5040,46 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       });
     },
   );
+
+  registerTool(
+    "runtime_apply_recover_stalled",
+    {
+      title: "Recover stalled runtime apply receipt",
+      description:
+        "Fail-closed recovery for an ACTIVATION_REQUESTED runtime apply whose worker is stale. It terminalizes only the persisted apply receipt, and only after proving the live runtime fingerprint/root, active-runtime pointer, and supervisor are still the exact pre-apply values. It never switches the runtime pointer, restarts processes, or changes connector/tunnel state.",
+      annotations: LOCAL_STATE_ANNOTATIONS,
+      _meta: chatGptToolMeta("Verifying stalled runtime apply...", "Stalled runtime apply checked"),
+      inputSchema: {
+        projectId: z.string().min(1).max(120),
+        operationId: z.string().regex(/^rt_[0-9a-f-]{36}$/u),
+      },
+    },
+    async (input) => {
+      return withErrorMapping(ctx, "runtime_apply_recover_stalled", input, async () => {
+        await requireProjectLease(ctx, input.projectId, "write", undefined, { allowRemoteSerial: true });
+        const recovered = await recoverStalledRuntimeApply({
+          stateDir: ctx.stateDir,
+          projectId: input.projectId,
+          operationId: input.operationId,
+        });
+        if (recovered.recovered) {
+          await releaseRuntimeUpdateBarrier(ctx.stateDir, input.operationId).catch(() => false);
+        }
+        return makeResult(
+          {
+            ...runtimeApplyPublicReceipt(recovered.receipt),
+            recovered: recovered.recovered,
+            recoveryReason: recovered.reason,
+            sideEffects: recovered.recovered ? "runtime-receipt-terminalized-only" : "none",
+          },
+          recovered.recovered
+            ? `Runtime apply ${input.operationId}: stale activation terminalized after proving the previous runtime is still intact.`
+            : `Runtime apply ${input.operationId}: recovery refused (${recovered.reason}).`,
+        );
+      });
+    },
+  );
+
 
   registerTool(
     "runtime_apply_local",
@@ -5006,10 +5212,10 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         };
         let authorization: {
           requestId: string;
-          scope: "once";
+          scope: "once" | "project";
           operationFingerprint: string;
           approvalProvider: string;
-        } | null = authorizeDedicatedConsequentialAction({
+        } | null = authorizeConsequentialGptAction({
           ctx,
           lease,
           tool: "runtime_apply_local",
@@ -5692,6 +5898,9 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           refreshNotificationsAttempted: refreshNotifications.attempted,
           refreshNotificationsSent: refreshNotifications.sent,
         };
+        const schemaRecoveryFollowUpRequired =
+          schemaRecovery.reason === "runtime-schema-changed-awaiting-tools-list" ||
+          schemaRecovery.reason === "post-apply-tools-list-observed";
         const publicRuntimeUpdateBarrier = runtimeUpdateBarrier
           ? {
               ...runtimeUpdateBarrier,
@@ -5750,6 +5959,12 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               },
               postRuntimeBootstrap,
               schemaRecovery,
+              schemaRecoveryFollowUpRequired,
+              turnContinuationRequired: schemaRecoveryFollowUpRequired,
+              assistantMayFinalize: !schemaRecoveryFollowUpRequired,
+              turnContinuationAction: schemaRecoveryFollowUpRequired
+                ? "refresh-host-catalog-and-requery-direct-named-mount"
+                : "continue-goal-or-finalize",
               finalHealthy: true,
               sessionStateAvailable: sessionAvailable,
               activeProjectId: session.activeProjectId,
@@ -5868,6 +6083,12 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             runtimeSnapshotId: runtimeManifest.runtimeSnapshotId,
             toolSchemaRevision: runtimeManifest.toolSchemaRevision,
             schemaRecovery,
+            schemaRecoveryFollowUpRequired,
+            turnContinuationRequired: schemaRecoveryFollowUpRequired,
+            assistantMayFinalize: !schemaRecoveryFollowUpRequired,
+            turnContinuationAction: schemaRecoveryFollowUpRequired
+              ? "refresh-host-catalog-and-requery-direct-named-mount"
+              : "continue-goal-or-finalize",
             nodeVersion: runtimeManifest.nodeVersion,
             runtimeIdentityComplete: runtimeIdentityWarnings.length === 0,
             runtimeIdentityWarnings,
@@ -8816,7 +9037,16 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           await requireProjectLease(ctx, input.projectId, "read", input.workLaneId);
         }
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
-        const allCommands = await listCommands(entry.root);
+        const manifestCommands = await listCommands(entry.root);
+        const approvedGrants = await listApprovedCommandGrants({
+          stateDir: ctx.stateDir,
+          projectId: entry.projectId,
+          projectRoot: entry.root,
+        });
+        const allCommands = [
+          ...manifestCommands,
+          ...approvedGrants.map((grant) => approvedGrantAsListedCommand(grant)),
+        ];
         const version = commandCatalogVersion(allCommands);
         const normalizedQuery = input.query?.toLowerCase();
         const requestedIds = input.commandIds ? new Set(input.commandIds) : undefined;
@@ -9007,6 +9237,340 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
   );
 
   registerTool(
+    "command_request",
+    {
+      title: "Request exact external command",
+      description:
+        "Request one exact external executable + argv profile when command_list has no suitable allowlisted command. This is not arbitrary shell: shell wrappers, inline-code dispatch, pipe/redirection chains, caller-supplied shell scripts, and generic dispatch wrappers are rejected. C2CT resolves the executable canonically, reclassifies risk independently of declared intent, binds approval to the exact project/executable/argv/cwd/policy fingerprint, and remote ChatGPT execution resumes the captured operation after the approval card instead of reconstructing argv. 'This project' approval promotes only the exact argv profile into command_list/command_run.",
+      annotations: COMMAND_RUN_ANNOTATIONS,
+      _meta: chatGptToolMeta("Validating exact command request...", "Command request processed"),
+      inputSchema: {
+        projectId: z.string(),
+        workLaneId: WORK_LANE_ID_SCHEMA.optional(),
+        executable: z.string().min(1).max(4096),
+        args: z.array(z.string().max(4096)).max(64).optional(),
+        cwd: z.string().max(4096).optional(),
+        purpose: z.string().min(1).max(400),
+        timeoutSec: z.number().int().min(1).max(300).optional(),
+        intent: z.object({
+          writesWorkspace: z.boolean().optional(),
+          writesExternalLocalPath: z.boolean().optional(),
+          needsNetwork: z.boolean().optional(),
+          launchesPersistentProcess: z.boolean().optional(),
+          destructive: z.boolean().optional(),
+        }).optional(),
+      },
+    },
+    async (input, extra) => {
+      return withErrorMapping<Record<string, unknown>>(ctx, "command_request", input, async (progress, operationId) => {
+        const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const readLease = await requireProjectLease(ctx, entry.projectId, "read", input.workLaneId);
+        await progress?.update("preparing", "Resolving executable and reclassifying exact argv request");
+        const validated = await validateCommandRequest({
+          projectId: entry.projectId,
+          projectRoot: entry.root,
+          executable: input.executable,
+          argv: input.args,
+          cwd: input.cwd,
+          purpose: input.purpose,
+          intent: input.intent,
+        });
+        const capability = validated.risk === "read-only" ? "read" : "remote";
+        const lease = capability === "read"
+          ? readLease
+          : await requireProjectLease(ctx, entry.projectId, capability, input.workLaneId);
+        const commandId = `requested:${validated.requestFingerprint.slice(0, 24)}`;
+        const approvalSurface = ctx.remote === true
+          ? (validated.risk === "destructive-privileged" ? "chatgpt-widget-critical" : "chatgpt-widget")
+          : "local";
+        const approvalInput = {
+          stateDir: ctx.stateDir,
+          lease,
+          tool: "command_request",
+          risk: validated.risk as OperationRisk,
+          approvalSurface: approvalSurface as OperationApprovalSurface,
+          operation: {
+            policyVersion: validated.policyVersion,
+            requestFingerprint: validated.requestFingerprint,
+            resolvedExecutable: validated.resolvedExecutable,
+            argv: validated.argv,
+            cwd: validated.cwd,
+            risk: validated.risk,
+            effects: validated.effects,
+          },
+          preview: [validated.resolvedExecutable, ...validated.argv].join(" "),
+          summary: `도구 사용 요청 · ${validated.resolvedExecutable}`,
+          impact: `${riskDisplayName(validated.risk)} · exact executable + argv만 승인`,
+          details: commandRequestApprovalDetails(validated),
+          projectScopeAllowed: validated.risk !== "destructive-privileged",
+          ...(operationId ? { originOperationId: operationId } : {}),
+        };
+
+        const backgroundExecute = (approvalRequestId?: string): BackgroundExecute =>
+          async (backgroundOperationId, signal, update, _registerTimeoutControl) => {
+            await ctx.ledger.append({
+              type: "process.started",
+              projectId: entry.projectId,
+              commandId,
+              executionMode: "background",
+            });
+            const result = await runRequestedCommand(
+              validated,
+              input.timeoutSec,
+              (event) => {
+                void update({
+                  state: event.phase === "running" ? "running" : event.phase === "cleanup" ? "cleanup" : undefined,
+                  phase: event.phase === "completed" ? "serialize" : event.phase,
+                  subprocessStarted: event.subprocessStarted,
+                  subprocessStillRunning: event.subprocessStillRunning,
+                  cleanupStarted: event.cleanupStarted,
+                  cleanupCompleted: event.cleanupCompleted,
+                });
+                void ctx.diagnostics?.record({
+                  event: "command.lifecycle",
+                  outcome: "info",
+                  tool: "command_request",
+                  operationId: backgroundOperationId,
+                  phase: event.phase,
+                  actionStarted: true,
+                  subprocessStarted: event.subprocessStarted,
+                  subprocessStillRunning: event.subprocessStillRunning,
+                  cleanupStarted: event.cleanupStarted,
+                  cleanupCompleted: event.cleanupCompleted,
+                  ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
+                  ...(event.commandStatus ? { commandStatus: event.commandStatus } : {}),
+                  ...(event.cleanupStatus ? { cleanupStatus: event.cleanupStatus } : {}),
+                  safeInputs: {
+                    projectId: entry.projectId,
+                    commandId,
+                    writesWorkspace: validated.effects.writesWorkspace,
+                    needsNetwork: validated.effects.needsNetwork,
+                    destructive: validated.effects.destructive,
+                  },
+                }).catch(() => undefined);
+              },
+              { signal, captureOutput: true },
+            );
+            let outputArtifact: Awaited<ReturnType<typeof createOutputArtifact>> | undefined;
+            let artifactError: string | undefined;
+            if (result.capturedOutput) {
+              try {
+                outputArtifact = await createOutputArtifact({
+                  stateDir: ctx.stateDir,
+                  projectId: entry.projectId,
+                  ...(approvalRequestId
+                    ? { approvalRequestId, ownerScope: backgroundOwnerScope(ctx) }
+                    : input.workLaneId
+                      ? { laneDigest: projectLaneDigest(input.workLaneId) }
+                      : {}),
+                  tool: "command_request",
+                  stdout: result.capturedOutput.stdout,
+                  stderr: result.capturedOutput.stderr,
+                  sourceTruncated: result.outputTruncated,
+                  artifactTruncated: result.capturedOutput.artifactTruncated,
+                  stdoutBytes: result.capturedOutput.stdoutBytes,
+                  stderrBytes: result.capturedOutput.stderrBytes,
+                });
+              } catch (error) {
+                artifactError = toArtifactError(error, ctx.remote === true);
+              }
+            }
+            const artifactStatus = artifactError
+              ? "FAILED" as const
+              : outputArtifact?.artifactTruncated
+                ? "TRUNCATED" as const
+                : outputArtifact
+                  ? "CREATED" as const
+                  : "FAILED" as const;
+            await ctx.ledger.append({
+              type: "process.output.redacted",
+              projectId: entry.projectId,
+              commandId,
+              commandStatus: result.commandStatus,
+              exitCode: result.exitCode,
+              cleanupStatus: result.cleanupStatus,
+              artifactStatus,
+              executionMode: "background",
+            });
+            return {
+              state: backgroundTerminalState(result.commandStatus),
+              commandStatus: result.commandStatus,
+              exitCode: result.exitCode,
+              terminationSignal: result.terminationSignal,
+              cleanupStatus: result.cleanupStatus,
+              artifactStatus,
+              domainStatus: null,
+              domainStatusSource: "not-provided" as const,
+              durationMs: result.durationMs,
+              resolvedExecutable: validated.resolvedExecutable,
+              argv: validated.argv,
+              cwd: validated.cwd,
+              risk: validated.risk,
+              requestFingerprint: validated.requestFingerprint,
+              ...(outputArtifact ? {
+                outputRef: outputArtifact.outputRef,
+                resourceUri: outputArtifact.resourceUri,
+                outputBytes: outputArtifact.stdoutBytes + outputArtifact.stderrBytes,
+                artifactTruncated: outputArtifact.artifactTruncated,
+              } : {}),
+              ...(artifactError ? { errorCode: "OUTPUT_ARTIFACT_FAILED" } : {}),
+            };
+          };
+
+        await progress?.update("approval", `Request classified as ${riskDisplayName(validated.risk)}; requesting exact-operation approval`);
+        let authorization: Awaited<ReturnType<typeof ensureOperationAuthorized>>;
+        try {
+          authorization = await ensureOperationAuthorized(approvalInput);
+        } catch (error) {
+          const requestId = error instanceof DomainError &&
+            error.code === ErrorCode.APPROVAL_REQUIRED &&
+            typeof error.details?.requestId === "string"
+            ? error.details.requestId
+            : undefined;
+          if (!requestId) throw error;
+          if (ctx.remote === true) {
+            const sessionScope = ctx.sessionScope;
+            const expiresAt = error instanceof DomainError && typeof error.details?.expiresAt === "number"
+              ? error.details.expiresAt
+              : undefined;
+            if (sessionScope && expiresAt) {
+              registerCommandRequestContinuation({
+                requestId,
+                sessionScope,
+                expiresAt,
+                run: async () => {
+                  const resumed = await ensureOperationAuthorized({
+                    ...approvalInput,
+                    resumeRequestId: requestId,
+                    resumeSessionScope: sessionScope,
+                    requiredApprovalVia: approvalSurface === "chatgpt-widget-critical"
+                      ? "chatgpt-widget-critical"
+                      : "chatgpt-widget",
+                  });
+                  const liveLease = await requireProjectLease(ctx, entry.projectId, capability, input.workLaneId);
+                  if (liveLease.leaseId !== lease.leaseId) {
+                    throw new DomainError(ErrorCode.LEASE_EXPIRED, "Command request approval lease changed before spawn", {
+                      requestId,
+                      actionStarted: false,
+                      subprocessStarted: false,
+                    });
+                  }
+                  let projectGrantCommandId: string | undefined;
+                  if (resumed.scope === "project") {
+                    const grant = await persistApprovedCommandGrant({
+                      stateDir: ctx.stateDir,
+                      projectId: entry.projectId,
+                      projectRoot: entry.root,
+                      request: validated,
+                      approvalRequestId: requestId,
+                    });
+                    projectGrantCommandId = grant.commandId;
+                  }
+                  await assertRuntimeUpdateNotDraining(ctx.stateDir);
+                  const manager = backgroundOperationManager(ctx.stateDir);
+                  const snapshot = await manager.start({
+                    ownerScope: backgroundOwnerScope(ctx),
+                    projectId: entry.projectId,
+                    projectRoot: entry.root,
+                    leaseId: lease.leaseId,
+                    leasePreset: lease.preset,
+                    commandId,
+                    operationFingerprint: resumed.operationFingerprint,
+                    approvalRequestId: requestId,
+                    execute: backgroundExecute(requestId),
+                  });
+                  return {
+                    turnlessContinuation: true,
+                    continuationStarted: true,
+                    fallbackRequiresExactReplay: false,
+                    actionStarted: true,
+                    subprocessStarted: snapshot.subprocessStarted,
+                    operationId: snapshot.operationId,
+                    approvalRequestId: requestId,
+                    sideEffects: "background-operation-started",
+                    ...(projectGrantCommandId ? { projectGrantCommandId } : {}),
+                  } as const;
+                },
+              });
+            }
+            return chatGptOperationApprovalPending(ctx, {
+              requestId,
+              tool: "command_request",
+              allowFollowUpPrompt: "C2CT command_request를 이번만 허용했어. command_request를 재호출하지 말고 operation_status를 approvalRequestId로 status-only 확인해서 이어가줘.",
+              denyFollowUpPrompt: "C2CT command_request를 거절했어. 이 exact operation은 실행하지 말고 종료해줘.",
+              extra: {
+                projectId: entry.projectId,
+                resolvedExecutable: validated.resolvedExecutable,
+                argv: validated.argv,
+                risk: validated.risk,
+                requestFingerprint: validated.requestFingerprint,
+              },
+            });
+          }
+          const clientCancelled = (): boolean => {
+            if (!operationId || !ctx.activity) return false;
+            return ctx.activity.tracker.activeOperations({ session: ctx.activity.session })
+              .some((candidate) => candidate.operationId === operationId && candidate.clientCancellation !== undefined);
+          };
+          authorization = await waitForOperationAuthorization({
+            ...approvalInput,
+            requestId,
+            shouldAbort: clientCancelled,
+          });
+          if (clientCancelled()) {
+            throw new DomainError(ErrorCode.PERMISSION_DENIED, "Client cancelled command_request before approved command spawn", {
+              requestId,
+              actionStarted: false,
+              subprocessStarted: false,
+            });
+          }
+        }
+        if (authorization.scope === "project") {
+          await persistApprovedCommandGrant({
+            stateDir: ctx.stateDir,
+            projectId: entry.projectId,
+            projectRoot: entry.root,
+            request: validated,
+            approvalRequestId: authorization.requestId,
+          });
+        }
+        const manager = backgroundOperationManager(ctx.stateDir);
+        const snapshot = await manager.start({
+          ownerScope: backgroundOwnerScope(ctx),
+          projectId: entry.projectId,
+          projectRoot: entry.root,
+          ...(input.workLaneId ? { laneDigest: projectLaneDigest(input.workLaneId) } : {}),
+          leaseId: lease.leaseId,
+          leasePreset: lease.preset,
+          commandId,
+          operationFingerprint: authorization.operationFingerprint,
+          execute: backgroundExecute(),
+        });
+        return makeResult({
+          ...snapshot,
+          hostSafeHandoff: ctx.remote === true,
+          resolvedExecutable: validated.resolvedExecutable,
+          argv: validated.argv,
+          cwd: validated.cwd,
+          risk: validated.risk,
+          effects: validated.effects,
+          requestFingerprint: validated.requestFingerprint,
+          approvalScope: authorization.scope,
+          turnContinuationRequired: true,
+          assistantMayFinalize: false,
+          turnContinuationAction: "poll-operation-status-until-terminal",
+          pollAfterMs: 3_000,
+        }, `Exact ${validated.resolvedExecutable} request approved and handed off as ${snapshot.operationId}; poll operation_status until terminal.`);
+      }, {
+        extra: extra as ToolProgressHandlerExtra,
+        initialPhase: "preparing",
+        initialMessage: "Validating exact executable + argv request",
+        requiredCapability: "read",
+      });
+    },
+  );
+
+  registerTool(
     "command_run",
     {
       title: "Run project command",
@@ -9033,7 +9597,27 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     async (input, extra) => {
       return withErrorMapping<Record<string, unknown>>(ctx, "command_run", input, async (progress, operationId) => {
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
-        const commandForPolicy = await resolveCommandPolicy(entry.root, input.commandId, input.args ?? []);
+        const manifestCommandForPolicy = await resolveCommandPolicy(entry.root, input.commandId, input.args ?? []);
+        const approvedGrant = manifestCommandForPolicy
+          ? null
+          : await resolveApprovedCommandGrant({
+              stateDir: ctx.stateDir,
+              projectId: entry.projectId,
+              projectRoot: entry.root,
+              commandId: input.commandId,
+            });
+        if (approvedGrant && (input.args?.length ?? 0) > 0) {
+          throw new DomainError(
+            ErrorCode.COMMAND_NOT_ALLOWED,
+            "project-approved command grants use fixed argv and do not accept forwarded arguments",
+            {
+              commandId: input.commandId,
+              sourceOfTruth: "approved-project-grant",
+              fixedArgv: approvedGrant.argv,
+            },
+          );
+        }
+        const commandForPolicy = manifestCommandForPolicy ?? (approvedGrant ? approvedGrantAsListedCommand(approvedGrant) : null);
         if (commandForPolicy?.sideEffects.needsNetwork === true && input.intent?.needsNetwork === false) {
           throw new DomainError(
             ErrorCode.COMMAND_NOT_ALLOWED,
@@ -9048,7 +9632,13 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             { commandId: input.commandId, writesWorkspace: true, sourceOfTruth: "command-policy" },
           );
         }
-        const capability = commandForPolicy?.riskTier === "verify" ? "verify" : commandForPolicy?.riskTier === "read" ? "read" : "remote";
+        const capability = approvedGrant?.risk === "read-only"
+          ? "read"
+          : commandForPolicy?.riskTier === "verify"
+            ? "verify"
+            : commandForPolicy?.riskTier === "read"
+              ? "read"
+              : "remote";
         const lease = await requireProjectLease(ctx, input.projectId, capability, input.workLaneId);
         const lifecycleSafeInputs: ConnectionDiagnosticSafeInputs = {
           projectId: entry.projectId,
@@ -9069,13 +9659,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               commandId: input.commandId,
               executionMode: "background",
             });
-            const result = await runCommand(
-              entry.root,
-              input.commandId,
-              input.args,
-              input.intent?.expectedDurationSec,
-              { granted: operationRisk !== null },
-              (event) => {
+            const observeLifecycle = (event: CommandLifecycleEvent) => {
                 void update({
                   state: event.phase === "running" ? "running" : event.phase === "cleanup" ? "cleanup" : undefined,
                   phase: event.phase === "completed" ? "serialize" : event.phase,
@@ -9100,9 +9684,24 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                   ...(event.cleanupStatus ? { cleanupStatus: event.cleanupStatus } : {}),
                   safeInputs: lifecycleSafeInputs,
                 }).catch(() => undefined);
-              },
-              { signal, captureOutput: true, onTimeoutControl: registerTimeoutControl },
-            );
+              };
+            const executionOptions = { signal, captureOutput: true, onTimeoutControl: registerTimeoutControl };
+            const result = approvedGrant
+              ? await runRequestedCommand(
+                  approvedGrant,
+                  input.intent?.expectedDurationSec,
+                  observeLifecycle,
+                  executionOptions,
+                )
+              : await runCommand(
+                  entry.root,
+                  input.commandId,
+                  input.args,
+                  input.intent?.expectedDurationSec,
+                  { granted: operationRisk !== null },
+                  observeLifecycle,
+                  executionOptions,
+                );
             let outputArtifact: Awaited<ReturnType<typeof createOutputArtifact>> | undefined;
             let artifactError: string | undefined;
             if (result.capturedOutput) {
@@ -9195,7 +9794,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               commandId: input.commandId,
               args: input.args ?? [],
               sideEffects: commandForPolicy?.sideEffects ?? null,
-              matchedProfileId: commandForPolicy?.matchedProfileId ?? null,
+              matchedProfileId: manifestCommandForPolicy?.matchedProfileId ?? null,
             },
             preview: redact([commandForPolicy?.display ?? input.commandId, ...(input.args ?? [])].join(" ")),
             ...(operationId ? { originOperationId: operationId } : {}),
@@ -9352,13 +9951,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           projectId: input.projectId,
           commandId: input.commandId,
         });
-        const result = await runCommand(
-          entry.root,
-          input.commandId,
-          input.args,
-          input.intent?.expectedDurationSec,
-          { granted: operationRisk !== null },
-          (event) => {
+        const observeLifecycle = (event: CommandLifecycleEvent) => {
             void progress?.update(
               event.phase,
               event.phase === "running"
@@ -9383,8 +9976,21 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               ...(event.cleanupStatus ? { cleanupStatus: event.cleanupStatus } : {}),
               safeInputs: lifecycleSafeInputs,
             }).catch(() => undefined);
-          },
-        );
+          };
+        const result = approvedGrant
+          ? await runRequestedCommand(
+              approvedGrant,
+              input.intent?.expectedDurationSec,
+              observeLifecycle,
+            )
+          : await runCommand(
+              entry.root,
+              input.commandId,
+              input.args,
+              input.intent?.expectedDurationSec,
+              { granted: operationRisk !== null },
+              observeLifecycle,
+            );
         let outputArtifact: Awaited<ReturnType<typeof createOutputArtifact>> | undefined;
         let artifactError: string | undefined;
         if (result.outputTruncated && result.capturedOutput) {
@@ -9483,7 +10089,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       let snapshot;
       if (input.approvalRequestId) {
         const approval = await receiptApprovalForCaller(ctx, entry.projectId, input.approvalRequestId);
-        if (!approval || (approval.tool !== "command_run" && approval.tool !== "e2e_run_command")) {
+        if (!approval || !isTurnlessBackgroundApprovalTool(approval.tool)) {
           throw new DomainError(ErrorCode.OPERATION_NOT_FOUND, "Turnless background approval was not found for this ChatGPT session");
         }
         snapshot = await backgroundOperationManager(ctx.stateDir).statusByApproval({

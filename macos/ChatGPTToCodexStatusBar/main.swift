@@ -774,7 +774,7 @@ private final class ServiceController {
         let createdAt: TimeInterval
         let expiresAt: TimeInterval
 
-        var canResolveLocally: Bool { approvalSurface == "local" || tool == "runtime_apply_local" }
+        var canResolveLocally: Bool { approvalSurface == "local" }
     }
 
     struct PendingOAuthApproval {

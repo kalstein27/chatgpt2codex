@@ -10,7 +10,16 @@ const DEFAULT_TTL_MS = 10 * 60 * 1000;
 const DEFAULT_APPROVED_CONSUME_TTL_MS = 5 * 60 * 1000;
 const MAX_RETAINED_REQUESTS = 100;
 
-export type OperationRisk = "network" | "destructive" | "local-file-mutation";
+export type OperationRisk =
+  | "read-only"
+  | "workspace-write"
+  | "external-local-write"
+  | "network"
+  | "process-system-state"
+  | "destructive-privileged"
+  | "destructive"
+  | "local-file-mutation";
+export type OperationApprovalScope = "once" | "project";
 export type OperationApprovalStatus = "pending" | "approved" | "rejected" | "expired" | "consumed";
 export type OperationApprovalVia = "local-control-api" | "menu-bar-ui" | "mobile-ntfy" | "mobile-web" | "chatgpt-widget" | "chatgpt-widget-critical";
 export type OperationApprovalSurface = "local" | "chatgpt-widget" | "chatgpt-widget-critical";
@@ -53,6 +62,8 @@ export interface OperationApprovalRequest {
   resolvedAt?: number;
   consumedAt?: number;
   approvedVia?: OperationApprovalVia;
+  approvalScope?: OperationApprovalScope;
+  projectScopeAllowed?: boolean;
 }
 
 function chatGptSessionScopeDigest(sessionScope: string): string {
@@ -81,6 +92,10 @@ export interface EnsureOperationApprovalInput {
   risk: OperationRisk;
   operation: unknown;
   preview: string;
+  summary?: string;
+  impact?: string;
+  details?: string;
+  projectScopeAllowed?: boolean;
   originOperationId?: string;
   approvalSurface?: OperationApprovalSurface;
   /**
@@ -105,7 +120,7 @@ export interface WaitForOperationAuthorizationInput extends EnsureOperationAppro
 
 export interface OperationAuthorization {
   requestId: string;
-  scope: "once";
+  scope: OperationApprovalScope;
   operationFingerprint: string;
 }
 
@@ -149,6 +164,8 @@ function operationSummary(tool: string, projectId: string, operation?: unknown):
       return commandId
         ? `프로젝트 ${projectId} · 허용 명령 “${commandId}” 1회 실행`
         : `프로젝트 ${projectId} · 허용 명령 1회 실행`;
+    case "command_request":
+      return `프로젝트 ${projectId} · 새 외부 도구 사용 요청`;
     case "e2e_run_command":
       return `프로젝트 ${projectId} · E2E 검증 명령 1회 실행`;
     case "e2e_start_server":
@@ -173,7 +190,12 @@ function operationSummary(tool: string, projectId: string, operation?: unknown):
 }
 
 function operationImpact(risk: OperationRisk): string {
+  if (risk === "read-only") return "읽기 전용 · 파일/네트워크/시스템 상태 변경 없음";
+  if (risk === "workspace-write") return "프로젝트 workspace 내부 변경 가능";
+  if (risk === "external-local-write") return "프로젝트 밖 로컬 파일 또는 설정 변경 가능";
   if (risk === "network") return "외부 네트워크 통신 가능";
+  if (risk === "process-system-state") return "앱·프로세스·서비스 또는 시스템 선택 상태 변경 가능";
+  if (risk === "destructive-privileged") return "삭제·설치·권한·시스템 설정 등 파괴적/특권 변경 가능";
   if (risk === "local-file-mutation") return "검증 범위 로컬 파일 변경";
   return "파일 교체·삭제·작업 취소 등 되돌리기 어려운 변경 가능";
 }
@@ -225,7 +247,9 @@ function validRequest(value: unknown): value is OperationApprovalRequest {
       request.leasePreset === "image-only" ||
       request.leasePreset === "control") &&
     typeof request.tool === "string" &&
-    (request.risk === "network" || request.risk === "destructive" || request.risk === "local-file-mutation") &&
+    (request.risk === "read-only" || request.risk === "workspace-write" || request.risk === "external-local-write" ||
+      request.risk === "network" || request.risk === "process-system-state" || request.risk === "destructive-privileged" ||
+      request.risk === "destructive" || request.risk === "local-file-mutation") &&
     typeof request.operationFingerprint === "string" &&
     typeof request.preview === "string" &&
     (request.summary === undefined || typeof request.summary === "string") &&
@@ -234,6 +258,8 @@ function validRequest(value: unknown): value is OperationApprovalRequest {
     (request.originOperationId === undefined || typeof request.originOperationId === "string") &&
     (request.approvalSurface === undefined || request.approvalSurface === "local" || request.approvalSurface === "chatgpt-widget" || request.approvalSurface === "chatgpt-widget-critical") &&
     (request.chatGptSessionScopeDigest === undefined || /^[a-f0-9]{64}$/u.test(request.chatGptSessionScopeDigest)) &&
+    (request.approvalScope === undefined || request.approvalScope === "once" || request.approvalScope === "project") &&
+    (request.projectScopeAllowed === undefined || typeof request.projectScopeAllowed === "boolean") &&
     typeof request.createdAt === "number" &&
     typeof request.expiresAt === "number" &&
     (request.approvedVia === undefined ||
@@ -387,6 +413,8 @@ function requestDetails(request: OperationApprovalRequest, created: boolean): Re
     expiresAt: request.status === "approved" ? (request.consumeExpiresAt ?? request.expiresAt) : request.expiresAt,
     pendingExpiresAt: request.expiresAt,
     consumeExpiresAt: request.consumeExpiresAt ?? null,
+    approvalScope: request.approvalScope ?? null,
+    projectScopeAllowed: request.projectScopeAllowed === true,
   };
 }
 
@@ -459,7 +487,7 @@ export async function ensureOperationAuthorized(
       matching.status = "consumed";
       matching.consumedAt = now;
       await writeState(input.stateDir, state);
-      return { requestId: matching.requestId, scope: "once", operationFingerprint: fingerprint };
+      return { requestId: matching.requestId, scope: matching.approvalScope ?? "once", operationFingerprint: fingerprint };
     }
 
     if (matching?.status === "approved") {
@@ -486,12 +514,12 @@ export async function ensureOperationAuthorized(
 
     const ttlMs = Math.min(DEFAULT_TTL_MS, Math.max(30_000, input.ttlMs ?? DEFAULT_TTL_MS));
     const summary = normalizeText(
-      operationSummary(input.tool, input.lease.projectId, input.operation),
+      input.summary ?? operationSummary(input.tool, input.lease.projectId, input.operation),
       "보호 작업 1회 수행",
       200,
     );
-    const impact = normalizeText(operationImpact(input.risk), "승인 범위 시스템 상태 변경 가능", 200);
-    const details = normalizeDetails(input.preview, "상세 정보 없음", 4096);
+    const impact = normalizeText(input.impact ?? operationImpact(input.risk), "승인 범위 시스템 상태 변경 가능", 200);
+    const details = normalizeDetails(input.details ?? input.preview, "상세 정보 없음", 4096);
     const request: OperationApprovalRequest = {
       requestId: `op_${randomUUID()}`,
       status: "pending",
@@ -507,6 +535,9 @@ export async function ensureOperationAuthorized(
       summary,
       impact,
       details,
+      projectScopeAllowed: input.projectScopeAllowed === true &&
+        input.tool === "command_request" &&
+        input.risk !== "destructive-privileged",
       ...(input.originOperationId
         ? { originOperationId: normalizeText(input.originOperationId, "operation", 120) }
         : {}),
@@ -626,7 +657,7 @@ export async function waitForOperationAuthorization(
         await writeState(input.stateDir, state);
         return {
           kind: "authorized" as const,
-          authorization: { requestId: request.requestId, scope: "once" as const, operationFingerprint: fingerprint },
+          authorization: { requestId: request.requestId, scope: request.approvalScope ?? "once", operationFingerprint: fingerprint },
         };
       }
       if (request.status === "rejected") {
@@ -684,6 +715,7 @@ export async function resolveOperationApprovalRequest(input: {
   stateDir: string;
   requestId: string;
   decision: "approve" | "reject";
+  approvalScope?: OperationApprovalScope;
   approvedVia?: OperationApprovalVia;
   now?: number;
 }): Promise<OperationApprovalRequest> {
@@ -707,14 +739,10 @@ export async function resolveOperationApprovalRequest(input: {
         ? "chatgpt-widget"
         : null;
     const localOwnerReject = input.decision === "reject" && approvalVia === "local-control-api";
-    const localRuntimeApplyApproval =
-      input.decision === "approve" &&
-      approvalVia === "menu-bar-ui" &&
-      request.tool === "runtime_apply_local";
-    if (widgetApprovalVia && approvalVia !== widgetApprovalVia && !localOwnerReject && !localRuntimeApplyApproval) {
+    if (widgetApprovalVia && approvalVia !== widgetApprovalVia && !localOwnerReject) {
       throw new DomainError(
         ErrorCode.APPROVAL_REQUIRED,
-        "ChatGPT widget approval requests can only be approved from their bound ChatGPT widget surface, except the runtime_apply_local menu-bar fallback; the local owner may reject a pending request for recovery",
+        "ChatGPT widget approval requests can only be approved from their bound ChatGPT widget surface; the local owner may reject a pending request for recovery",
         {
           requestId: input.requestId,
           tool: request.tool,
@@ -732,19 +760,25 @@ export async function resolveOperationApprovalRequest(input: {
         { requestId: input.requestId, tool: request.tool },
       );
     }
-    if (input.decision === "approve" &&
-        request.tool === "runtime_apply_local" &&
-        approvalVia !== "menu-bar-ui" &&
-        approvalVia !== "chatgpt-widget-critical") {
-      throw new DomainError(
-        ErrorCode.APPROVAL_REQUIRED,
-        "Runtime apply requires either the local menu-bar approval or the session-bound critical ChatGPT approval surface",
-        {
-          requestId: input.requestId,
-          tool: request.tool,
-          requiredApprovalVia: ["menu-bar-ui", "chatgpt-widget-critical"],
-        },
-      );
+    if (input.decision === "approve" && request.tool === "runtime_apply_local") {
+      const requiredRuntimeApprovalVia = approvalSurface === "chatgpt-widget-critical"
+        ? "chatgpt-widget-critical"
+        : approvalSurface === "local"
+          ? "menu-bar-ui"
+          : null;
+      if (!requiredRuntimeApprovalVia || approvalVia !== requiredRuntimeApprovalVia) {
+        throw new DomainError(
+          ErrorCode.APPROVAL_REQUIRED,
+          "Runtime apply approval must use the request's bound approval surface",
+          {
+            requestId: input.requestId,
+            tool: request.tool,
+            approvalSurface,
+            approvedVia: approvalVia,
+            requiredApprovalVia: requiredRuntimeApprovalVia,
+          },
+        );
+      }
     }
     if (input.decision === "approve" &&
         approvalVia === "menu-bar-ui" &&
@@ -755,9 +789,21 @@ export async function resolveOperationApprovalRequest(input: {
         { requestId: input.requestId, tool: request.tool },
       );
     }
+    const approvalScope = input.approvalScope ?? "once";
+    if (input.decision === "approve" && approvalScope === "project" &&
+        (request.tool !== "command_request" ||
+          request.projectScopeAllowed !== true ||
+          request.risk === "destructive-privileged")) {
+      throw new DomainError(
+        ErrorCode.PERMISSION_DENIED,
+        "Project-scoped approval is available only for non-destructive command_request operations that explicitly allow exact-profile promotion",
+        { requestId: input.requestId, tool: request.tool, risk: request.risk },
+      );
+    }
     request.status = input.decision === "approve" ? "approved" : "rejected";
     if (input.decision === "approve") {
       request.approvedVia = approvalVia;
+      request.approvalScope = approvalScope;
       request.consumeExpiresAt = Math.min(now + DEFAULT_APPROVED_CONSUME_TTL_MS, request.leaseExpiresAt);
     }
     request.resolvedAt = now;
@@ -786,5 +832,7 @@ export function operationApprovalSummary(request: OperationApprovalRequest): Rec
     consumeExpiresAt: request.consumeExpiresAt,
     resolvedAt: request.resolvedAt,
     approvedVia: request.approvedVia,
+    approvalScope: request.approvalScope,
+    projectScopeAllowed: request.projectScopeAllowed === true,
   };
 }

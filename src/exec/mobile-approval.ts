@@ -26,6 +26,7 @@ import {
   type ActivityDashboardApproval,
   type ActivityDashboardDeployment,
 } from "../server/activity-dashboard.js";
+import { listAllApprovedCommandGrants, revokeApprovedCommandGrant } from "./command-request.js";
 import { patchDesktopSettings, readDesktopSettings } from "../runtime/desktop-settings.js";
 import { activityMcpHealth } from "../server/activity-mcp-health.js";
 import { DomainError } from "../types.js";
@@ -1041,6 +1042,29 @@ export class MobileApprovalBridge {
         }));
         return;
       }
+      if (requestPath === "/activity/api/command-grants") {
+        if (!isLoopbackRequest(req)) {
+          sendJson(res, 403, { ok: false, error: "command_grants_loopback_only" });
+          return;
+        }
+        const grants = await listAllApprovedCommandGrants({ stateDir: this.stateDir });
+        sendJson(res, 200, {
+          ok: true,
+          grants: grants.map((grant) => ({
+            grantId: grant.grantId,
+            commandId: grant.commandId,
+            projectId: grant.projectId,
+            resolvedExecutable: grant.resolvedExecutable,
+            argv: [...grant.argv],
+            cwd: grant.cwd,
+            purpose: grant.purpose,
+            risk: grant.risk,
+            requestFingerprint: grant.requestFingerprint,
+            createdAt: grant.createdAt,
+          })),
+        });
+        return;
+      }
       if (requestPath === "/activity/api/settings") {
         if (!isLoopbackRequest(req)) {
           sendJson(res, 403, { ok: false, error: "settings_loopback_only" });
@@ -1168,6 +1192,64 @@ export class MobileApprovalBridge {
       }
       return;
     }
+    if (req.method === "POST" && requestPath === "/activity/api/command-grants/revoke") {
+      if (!this.activityTracker) {
+        sendJson(res, 404, { ok: false });
+        return;
+      }
+      setDashboardHeaders(res);
+      if (!isLoopbackRequest(req)) {
+        sendJson(res, 403, { ok: false, error: "command_grants_loopback_only" });
+        return;
+      }
+      if (!localActivityOriginMatches(req)) {
+        sendJson(res, 403, { ok: false, error: "command_grants_same_origin_required" });
+        return;
+      }
+      const contentType = req.headers["content-type"];
+      if (typeof contentType !== "string" || !contentType.toLowerCase().startsWith("application/json")) {
+        sendJson(res, 415, { ok: false, error: "command_grants_json_required" });
+        return;
+      }
+      try {
+        const body = await readJsonBody(req);
+        const projectId = typeof body.projectId === "string" ? body.projectId.trim() : "";
+        const grantId = typeof body.grantId === "string" ? body.grantId.trim() : "";
+        if (!projectId || projectId.length > 120 || !/^pcg_[0-9a-f-]{36}$/u.test(grantId)) {
+          sendJson(res, 400, { ok: false, error: "invalid_command_grant_revoke" });
+          return;
+        }
+        const revoked = await revokeApprovedCommandGrant({
+          stateDir: this.stateDir,
+          projectId,
+          grantId,
+        });
+        if (!revoked) {
+          sendJson(res, 404, { ok: false, error: "command_grant_not_found" });
+          return;
+        }
+        await this.ledgerAppend?.({
+          type: "command.grant.revoked",
+          projectId: revoked.projectId,
+          commandId: revoked.commandId,
+          grantId: revoked.grantId,
+          requestFingerprint: revoked.requestFingerprint,
+        }).catch(() => undefined);
+        sendJson(res, 200, {
+          ok: true,
+          revoked: {
+            grantId: revoked.grantId,
+            commandId: revoked.commandId,
+            projectId: revoked.projectId,
+            requestFingerprint: revoked.requestFingerprint,
+          },
+        });
+      } catch {
+        sendJson(res, 400, { ok: false, error: "invalid_command_grant_revoke" });
+      }
+      return;
+    }
+
 
     if (req.method === "POST" && requestPath === "/activity/api/native/restart-mcp") {
       if (!this.activityTracker) {

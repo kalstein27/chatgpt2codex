@@ -45,6 +45,7 @@
     "lock:refresh": "npm install --package-lock-only --ignore-scripts",
     "publication:check": "npm run build --silent && node scripts/check-publication-boundary.mjs",
     "runtime:bootstrap-local": "node dist/cli.js runtime-bootstrap-local",
+    "runtime:recover-stalled-local": "node dist/cli.js runtime-apply-recover-stalled-local",
     "typecheck": "tsc --noEmit"
   },
   "c2ct": {
@@ -157,6 +158,17 @@
           "destructive": false,
           "fixedDestination": true,
           "localApproval": "none"
+        }
+      },
+      "runtime:recover-stalled-local": {
+        "sideEffects": {
+          "needsNetwork": false,
+          "writesWorkspace": false,
+          "writesExternalLocalPath": true,
+          "launchesProcess": true,
+          "destructive": false,
+          "fixedDestination": false,
+          "localApproval": "once"
         }
       }
     },
