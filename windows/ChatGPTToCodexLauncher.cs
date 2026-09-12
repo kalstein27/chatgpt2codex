@@ -360,6 +360,7 @@ internal sealed class LauncherForm : Form
     };
     private readonly string[] args;
     private readonly string root;
+    private readonly bool passiveColdBoot;
     private readonly string appDataDir;
     private readonly string logDir;
     private readonly string logFile;
@@ -426,6 +427,7 @@ internal sealed class LauncherForm : Form
     {
         this.args = args;
         root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        passiveColdBoot = File.Exists(Path.Combine(root, "portable-manifest.json"));
         var localAppData = Environment.GetEnvironmentVariable("LOCALAPPDATA");
         if (string.IsNullOrWhiteSpace(localAppData)) localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         appDataDir = Path.Combine(localAppData, "ChatGPT To Codex");
@@ -456,7 +458,7 @@ internal sealed class LauncherForm : Form
             "chatgpt2codex",
             "connection-events.jsonl");
 
-        Text = "ChatGPT To Codex";
+        Text = passiveColdBoot ? "ChatGPT To Codex Cold Boot" : "ChatGPT To Codex";
         Width = 920;
         Height = 620;
         StartPosition = FormStartPosition.CenterScreen;
@@ -545,9 +547,17 @@ internal sealed class LauncherForm : Form
         bottomPanel.Controls.Add(urlPanel, 0, 0);
         bottomPanel.Controls.Add(tokenPanel, 0, 1);
 
-        Controls.Add(logBox);
-        Controls.Add(bottomPanel);
-        Controls.Add(statusLabel);
+        if (passiveColdBoot)
+        {
+            logBox.Text = "Cold boot console" + Environment.NewLine;
+            Controls.Add(logBox);
+        }
+        else
+        {
+            Controls.Add(logBox);
+            Controls.Add(bottomPanel);
+            Controls.Add(statusLabel);
+        }
 
         trayMenu = new ContextMenuStrip();
         statusTrayItem = new ToolStripMenuItem("ChatGPT To Codex: " + L("statusChecking"));
@@ -622,7 +632,7 @@ internal sealed class LauncherForm : Form
 
         Shown += delegate
         {
-            if (startMcpOnOpen || args.Length > 0)
+            if (passiveColdBoot || startMcpOnOpen || args.Length > 0)
             {
                 StartLauncher();
             }
