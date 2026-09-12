@@ -14,9 +14,11 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $machinePath = [System.Environment]::GetEnvironmentVariable("PATH", "Machine")
 $userPath = [System.Environment]::GetEnvironmentVariable("PATH", "User")
-$nodePath = Join-Path $env:ProgramFiles "nodejs"
-$cloudflaredPath = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages\Cloudflare.cloudflared_Microsoft.Winget.Source_8wekyb3d8bbwe"
-$env:PATH = "$Root\bin;$nodePath;$cloudflaredPath;$env:USERPROFILE\.local\bin;$machinePath;$userPath;$env:PATH"
+$nodePath = if ($env:ProgramFiles) { Join-Path $env:ProgramFiles "nodejs" } else { $null }
+$cloudflaredPath = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages\Cloudflare.cloudflared_Microsoft.Winget.Source_8wekyb3d8bbwe" } else { $null }
+$userLocalBin = if ($env:USERPROFILE) { Join-Path $env:USERPROFILE ".local\bin" } else { $null }
+$pathParts = @("$Root\bin", $nodePath, $cloudflaredPath, $userLocalBin, $machinePath, $userPath, $env:PATH) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+$env:PATH = ($pathParts -join ";")
 
 if (-not $Workspace) {
     $Workspace = Join-Path $HOME "workspace"
@@ -112,7 +114,7 @@ function Resolve-HostWithCloudflareDoh([string]$HostName) {
     }
 }
 
-function Test-HttpOkWithCurlResolve([string]$Url) {
+function Test-HttpOkWithCurlResolve([string]$Url, [string]$ExpectedInstance = "") {
     $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
     if (-not $curl) { return $false }
 
@@ -127,7 +129,12 @@ function Test-HttpOkWithCurlResolve([string]$Url) {
             $statusMatch = [regex]::Match($text, "HTTP_STATUS:(\d+)")
             $status = if ($statusMatch.Success) { [int]$statusMatch.Groups[1].Value } else { 0 }
             if ($LASTEXITCODE -eq 0 -and $status -ge 200 -and $status -lt 300) {
-                return $true
+                if (-not $ExpectedInstance) { return $true }
+                try {
+                    $bodyText = [regex]::Replace($text, "`r?`nHTTP_STATUS:\d+\s*$", "")
+                    $body = $bodyText | ConvertFrom-Json
+                    if ($body.ok -eq $true -and $body.instanceMatch -eq $true) { return $true }
+                } catch {}
             }
         }
     } catch {
@@ -135,19 +142,23 @@ function Test-HttpOkWithCurlResolve([string]$Url) {
     return $false
 }
 
-function Wait-PublicHttpOk([string]$Url, [int]$Tries, [string]$Label, [bool]$AllowCloudflareFallback = $false) {
+function Wait-PublicHttpOk([string]$Url, [int]$Tries, [string]$Label, [bool]$AllowCloudflareFallback = $false, [string]$ExpectedInstance = "") {
     for ($i = 0; $i -lt $Tries; $i++) {
         $standardError = $null
         try {
             $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Uri $Url
             if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 300) {
-                return
+                if (-not $ExpectedInstance) { return }
+                try {
+                    $body = $response.Content | ConvertFrom-Json
+                    if ($body.ok -eq $true -and $body.instanceMatch -eq $true) { return }
+                } catch {}
             }
         } catch {
             $standardError = $_.Exception.Message
         }
         if ($AllowCloudflareFallback -and $standardError -and ($i % 5 -eq 0) -and
-            (Test-HttpOkWithCurlResolve $Url)) {
+            (Test-HttpOkWithCurlResolve $Url $ExpectedInstance)) {
             return
         }
         Start-Sleep -Seconds 1
@@ -305,7 +316,14 @@ function Stop-StaleRuntimeProcesses([int]$PortToStop, [string]$ResolvedTunnelMod
     }
 }
 
-Need-Command node
+$bundledNode = Join-Path $Root "runtime\node.exe"
+if (Test-Path -LiteralPath $bundledNode) {
+    $nodeExe = $bundledNode
+} else {
+    $nodeCommand = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $nodeCommand) { throw "Missing command: node" }
+    $nodeExe = $nodeCommand.Source
+}
 Set-Location $Root
 
 if (-not (Test-Path (Join-Path $Root "dist\cli.js"))) {
@@ -323,7 +341,7 @@ if (Test-PortBusy $Port) {
 $cli = Join-Path $Root "dist\cli.js"
 if ($RotateOwnerToken -or $env:CHATGPT2CODEX_ROTATE_OWNER_TOKEN -eq "1") {
     Write-Host "[chatgpt2codex] generating owner token..."
-    $tokenJsonText = node $cli owner-token --generate --workspace $Workspace
+    $tokenJsonText = & $nodeExe $cli owner-token --generate --workspace $Workspace
     if ($LASTEXITCODE -ne 0) {
         throw "Owner token generation failed."
     }
@@ -338,10 +356,11 @@ if ($RotateOwnerToken -or $env:CHATGPT2CODEX_ROTATE_OWNER_TOKEN -eq "1") {
     Write-Host ""
     Write-Host "Store this securely. It is required to approve ChatGPT/MCP connections."
 }
-$doctor = node $cli doctor 2>$null
+$doctor = & $nodeExe $cli doctor 2>$null
 if (($doctor -join "`n") -notmatch "owner token configured") {
     throw "Owner token is not configured. Open ChatGPT To Codex settings and generate or set an owner token first."
 }
+Write-Host "chatgpt2codex init: owner token already set (configured state verified)."
 
 $cfProc = $null
 $srvProc = $null
@@ -352,6 +371,11 @@ try {
     if ($resolvedTunnelMode -eq "external") {
         $publicUrl = Resolve-ExternalPublicUrl
         Write-Host "[chatgpt2codex] 1/3 using externally managed HTTPS tunnel; no cloudflared process will be started."
+        if ($publicUrl -match '^https://[^/]+\.ts\.net$') {
+            Write-Host "[chatgpt2codex] Tailscale HTTPS origin detected."
+            Write-Host "[chatgpt2codex] Tailscale Serve is tailnet-private; ChatGPT web requires Funnel or another publicly reachable HTTPS origin."
+            Write-Host "[chatgpt2codex] This app does not enable or disable Serve/Funnel for an externally managed Tailscale URL."
+        }
     } elseif ($managesCloudflared) {
         if ($resolvedTunnelMode -eq "cloudflare-named") {
             if (-not $PublicHostname) {
@@ -388,44 +412,60 @@ try {
     if ($ActiveProjectRoot) {
         $serverArgs += @("--active-project-root", $ActiveProjectRoot, "--active-project-preset", $ActiveProjectPreset)
     }
-    $srvProc = Start-LoggedProcess "node" $serverArgs $srvOut $srvErr
-    Wait-HttpOk "http://127.0.0.1:$Port/healthz" 20 "local server"
+    $srvProc = Start-LoggedProcess $nodeExe $serverArgs $srvOut $srvErr
+    # Native Windows ARM64 startup can be noticeably slower on first launch
+    # (Defender/JIT/native-module warmup), while a healthy server still follows
+    # the exact same readiness contract. Keep the check strict but allow enough
+    # time for slow first boots instead of failing after the old 20-try window.
+    Wait-HttpOk "http://127.0.0.1:$Port/healthz" 45 "local server"
+    $localHealth = Invoke-RestMethod -UseBasicParsing -TimeoutSec 3 -Uri "http://127.0.0.1:$Port/healthz"
+    $healthInstanceId = [string]$localHealth.healthInstanceId
+    if ($healthInstanceId -notmatch '^[a-f0-9]{32}$') {
+        throw "local server health did not expose a valid instance proof"
+    }
 
-    Write-Host ""
-    Write-Host "[chatgpt2codex] connector URL ready:"
-    Write-Host "   $publicUrl/mcp"
-    Write-Host ""
+    $connectorReady = -not $usePublicEndpoint
+    $announceConnectorReady = {
+        Write-Host ""
+        Write-Host "[chatgpt2codex] connector URL ready:"
+        Write-Host "   $publicUrl/mcp"
+        Write-Host ""
+        Write-Host "============================================================"
+        Write-Host " ChatGPT To Codex is ready"
+        Write-Host "============================================================"
+        Write-Host " MCP URL:"
+        Write-Host ""
+        Write-Host "   $publicUrl/mcp"
+        Write-Host ""
+        Write-Host " Notes:"
+        Write-Host "   - Keep this window or tray app running."
+        Write-Host "   - Default mode is loopback-only and is not reachable from ChatGPT web."
+        Write-Host "   - Enable ChatGPT web tunnel only while a public URL is needed."
+        Write-Host "   - Web mode stays running unless CHATGPT2CODEX_IDLE_SHUTDOWN_MINUTES is set."
+        if ($resolvedTunnelMode -eq "cloudflare-quick") {
+            Write-Host "   - This trycloudflare.com URL is temporary and changes when the tunnel restarts."
+            Write-Host "   - For a ChatGPT app you keep using, configure PUBLIC_HOSTNAME with a named tunnel."
+        }
+        Write-Host "   - If the owner token appeared in a chat/screenshot, rotate it."
+        Write-Host "============================================================"
+    }
 
     if ($usePublicEndpoint) {
         Write-Host "[chatgpt2codex] 3/3 checking public health..."
         try {
-            Wait-PublicHttpOk "$publicUrl/healthz" 60 "public endpoint" $managesCloudflared
+            Wait-PublicHttpOk "$publicUrl/healthz?instance=$healthInstanceId" 60 "public endpoint" $managesCloudflared $healthInstanceId
+            $connectorReady = $true
         } catch {
-            Write-Host "[chatgpt2codex] public health check is still warming up: $($_.Exception.Message)"
+            Write-Host "[chatgpt2codex] public tunnel did not become ready; endpoint is not reachable yet: $($_.Exception.Message)"
             Write-Host "[chatgpt2codex] keeping the server and tunnel alive; retry health from the app or ChatGPT."
         }
     }
 
-    Write-Host ""
-    Write-Host "============================================================"
-    Write-Host " ChatGPT To Codex is ready"
-    Write-Host "============================================================"
-    Write-Host " MCP URL:"
-    Write-Host ""
-    Write-Host "   $publicUrl/mcp"
-    Write-Host ""
-    Write-Host " Notes:"
-    Write-Host "   - Keep this window or tray app running."
-    Write-Host "   - Default mode is loopback-only and is not reachable from ChatGPT web."
-    Write-Host "   - Enable ChatGPT web tunnel only while a public URL is needed."
-    Write-Host "   - Web mode stays running unless CHATGPT2CODEX_IDLE_SHUTDOWN_MINUTES is set."
-    if ($resolvedTunnelMode -eq "cloudflare-quick") {
-        Write-Host "   - This trycloudflare.com URL is temporary and changes when the tunnel restarts."
-        Write-Host "   - For a ChatGPT app you keep using, configure PUBLIC_HOSTNAME with a named tunnel."
+    if ($connectorReady) {
+        & $announceConnectorReady
     }
-    Write-Host "   - If the owner token appeared in a chat/screenshot, rotate it."
-    Write-Host "============================================================"
 
+    $nextPublicHealthCheck = [DateTime]::UtcNow.AddSeconds(10)
     while ($true) {
         if ($srvProc.HasExited) {
             if ($srvProc.ExitCode -eq 0) {
@@ -435,6 +475,17 @@ try {
             throw "server exited. See $srvOut and $srvErr"
         }
         if ($managesCloudflared -and $cfProc -and $cfProc.HasExited) { throw "cloudflared exited. See $cfOut and $cfErr" }
+        if ($usePublicEndpoint -and -not $connectorReady -and [DateTime]::UtcNow -ge $nextPublicHealthCheck) {
+            try {
+                Wait-PublicHttpOk "$publicUrl/healthz?instance=$healthInstanceId" 1 "public endpoint" $managesCloudflared $healthInstanceId
+                $connectorReady = $true
+                Write-Host "[chatgpt2codex] public health verified."
+                & $announceConnectorReady
+            } catch {
+                Write-Host "[chatgpt2codex] public endpoint is still not reachable; connector remains not ready."
+                $nextPublicHealthCheck = [DateTime]::UtcNow.AddSeconds(15)
+            }
+        }
         Start-Sleep -Seconds 1
     }
 } finally {

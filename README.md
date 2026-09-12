@@ -20,6 +20,33 @@ edited.
 
 [Official releases](https://github.com/ezBuilder/chatgpt2codex/releases)
 
+## Windows agent install entry point
+
+If a user gives a coding agent only this repository link and says **"install this"**,
+treat that as a request for the verified Windows **portable end-user install**, not
+a source/developer build. Read and follow the public
+[Codex / coding-agent clean-install guide](windows/README.md#codex--coding-agent-clean-install-guide)
+before taking installation actions.
+
+The short contract is: detect `arm64` vs `x64`, obtain the matching ZIP and
+`.zip.sha256` from the latest official GitHub Release, require the SHA-256 to
+match, extract the **entire** bundle to `%LOCALAPPDATA%\Programs\ChatGPT To Codex`,
+verify the portable manifest and required bundled files, then launch
+`ChatGPT To Codex.exe`. Do not install machine-wide Node/npm/Git for this
+portable path. Stop rather than substituting a source build, Actions artifact,
+architecture mismatch, missing hash, or unverified binary unless the user
+explicitly asks for that different path.
+
+After launch, guide only the human UI steps needed to start MCP, confirm local
+health, enable the web connector, and register the externally reachable HTTPS
+bare `/mcp` endpoint in ChatGPT as `C2CT`. Prefer OAuth and never expose Owner
+Token or OAuth credentials. If ChatGPT offers a custom connector icon, use the
+bundled `assets\chatgpt2codex-plugin-icon.png`; otherwise do not invent that UI.
+Finish by asking for a new ChatGPT conversation to call `@C2CT connection_status`
+and immediately `agent_guide`, and require `finalHealthy=true` with
+`transportErrors=0`.
+
+
 > Help us get this in front of more builders: star the repo if you want
 > ChatGPT to stop talking about code and start safely doing the repo loop.
 
@@ -35,7 +62,7 @@ ChatGPT To Codex fills that gap:
 - macOS app/window screenshot capture for visual E2E proof (Windows native capture planned)
 - temporary or fixed HTTPS connector URL for ChatGPT web
 - OAuth 2.1 + PKCE approval, with one-click local macOS approval and an Owner Token fallback
-- multilingual macOS app window and Windows tray UI for non-English users
+- one shared multilingual desktop shell on macOS and Windows, with platform-native tray/menu integration around it
 
 The mental model is simple:
 
@@ -133,43 +160,48 @@ macOS short version:
 1. When a signed and notarized DMG is attached, download it from the official release.
 2. Open the DMG and drag **ChatGPT To Codex** onto the **Applications** shortcut.
 3. If macOS blocks the app, Control-click it, choose **Open**, and confirm in **System Settings** -> **Privacy & Security** if needed.
-4. Open **ChatGPT To Codex** from Applications. The main window contains the former menu-bar commands in its left command sidebar.
-5. Click **Settings...** in that sidebar.
+4. Open **ChatGPT To Codex** from Applications. The main window uses the same shared desktop shell as Windows: Activity, Approvals, MCP / Connection, Settings, and Diagnostics.
+5. Open **Settings** in the shared sidebar.
 6. Project folder selection is optional for first connection. The app can start MCP with its default workspace even when zero projects are registered; add or choose a project when you are ready to work on one.
 7. Enable **ChatGPT web connector** if you want ChatGPT in the browser to connect.
-8. Click **Start MCP** in the app sidebar.
-9. Click **Copy Connector URL** in the app sidebar.
+8. Start MCP using the app's platform-native lifecycle control, then return to the shared shell for status and diagnostics.
+9. Copy the connector URL from the app's connector control.
 10. Register that `/mcp` URL in ChatGPT Apps / Connectors. On macOS, approve the exact OAuth request once in the ChatGPT To Codex app; use the Owner Token form only as a fallback.
 
-The legacy macOS status item remains hidden; its command model is retained internally for compatibility, while user-facing controls live in the regular app window.
+The legacy macOS status-item command model is retained internally for compatibility, while the regular app window uses the shared cross-platform desktop shell.
 
-Windows short version (recommended source checkout):
+Windows short version (recommended portable install):
 
-1. Install Git for Windows and Node.js 22 or newer.
-2. Tailscale is optional, but signing the Windows PC and your phone into the same
+1. Download the architecture-matched Windows portable ZIP from a verified build
+   or release and extract the **entire** folder.
+2. Launch `ChatGPT To Codex.exe`. The portable bundle includes its own Node and
+   npm, so ordinary users do not need a machine-wide Node/npm installation.
+3. Tailscale is optional, but signing the Windows PC and your phone into the same
    tailnet is recommended for stable private operator access and future mobile
    Activity/approval workflows.
-3. Clone and build the repository:
+4. Use the tray/dashboard Settings surface to choose the project folder, then
+   start MCP and verify local health.
+5. For ChatGPT web, enable the web connector, copy its HTTPS `/mcp` URL, and
+   register that URL in ChatGPT Apps / Connectors.
+
+For development or rebuilding the portable bundle from source, clone the repo
+and use the source toolchain:
 
 ```powershell
 git clone https://github.com/kalstein27/chatgpt2codex.git ChatGPT2Codex
 cd ChatGPT2Codex
 npm ci --ignore-scripts
 npm run typecheck
-npm test
+npm run test:publication
 npm run build
+windows\Build-And-Verify-Portable.cmd
 ```
 
-4. Start the tray UI with `windows\Start-ChatGPTToCodexTray.cmd`. The launcher
-   helper can install missing Node.js and `cloudflared` through WinGet.
-5. Open **Settings...**, choose the project folder, and click **Start MCP**.
-6. Open local health, then open `http://127.0.0.1:7980/activity/` to verify the
-   Activity dashboard.
-7. For ChatGPT web, enable the web connector, copy its HTTPS `/mcp` URL, and
-   register that URL in ChatGPT Apps / Connectors.
-
-The runtime-only alternative is `npm run chatgpt:windows`. Administrator mode is
-not normally required for ChatGPT To Codex itself. See
+If a developer checkout has a broken or missing Node/npm installation, use
+`windows\Repair-Node-Npm.cmd` once rather than making Node a runtime dependency
+of the portable app. The runtime-only source alternative is
+`npm run chatgpt:windows`. Administrator mode is not normally required for
+ChatGPT To Codex itself. See
 [windows/README.md](windows/README.md) for the full clone/build walkthrough,
 Tailscale recommendation, Activity page, first-run checks, and Windows/macOS
 parity notes.

@@ -1,5 +1,6 @@
 import { clearRuntimeApplyMaintenanceMarker, runRuntimeApplyWorker } from "./runtime-apply.js";
 import { releaseRuntimeUpdateBarrier } from "./runtime-update-barrier.js";
+import { markRuntimeApplyWorkerUnexpectedFailure, recordRuntimeApplyWorkerPid } from "./runtime-apply.js";
 
 function argument(name: string): string | null {
   const index = process.argv.indexOf(name);
@@ -16,7 +17,11 @@ async function main(): Promise<void> {
     return;
   }
   try {
+    await recordRuntimeApplyWorkerPid(stateDir, operationId, process.pid);
     await runRuntimeApplyWorker({ stateDir, operationId, port, stabilityProbeCount: 7 });
+  } catch {
+    await markRuntimeApplyWorkerUnexpectedFailure(stateDir, operationId).catch(() => undefined);
+    process.exitCode = 1;
   } finally {
     await clearRuntimeApplyMaintenanceMarker(stateDir, operationId).catch(() => undefined);
     await releaseRuntimeUpdateBarrier(stateDir, operationId).catch(() => false);

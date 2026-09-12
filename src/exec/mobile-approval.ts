@@ -4,6 +4,7 @@ import { constants as fsConstants } from "node:fs";
 import { promises as fs } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { listArmRequests, type ArmRequestRecord } from "../control/arm-requests.js";
 import {
@@ -25,6 +26,8 @@ import {
   type ActivityDashboardApproval,
   type ActivityDashboardDeployment,
 } from "../server/activity-dashboard.js";
+import { listAllApprovedCommandGrants, revokeApprovedCommandGrant } from "./command-request.js";
+import { patchDesktopSettings, readDesktopSettings } from "../runtime/desktop-settings.js";
 import { activityMcpHealth } from "../server/activity-mcp-health.js";
 import { DomainError } from "../types.js";
 
@@ -32,6 +35,7 @@ const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
 const CONFIG_SCHEMA_VERSION = 1;
 const CONFIG_FILE = "mobile-approval.json";
+const DESKTOP_COMMAND_FILE = "desktop-command.json";
 const NTFY_BASE_URL = "https://ntfy.sh";
 const CALLBACK_HOST = "127.0.0.1";
 export const MOBILE_APPROVAL_CALLBACK_PORT = 7980;
@@ -39,6 +43,10 @@ export const MOBILE_APPROVAL_TAILSCALE_HTTPS_PORT = 8443;
 const POLL_INTERVAL_MS = 1_000;
 const RETRY_INTERVAL_MS = 15_000;
 const PUBLISH_TIMEOUT_MS = 5_000;
+const ACTIVITY_APP_ASSET_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "assets");
+const ACTIVITY_APP_ICON_ICO_FILE = path.join(ACTIVITY_APP_ASSET_DIR, "chatgpt2codex-icon.ico");
+const ACTIVITY_APP_ICON_PNG_FILE = path.join(ACTIVITY_APP_ASSET_DIR, "chatgpt2codex-icon.png");
+const ACTIVITY_APP_ICON_SVG_FILE = path.join(ACTIVITY_APP_ASSET_DIR, "chatgpt2codex-icon.svg");
 const POLL_ERROR_BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 15_000] as const;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/u;
 const TOPIC_PATTERN = /^c2ct-[A-Za-z0-9_-]{43}$/u;
@@ -140,6 +148,21 @@ function configPath(stateDir: string): string {
 async function ensureStateDir(stateDir: string): Promise<void> {
   await fs.mkdir(stateDir, { recursive: true, mode: DIR_MODE });
   await fs.chmod(stateDir, DIR_MODE).catch(() => undefined);
+}
+
+async function queueDesktopRestartCommand(stateDir: string): Promise<{ requestId: string }> {
+  await ensureStateDir(stateDir);
+  const requestId = randomUUID();
+  const destination = path.join(stateDir, DESKTOP_COMMAND_FILE);
+  const command = {
+    schemaVersion: 1,
+    requestId,
+    action: "restart-mcp",
+    createdAt: Date.now(),
+  } as const;
+  await fs.writeFile(destination, `${JSON.stringify(command)}\n`, { mode: FILE_MODE, flag: "wx" });
+  await fs.chmod(destination, FILE_MODE).catch(() => undefined);
+  return { requestId };
 }
 
 function validConfig(value: unknown): value is MobileApprovalConfig {
@@ -317,9 +340,56 @@ function sendJson(res: ServerResponse, status: number, body: Record<string, unkn
   res.end(`${JSON.stringify(body)}\n`);
 }
 
+async function readJsonBody(req: IncomingMessage, maxBytes = 16 * 1024): Promise<Record<string, unknown>> {
+  return await new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    req.on("data", (chunk: Buffer | string) => {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buffer.length;
+      if (bytes > maxBytes) {
+        reject(new Error("request_body_too_large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(buffer);
+    });
+    req.on("end", () => {
+      try {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+          reject(new Error("invalid_json_object"));
+          return;
+        }
+        resolve(parsed as Record<string, unknown>);
+      } catch (error) {
+        reject(error);
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
 function isLoopbackRequest(req: IncomingMessage): boolean {
   const address = req.socket.remoteAddress;
   return address === "127.0.0.1" || address === "::1" || address === "::ffff:127.0.0.1";
+}
+
+function localActivityOriginMatches(req: IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  const host = req.headers.host;
+  if (typeof origin !== "string" || typeof host !== "string") return false;
+  try {
+    const parsed = new URL(origin);
+    if (parsed.protocol !== "http:") return false;
+    if (parsed.host !== host) return false;
+    return parsed.hostname === "localhost" ||
+      parsed.hostname === "127.0.0.1" ||
+      parsed.hostname === "::1" ||
+      parsed.hostname === "[::1]";
+  } catch {
+    return false;
+  }
 }
 
 function setDashboardHeaders(res: ServerResponse): void {
@@ -921,17 +991,94 @@ export class MobileApprovalBridge {
   }
 
   private async handleCallback(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const requestPath = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+    const requestUrl = new URL(req.url ?? "/", "http://127.0.0.1");
+    const requestPath = requestUrl.pathname;
     if (req.method === "GET" && requestPath.startsWith("/activity")) {
       if (!this.activityTracker || (!isLoopbackRequest(req) && !tailscaleIdentity(req))) {
         sendJson(res, this.activityTracker ? 403 : 404, { ok: false });
         return;
       }
       setDashboardHeaders(res);
+      if (requestPath === "/activity/favicon.ico" || requestPath === "/activity/app-icon.png" || requestPath === "/activity/app-icon.svg") {
+        const iconFile = requestPath.endsWith(".ico")
+          ? ACTIVITY_APP_ICON_ICO_FILE
+          : requestPath.endsWith(".png")
+            ? ACTIVITY_APP_ICON_PNG_FILE
+            : ACTIVITY_APP_ICON_SVG_FILE;
+        const contentType = requestPath.endsWith(".ico")
+          ? "image/x-icon"
+          : requestPath.endsWith(".png")
+            ? "image/png"
+            : "image/svg+xml";
+        try {
+          const icon = await fs.readFile(iconFile);
+          res.statusCode = 200;
+          res.setHeader("content-type", contentType);
+          res.setHeader("cache-control", "no-cache, no-store, must-revalidate");
+          res.setHeader("x-content-type-options", "nosniff");
+          res.end(icon);
+        } catch {
+          sendJson(res, 404, { ok: false, error: "activity_icon_missing" });
+        }
+        return;
+      }
+      if (requestPath === "/activity/manifest.webmanifest") {
+        res.statusCode = 200;
+        res.setHeader("content-type", "application/manifest+json; charset=utf-8");
+        res.setHeader("cache-control", "no-cache, no-store, must-revalidate");
+        res.end(JSON.stringify({
+          id: "/activity/",
+          name: "ChatGPT To Codex",
+          short_name: "C2CT",
+          start_url: "/activity/",
+          scope: "/activity/",
+          display: "standalone",
+          background_color: "#087E78",
+          theme_color: "#087E78",
+          icons: [
+            { src: "/activity/app-icon.svg?brand=20260910", sizes: "any", type: "image/svg+xml", purpose: "any maskable" },
+            { src: "/activity/app-icon.png?brand=20260910", sizes: "1024x1024", type: "image/png", purpose: "any maskable" },
+          ],
+        }));
+        return;
+      }
+      if (requestPath === "/activity/api/command-grants") {
+        if (!isLoopbackRequest(req)) {
+          sendJson(res, 403, { ok: false, error: "command_grants_loopback_only" });
+          return;
+        }
+        const grants = await listAllApprovedCommandGrants({ stateDir: this.stateDir });
+        sendJson(res, 200, {
+          ok: true,
+          grants: grants.map((grant) => ({
+            grantId: grant.grantId,
+            commandId: grant.commandId,
+            projectId: grant.projectId,
+            resolvedExecutable: grant.resolvedExecutable,
+            argv: [...grant.argv],
+            cwd: grant.cwd,
+            purpose: grant.purpose,
+            risk: grant.risk,
+            requestFingerprint: grant.requestFingerprint,
+            createdAt: grant.createdAt,
+          })),
+        });
+        return;
+      }
+      if (requestPath === "/activity/api/settings") {
+        if (!isLoopbackRequest(req)) {
+          sendJson(res, 403, { ok: false, error: "settings_loopback_only" });
+          return;
+        }
+        const settings = await readDesktopSettings(this.stateDir);
+        sendJson(res, 200, { ok: true, platform: process.platform, settings });
+        return;
+      }
       if (requestPath === "/activity/api/activity") {
         const now = Date.now();
         const dashboard = await activityDashboardDocument(this.stateDir);
         const config = await readMobileApprovalConfig(this.stateDir);
+        const devHealthEnabled = isLoopbackRequest(req) && requestUrl.searchParams.get("devHealth") === "1";
         const [approvalItems, runtimeApply, macosAppApply, diagnostics, watchdog] = await Promise.all([
           dashboardApprovalItems(
             this.stateDir,
@@ -941,7 +1088,7 @@ export class MobileApprovalBridge {
           getLatestRuntimeApplyReceipt(this.stateDir).catch(() => null),
           getLatestMacosAppApplyReceipt(this.stateDir).catch(() => null),
           this.diagnostics?.summary(80).catch(() => null) ?? Promise.resolve(null),
-          readExternalWatchdogStatus().catch(() => null),
+          devHealthEnabled ? readExternalWatchdogStatus().catch(() => null) : Promise.resolve(null),
         ]);
         const deployments: ActivityDashboardDeployment[] = [];
         if (runtimeApply) {
@@ -1009,6 +1156,132 @@ export class MobileApprovalBridge {
         return;
       }
       sendJson(res, 404, { ok: false });
+      return;
+    }
+
+    if (req.method === "POST" && requestPath === "/activity/api/settings") {
+      if (!this.activityTracker) {
+        sendJson(res, 404, { ok: false });
+        return;
+      }
+      setDashboardHeaders(res);
+      if (!isLoopbackRequest(req)) {
+        sendJson(res, 403, { ok: false, error: "settings_loopback_only" });
+        return;
+      }
+      if (!localActivityOriginMatches(req)) {
+        sendJson(res, 403, { ok: false, error: "settings_same_origin_required" });
+        return;
+      }
+      const contentType = req.headers["content-type"];
+      if (typeof contentType !== "string" || !contentType.toLowerCase().startsWith("application/json")) {
+        sendJson(res, 415, { ok: false, error: "settings_json_required" });
+        return;
+      }
+      try {
+        const body = await readJsonBody(req);
+        const settings = await patchDesktopSettings(this.stateDir, body);
+        sendJson(res, 200, {
+          ok: true,
+          platform: process.platform,
+          settings,
+          nativeApplyRequired: true,
+        });
+      } catch {
+        sendJson(res, 400, { ok: false, error: "invalid_desktop_settings" });
+      }
+      return;
+    }
+    if (req.method === "POST" && requestPath === "/activity/api/command-grants/revoke") {
+      if (!this.activityTracker) {
+        sendJson(res, 404, { ok: false });
+        return;
+      }
+      setDashboardHeaders(res);
+      if (!isLoopbackRequest(req)) {
+        sendJson(res, 403, { ok: false, error: "command_grants_loopback_only" });
+        return;
+      }
+      if (!localActivityOriginMatches(req)) {
+        sendJson(res, 403, { ok: false, error: "command_grants_same_origin_required" });
+        return;
+      }
+      const contentType = req.headers["content-type"];
+      if (typeof contentType !== "string" || !contentType.toLowerCase().startsWith("application/json")) {
+        sendJson(res, 415, { ok: false, error: "command_grants_json_required" });
+        return;
+      }
+      try {
+        const body = await readJsonBody(req);
+        const projectId = typeof body.projectId === "string" ? body.projectId.trim() : "";
+        const grantId = typeof body.grantId === "string" ? body.grantId.trim() : "";
+        if (!projectId || projectId.length > 120 || !/^pcg_[0-9a-f-]{36}$/u.test(grantId)) {
+          sendJson(res, 400, { ok: false, error: "invalid_command_grant_revoke" });
+          return;
+        }
+        const revoked = await revokeApprovedCommandGrant({
+          stateDir: this.stateDir,
+          projectId,
+          grantId,
+        });
+        if (!revoked) {
+          sendJson(res, 404, { ok: false, error: "command_grant_not_found" });
+          return;
+        }
+        await this.ledgerAppend?.({
+          type: "command.grant.revoked",
+          projectId: revoked.projectId,
+          commandId: revoked.commandId,
+          grantId: revoked.grantId,
+          requestFingerprint: revoked.requestFingerprint,
+        }).catch(() => undefined);
+        sendJson(res, 200, {
+          ok: true,
+          revoked: {
+            grantId: revoked.grantId,
+            commandId: revoked.commandId,
+            projectId: revoked.projectId,
+            requestFingerprint: revoked.requestFingerprint,
+          },
+        });
+      } catch {
+        sendJson(res, 400, { ok: false, error: "invalid_command_grant_revoke" });
+      }
+      return;
+    }
+
+
+    if (req.method === "POST" && requestPath === "/activity/api/native/restart-mcp") {
+      if (!this.activityTracker) {
+        sendJson(res, 404, { ok: false });
+        return;
+      }
+      setDashboardHeaders(res);
+      if (!isLoopbackRequest(req)) {
+        sendJson(res, 403, { ok: false, error: "restart_loopback_only" });
+        return;
+      }
+      if (!localActivityOriginMatches(req)) {
+        sendJson(res, 403, { ok: false, error: "restart_same_origin_required" });
+        return;
+      }
+      if (process.platform !== "win32") {
+        sendJson(res, 409, { ok: false, error: "restart_native_bridge_unavailable" });
+        return;
+      }
+      try {
+        const queued = await queueDesktopRestartCommand(this.stateDir);
+        sendJson(res, 202, { ok: true, requestId: queued.requestId });
+      } catch (error) {
+        const code = error && typeof error === "object" && "code" in error
+          ? String((error as { code?: unknown }).code ?? "")
+          : "";
+        if (code === "EEXIST") {
+          sendJson(res, 409, { ok: false, error: "restart_already_queued" });
+        } else {
+          sendJson(res, 500, { ok: false, error: "restart_queue_failed" });
+        }
+      }
       return;
     }
 

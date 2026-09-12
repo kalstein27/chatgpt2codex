@@ -4,11 +4,12 @@ Windows has a WinForms/PowerShell launcher and the shared TypeScript/Node runtim
 Together they provide project, file, patch, command, Git, image intake, OAuth,
 connector, approval, and session-status features.
 
-The current public tree does **not** contain the installer/portable-package/
-installer-E2E builder automation referenced by older documentation. Treat an
-installer filename as a release convention, not proof that a current Windows
-artifact exists or passed acceptance. A successful TypeScript build or macOS
-test is also not Windows release evidence.
+The public tree now contains a source-driven portable-package builder. It creates
+an architecture-matched ZIP with the launcher, built runtime, production Node
+dependencies, its own `runtime\node.exe`, and a bundled `npm\bin\npm-cli.js`.
+The portable runtime therefore does not depend on a machine-wide Node/npm install
+for normal operation or in-app package-script verification. This is build evidence,
+not proof of signing, SmartScreen acceptance, or installer-style release acceptance.
 
 Native Windows screenshot, click/type control, and UI Automation are not
 implemented yet, so `Agent Arm` remains unavailable by design.
@@ -18,7 +19,8 @@ implemented yet, so `Agent Arm` remains unavailable by design.
 | Area | Windows status |
 | --- | --- |
 | Windows 10 / 11 desktop | Intended source-run target; a release still needs real-Windows acceptance |
-| Node runtime | Node.js 22 or newer is required for the public source-run path |
+| Node runtime | Node.js 22 or newer is required for the public source-run path; the portable bundle carries its own runtime |
+| npm | `packageManager` records npm 11.19.0 as the validated release-tooling version; the portable bundle carries its own npm CLI |
 | PowerShell | Required; launch scripts use `powershell.exe -NoProfile -ExecutionPolicy Bypass` |
 | Core local coding workflow | Supported through the shared runtime |
 | Local loopback MCP | Supported without a public tunnel |
@@ -30,26 +32,103 @@ implemented yet, so `Agent Arm` remains unavailable by design.
 
 ## What GitHub verifies on real Windows
 
-The public `.github/workflows/verify-windows.yml` job runs on `windows-latest`
-with read-only repository permissions. It currently verifies:
+The public `.github/workflows/verify-windows.yml` job runs a native x64/ARM64
+matrix with read-only repository permissions. It currently verifies:
 
 - `npm ci --ignore-scripts` and a production dependency audit
 - TypeScript typecheck and the shared runtime build
 - PowerShell parser acceptance for the public Windows scripts
 - compilation of `windows/ChatGPTToCodexLauncher.cs` with the Windows .NET
   Framework C# compiler
+- a self-contained portable ZIP for the native runner architecture, including
+  bundled Node/npm version and npm CLI hash verification
+- an isolated portable first-install/restart test whose child PATH contains no
+  machine-wide Node/npm
 - a live loopback HTTP smoke test that requires `/healthz` to report
   `platform=win32` and `transport=http`
 
 That workflow is strong source/runtime evidence, but it intentionally does not
-package, sign, publish, or click through a Windows installer. Installer and
+sign, publish a GitHub Release, or click through a Windows installer. Signing and
 SmartScreen acceptance therefore remain separate release evidence.
 
-## Recommended install: clone the repository and build it yourself
+## End-user install: use the self-contained portable bundle
 
-The recommended Windows path is to clone the public repository, install the Node
-dependencies, build the current source, and run that checkout. This avoids
-depending on a separately packaged Windows build.
+For ordinary Windows use, prefer the architecture-matched portable ZIP produced
+by the verified Windows build/release flow. Extract the whole folder and launch
+`ChatGPT To Codex.exe`. The portable bundle carries its own Node runtime and npm
+CLI, so rebooting the PC or losing a machine-wide Node/npm installation does not
+break the app's package-script execution path.
+
+### Codex / coding-agent clean-install guide
+
+If the user supplies only the GitHub repository URL and says **"install this"**,
+do not ask them to locate a ZIP manually and do not default to a source build.
+Use the repository's latest official GitHub Release as the discovery point, then
+follow this section end to end. If no matching verified Release asset exists,
+stop and report that release packaging is not ready instead of silently switching
+to an Actions artifact, source build, or unverified download.
+
+This is the public one-pass path for a coding agent installing ChatGPT To Codex
+on a clean Windows PC. The portable path must not install machine-wide Node, npm,
+Git, or other developer tooling unless the user explicitly chooses the source
+build path instead.
+
+1. Detect the Windows CPU architecture and choose the exact matching Release
+   asset: `chatgpt2codex-windows-arm64.zip` or
+   `chatgpt2codex-windows-x64.zip`. End users should prefer a GitHub Release
+   asset. GitHub Actions artifacts are short-lived verification candidates, not
+   a substitute for a published Release.
+2. If the matching `.zip.sha256` file is published, calculate the ZIP SHA-256
+   with `Get-FileHash -Algorithm SHA256` and require an exact match before
+   extraction.
+3. Extract the entire archive to
+   `%LOCALAPPDATA%\Programs\ChatGPT To Codex`. Do not run the EXE from inside the
+   ZIP and do not copy only the EXE.
+4. Before launch, verify at least these bundle members exist:
+   `ChatGPT To Codex.exe`, `runtime\node.exe`, `npm\bin\npm-cli.js`,
+   `dist\cli.js`, `start-chatgpt.ps1`, `portable-manifest.json`, `README.txt`,
+   and `assets\chatgpt2codex-plugin-icon.png`. Confirm the manifest architecture
+   matches the current PC.
+5. Launch `ChatGPT To Codex.exe`, start MCP, and require local health to become
+   healthy before continuing. If a step requires a human UI decision, stop and
+   tell the user exactly what to click rather than guessing or bypassing it.
+6. For ChatGPT web, enable the web connector and copy the externally reachable
+   HTTPS connector URL. Register the bare `/mcp` endpoint in ChatGPT Apps /
+   Plugins / Connectors under the name `C2CT`; do not append schema hashes or
+   ad-hoc query parameters.
+7. Complete OAuth interactively when offered. Keep Owner Token values private
+   and use them only as a fallback. Never ask the user to paste credentials into
+   an agent transcript.
+8. If the ChatGPT connector registration UI exposes a custom-icon control, use
+   `%LOCALAPPDATA%\Programs\ChatGPT To Codex\assets\chatgpt2codex-plugin-icon.png`.
+   If the UI has no such control, report that fact instead of inventing one.
+9. Final connection proof is a new ChatGPT conversation calling
+   `connection_status` and immediately `agent_guide`. Treat the install as
+   complete only when connection status reports `ok=true`, `finalHealthy=true`,
+   and `transportErrors=0`.
+
+One-shot prompt for Codex or another local coding agent:
+
+```text
+Install ChatGPT To Codex on this clean Windows PC using the latest verified
+architecture-matched portable ZIP from the project's GitHub Release. Do not
+install machine-wide Node/npm/Git for the portable path. Verify the published
+SHA-256 when available, extract the whole bundle to
+%LOCALAPPDATA%\Programs\ChatGPT To Codex, validate portable-manifest.json and the
+required bundled files, then launch ChatGPT To Codex.exe. Guide me through only
+the human steps needed to start MCP, confirm local health, enable the web
+connector, and register the HTTPS bare /mcp endpoint in ChatGPT as C2CT. Use the
+bundled assets\chatgpt2codex-plugin-icon.png only if the registration UI supports
+a custom icon. Prefer OAuth; never expose Owner Token or OAuth credentials. Stop
+on any architecture/hash/health mismatch and report the exact evidence.
+```
+
+
+## Developer/source install: clone and build the repository
+
+Clone/build is the development path. It requires a machine-wide Node/npm toolchain
+to install dependencies and create the first portable bundle. Once a portable
+bundle is built, that bundle no longer depends on the machine-wide toolchain.
 
 ### 1. Install the prerequisites
 
@@ -58,7 +137,20 @@ Required:
 - Windows 10 or Windows 11
 - PowerShell
 - Git for Windows
-- Node.js 22 or newer
+- Node.js 22 or newer, including npm
+
+If Node/npm is missing, broken after a reboot, or only partially visible on PATH,
+run this source-tree repair helper once:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows\Repair-Node-Npm.ps1
+```
+
+For a double-clickable wrapper, use `windows\Repair-Node-Npm.cmd`. The helper uses
+the official WinGet package ID `OpenJS.NodeJS.LTS`, then refreshes the current
+process PATH and verifies both Node.js 22+ and npm. WinGet may show Windows UAC
+because the Node.js LTS package is machine-wide. It never deletes the checkout or
+uninstalls unrelated software.
 
 Recommended:
 
@@ -74,6 +166,13 @@ The official Windows client requires Windows 10 or later. Tailscale's current
 Windows installation guide is:
 
 `https://tailscale.com/docs/install/windows`
+
+ChatGPT To Codex resolves `tailscale.exe` automatically. It prefers Windows
+machine-wide App Paths and installer registration when available, then checks
+the documented Program Files default, the registered Tailscale service location,
+per-user install/app-alias locations, and finally `PATH`. This also supports MSI
+installs whose `INSTALLDIR` was customized, without storing a per-PC hard-coded
+Tailscale path in ChatGPT To Codex settings.
 
 ### 2. Clone ChatGPT To Codex
 
@@ -98,13 +197,26 @@ a checkout that contains work you want to keep.
 ```powershell
 npm ci --ignore-scripts
 npm run typecheck
-npm test
+npm run test:publication
 npm run build
 ```
 
 `npm run build` produces the shared Node runtime in `dist/`. If `dist/cli.js` is
 missing when the launcher starts, `start-chatgpt.ps1` also attempts a build, but
 running the explicit build above gives a much clearer first-install failure point.
+Ordinary end users should not need this source-development toolchain; use the
+self-contained portable artifact instead.
+
+The public branch intentionally excludes development-only `*.test.ts` files.
+`npm test` therefore stays strict for development checkouts that contain tests,
+while `npm run test:publication` is the publication-checkout command and permits
+an empty Vitest set. Real Windows CI still performs typecheck, build, launcher
+compilation, portable packaging, and a live HTTP health smoke test.
+
+Use the same normal Windows user for `git clone`, `npm ci`, build, and runtime
+launch. Do not clone as Administrator and then build as a different user. If Git
+reports dubious ownership, prefer a fresh clone owned by the intended user; do
+not silence the boundary globally with `safe.directory=*`.
 
 ### 4. Start the Windows tray UI
 
@@ -116,8 +228,8 @@ For the closest Windows equivalent to the desktop app experience, launch:
 
 You can also double-click `windows\Start-ChatGPTToCodexTray.cmd` in Explorer.
 That entry point runs the prerequisite helper and then starts the PowerShell tray
-UI. The prerequisite helper can install Node.js and `cloudflared` through WinGet
-when either command is missing.
+UI. Node.js is the default prerequisite. `cloudflared` is checked/installed only
+when `CHATGPT2CODEX_TUNNEL_MODE` explicitly selects a Cloudflare tunnel mode.
 
 If you only want the runtime without the tray UI, use:
 
@@ -173,17 +285,24 @@ helper still resolves only the approved macOS Tailscale CLI locations. Therefore
 the fully automatic Mac-style Tailscale/mobile-approval setup is **not yet Windows
 parity** and should not be described as automatic on Windows.
 
-## Activity page
+## Shared desktop UI
 
-The Activity dashboard is part of the shared runtime and starts on Windows too.
-While MCP is running, open this on the Windows PC:
+The Activity dashboard and desktop settings are one shared web UI used by both
+macOS and Windows. While MCP is running, the Windows launcher opens the same UI
+in Edge app mode when available, then Chrome app mode as a fallback, and hides
+the legacy launcher/log window to the tray.
+Double-clicking the tray icon, or choosing **Open ChatGPT To Codex**, opens it
+again. The direct loopback URL remains:
 
 `http://127.0.0.1:7980/activity/`
 
-The page shows the current conversation/activity model, operation history,
-pending approvals, deployment/runtime state, widget-load information, and MCP
-health diagnostics. It is the best place to answer "is ChatGPT actually still
-working?" without reading raw logs.
+The UI shows the current conversation/activity model, operation history, pending
+approvals, deployment/runtime state, widget-load information, MCP health, and a
+shared **Settings** tab. Those settings are persisted in the common desktop
+settings document and then applied by the platform-native launcher. If neither
+Edge nor Chrome app mode is available, Windows falls back to the system browser.
+The old WinForms window remains a startup/recovery/log surface rather than the
+normal daily UI.
 
 Local loopback viewing works cross-platform. Remote viewing is accepted only from
 loopback or a request carrying a Tailscale identity. If you manually expose the
@@ -197,12 +316,61 @@ so do not expect the full Mac mobile-approval experience on Windows yet.
 
 ## Web connector and cloudflared
 
-The release workflow is not included in the minimal public source tree, and the
-installer-E2E automation remains local-only. Installer/portable packaging still
-needs to run on a real Windows runner before any artifact is treated as a release
-candidate. Release binaries belong in GitHub Releases, not in the Git tree.
+The portable builder is:
 
-## Web connector and cloudflared
+```powershell
+npm run build:windows-portable
+```
+
+It emits `build\windows-portable\chatgpt2codex-windows-<arch>.zip`. The archive
+includes its own Node executable and npm CLI and can run without a separately
+installed Node/npm toolchain after extraction. The manifest records both bundled
+versions and the npm CLI hash. Build it on the same CPU architecture you intend
+to ship, and still perform real-Windows acceptance before treating it as a release.
+Release binaries belong in GitHub Releases, not in the Git tree.
+
+For the complete source-to-portable acceptance loop on a Windows developer PC,
+double-click:
+
+```text
+windows\Build-And-Verify-Portable.cmd
+```
+
+It builds into the separate `build\windows-portable-next` staging root so a
+currently running portable installation is never overwritten. If a matching
+sealed stage and non-empty ZIP already exist and only the final isolation check
+needs to be resumed, use `windows\Resume-Portable-Verify.cmd` instead.
+
+The portable builder and archive helper calculate SHA-256 directly through .NET
+cryptography instead of depending on `Get-FileHash` module auto-loading. The
+builder also prints its PowerShell version and host executable for diagnostics.
+
+Supported non-interactive Windows verification commands are:
+
+```powershell
+npm run verify:windows-oauth-wiring
+npm run verify:windows-portable
+```
+
+The OAuth check verifies the launcher/local-control approval wiring from source.
+The portable check validates launcher, bundled Node, bundled npm CLI, manifest
+versions/hashes, architecture, brand assets, and the final non-empty ZIP. The
+stronger `npm run verify:windows-portable-first-install-ui` test additionally
+launches the portable runtime in an isolated child environment with machine-wide
+Node/npm removed from PATH. `npm run verify:windows-owner-token-ui` remains an
+interactive Win32 UI E2E test and is intentionally separate from unattended automation.
+
+For source verification and CI, prefer `npm ci --ignore-scripts`. If a newer npm
+reports an `allowScripts` warning for `esbuild`, do not globally enable package
+scripts merely to silence the warning. The verified source flow installs with
+scripts disabled, then runs typecheck/build explicitly. Review dependency state
+with `npm run audit:prod` for production exposure and `npm run audit:moderate`
+when reviewing development-tooling advisories.
+
+`npm run publication:check` now builds the shared runtime first and executes the
+publication guard with plain Node rather than `tsx`. This keeps the check usable
+in restricted Windows user/sandbox contexts where TypeScript-loader startup can
+fail during OS account discovery.
 
 Starting MCP without the web connector is loopback-only. ChatGPT on the web needs
 an externally reachable HTTPS connector URL. The Windows launcher supports
@@ -220,6 +388,13 @@ winget install --id Cloudflare.cloudflared
 A Quick Tunnel `trycloudflare.com` URL can change after restart. Reconnect or
 update the ChatGPT connector when that happens. For regular use, prefer a stable
 HTTPS hostname that you control.
+
+For a `.ts.net` external HTTPS origin, keep the distinction explicit: Tailscale
+**Serve** is tailnet-private and is not enough for ChatGPT web. Tailscale
+**Funnel** is the public exposure mode. ChatGPT To Codex verifies public health
+before marking the connector Ready, but an externally managed Serve/Funnel
+configuration is not enabled or disabled by this app. Quitting the Windows app
+therefore warns that Funnel configuration may remain enabled separately.
 
 ## Runtime behavior
 
@@ -265,21 +440,18 @@ project discovery, work lanes, file read/write/patching, guarded commands, Git,
 image intake, OAuth/connector sessions, approvals/status, connection diagnostics,
 and the Activity dashboard are shared.
 
-It is **not yet identical** to macOS in three important areas:
+It is **not yet identical** to macOS in two important areas:
 
-1. The macOS app has a native embedded Activity window; Windows currently uses
-   the browser-hosted `http://127.0.0.1:7980/activity/` page.
-2. The automatic Tailscale Serve + ntfy mobile-approval setup currently resolves
+1. The automatic Tailscale Serve + ntfy mobile-approval setup currently resolves
    macOS Tailscale CLI paths only. Windows can run Tailscale and Tailscale Serve,
    but C2CT does not yet automate that setup on Windows.
-3. Native desktop screenshot/click/type/UI-Automation control is not implemented
+2. Native desktop screenshot/click/type/UI-Automation control is not implemented
    on Windows, so `Agent Arm` remains unavailable.
 
 If your normal Mac usage is ChatGPT asking C2CT to inspect/edit/test/build Git
 projects, Windows should exercise the same shared runtime path. If your workflow
-depends on Mac desktop control, the embedded Activity window, or one-tap mobile
-approval over the automatically configured Tailscale bridge, Windows is not yet
-feature-identical.
+depends on Mac desktop control or one-tap mobile approval over the automatically
+configured Tailscale bridge, Windows is not yet feature-identical.
 
 ## First-run verification on the Windows PC
 
@@ -303,6 +475,14 @@ version for source-run testing, artifact SHA-256, and signing/SmartScreen state.
 - If the connector URL is empty, enable the web connector and restart MCP.
 - If Cloudflare connector startup fails, confirm `cloudflared` is installed and
   reachable before retrying.
+- If a source rebuild says `node.exe` is in use, do not overwrite the running
+  portable directory. Keep the app running from one extracted folder and build
+  into `build\windows-portable-next`, or exit the old portable before replacing
+  that exact folder. The builder refuses an unsafe in-place overwrite.
+- If system npm disappears after reboot, ordinary portable use should continue
+  because bundled npm is used. Only a source/developer rebuild needs the system
+  toolchain; use `windows\Repair-Node-Npm.cmd` when that source toolchain is
+  genuinely missing or broken.
 - If a temporary connector URL changes, replace the old ChatGPT connection.
 - If tools are visible but calls fail, open **Connection Diagnostics...**. No
   event at the failure time means the request did not reach the local runtime.

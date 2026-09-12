@@ -113,6 +113,9 @@ export interface RuntimeApplyReceipt {
   recommendedAction: string;
   approvalRequestId?: string;
   workerPid?: number;
+  workerStartedAt?: string;
+  workerHeartbeatAt?: string;
+  workerFailureDetectedAt?: string;
   disconnectStartedAt?: string;
   reconnectObservedAt?: string;
   reconnectDurationMs?: number;
@@ -855,7 +858,67 @@ export async function recordRuntimeApplyWorkerPid(
   operationId: string,
   workerPid: number,
 ): Promise<RuntimeApplyReceipt> {
-  return updateRuntimeApplyReceipt(stateDir, operationId, (receipt) => ({ ...receipt, workerPid, updatedAt: timestamp() }));
+  const at = timestamp();
+  return updateRuntimeApplyReceipt(stateDir, operationId, (receipt) => ({
+    ...receipt,
+    workerPid,
+    workerStartedAt: receipt.workerStartedAt ?? at,
+    workerHeartbeatAt: at,
+    updatedAt: at,
+  }));
+}
+
+export async function recordRuntimeApplyWorkerHeartbeat(
+  stateDir: string,
+  operationId: string,
+  workerPid: number,
+): Promise<RuntimeApplyReceipt> {
+  const at = timestamp();
+  return updateRuntimeApplyReceipt(stateDir, operationId, (receipt) => {
+    if (receipt.state !== "ACTIVATION_REQUESTED") return receipt;
+    if (receipt.workerPid !== undefined && receipt.workerPid !== workerPid) return receipt;
+    return {
+      ...receipt,
+      workerPid,
+      workerStartedAt: receipt.workerStartedAt ?? at,
+      workerHeartbeatAt: at,
+      updatedAt: at,
+    };
+  });
+}
+
+export async function markRuntimeApplyWorkerUnexpectedFailure(
+  stateDir: string,
+  operationId: string,
+): Promise<RuntimeApplyReceipt> {
+  const [health, pointer] = await Promise.all([
+    probeRuntimeHealth(runtimePort()).catch((): RuntimeHealthSnapshot => ({
+      healthy: false,
+      checkedAt: timestamp(),
+      runtimePid: null,
+      supervisorPid: null,
+      manifest: null,
+      externalIdentity: null,
+    })),
+    readActiveRuntimePointer(stateDir).catch(() => null),
+  ]);
+  const at = timestamp();
+  return updateRuntimeApplyReceipt(stateDir, operationId, (receipt) => {
+    if (receipt.state !== "ACTIVATION_REQUESTED") return receipt;
+    const next = transition(receipt, "APPLY_START_FAILED", "complete");
+    next.workerFailureDetectedAt = at;
+    next.workerHeartbeatAt = at;
+    next.failurePhase = receipt.disconnectStartedAt ? "health" : "activation";
+    next.activeRuntimePointer = pointer;
+    next.postApplyHealth = health;
+    next.currentRuntimePid = health.runtimePid;
+    next.currentRuntimeRoot = health.manifest?.runtimeRoot ?? receipt.currentRuntimeRoot;
+    next.finalHealthy = health.healthy;
+    next.recommendedAction = health.healthy
+      ? "refresh-live-runtime-identity-before-retry"
+      : "inspect-runtime-worker-failure";
+    return next;
+  });
 }
 
 /**
@@ -949,6 +1012,104 @@ function processAlive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+export interface RuntimeApplyWorkerStatus {
+  workerPidRecorded: boolean;
+  workerAlive: boolean;
+  activationAgeMs: number;
+  activationStalled: boolean;
+}
+
+export function runtimeApplyWorkerStatus(
+  receipt: RuntimeApplyReceipt,
+  options: { nowMs?: number; pidAlive?: (pid: number) => boolean; stallAfterMs?: number } = {},
+): RuntimeApplyWorkerStatus {
+  const nowMs = options.nowMs ?? Date.now();
+  const pidAlive = options.pidAlive ?? processAlive;
+  const stallAfterMs = Math.max(1_000, options.stallAfterMs ?? 10_000);
+  const heartbeatAt = receipt.workerHeartbeatAt ?? receipt.workerStartedAt ?? receipt.updatedAt;
+  const heartbeatMs = Date.parse(heartbeatAt);
+  const activationAgeMs = Number.isFinite(heartbeatMs) ? Math.max(0, nowMs - heartbeatMs) : Number.POSITIVE_INFINITY;
+  const workerPidRecorded = typeof receipt.workerPid === "number" && Number.isSafeInteger(receipt.workerPid) && receipt.workerPid > 0;
+  const workerAlive = workerPidRecorded ? pidAlive(receipt.workerPid!) : false;
+  const activationStalled = receipt.state === "ACTIVATION_REQUESTED"
+    && activationAgeMs >= stallAfterMs
+    && (!workerPidRecorded || !workerAlive);
+  return { workerPidRecorded, workerAlive, activationAgeMs, activationStalled };
+}
+
+export async function recoverStalledRuntimeApply(input: {
+  stateDir: string;
+  projectId: string;
+  operationId: string;
+  stallAfterMs?: number;
+  nowMs?: number;
+  pidAlive?: (pid: number) => boolean;
+  probeHealth?: (port: number) => Promise<RuntimeHealthSnapshot>;
+}): Promise<{ receipt: RuntimeApplyReceipt; recovered: boolean; reason: string }> {
+  const receipt = await getRuntimeApplyReceipt(input.stateDir, { operationId: input.operationId });
+  if (!receipt) throw new Error(`Runtime apply receipt not found: ${input.operationId}`);
+  if (receipt.projectId !== input.projectId) {
+    throw new DomainError(ErrorCode.OPERATION_NOT_FOUND, "Runtime apply receipt does not belong to this project", {
+      projectId: input.projectId,
+      operationId: input.operationId,
+    });
+  }
+  if (receipt.state !== "ACTIVATION_REQUESTED") {
+    return { receipt, recovered: false, reason: "runtime-apply-not-activating" };
+  }
+  const worker = runtimeApplyWorkerStatus(receipt, {
+    ...(input.nowMs !== undefined ? { nowMs: input.nowMs } : {}),
+    ...(input.pidAlive ? { pidAlive: input.pidAlive } : {}),
+    ...(input.stallAfterMs !== undefined ? { stallAfterMs: input.stallAfterMs } : {}),
+  });
+  if (!worker.activationStalled) {
+    return { receipt, recovered: false, reason: worker.workerAlive ? "runtime-worker-still-running" : "activation-stall-grace-period" };
+  }
+
+  const probe = input.probeHealth ?? probeRuntimeHealth;
+  const [health, pointer] = await Promise.all([
+    probe(runtimePort()),
+    readActiveRuntimePointer(input.stateDir),
+  ]);
+  const externalIdentity = health.externalIdentity;
+  const supervisorPid = externalIdentity?.supervisorPid ?? health.supervisorPid;
+  const externalTopologyUnchanged = Boolean(externalIdentity)
+    && externalIdentity?.connectorPublicOrigin === receipt.externalIdentityBefore.connectorPublicOrigin
+    && externalIdentity?.tunnelMode === receipt.externalIdentityBefore.tunnelMode
+    && externalIdentity?.cloudflaredPid === receipt.externalIdentityBefore.cloudflaredPid;
+  const unchanged = health.healthy
+    && health.manifest?.buildFingerprint === receipt.expectedCurrentFingerprint
+    && health.manifest.runtimeRoot === receipt.previousRuntimeRoot
+    && pointer === receipt.previousPointerValue
+    && supervisorPid !== null
+    && externalTopologyUnchanged;
+  if (!unchanged) {
+    return { receipt, recovered: false, reason: "live-runtime-topology-not-proven-unchanged" };
+  }
+
+  const recovered = await updateRuntimeApplyReceipt(input.stateDir, input.operationId, (value) => {
+    if (value.state !== "ACTIVATION_REQUESTED") return value;
+    const next = transition(value, "APPLY_START_FAILED", "complete");
+    next.workerFailureDetectedAt = timestamp();
+    next.failurePhase = "activation";
+    next.activeRuntimePointer = pointer;
+    next.postApplyHealth = health;
+    next.currentRuntimePid = health.runtimePid;
+    next.currentRuntimeRoot = health.manifest?.runtimeRoot ?? value.previousRuntimeRoot;
+    next.supervisorPreserved = supervisorPid === value.externalIdentityBefore.supervisorPid;
+    next.connectorPreserved = health.externalIdentity?.connectorPublicOrigin === value.externalIdentityBefore.connectorPublicOrigin;
+    next.tunnelProcessesPreserved = health.externalIdentity?.tunnelMode === value.externalIdentityBefore.tunnelMode
+      && health.externalIdentity?.cloudflaredPid === value.externalIdentityBefore.cloudflaredPid;
+    next.rollbackAttempted = false;
+    next.rollbackSucceeded = null;
+    next.previousRuntimeRestored = true;
+    next.finalHealthy = true;
+    next.recommendedAction = "retry-runtime-apply-with-new-requestId";
+    return next;
+  });
+  return { receipt: recovered, recovered: recovered.state === "APPLY_START_FAILED", reason: "stale-activation-terminalized" };
 }
 
 function preservation(receipt: RuntimeApplyReceipt, health: RuntimeHealthSnapshot | null, pidAlive: (pid: number) => boolean): {
@@ -1287,6 +1448,7 @@ export function runtimeApplyPublicReceipt(receipt: RuntimeApplyReceipt): Record<
   const schemaRefreshRequired =
     (receipt.state === "APPLIED" || receipt.state === "ALREADY_APPLIED")
     && runtimeSchemaRefreshRequired(receipt.previousManifest, receipt.targetManifest);
+  const workerStatus = runtimeApplyWorkerStatus(receipt);
   return {
     requestId: receipt.requestId,
     operationId: receipt.operationId,
@@ -1313,6 +1475,13 @@ export function runtimeApplyPublicReceipt(receipt: RuntimeApplyReceipt): Record<
     diagnosticId: receipt.diagnosticId,
     failurePhase: receipt.failurePhase,
     recommendedAction: receipt.recommendedAction,
+    workerPidRecorded: workerStatus.workerPidRecorded,
+    workerAlive: workerStatus.workerAlive,
+    activationAgeMs: workerStatus.activationAgeMs,
+    activationStalled: workerStatus.activationStalled,
+    workerStartedAt: receipt.workerStartedAt ?? null,
+    workerHeartbeatAt: receipt.workerHeartbeatAt ?? null,
+    workerFailureDetectedAt: receipt.workerFailureDetectedAt ?? null,
     disconnectStartedAt: receipt.disconnectStartedAt ?? null,
     reconnectObservedAt: receipt.reconnectObservedAt ?? null,
     reconnectDurationMs: receipt.reconnectDurationMs ?? null,

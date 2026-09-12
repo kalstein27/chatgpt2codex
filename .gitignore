@@ -102,6 +102,7 @@ id_ed25519
 !/scripts/apply-activity-dashboard.ts
 !/scripts/macos-dependency-doctor.sh
 !/scripts/check-publication-boundary.ts
+!/scripts/check-publication-boundary.mjs
 /linux/
 /windows/Build-ChatGPTToCodexExe.ps1
 /windows/ChatGPTToCodexSetup.cs
@@ -118,6 +119,8 @@ id_ed25519
 /assets/*
 !/assets/chatgpt2codex-icon.png
 !/assets/chatgpt2codex-icon.ico
+!/assets/chatgpt2codex-icon.svg
+!/assets/chatgpt2codex-plugin-icon.png
 !/assets/readme-hero.png
 
 # Documentation and working notes are local-only. Existing tracked files are

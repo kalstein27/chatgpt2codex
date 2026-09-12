@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Web.Script.Serialization;
@@ -24,7 +25,26 @@ internal static class ChatGPTToCodexLauncher
 internal sealed class LocalControlSnapshot
 {
     public LocalControlInfo control { get; set; }
+    public LocalOAuthApprovalsInfo oauthApprovals { get; set; }
     public LocalControlSession[] sessions { get; set; }
+}
+
+internal sealed class LocalOAuthApprovalsInfo
+{
+    public int pendingRequestCount { get; set; }
+    public LocalPendingOAuthApproval[] pendingRequests { get; set; }
+}
+
+internal sealed class LocalPendingOAuthApproval
+{
+    public string requestId { get; set; }
+    public string status { get; set; }
+    public string clientName { get; set; }
+    public string[] scopes { get; set; }
+    public string resource { get; set; }
+    public string redirectHost { get; set; }
+    public long createdAt { get; set; }
+    public long expiresAt { get; set; }
 }
 
 internal sealed class LocalControlInfo
@@ -61,6 +81,184 @@ internal sealed class LocalControlOperation
     public string tool { get; set; }
     public string state { get; set; }
     public long elapsedMs { get; set; }
+}
+
+internal sealed class DesktopSettings
+{
+    public int schemaVersion { get; set; }
+    public string language { get; set; }
+    public string projectFolder { get; set; }
+    public bool launchAtStartup { get; set; }
+    public bool startMcpOnOpen { get; set; }
+    public bool autoCheckUpdates { get; set; }
+    public bool multiProjectLanesEnabled { get; set; }
+    public bool enablePublicTunnel { get; set; }
+    public string publicHostname { get; set; }
+    public int port { get; set; }
+    public string[] controlAllowlist { get; set; }
+}
+
+internal static class DashboardWindowBranding
+{
+    private const uint WmSetIcon = 0x0080;
+    private static readonly IntPtr IconSmall = IntPtr.Zero;
+    private static readonly IntPtr IconBig = new IntPtr(1);
+    private const uint ImageIcon = 1;
+    private const uint LrLoadFromFile = 0x0010;
+    private const uint LrDefaultSize = 0x0040;
+    private const ushort VtLpwstr = 31;
+    private static readonly Guid PropertyStoreGuid = new Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99");
+    private static readonly PropertyKey AppUserModelIdKey = new PropertyKey(
+        new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), 5);
+    private static readonly PropertyKey RelaunchIconResourceKey = new PropertyKey(
+        new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), 3);
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    private struct PropertyKey
+    {
+        public Guid formatId;
+        public uint propertyId;
+
+        public PropertyKey(Guid formatId, uint propertyId)
+        {
+            this.formatId = formatId;
+            this.propertyId = propertyId;
+        }
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    private struct PropVariant
+    {
+        [FieldOffset(0)] public ushort valueType;
+        [FieldOffset(8)] public IntPtr pointerValue;
+
+        public static PropVariant FromString(string value)
+        {
+            var result = new PropVariant();
+            result.valueType = VtLpwstr;
+            result.pointerValue = Marshal.StringToCoTaskMemUni(value);
+            return result;
+        }
+    }
+
+    [ComImport]
+    [Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IPropertyStore
+    {
+        [PreserveSig] int GetCount(out uint propertyCount);
+        [PreserveSig] int GetAt(uint propertyIndex, out PropertyKey key);
+        [PreserveSig] int GetValue(ref PropertyKey key, out PropVariant value);
+        [PreserveSig] int SetValue(ref PropertyKey key, ref PropVariant value);
+        [PreserveSig] int Commit();
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetWindowTextLength(IntPtr hWnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr LoadImage(IntPtr hInst, string name, uint type, int cx, int cy, uint fuLoad);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("shell32.dll")]
+    private static extern int SHGetPropertyStoreForWindow(
+        IntPtr hWnd,
+        ref Guid interfaceId,
+        [MarshalAs(UnmanagedType.Interface)] out IPropertyStore propertyStore);
+
+    [DllImport("ole32.dll")]
+    private static extern int PropVariantClear(ref PropVariant value);
+
+    private static void ApplyTaskbarIdentity(IntPtr hWnd, string iconPath)
+    {
+        IPropertyStore store = null;
+        try
+        {
+            var interfaceId = PropertyStoreGuid;
+            if (SHGetPropertyStoreForWindow(hWnd, ref interfaceId, out store) != 0 || store == null) return;
+
+            var appId = PropVariant.FromString("ChatGPTToCodex.Dashboard");
+            try
+            {
+                var key = AppUserModelIdKey;
+                store.SetValue(ref key, ref appId);
+            }
+            finally
+            {
+                PropVariantClear(ref appId);
+            }
+
+            var iconResource = PropVariant.FromString(iconPath + ",0");
+            try
+            {
+                var key = RelaunchIconResourceKey;
+                store.SetValue(ref key, ref iconResource);
+            }
+            finally
+            {
+                PropVariantClear(ref iconResource);
+            }
+
+            store.Commit();
+        }
+        catch
+        {
+            // WM_SETICON remains the fallback when a browser rejects shell properties.
+        }
+        finally
+        {
+            if (store != null && Marshal.IsComObject(store)) Marshal.FinalReleaseComObject(store);
+        }
+    }
+
+    public static void ApplyAsync()
+    {
+        System.Threading.ThreadPool.QueueUserWorkItem(_ =>
+        {
+            var iconPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "assets", "chatgpt2codex-icon.ico");
+            if (!File.Exists(iconPath)) return;
+
+            var icon = LoadImage(IntPtr.Zero, iconPath, ImageIcon, 0, 0, LrLoadFromFile | LrDefaultSize);
+            if (icon == IntPtr.Zero) return;
+
+            // Chromium may replace the window icon again as the page finishes loading.
+            // Re-apply for a bounded settling period and also assign a per-window
+            // AppUserModelID/icon resource so the Windows taskbar does not keep the
+            // browser's generic globe/group icon.
+            for (var attempt = 0; attempt < 120; attempt++)
+            {
+                EnumWindows((hWnd, lParam) =>
+                {
+                    if (!IsWindowVisible(hWnd)) return true;
+                    var length = GetWindowTextLength(hWnd);
+                    if (length <= 0 || length > 256) return true;
+                    var title = new StringBuilder(length + 1);
+                    GetWindowText(hWnd, title, title.Capacity);
+                    if (!string.Equals(title.ToString(), "ChatGPT To Codex", StringComparison.Ordinal)) return true;
+
+                    SendMessage(hWnd, WmSetIcon, IconBig, icon);
+                    SendMessage(hWnd, WmSetIcon, IconSmall, icon);
+                    ApplyTaskbarIdentity(hWnd, iconPath);
+                    return true;
+                }, IntPtr.Zero);
+
+                System.Threading.Thread.Sleep(125);
+            }
+        });
+    }
 }
 
 internal sealed class LauncherForm : Form
@@ -146,6 +344,10 @@ internal sealed class LauncherForm : Form
         {"controlNoPendingActions", new[] {"No pending actions", "대기 중인 작업 없음"}},
         {"controlApprove", new[] {"Approve", "승인"}},
         {"controlReject", new[] {"Reject", "거부"}},
+        {"pendingOAuthApprovalsMenu", new[] {"Pending OAuth connections", "대기 중인 OAuth 연결"}},
+        {"oauthNoPendingApprovals", new[] {"No pending OAuth connections", "대기 중인 OAuth 연결 없음"}},
+        {"oauthApprovalTitle", new[] {"ChatGPT OAuth connection", "ChatGPT OAuth 연결"}},
+        {"oauthApprovalPrompt", new[] {"Approve this one OAuth connection request?\r\n\r\nClient: {0}\r\nScopes: {1}\r\nConnector: {2}\r\nReturn host: {3}\r\n\r\nYes = approve, No = reject, Cancel = later.\r\nOwner Token and OAuth access/refresh tokens are never shown here.", "이 OAuth 연결 요청 한 건을 승인할까요?\r\n\r\n클라이언트: {0}\r\n권한: {1}\r\n커넥터: {2}\r\n돌아갈 호스트: {3}\r\n\r\n예 = 승인, 아니요 = 거부, 취소 = 나중에.\r\nOwner Token과 OAuth access/refresh token은 여기에 표시되지 않습니다."}},
         {"approveAllControlMenu", new[] {"Approve all pending", "대기 중인 작업 모두 승인"}},
         {"autoApproveOnMenu", new[] {"Turn on auto-approve (10 min)", "자동 승인 켜기 (10분)"}},
         {"autoApproveOffMenu", new[] {"Turn off auto-approve", "자동 승인 끄기"}},
@@ -158,12 +360,15 @@ internal sealed class LauncherForm : Form
     };
     private readonly string[] args;
     private readonly string root;
+    private readonly bool passiveColdBoot;
     private readonly string appDataDir;
     private readonly string logDir;
     private readonly string logFile;
     private readonly string connectionDiagnosticsFile;
     private readonly string selectedProjectFile;
     private readonly string settingsFile;
+    private readonly string sharedSettingsFile;
+    private readonly string sharedDesktopCommandFile;
     private readonly string defaultWorkspace;
     private string configuredPublicHost;
     private string lastConnectorUrl;
@@ -174,6 +379,9 @@ internal sealed class LauncherForm : Form
     private bool launchAtStartup;
     private bool startMcpOnOpen;
     private bool autoCheckUpdates;
+    private bool multiProjectLanesEnabled = true;
+    private string[] controlAllowlist = new[] { "Finder" };
+    private DateTime sharedSettingsLastWriteUtc = DateTime.MinValue;
     private readonly TextBox logBox;
     private readonly TextBox urlBox;
     private readonly TextBox ownerTokenBox;
@@ -189,12 +397,14 @@ internal sealed class LauncherForm : Form
     private readonly ToolStripMenuItem projectTrayItem;
     private readonly ToolStripMenuItem portTrayItem;
     private readonly ToolStripMenuItem sessionsTrayItem;
+    private readonly ToolStripMenuItem oauthApprovalsTrayItem;
     private readonly ToolStripMenuItem armTrayItem;
     private readonly ToolStripMenuItem killTrayItem;
     private readonly ToolStripMenuItem pendingTrayItem;
     private readonly ToolStripMenuItem toggleTrayItem;
     private readonly ToolStripMenuItem restartTrayItem;
     private readonly ToolStripMenuItem connectionDiagnosticsTrayItem;
+    private readonly ToolStripMenuItem activityTrayItem;
     private readonly ToolStripMenuItem settingsTrayItem;
     private readonly ToolStripMenuItem quitTrayItem;
     private readonly System.Windows.Forms.Timer controlStatusTimer;
@@ -206,18 +416,29 @@ internal sealed class LauncherForm : Form
     private bool stopping;
     private bool exitRequested;
     private bool trayNoticeShown;
+    private bool unifiedDashboardShown;
     private bool autoGenerateOwnerTokenOnNextStart;
     private bool controlStatusRefreshInFlight;
     private LocalControlSnapshot latestControlSnapshot;
+    private readonly HashSet<string> presentedOAuthApprovalIds = new HashSet<string>(StringComparer.Ordinal);
+    private bool oauthApprovalDialogOpen;
 
     internal LauncherForm(string[] args)
     {
         this.args = args;
         root = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        appDataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ChatGPT To Codex");
+        passiveColdBoot = File.Exists(Path.Combine(root, "portable-manifest.json"));
+        var localAppData = Environment.GetEnvironmentVariable("LOCALAPPDATA");
+        if (string.IsNullOrWhiteSpace(localAppData)) localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        appDataDir = Path.Combine(localAppData, "ChatGPT To Codex");
         logDir = Path.Combine(appDataDir, "logs");
         selectedProjectFile = Path.Combine(appDataDir, "selected-project.txt");
         settingsFile = Path.Combine(appDataDir, "settings.ini");
+        var userProfile = ResolveUserProfileDirectory();
+        var sharedStateDir = Path.Combine(userProfile, ".local", "share", "chatgpt2codex");
+        sharedSettingsFile = Path.Combine(sharedStateDir, "desktop-settings.json");
+        sharedDesktopCommandFile = Path.Combine(sharedStateDir, "desktop-command.json");
+        TryDelete(new FileInfo(sharedDesktopCommandFile));
         defaultWorkspace = ResolveDefaultWorkspace();
         configuredPublicHost = ResolveConfiguredPublicHost();
         port = ResolvePort();
@@ -226,17 +447,18 @@ internal sealed class LauncherForm : Form
         if (string.IsNullOrWhiteSpace(githubRepoUrl)) githubRepoUrl = "https://github.com/ezBuilder/chatgpt2codex";
         LoadSettings();
         if (string.IsNullOrEmpty(selectedProjectPath)) selectedProjectPath = LoadSelectedProjectPath();
+        SeedOrLoadSharedSettings();
         Directory.CreateDirectory(logDir);
         PruneLauncherLogs(logDir);
         logFile = Path.Combine(logDir, "launcher-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".log");
         connectionDiagnosticsFile = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            userProfile,
             ".local",
             "share",
             "chatgpt2codex",
             "connection-events.jsonl");
 
-        Text = "ChatGPT To Codex";
+        Text = passiveColdBoot ? "ChatGPT To Codex Cold Boot" : "ChatGPT To Codex";
         Width = 920;
         Height = 620;
         StartPosition = FormStartPosition.CenterScreen;
@@ -325,9 +547,17 @@ internal sealed class LauncherForm : Form
         bottomPanel.Controls.Add(urlPanel, 0, 0);
         bottomPanel.Controls.Add(tokenPanel, 0, 1);
 
-        Controls.Add(logBox);
-        Controls.Add(bottomPanel);
-        Controls.Add(statusLabel);
+        if (passiveColdBoot)
+        {
+            logBox.Text = "Cold boot console" + Environment.NewLine;
+            Controls.Add(logBox);
+        }
+        else
+        {
+            Controls.Add(logBox);
+            Controls.Add(bottomPanel);
+            Controls.Add(statusLabel);
+        }
 
         trayMenu = new ContextMenuStrip();
         statusTrayItem = new ToolStripMenuItem("ChatGPT To Codex: " + L("statusChecking"));
@@ -338,6 +568,8 @@ internal sealed class LauncherForm : Form
         portTrayItem.Enabled = false;
         sessionsTrayItem = new ToolStripMenuItem(L("activeSessionsMenu"));
         sessionsTrayItem.DropDownItems.Add(new ToolStripMenuItem(L("sessionNoActive")) { Enabled = false });
+        oauthApprovalsTrayItem = new ToolStripMenuItem(L("pendingOAuthApprovalsMenu"));
+        oauthApprovalsTrayItem.DropDownItems.Add(new ToolStripMenuItem(L("oauthNoPendingApprovals")) { Enabled = false });
         armTrayItem = new ToolStripMenuItem(L("agentArmOffMenu"), null, delegate { ToggleAgentArm(); });
         armTrayItem.Enabled = false;
         killTrayItem = new ToolStripMenuItem(L("killControlMenu"), null, delegate { KillControl(); });
@@ -350,12 +582,18 @@ internal sealed class LauncherForm : Form
             L("connectionDiagnosticsMenu"),
             null,
             delegate { ShowConnectionDiagnostics(); });
-        settingsTrayItem = new ToolStripMenuItem(L("settingsMenu"), null, delegate { ShowSettings(); });
+        activityTrayItem = new ToolStripMenuItem("Open ChatGPT To Codex", null, delegate
+        {
+            if (IsManagedProcessRunning()) OpenUnifiedDashboard(null);
+            else ShowFromTray();
+        });
+        settingsTrayItem = new ToolStripMenuItem(L("settingsMenu"), null, delegate { OpenSettingsExperience(); });
         quitTrayItem = new ToolStripMenuItem(L("quit"), null, delegate { ExitApplication(); });
         trayMenu.Items.Add(statusTrayItem);
         trayMenu.Items.Add(projectTrayItem);
         trayMenu.Items.Add(portTrayItem);
         trayMenu.Items.Add(sessionsTrayItem);
+        trayMenu.Items.Add(oauthApprovalsTrayItem);
         trayMenu.Items.Add(new ToolStripSeparator());
         trayMenu.Items.Add(armTrayItem);
         trayMenu.Items.Add(killTrayItem);
@@ -363,6 +601,7 @@ internal sealed class LauncherForm : Form
         trayMenu.Items.Add(new ToolStripSeparator());
         trayMenu.Items.Add(toggleTrayItem);
         trayMenu.Items.Add(restartTrayItem);
+        trayMenu.Items.Add(activityTrayItem);
         trayMenu.Items.Add(connectionDiagnosticsTrayItem);
         trayMenu.Items.Add(settingsTrayItem);
         trayMenu.Items.Add(new ToolStripSeparator());
@@ -374,17 +613,26 @@ internal sealed class LauncherForm : Form
         trayIcon.Icon = Icon == null ? System.Drawing.SystemIcons.Application : Icon;
         trayIcon.ContextMenuStrip = trayMenu;
         trayIcon.Visible = true;
-        trayIcon.DoubleClick += delegate { ShowFromTray(); };
+        trayIcon.DoubleClick += delegate
+        {
+            if (IsManagedProcessRunning()) OpenUnifiedDashboard(null);
+            else ShowFromTray();
+        };
 
         controlStatusTimer = new System.Windows.Forms.Timer();
         controlStatusTimer.Interval = 2000;
-        controlStatusTimer.Tick += delegate { RequestLocalControlRefresh(); };
+        controlStatusTimer.Tick += delegate
+        {
+            RequestLocalControlRefresh();
+            RefreshSharedSettingsIfChanged();
+            HandleSharedDesktopCommand();
+        };
         controlStatusTimer.Start();
         RefreshTrayState();
 
         Shown += delegate
         {
-            if (startMcpOnOpen || args.Length > 0)
+            if (passiveColdBoot || startMcpOnOpen || args.Length > 0)
             {
                 StartLauncher();
             }
@@ -494,6 +742,14 @@ internal sealed class LauncherForm : Form
         return null;
     }
 
+    private static string ResolveUserProfileDirectory()
+    {
+        var value = Environment.GetEnvironmentVariable("USERPROFILE");
+        if (string.IsNullOrWhiteSpace(value)) value = Environment.GetEnvironmentVariable("HOME");
+        if (string.IsNullOrWhiteSpace(value)) value = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        return Path.GetFullPath(value);
+    }
+
     private string ResolveDefaultWorkspace()
     {
         var value = GetArgValue("-Workspace");
@@ -501,7 +757,7 @@ internal sealed class LauncherForm : Form
         if (string.IsNullOrWhiteSpace(value)) value = Environment.GetEnvironmentVariable("CHATGPT2CODEX_WORKSPACE");
         if (string.IsNullOrWhiteSpace(value))
         {
-            value = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "workspace");
+            value = Path.Combine(ResolveUserProfileDirectory(), "workspace");
         }
         return Path.GetFullPath(value);
     }
@@ -569,6 +825,14 @@ internal sealed class LauncherForm : Form
         return uri.GetLeftPart(UriPartial.Authority).TrimEnd('/');
     }
 
+    private bool IsTailscaleExternalOrigin()
+    {
+        var value = ResolveExternalPublicUrl();
+        Uri uri;
+        return !string.IsNullOrWhiteSpace(value) && Uri.TryCreate(value, UriKind.Absolute, out uri) &&
+            uri.Host.EndsWith(".ts.net", StringComparison.OrdinalIgnoreCase);
+    }
+
     private string LoadSelectedProjectPath()
     {
         try
@@ -629,6 +893,8 @@ internal sealed class LauncherForm : Form
                 else if (key == "LaunchAtStartup") launchAtStartup = ParseBool(value);
                 else if (key == "StartMcpOnOpen") startMcpOnOpen = ParseBool(value);
                 else if (key == "AutoCheckUpdates") autoCheckUpdates = ParseBool(value);
+                else if (key == "MultiProjectLanesEnabled") multiProjectLanesEnabled = ParseBool(value);
+                else if (key == "ControlAllowlist") controlAllowlist = NormalizeControlAllowlist(value.Split(','));
                 else if (key == "GitHubRepoUrl" && !string.IsNullOrWhiteSpace(value)) githubRepoUrl = value.Trim();
                 else if (key == "Language" && !string.IsNullOrWhiteSpace(value)) preferredLanguage = value.Trim();
                 else if (key == "LastConnectorUrl" && !string.IsNullOrWhiteSpace(value)) lastConnectorUrl = value.Trim();
@@ -658,6 +924,8 @@ internal sealed class LauncherForm : Form
             "LaunchAtStartup=" + EncodeSetting(launchAtStartup ? "true" : "false"),
             "StartMcpOnOpen=" + EncodeSetting(startMcpOnOpen ? "true" : "false"),
             "AutoCheckUpdates=" + EncodeSetting(autoCheckUpdates ? "true" : "false"),
+            "MultiProjectLanesEnabled=" + EncodeSetting(multiProjectLanesEnabled ? "true" : "false"),
+            "ControlAllowlist=" + EncodeSetting(string.Join(",", controlAllowlist ?? new string[0])),
             "GitHubRepoUrl=" + EncodeSetting(githubRepoUrl ?? string.Empty),
             "Language=" + EncodeSetting(preferredLanguage ?? "auto"),
             "LastConnectorUrl=" + EncodeSetting(lastConnectorUrl ?? string.Empty)
@@ -665,6 +933,171 @@ internal sealed class LauncherForm : Form
         File.WriteAllLines(settingsFile, lines, Encoding.UTF8);
         SaveSelectedProjectPath();
         SetLaunchAtStartup(launchAtStartup);
+        SaveSharedSettings();
+    }
+
+    private static string[] NormalizeControlAllowlist(IEnumerable<string> values)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new List<string>();
+        foreach (var raw in values ?? Enumerable.Empty<string>())
+        {
+            var value = (raw ?? string.Empty).Trim();
+            if (value.Length == 0) continue;
+            if (value.Length > 120) value = value.Substring(0, 120);
+            if (!seen.Add(value)) continue;
+            result.Add(value);
+            if (result.Count >= 64) break;
+        }
+        return result.ToArray();
+    }
+
+    private DesktopSettings CurrentDesktopSettings()
+    {
+        return new DesktopSettings
+        {
+            schemaVersion = 1,
+            language = string.IsNullOrWhiteSpace(preferredLanguage) ? "auto" : preferredLanguage,
+            projectFolder = selectedProjectPath,
+            launchAtStartup = launchAtStartup,
+            startMcpOnOpen = startMcpOnOpen,
+            autoCheckUpdates = autoCheckUpdates,
+            multiProjectLanesEnabled = multiProjectLanesEnabled,
+            enablePublicTunnel = publicTunnelEnabled,
+            publicHostname = configuredPublicHost,
+            port = port,
+            controlAllowlist = controlAllowlist ?? new string[0]
+        };
+    }
+
+    private void SaveSharedSettings()
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(sharedSettingsFile);
+            if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
+            var json = new JavaScriptSerializer().Serialize(CurrentDesktopSettings());
+            var temporary = sharedSettingsFile + ".tmp-" + Process.GetCurrentProcess().Id;
+            File.WriteAllText(temporary, json + Environment.NewLine, new UTF8Encoding(false));
+            if (File.Exists(sharedSettingsFile))
+            {
+                try
+                {
+                    File.Replace(temporary, sharedSettingsFile, null);
+                }
+                catch
+                {
+                    File.Copy(temporary, sharedSettingsFile, true);
+                    File.Delete(temporary);
+                }
+            }
+            else
+            {
+                File.Move(temporary, sharedSettingsFile);
+            }
+            sharedSettingsLastWriteUtc = File.GetLastWriteTimeUtc(sharedSettingsFile);
+        }
+        catch
+        {
+            // Legacy settings remain usable if the shared settings mirror cannot be written.
+        }
+    }
+
+    private bool LoadSharedSettings(bool promptForRestart)
+    {
+        try
+        {
+            if (!File.Exists(sharedSettingsFile)) return false;
+            var json = File.ReadAllText(sharedSettingsFile, Encoding.UTF8);
+            var settings = new JavaScriptSerializer().Deserialize<DesktopSettings>(json);
+            if (settings == null || settings.schemaVersion != 1) return false;
+
+            var previousProject = selectedProjectPath ?? string.Empty;
+            var previousHost = configuredPublicHost ?? string.Empty;
+            var previousPort = port;
+            var previousTunnel = publicTunnelEnabled;
+            var previousLanes = multiProjectLanesEnabled;
+
+            if (!string.IsNullOrWhiteSpace(settings.language) &&
+                (settings.language == "auto" || LanguageOptionCodes.Contains(settings.language)))
+            {
+                preferredLanguage = settings.language;
+            }
+            if (string.IsNullOrWhiteSpace(settings.projectFolder))
+            {
+                selectedProjectPath = null;
+            }
+            else
+            {
+                try
+                {
+                    var projectPath = Path.GetFullPath(settings.projectFolder.Trim());
+                    Directory.CreateDirectory(projectPath);
+                    selectedProjectPath = projectPath;
+                }
+                catch
+                {
+                    // Keep the previous project if the new path is invalid or inaccessible.
+                }
+            }
+            launchAtStartup = settings.launchAtStartup;
+            startMcpOnOpen = settings.startMcpOnOpen;
+            autoCheckUpdates = settings.autoCheckUpdates;
+            multiProjectLanesEnabled = settings.multiProjectLanesEnabled;
+            publicTunnelEnabled = settings.enablePublicTunnel;
+            configuredPublicHost = string.IsNullOrWhiteSpace(settings.publicHostname) ? null : settings.publicHostname.Trim();
+            if (settings.port > 0 && settings.port <= 65535) port = settings.port;
+            controlAllowlist = NormalizeControlAllowlist(settings.controlAllowlist ?? new string[0]);
+
+            var runtimeChanged = previousProject != (selectedProjectPath ?? string.Empty) ||
+                previousHost != (configuredPublicHost ?? string.Empty) ||
+                previousPort != port ||
+                previousTunnel != publicTunnelEnabled ||
+                previousLanes != multiProjectLanesEnabled;
+
+            SaveSettings();
+            RefreshTrayState();
+            if (promptForRestart && runtimeChanged && IsManagedProcessRunning())
+            {
+                var result = MessageBox.Show(
+                    this,
+                    "Settings were saved. Restart MCP now to apply project, tunnel, port, and runtime options?",
+                    "Restart MCP?",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Information);
+                if (result == DialogResult.Yes) RestartServer();
+            }
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void SeedOrLoadSharedSettings()
+    {
+        if (File.Exists(sharedSettingsFile))
+        {
+            LoadSharedSettings(false);
+            return;
+        }
+        SaveSharedSettings();
+    }
+
+    private void RefreshSharedSettingsIfChanged()
+    {
+        try
+        {
+            if (!File.Exists(sharedSettingsFile)) return;
+            var changedAt = File.GetLastWriteTimeUtc(sharedSettingsFile);
+            if (changedAt == sharedSettingsLastWriteUtc) return;
+            LoadSharedSettings(true);
+        }
+        catch
+        {
+            // Polling must never destabilize the tray app.
+        }
     }
 
     private void SaveSelectedProjectPath()
@@ -747,14 +1180,23 @@ internal sealed class LauncherForm : Form
     {
         if (!string.IsNullOrEmpty(mcpUrl)) return mcpUrl;
         var tunnelMode = ResolveTunnelMode();
+        return tunnelMode == "loopback" ? "http://127.0.0.1:" + port + "/mcp" : null;
+    }
+
+    private string ConfiguredPublicConnectorUrl()
+    {
+        if (!string.IsNullOrEmpty(mcpUrl)) return mcpUrl;
+        var tunnelMode = ResolveTunnelMode();
         if (tunnelMode == "external")
         {
             var externalUrl = ResolveExternalPublicUrl();
             return string.IsNullOrEmpty(externalUrl) ? null : externalUrl + "/mcp";
         }
-        if (tunnelMode == "cloudflare-named" && !string.IsNullOrEmpty(configuredPublicHost)) return "https://" + configuredPublicHost + "/mcp";
-        if (tunnelMode == "cloudflare-quick") return null;
-        return "http://127.0.0.1:" + port + "/mcp";
+        if (tunnelMode == "cloudflare-named" && !string.IsNullOrEmpty(configuredPublicHost))
+        {
+            return "https://" + configuredPublicHost + "/mcp";
+        }
+        return null;
     }
 
     private static bool IsTemporaryTunnelUrl(string url)
@@ -766,7 +1208,7 @@ internal sealed class LauncherForm : Form
 
     private string PublicHealthUrl()
     {
-        var connector = ConnectorUrl();
+        var connector = ConnectorUrl() ?? ConfiguredPublicConnectorUrl();
         if (string.IsNullOrEmpty(connector)) return null;
         return Regex.Replace(connector, @"/mcp/?$", "/healthz", RegexOptions.IgnoreCase);
     }
@@ -784,6 +1226,95 @@ internal sealed class LauncherForm : Form
             FileName = url,
             UseShellExecute = true
         });
+    }
+
+    private string UnifiedDashboardUrl(string view)
+    {
+        var url = "http://127.0.0.1:7980/activity/?embedded=windows";
+        if (!string.IsNullOrWhiteSpace(view)) url += "&view=" + Uri.EscapeDataString(view);
+        return url;
+    }
+
+    private void OpenUnifiedDashboard(string view)
+    {
+        var url = UnifiedDashboardUrl(view);
+        var candidates = new[]
+        {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Microsoft", "Edge", "Application", "msedge.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Microsoft", "Edge", "Application", "msedge.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Microsoft", "Edge", "Application", "msedge.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Google", "Chrome", "Application", "chrome.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Google", "Chrome", "Application", "chrome.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Google", "Chrome", "Application", "chrome.exe")
+        };
+        foreach (var candidate in candidates)
+        {
+            if (!File.Exists(candidate)) continue;
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = candidate,
+                    Arguments = "--app=" + Quote(url) + " --window-size=920,640",
+                    UseShellExecute = false
+                });
+                DashboardWindowBranding.ApplyAsync();
+                return;
+            }
+            catch
+            {
+                // Fall through to the system browser.
+            }
+        }
+        OpenUrl(url);
+    }
+
+    private void OpenSettingsExperience()
+    {
+        if (IsManagedProcessRunning())
+        {
+            OpenUnifiedDashboard("settings");
+            return;
+        }
+        ShowSettings();
+    }
+
+    private void HandleSharedDesktopCommand()
+    {
+        if (!File.Exists(sharedDesktopCommandFile)) return;
+        string requestId = null;
+        string action = null;
+        var valid = false;
+        try
+        {
+            var json = File.ReadAllText(sharedDesktopCommandFile, Encoding.UTF8);
+            var serializer = new JavaScriptSerializer();
+            var command = serializer.Deserialize<Dictionary<string, object>>(json);
+            object schemaValue;
+            object requestValue;
+            object actionValue;
+            int schemaVersion;
+            valid = command != null &&
+                command.TryGetValue("schemaVersion", out schemaValue) &&
+                int.TryParse(Convert.ToString(schemaValue), out schemaVersion) && schemaVersion == 1 &&
+                command.TryGetValue("requestId", out requestValue) &&
+                !string.IsNullOrWhiteSpace(requestId = Convert.ToString(requestValue)) &&
+                command.TryGetValue("action", out actionValue) &&
+                string.Equals(action = Convert.ToString(actionValue), "restart-mcp", StringComparison.Ordinal);
+        }
+        catch (Exception error)
+        {
+            AppendLog("[chatgpt2codex] Ignoring malformed desktop command: " + error.GetType().Name);
+        }
+
+        TryDelete(new FileInfo(sharedDesktopCommandFile));
+        if (!valid)
+        {
+            AppendLog("[chatgpt2codex] Ignored invalid desktop command.");
+            return;
+        }
+        AppendLog("[chatgpt2codex] Desktop command accepted: " + action + " request=" + requestId);
+        RestartServer();
     }
 
     private void OpenLocalHealth()
@@ -1120,7 +1651,7 @@ internal sealed class LauncherForm : Form
     private string LocalControlTokenPath()
     {
         return Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ResolveUserProfileDirectory(),
             ".local",
             "share",
             "chatgpt2codex",
@@ -1237,6 +1768,92 @@ internal sealed class LauncherForm : Form
         });
     }
 
+    private void ResolveOAuthApproval(LocalPendingOAuthApproval request, string decision)
+    {
+        if (request == null || string.IsNullOrWhiteSpace(request.requestId)) return;
+        PerformLocalControl(
+            "/oauth-approvals/" + Uri.EscapeDataString(request.requestId) + "/" + decision);
+    }
+
+    private void PresentOAuthApproval(LocalPendingOAuthApproval request)
+    {
+        if (request == null || string.IsNullOrWhiteSpace(request.requestId)) return;
+        if (!string.Equals(request.status, "pending", StringComparison.OrdinalIgnoreCase)) return;
+
+        var scopeText = request.scopes != null && request.scopes.Length > 0
+            ? string.Join(", ", request.scopes)
+            : "chatgpt2codex";
+        var answer = MessageBox.Show(
+            LFormat(
+                "oauthApprovalPrompt",
+                string.IsNullOrWhiteSpace(request.clientName) ? "ChatGPT" : request.clientName,
+                scopeText,
+                string.IsNullOrWhiteSpace(request.resource) ? "C2CT" : request.resource,
+                string.IsNullOrWhiteSpace(request.redirectHost) ? "chatgpt.com" : request.redirectHost),
+            L("oauthApprovalTitle"),
+            MessageBoxButtons.YesNoCancel,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button1);
+        if (answer == DialogResult.Yes) ResolveOAuthApproval(request, "approve");
+        else if (answer == DialogResult.No) ResolveOAuthApproval(request, "reject");
+    }
+
+    private void ApplyOAuthApprovals(LocalControlSnapshot snapshot)
+    {
+        var approvals = snapshot != null && snapshot.oauthApprovals != null && snapshot.oauthApprovals.pendingRequests != null
+            ? snapshot.oauthApprovals.pendingRequests
+            : new LocalPendingOAuthApproval[0];
+        var pending = approvals
+            .Where(request => request != null && string.Equals(request.status, "pending", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+
+        oauthApprovalsTrayItem.Text = L("pendingOAuthApprovalsMenu") + " (" + pending.Length + ")";
+        oauthApprovalsTrayItem.DropDownItems.Clear();
+        if (pending.Length == 0)
+        {
+            oauthApprovalsTrayItem.DropDownItems.Add(new ToolStripMenuItem(L("oauthNoPendingApprovals")) { Enabled = false });
+            return;
+        }
+
+        foreach (var request in pending)
+        {
+            var scopeText = request.scopes != null && request.scopes.Length > 0
+                ? string.Join(", ", request.scopes)
+                : "chatgpt2codex";
+            var summary = (string.IsNullOrWhiteSpace(request.clientName) ? "ChatGPT" : request.clientName) +
+                " · " + scopeText;
+            var requestItem = new ToolStripMenuItem(summary);
+            var captured = request;
+            requestItem.DropDownItems.Add(new ToolStripMenuItem(
+                L("controlApprove"),
+                null,
+                delegate { ResolveOAuthApproval(captured, "approve"); }));
+            requestItem.DropDownItems.Add(new ToolStripMenuItem(
+                L("controlReject"),
+                null,
+                delegate { ResolveOAuthApproval(captured, "reject"); }));
+            requestItem.DropDownItems.Add(new ToolStripMenuItem(
+                L("oauthApprovalTitle"),
+                null,
+                delegate { PresentOAuthApproval(captured); }));
+            oauthApprovalsTrayItem.DropDownItems.Add(requestItem);
+        }
+
+        if (oauthApprovalDialogOpen) return;
+        var firstUnseen = pending.FirstOrDefault(request => !presentedOAuthApprovalIds.Contains(request.requestId));
+        if (firstUnseen == null) return;
+        presentedOAuthApprovalIds.Add(firstUnseen.requestId);
+        oauthApprovalDialogOpen = true;
+        try
+        {
+            PresentOAuthApproval(firstUnseen);
+        }
+        finally
+        {
+            oauthApprovalDialogOpen = false;
+        }
+    }
+
     private void ToggleAgentArm()
     {
         var control = latestControlSnapshot == null ? null : latestControlSnapshot.control;
@@ -1267,6 +1884,16 @@ internal sealed class LauncherForm : Form
     private void ApplyLocalControlSnapshot()
     {
         var snapshot = latestControlSnapshot;
+        ApplyOAuthApprovals(snapshot);
+        if (snapshot != null && IsManagedProcessRunning() && !unifiedDashboardShown && Visible)
+        {
+            unifiedDashboardShown = true;
+            BeginInvoke((MethodInvoker)delegate
+            {
+                OpenUnifiedDashboard(null);
+                HideToTray();
+            });
+        }
         var sessions = snapshot != null && snapshot.sessions != null
             ? snapshot.sessions
             : new LocalControlSession[0];
@@ -1401,6 +2028,7 @@ internal sealed class LauncherForm : Form
         autoGenerateOwnerTokenButton.Enabled = !exitRequested && !autoGenerateOwnerTokenOnNextStart;
         openLogButton.Text = L("showLogs");
         connectionDiagnosticsTrayItem.Text = L("connectionDiagnosticsMenu");
+        activityTrayItem.Text = ResolveLanguageCode(preferredLanguage) == "ko" ? "ChatGPT To Codex 열기" : "Open ChatGPT To Codex";
         settingsTrayItem.Text = L("settingsMenu");
         quitTrayItem.Text = L("quit");
         if (!running)
@@ -1601,29 +2229,88 @@ internal sealed class LauncherForm : Form
 
     private void AutoGenerateOwnerToken()
     {
-        if (exitRequested || autoGenerateOwnerTokenOnNextStart) return;
+        if (exitRequested) return;
 
-        autoGenerateOwnerTokenOnNextStart = true;
         ownerToken = null;
         ownerTokenBox.UseSystemPasswordChar = false;
         ownerTokenBox.Text = L("ownerTokenGenerating");
         copyOwnerTokenButton.Enabled = false;
         autoGenerateOwnerTokenButton.Enabled = false;
-        AppendLog("[chatgpt2codex] Auto-generating owner token and restarting runtime...");
-        StopProcessTree();
+        statusLabel.Text = L("ownerTokenGenerating");
+        AppendLog("[chatgpt2codex] Generating owner token before runtime restart...");
 
-        var timer = new Timer();
-        timer.Interval = 1200;
-        timer.Tick += delegate
+        var workspace = string.IsNullOrEmpty(selectedProjectPath) ? defaultWorkspace : selectedProjectPath;
+        var cliPath = Path.Combine(root, "dist", "cli.js");
+        System.Threading.ThreadPool.QueueUserWorkItem(delegate
         {
-            timer.Stop();
-            timer.Dispose();
-            stopping = false;
-            stopButton.Enabled = true;
-            autoGenerateOwnerTokenButton.Enabled = true;
-            StartLauncher();
-        };
-        timer.Start();
+            string generatedToken = null;
+            string generationError = null;
+            try
+            {
+                var generation = new Process();
+                generation.StartInfo = new ProcessStartInfo
+                {
+                    FileName = "node",
+                    Arguments = Quote(cliPath) + " owner-token --generate --workspace " + Quote(workspace),
+                    WorkingDirectory = root,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                };
+                generation.Start();
+                var stdout = generation.StandardOutput.ReadToEnd();
+                generation.StandardError.ReadToEnd();
+                generation.WaitForExit();
+                if (generation.ExitCode != 0)
+                {
+                    generationError = "owner-token command exited with code " + generation.ExitCode;
+                }
+                else
+                {
+                    var payload = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(stdout);
+                    object tokenValue;
+                    if (payload != null && payload.TryGetValue("ownerToken", out tokenValue))
+                    {
+                        generatedToken = Convert.ToString(tokenValue);
+                    }
+                    if (string.IsNullOrWhiteSpace(generatedToken) || generatedToken.Length < 40)
+                    {
+                        generatedToken = null;
+                        generationError = "owner-token command did not return a valid token";
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                generationError = ex.GetType().Name;
+            }
+
+            if (IsDisposed || !IsHandleCreated) return;
+            try
+            {
+                BeginInvoke((Action)delegate
+                {
+                    if (string.IsNullOrEmpty(generatedToken))
+                    {
+                        ownerTokenBox.Text = "Owner token generation failed";
+                        autoGenerateOwnerTokenButton.Enabled = true;
+                        statusLabel.Text = "Owner token generation failed";
+                        AppendLog("[chatgpt2codex] Owner token generation failed: " + (generationError ?? "unknown error"));
+                        RefreshTrayState();
+                        return;
+                    }
+
+                    SetOwnerToken(generatedToken);
+                    AppendLog("[chatgpt2codex] Owner token generated. Restarting MCP runtime...");
+                    RestartServer();
+                });
+            }
+            catch (InvalidOperationException)
+            {
+                // The form is already closing.
+            }
+        });
     }
 
     private void SetOwnerToken(string value)
@@ -1673,6 +2360,16 @@ internal sealed class LauncherForm : Form
     private void ExitApplication()
     {
         if (exitRequested) return;
+        if (IsTailscaleExternalOrigin() && process != null && !process.HasExited)
+        {
+            var answer = MessageBox.Show(
+                this,
+                "This app will stop the local MCP server, but it does not disable an externally managed Tailscale Serve/Funnel configuration.\r\n\r\nIf Funnel is enabled, disable it separately when you no longer want the public endpoint configured.\r\n\r\nQuit ChatGPT To Codex now?",
+                "Tailscale public exposure",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning);
+            if (answer != DialogResult.Yes) return;
+        }
         exitRequested = true;
         trayIcon.Visible = false;
         StopProcessTree();
@@ -1696,11 +2393,15 @@ internal sealed class LauncherForm : Form
     private void StartLauncher()
     {
         stopping = false;
-        if (ResolveTunnelMode() == "cloudflare-quick")
+        unifiedDashboardShown = false;
+        mcpUrl = null;
+        if (ResolveTunnelMode() != "loopback")
         {
-            mcpUrl = null;
-            urlBox.Text = "Waiting for Cloudflare connector URL...";
+            urlBox.Text = "Checking public connector...";
             copyButton.Enabled = false;
+            statusLabel.Text = IsTailscaleExternalOrigin()
+                ? "Tailscale URL configured; verifying Funnel/public reachability (Serve-only is private)"
+                : "Local runtime starting; public connector not verified yet";
         }
         var script = Path.Combine(root, "start-chatgpt.ps1");
         if (!File.Exists(script))
@@ -1746,6 +2447,8 @@ internal sealed class LauncherForm : Form
             RedirectStandardOutput = true,
             RedirectStandardError = true
         };
+        process.StartInfo.EnvironmentVariables["CHATGPT2CODEX_MULTI_PROJECT_LANES"] = multiProjectLanesEnabled ? "1" : "0";
+        process.StartInfo.EnvironmentVariables["CHATGPT2CODEX_CONTROL_ALLOWLIST"] = string.Join(",", controlAllowlist ?? new string[0]);
         if (autoGenerateOwnerTokenOnNextStart)
         {
             process.StartInfo.EnvironmentVariables["CHATGPT2CODEX_ROTATE_OWNER_TOKEN"] = "1";
@@ -1846,6 +2549,10 @@ internal sealed class LauncherForm : Form
             statusLabel.Text = string.IsNullOrEmpty(mcpUrl)
                 ? "Local server is running; waiting for public tunnel"
                 : "MCP URL ready; public tunnel is still warming up";
+        }
+        else if (line.IndexOf("Tailscale Serve is tailnet-private", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            statusLabel.Text = "Tailscale Serve is private; ChatGPT web needs Funnel/public HTTPS";
         }
         else if (line.IndexOf("chatgpt2codex is ready", StringComparison.OrdinalIgnoreCase) >= 0)
         {

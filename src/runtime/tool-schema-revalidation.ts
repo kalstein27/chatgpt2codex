@@ -197,12 +197,15 @@ export function toolSchemaRecoveryPlan(input: {
 }): ToolSchemaRecoveryPlan {
   const { runtimeManifest, lastRuntimeApply, revalidation, hostCatalogRebind = null } = input;
   const toolSchemaChanged = appliedSchemaChange(lastRuntimeApply);
+  const applyTargetsCurrent = Boolean(
+    lastRuntimeApply && applyTargetsCurrentRuntime(lastRuntimeApply, runtimeManifest),
+  );
   const applyAt = lastRuntimeApply ? Date.parse(lastRuntimeApply.updatedAt) : Number.NaN;
   const rebindObservedAt = hostCatalogRebind ? Date.parse(hostCatalogRebind.observedAt) : Number.NaN;
   const refreshCompletedAt = lastRuntimeApply?.hostCatalogRefreshCompletedAt
     ? Date.parse(lastRuntimeApply.hostCatalogRefreshCompletedAt)
     : Number.NaN;
-  const hostCatalogRebindVerified = hostCatalogRebind
+  const hostCatalogRebindVerified = hostCatalogRebind && applyTargetsCurrent
     ? Boolean(
       lastRuntimeApply
       && lastRuntimeApply.hostCatalogRefreshAttempted === true
@@ -247,7 +250,7 @@ export function toolSchemaRecoveryPlan(input: {
     };
   }
 
-  if (!applyTargetsCurrentRuntime(lastRuntimeApply, runtimeManifest)) {
+  if (!applyTargetsCurrent) {
     return {
       ...base,
       mode: "named-tools-preferred",

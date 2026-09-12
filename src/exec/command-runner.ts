@@ -496,9 +496,14 @@ function quoteCmdArg(value: string): string {
 function buildSpawnInvocation(cmd: string, args: string[]): { file: string; args: string[] } {
   if (process.platform === "win32" && /\.cmd$/i.test(cmd)) {
     const comspec = process.env.ComSpec || process.env.COMSPEC || "cmd.exe";
+    const commandLine = [cmd, ...args].map(quoteCmdArg).join(" ");
     return {
       file: comspec,
-      args: ["/d", "/s", "/c", [cmd, ...args].map(quoteCmdArg).join(" ")],
+      // cmd.exe /s /c has special handling when the command itself starts with
+      // a quoted path. Wrap the entire command line so a path such as
+      // C:\Program Files\nodejs\npm.cmd keeps its opening/closing quotes instead
+      // of being parsed as literal filename characters.
+      args: ["/d", "/s", "/c", `"${commandLine}"`],
     };
   }
   return { file: cmd, args };

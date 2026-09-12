@@ -12,6 +12,7 @@ const MAX_WIDGET_APPROVAL_GRANTS_PER_REQUEST = 8;
 const grants = new Map<string, WidgetApprovalGrant[]>();
 
 const CHATGPT_WIDGET_APPROVABLE_OPERATION_TOOLS = new Set([
+  "command_request",
   "command_run",
   "e2e_run_command",
   "e2e_start_server",
@@ -29,7 +30,8 @@ const CHATGPT_WIDGET_CRITICAL_OPERATION_TOOLS = new Set([
 
 export type ChatGptWidgetApprovalMode = "standard" | "critical";
 
-export function chatGptWidgetApprovalMode(tool: string): ChatGptWidgetApprovalMode | null {
+export function chatGptWidgetApprovalMode(tool: string, risk?: string): ChatGptWidgetApprovalMode | null {
+  if (tool === "command_request" && risk === "destructive-privileged") return "critical";
   if (CHATGPT_WIDGET_CRITICAL_OPERATION_TOOLS.has(tool)) return "critical";
   if (CHATGPT_WIDGET_APPROVABLE_OPERATION_TOOLS.has(tool)) return "standard";
   return null;

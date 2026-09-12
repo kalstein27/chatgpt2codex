@@ -10,28 +10,68 @@ on:
       - "package.json"
       - "package-lock.json"
       - "tsconfig.json"
+      - "scripts/check-publication-boundary.mjs"
       - "src/**"
+      - "windows/Archive-Portable.ps1"
+      - "windows/Build-And-Verify-Portable.cmd"
+      - "windows/Build-And-Verify-Portable.ps1"
+      - "windows/Build-Portable.ps1"
       - "windows/ChatGPTToCodexLauncher.cs"
       - "windows/ChatGPTToCodexTray.ps1"
+      - "windows/Configure-Activity-Remote.ps1"
+      - "windows/Generate-BrandIcon.ps1"
       - "windows/Install-Prerequisites.ps1"
+      - "windows/Repair-Node-Npm.cmd"
+      - "windows/Repair-Node-Npm.ps1"
+      - "windows/Resume-Portable-Verify.cmd"
+      - "windows/Resume-Portable-Verify.ps1"
+      - "windows/Tailscale-Path.ps1"
+      - "windows/Verify-OAuth-Approval-Wiring.ps1"
+      - "windows/Verify-Portable-First-Install-UI.ps1"
+      - "windows/Verify-Portable.ps1"
+      - "windows/Verify-Tailscale-Path.ps1"
+      - "windows/Verify-Unified-Dashboard-UI.ps1"
       - "windows/Start-ChatGPTToCodexTray.cmd"
+      - "windows/Portable-README.txt"
       - "start-chatgpt.ps1"
       - "start-chatgpt.cmd"
       - "assets/chatgpt2codex-icon.ico"
+      - "assets/chatgpt2codex-icon.svg"
+      - "assets/chatgpt2codex-plugin-icon.png"
   pull_request:
     paths:
       - ".github/workflows/verify-windows.yml"
       - "package.json"
       - "package-lock.json"
       - "tsconfig.json"
+      - "scripts/check-publication-boundary.mjs"
       - "src/**"
+      - "windows/Archive-Portable.ps1"
+      - "windows/Build-And-Verify-Portable.cmd"
+      - "windows/Build-And-Verify-Portable.ps1"
+      - "windows/Build-Portable.ps1"
       - "windows/ChatGPTToCodexLauncher.cs"
       - "windows/ChatGPTToCodexTray.ps1"
+      - "windows/Configure-Activity-Remote.ps1"
+      - "windows/Generate-BrandIcon.ps1"
       - "windows/Install-Prerequisites.ps1"
+      - "windows/Repair-Node-Npm.cmd"
+      - "windows/Repair-Node-Npm.ps1"
+      - "windows/Resume-Portable-Verify.cmd"
+      - "windows/Resume-Portable-Verify.ps1"
+      - "windows/Tailscale-Path.ps1"
+      - "windows/Verify-OAuth-Approval-Wiring.ps1"
+      - "windows/Verify-Portable-First-Install-UI.ps1"
+      - "windows/Verify-Portable.ps1"
+      - "windows/Verify-Tailscale-Path.ps1"
+      - "windows/Verify-Unified-Dashboard-UI.ps1"
       - "windows/Start-ChatGPTToCodexTray.cmd"
+      - "windows/Portable-README.txt"
       - "start-chatgpt.ps1"
       - "start-chatgpt.cmd"
       - "assets/chatgpt2codex-icon.ico"
+      - "assets/chatgpt2codex-icon.svg"
+      - "assets/chatgpt2codex-plugin-icon.png"
 
 permissions:
   contents: read
@@ -42,8 +82,16 @@ concurrency:
 
 jobs:
   verify-windows-source:
-    runs-on: windows-latest
-    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            arch: x64
+          - runner: windows-11-vs2026-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
     permissions:
       contents: read
 
@@ -58,6 +106,7 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24.18.1"
+          architecture: ${{ matrix.arch }}
           cache: npm
 
       - name: Install dependencies
@@ -72,15 +121,33 @@ jobs:
         shell: pwsh
         run: |
           npm run typecheck
+          npm run test:publication
           npm run build
+
+      - name: Verify Windows OAuth approval wiring
+        shell: powershell
+        run: npm run verify:windows-oauth-wiring
 
       - name: Parse public PowerShell sources
         shell: pwsh
         run: |
           $files = @(
             "start-chatgpt.ps1",
+            "windows/Archive-Portable.ps1",
+            "windows/Build-And-Verify-Portable.ps1",
+            "windows/Build-Portable.ps1",
             "windows/ChatGPTToCodexTray.ps1",
-            "windows/Install-Prerequisites.ps1"
+            "windows/Configure-Activity-Remote.ps1",
+            "windows/Generate-BrandIcon.ps1",
+            "windows/Install-Prerequisites.ps1",
+            "windows/Repair-Node-Npm.ps1",
+            "windows/Resume-Portable-Verify.ps1",
+            "windows/Tailscale-Path.ps1",
+            "windows/Verify-OAuth-Approval-Wiring.ps1",
+            "windows/Verify-Portable-First-Install-UI.ps1",
+            "windows/Verify-Portable.ps1",
+            "windows/Verify-Tailscale-Path.ps1",
+            "windows/Verify-Unified-Dashboard-UI.ps1"
           )
           foreach ($file in $files) {
             $tokens = $null
@@ -90,6 +157,45 @@ jobs:
             if ($errors.Count -gt 0) {
               $details = ($errors | ForEach-Object { "${file}:$($_.Extent.StartLineNumber): $($_.Message)" }) -join "`n"
               throw "PowerShell parse errors:`n$details"
+            }
+          }
+
+      - name: Verify Windows PowerShell 5.1 compatibility
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $trayPath = (Resolve-Path -LiteralPath "windows/ChatGPTToCodexTray.ps1").Path
+          $bytes = [System.IO.File]::ReadAllBytes($trayPath)
+          if ($bytes.Length -lt 3 -or $bytes[0] -ne 0xEF -or $bytes[1] -ne 0xBB -or $bytes[2] -ne 0xBF) {
+            throw "windows/ChatGPTToCodexTray.ps1 must keep a UTF-8 BOM for Windows PowerShell 5.1."
+          }
+
+          $files = @(
+            "start-chatgpt.ps1",
+            "windows/Archive-Portable.ps1",
+            "windows/Build-And-Verify-Portable.ps1",
+            "windows/Build-Portable.ps1",
+            "windows/ChatGPTToCodexTray.ps1",
+            "windows/Configure-Activity-Remote.ps1",
+            "windows/Generate-BrandIcon.ps1",
+            "windows/Install-Prerequisites.ps1",
+            "windows/Repair-Node-Npm.ps1",
+            "windows/Resume-Portable-Verify.ps1",
+            "windows/Tailscale-Path.ps1",
+            "windows/Verify-OAuth-Approval-Wiring.ps1",
+            "windows/Verify-Portable-First-Install-UI.ps1",
+            "windows/Verify-Portable.ps1",
+            "windows/Verify-Tailscale-Path.ps1",
+            "windows/Verify-Unified-Dashboard-UI.ps1"
+          )
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            $path = (Resolve-Path -LiteralPath $file).Path
+            [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $details = ($errors | ForEach-Object { "${file}:$($_.Extent.StartLineNumber): $($_.Message)" }) -join "`n"
+              throw "Windows PowerShell 5.1 parse errors:`n$details"
             }
           }
 
@@ -105,7 +211,10 @@ jobs:
           $csc = $cscCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
           if (-not $csc) { throw "Microsoft .NET Framework csc.exe was not found." }
           $source = (Resolve-Path -LiteralPath "windows\ChatGPTToCodexLauncher.cs").Path
-          $icon = (Resolve-Path -LiteralPath "assets\chatgpt2codex-icon.ico").Path
+          $icon = (Join-Path (Resolve-Path -LiteralPath "build/windows").Path "chatgpt2codex-icon.ico")
+          $iconPng = (Join-Path (Resolve-Path -LiteralPath "build/windows").Path "chatgpt2codex-icon.png")
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "windows\Generate-BrandIcon.ps1" -SourceSvg "assets\chatgpt2codex-icon.svg" -OutputIco $icon -OutputPng $iconPng
+          if ($LASTEXITCODE -ne 0) { throw "Windows brand icon generation failed with exit code $LASTEXITCODE." }
           $output = (Join-Path (Resolve-Path -LiteralPath "build/windows").Path "ChatGPT To Codex.exe")
           & $csc `
             /nologo `
@@ -122,6 +231,58 @@ jobs:
           $artifact = Get-Item -LiteralPath $output -ErrorAction Stop
           if ($artifact.Length -le 0) { throw "Launcher artifact is empty." }
           Get-FileHash -LiteralPath $artifact.FullName -Algorithm SHA256
+
+      - name: Build portable Windows bundle
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          npm run build:windows-portable
+          npm run verify:windows-portable
+          $arch = (node -p "process.arch").Trim()
+          if ($arch -ne "${{ matrix.arch }}") {
+            throw "Portable architecture mismatch. Expected ${{ matrix.arch }}, got $arch."
+          }
+          $root = Join-Path $env:GITHUB_WORKSPACE "build\windows-portable\chatgpt2codex-windows-$arch"
+          $required = @(
+            "ChatGPT To Codex.exe",
+            "runtime\node.exe",
+            "npm\bin\npm-cli.js",
+            "dist\cli.js",
+            "start-chatgpt.ps1",
+            "node_modules",
+            "portable-manifest.json",
+            "README.txt",
+            "assets\chatgpt2codex-icon.ico",
+            "assets\chatgpt2codex-icon.png",
+            "assets\chatgpt2codex-icon.svg",
+            "assets\chatgpt2codex-plugin-icon.png"
+          )
+          foreach ($relative in $required) {
+            if (-not (Test-Path -LiteralPath (Join-Path $root $relative))) {
+              throw "Portable bundle is missing: $relative"
+            }
+          }
+          $portableNode = Join-Path $root "runtime\node.exe"
+          $portableNpmCli = Join-Path $root "npm\bin\npm-cli.js"
+          $manifest = Get-Content -Raw -LiteralPath (Join-Path $root "portable-manifest.json") | ConvertFrom-Json
+          $portableNpmVersion = (& $portableNode $portableNpmCli --version).Trim()
+          if (-not $portableNpmVersion) { throw "Bundled npm CLI did not execute." }
+          if ([string]$manifest.npmVersion -ne $portableNpmVersion) {
+            throw "Portable manifest npmVersion does not match bundled npm."
+          }
+          $portableNpmSha256 = (Get-FileHash -LiteralPath $portableNpmCli -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ([string]$manifest.npmCliSha256 -ne $portableNpmSha256) {
+            throw "Portable manifest npmCliSha256 does not match bundled npm CLI."
+          }
+          $zip = Join-Path $env:GITHUB_WORKSPACE "build\windows-portable\chatgpt2codex-windows-$arch.zip"
+          if (-not (Test-Path -LiteralPath $zip)) { throw "Portable zip was not produced." }
+          $zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "portable-zip-sha256=$zipHash"
+          "$zipHash  chatgpt2codex-windows-$arch.zip" | Set-Content -LiteralPath "$zip.sha256" -Encoding ASCII
+
+      - name: Verify portable first-install isolation
+        shell: powershell
+        run: npm run verify:windows-portable-first-install-ui
 
       - name: Smoke-test Windows HTTP runtime
         shell: pwsh
@@ -166,3 +327,13 @@ jobs:
               Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
             }
           }
+
+      - name: Upload verified portable candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: chatgpt2codex-windows-${{ matrix.arch }}
+          path: |
+            build/windows-portable/chatgpt2codex-windows-${{ matrix.arch }}.zip
+            build/windows-portable/chatgpt2codex-windows-${{ matrix.arch }}.zip.sha256
+          if-no-files-found: error
+          retention-days: 7

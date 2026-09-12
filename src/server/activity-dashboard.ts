@@ -188,6 +188,14 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
   <meta name="c2ct-activity-dashboard-contract" content="1">
+  <meta name="application-name" content="ChatGPT To Codex">
+  <meta name="theme-color" content="#087E78">
+  <meta name="msapplication-TileImage" content="/activity/app-icon.png?brand=20260910">
+  <link rel="manifest" href="/activity/manifest.webmanifest?brand=20260910">
+  <link rel="icon" type="image/png" sizes="1024x1024" href="/activity/app-icon.png?brand=20260910">
+  <link rel="icon" type="image/svg+xml" sizes="any" href="/activity/app-icon.svg?brand=20260910">
+  <link rel="shortcut icon" type="image/x-icon" href="/activity/favicon.ico?brand=20260910">
+  <link rel="apple-touch-icon" href="/activity/app-icon.png?brand=20260910">
   <title>ChatGPT To Codex</title>
   <style>
     :root {
@@ -226,7 +234,17 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     }
     * { box-sizing: border-box; }
     body { margin: 0; background: var(--bg); color: var(--text); }
-    main { width: min(1120px, 100%); margin: 0 auto; padding: max(12px, env(safe-area-inset-top)) 14px max(28px, env(safe-area-inset-bottom)); }
+    .desktop-shell { min-height: 100vh; display: grid; grid-template-columns: 220px minmax(0,1fr); }
+    .app-sidebar { position: sticky; top: 0; height: 100vh; padding: 18px 12px 14px; border-right: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 94%, var(--bg)); }
+    .sidebar-brand { padding: 2px 8px 16px; }
+    .sidebar-eyebrow { color: var(--muted); font-size: 9px; font-weight: 780; letter-spacing: .12em; }
+    .sidebar-title { margin-top: 4px; font-size: 19px; font-weight: 790; letter-spacing: -.02em; }
+    .sidebar-nav { display: grid; gap: 4px; }
+    .sidebar-nav .view-tab { width: 100%; min-height: 40px; display: flex; align-items: center; justify-content: flex-start; border: 1px solid transparent; border-radius: 10px; padding: 8px 10px; background: transparent; color: var(--muted); font-size: 12px; font-weight: 690; text-align: left; }
+    .sidebar-nav .view-tab.active { background: color-mix(in srgb, var(--blue) 9%, var(--panel)); border-color: color-mix(in srgb, var(--blue) 18%, var(--line)); color: var(--blue); box-shadow: none; }
+    .sidebar-meta { position: absolute; left: 20px; right: 20px; bottom: 15px; color: var(--muted); font-size: 9.5px; line-height: 1.45; }
+    .app-main { min-width: 0; }
+    main { width: min(1120px, 100%); margin: 0 auto; padding: max(12px, env(safe-area-inset-top)) 18px max(28px, env(safe-area-inset-bottom)); }
     header { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 44px; margin: 0 2px 11px; }
     .header-main { display: flex; align-items: center; gap: 11px; min-width: 0; }
     .app-mark { width: 38px; height: 38px; flex: 0 0 auto; filter: drop-shadow(0 3px 9px rgba(0,0,0,.1)); }
@@ -242,10 +260,37 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     .metric.attention.has-value { color: var(--orange); }
     .metric.approval.has-value { color: var(--blue); }
     .metric.attention.has-value span, .metric.approval.has-value span { color: currentColor; opacity: .78; }
-    .view-switch { display: inline-flex; gap: 3px; margin: 0 1px 10px; padding: 3px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel2); }
-    .view-tab { appearance: none; border: 0; border-radius: 8px; padding: 6px 10px; background: transparent; color: var(--muted); font-size: 11px; font-weight: 730; }
-    .view-tab.active { background: var(--panel); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+    .view-tab { appearance: none; cursor: pointer; }
     .view-panel[hidden] { display: none !important; }
+    .settings-stack { display: grid; gap: 10px; }
+    .settings-card { border: 1px solid var(--line); border-radius: 14px; padding: 15px 16px; background: var(--panel); box-shadow: var(--shadow); }
+    .settings-card h2 { margin: 0; font-size: 14px; }
+    .settings-card > p { margin: 5px 0 13px; color: var(--muted); font-size: 11px; line-height: 1.45; }
+    .settings-row { display: grid; grid-template-columns: 160px minmax(0,1fr); align-items: center; gap: 12px; min-height: 40px; }
+    .settings-row + .settings-row { border-top: 1px solid var(--line); }
+    .settings-label { color: var(--muted); font-size: 11px; line-height: 1.4; }
+    .settings-control { min-width: 0; }
+    .settings-control input[type="text"], .settings-control input[type="number"], .settings-control select {
+      width: 100%; min-height: 32px; border: 1px solid var(--line); border-radius: 9px; padding: 6px 9px;
+      background: var(--panel2); color: var(--text); font: inherit; font-size: 12px; outline: none;
+    }
+    .settings-control input:focus, .settings-control select:focus { border-color: color-mix(in srgb, var(--blue) 60%, var(--line)); box-shadow: 0 0 0 2px color-mix(in srgb, var(--blue) 12%, transparent); }
+    .settings-check { display: flex; align-items: center; gap: 8px; min-height: 32px; color: var(--text); font-size: 12px; }
+    .settings-check input { width: 16px; height: 16px; accent-color: var(--blue); }
+    .settings-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; margin-top: 12px; }
+    .settings-status { margin-right: auto; color: var(--muted); font-size: 11px; line-height: 1.4; }
+    .settings-status.success { color: var(--green); }
+    .settings-status.error { color: var(--red); }
+    .settings-save { appearance: none; min-height: 36px; border: 1px solid color-mix(in srgb, var(--blue) 45%, var(--line)); border-radius: 10px; padding: 7px 14px; background: color-mix(in srgb, var(--blue) 7%, var(--panel)); color: var(--blue); font-size: 12px; font-weight: 750; }
+    .settings-save:disabled { opacity: .5; }
+    .command-grant-list { display: grid; gap: 8px; }
+    .command-grant-item { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 10px; align-items: center; border: 1px solid var(--line); border-radius: 10px; padding: 10px 11px; background: var(--panel2); }
+    .command-grant-main { min-width: 0; }
+    .command-grant-command { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+    .command-grant-meta { margin-top: 5px; color: var(--muted); font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
+    .command-grant-revoke { appearance: none; min-height: 34px; border: 1px solid color-mix(in srgb, var(--red) 45%, var(--line)); border-radius: 9px; padding: 6px 11px; background: color-mix(in srgb, var(--red) 5%, var(--panel)); color: var(--red); font-size: 11px; font-weight: 750; }
+    .command-grant-revoke:disabled { opacity: .5; }
+    .command-grant-empty { color: var(--muted); font-size: 11px; line-height: 1.45; }
     .gallery-note { margin-bottom: 14px; border: 1px solid color-mix(in srgb, var(--blue) 24%, var(--line)); border-radius: 12px; padding: 11px 12px; background: color-mix(in srgb, var(--blue) 4%, var(--panel)); color: var(--muted); font-size: 12px; line-height: 1.5; }
     .gallery-note b { color: var(--text); }
     .gallery-section + .gallery-section { margin-top: 16px; }
@@ -410,9 +455,15 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
     }
-    html.embedded-mac main { width: 100%; max-width: none; padding-top: 10px; }
-    html.embedded-mac .footer { margin-bottom: 4px; }
+    html.embedded-mac main, html.embedded-windows main { width: 100%; max-width: none; padding-top: 10px; }
+    html.embedded-mac .footer, html.embedded-windows .footer { margin-bottom: 4px; }
     @media (max-width: 720px) {
+      .desktop-shell { display: block; }
+      .app-sidebar { position: sticky; z-index: 10; height: auto; padding: max(8px, env(safe-area-inset-top)) 10px 8px; border-right: 0; border-bottom: 1px solid var(--line); }
+      .sidebar-brand, .sidebar-meta { display: none; }
+      .sidebar-nav { display: flex; gap: 5px; overflow-x: auto; scrollbar-width: none; }
+      .sidebar-nav::-webkit-scrollbar { display: none; }
+      .sidebar-nav .view-tab { flex: 0 0 auto; width: auto; min-height: 40px; padding: 8px 12px; font-size: 14px; }
       main { padding-left: 12px; padding-right: 12px; padding-bottom: max(92px, calc(env(safe-area-inset-bottom) + 72px)); }
       header { gap: 10px; min-height: 50px; margin-bottom: 14px; }
       .header-main { gap: 9px; }
@@ -422,8 +473,6 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       .metric { min-height: 30px; padding: 4px 8px; gap: 5px; }
       .metric b { font-size: 15px; }
       .metric span { font-size: 13px; }
-      .view-switch { display: grid; grid-template-columns: 1fr 1fr; width: 100%; margin-bottom: 16px; padding: 4px; border-radius: 12px; }
-      .view-tab { min-height: 44px; padding: 9px 12px; border-radius: 9px; font-size: 15px; }
       .gallery-note { margin-bottom: 17px; padding: 12px 13px; border-radius: 13px; font-size: 14px; line-height: 1.55; }
       .gallery-section + .gallery-section { margin-top: 22px; }
       .section-head { align-items: flex-start; flex-wrap: wrap; margin-bottom: 11px; }
@@ -462,11 +511,36 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       .activity-time { flex-basis: 46px; font-size: 12px; }
       .activity-detail { margin-left: 54px; font-size: 12.5px; }
       .footer { font-size: 12px; }
+      .settings-card { padding: 15px; border-radius: 16px; }
+      .settings-card h2 { font-size: 18px; }
+      .settings-card > p { font-size: 13px; }
+      .settings-row { grid-template-columns: 1fr; gap: 5px; padding: 9px 0; }
+      .settings-label { font-size: 13px; }
+      .settings-control input[type="text"], .settings-control input[type="number"], .settings-control select { min-height: 42px; font-size: 15px; }
+      .settings-check { min-height: 40px; font-size: 15px; }
+      .settings-save { min-height: 44px; font-size: 15px; }
+      .settings-status { font-size: 13px; }
     }
   </style>
 </head>
 <body>
 <!-- activity-dashboard-hot-override-enabled -->
+<div class="desktop-shell">
+<aside class="app-sidebar" aria-label="ChatGPT To Codex 탐색">
+  <div class="sidebar-brand">
+    <div class="sidebar-eyebrow">CHATGPT TO CODEX</div>
+    <div class="sidebar-title">Local Agent</div>
+  </div>
+  <nav class="sidebar-nav" aria-label="데스크톱 보기">
+    <button id="view-activity" class="view-tab active" type="button">작업 현황</button>
+    <button id="view-approvals" class="view-tab" type="button">승인</button>
+    <button id="view-connection" class="view-tab" type="button">MCP / 연결</button>
+    <button id="view-settings" class="view-tab" type="button">설정</button>
+    <button id="view-diagnostics" class="view-tab" type="button">진단</button>
+  </nav>
+  <div class="sidebar-meta">Mac · Windows 공통 데스크톱 UI</div>
+</aside>
+<div class="app-main">
 <main>
   <header>
     <div class="header-main">
@@ -497,31 +571,69 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     </div>
     <div class="live"><span id="live-dot" class="dot"></span><span id="live-text">연결 중</span></div>
   </header>
-  <nav class="view-switch" aria-label="대시보드 보기">
-    <button id="view-activity" class="view-tab active" type="button">작업 현황</button>
-    <button id="view-gallery" class="view-tab" type="button">카드 보기</button>
-  </nav>
   <section id="activity-view" class="view-panel">
+    <nav id="filters" class="toolbar"></nav>
+    <section id="cards"></section>
+  </section>
+  <section id="approvals-view" class="view-panel" hidden>
     <section id="approval-box" class="approval-box hidden">
       <div class="section-head"><h2>승인 필요</h2><span id="approval-label">0건</span></div>
       <div id="approvals" class="approval-list"></div>
     </section>
-    <section id="deployment-box" class="deployment-box hidden">
-      <div class="section-head"><h2>배포 상태</h2><span id="deployment-label">0건</span></div>
-      <div id="deployments" class="deployment-list"></div>
-    </section>
+    <div id="approvals-empty" class="empty">현재 대기 중인 승인이 없습니다.</div>
+  </section>
+  <section id="connection-view" class="view-panel" hidden>
+    <div class="section-head"><h2>MCP / 연결</h2><span>공통 연결 상태</span></div>
     <section id="mcp-health-box" class="mcp-health-box">
       <div class="section-head"><h2>C2CT MCP Health</h2><span id="mcp-health-state" class="mcp-health-state healthy">확인 중</span></div>
       <div id="mcp-health-reason" class="mcp-health-reason">내부 진단 상태를 확인하는 중입니다.</div>
       <div id="mcp-health-meta" class="mcp-health-meta"></div>
       <div id="mcp-health-events" class="mcp-health-events"></div>
     </section>
+  </section>
+  <section id="diagnostics-view" class="view-panel" hidden>
+    <section id="deployment-box" class="deployment-box hidden">
+      <div class="section-head"><h2>배포 상태</h2><span id="deployment-label">0건</span></div>
+      <div id="deployments" class="deployment-list"></div>
+    </section>
     <section id="widget-load-box" class="widget-load-box hidden">
       <div class="section-head"><h2>카드 로딩</h2><span id="widget-load-label">0건</span></div>
       <div id="widget-loads" class="widget-load-list"></div>
     </section>
-    <nav id="filters" class="toolbar"></nav>
-    <section id="cards"></section>
+    <div id="diagnostics-empty" class="empty">표시할 배포 또는 카드 로딩 진단이 없습니다.</div>
+  </section>
+  <section id="settings-view" class="view-panel" hidden>
+    <div class="settings-stack">
+      <section class="settings-card">
+        <h2>일반</h2>
+        <p>Mac과 Windows가 함께 사용하는 데스크톱 설정입니다. 플랫폼별 동작은 각 네이티브 셸이 같은 값을 적용합니다.</p>
+        <div class="settings-row"><div class="settings-label">언어</div><div class="settings-control"><select id="setting-language"><option value="auto">자동</option><option value="ko">한국어</option><option value="en">English</option><option value="ja">日本語</option><option value="zh-Hans">简体中文</option><option value="zh-Hant">繁體中文</option></select></div></div>
+        <div class="settings-row"><div class="settings-label">기본 프로젝트</div><div class="settings-control"><input id="setting-project" type="text" autocomplete="off" placeholder="프로젝트 폴더 경로"></div></div>
+        <div class="settings-row"><div class="settings-label">시작 동작</div><div class="settings-control"><label class="settings-check"><input id="setting-launch" type="checkbox">로그인 시 ChatGPT To Codex 실행</label></div></div>
+        <div class="settings-row"><div class="settings-label"></div><div class="settings-control"><label class="settings-check"><input id="setting-start-mcp" type="checkbox">앱 실행 시 MCP 시작</label></div></div>
+        <div class="settings-row"><div class="settings-label"></div><div class="settings-control"><label class="settings-check"><input id="setting-updates" type="checkbox">업데이트 자동 확인</label></div></div>
+        <div class="settings-row"><div class="settings-label">프로젝트 작업</div><div class="settings-control"><label class="settings-check"><input id="setting-lanes" type="checkbox">멀티 프로젝트 작업 레인 사용</label></div></div>
+      </section>
+      <section class="settings-card">
+        <h2>연결</h2>
+        <p>로컬 MCP와 ChatGPT에서 접근할 공개 주소를 관리합니다. 터널 종류에 따른 실제 연결은 플랫폼 셸이 적용합니다.</p>
+        <div class="settings-row"><div class="settings-label">공개 연결</div><div class="settings-control"><label class="settings-check"><input id="setting-tunnel" type="checkbox">공개 터널 사용</label></div></div>
+        <div class="settings-row"><div class="settings-label">공개 주소</div><div class="settings-control"><input id="setting-host" type="text" autocomplete="off" placeholder="host.example.com 또는 https://..."></div></div>
+        <div class="settings-row"><div class="settings-label">MCP 포트</div><div class="settings-control"><input id="setting-port" type="number" min="1" max="65535" inputmode="numeric"></div></div>
+        <div class="settings-row"><div class="settings-label">MCP 서비스</div><div class="settings-control"><button id="settings-restart-mcp" class="settings-save" type="button">MCP 재시작</button></div></div>
+      </section>
+      <section class="settings-card">
+        <h2>데스크톱 제어</h2>
+        <p>ChatGPT가 제어할 수 있는 앱 이름입니다. 실행 중 앱을 + 버튼으로 고르는 UX는 후속 네이티브 브리지 단계에서 연결합니다.</p>
+        <div class="settings-row"><div class="settings-label">허용 앱</div><div class="settings-control"><input id="setting-allowlist" type="text" autocomplete="off" placeholder="Finder, UTM"></div></div>
+        <div class="settings-actions"><span id="settings-status" class="settings-status">이 PC의 설정을 불러오는 중…</span><button id="settings-save" class="settings-save" type="button">저장</button></div>
+      </section>
+      <section class="settings-card">
+        <h2>프로젝트 명령 승인</h2>
+        <p>“이 프로젝트에서 허용”으로 저장한 exact executable + argv 승인입니다. 회수하면 해당 프로필은 즉시 프로젝트 명령 승격에서 빠집니다.</p>
+        <div id="command-grants" class="command-grant-list"><div class="command-grant-empty">승인 목록을 불러오는 중…</div></div>
+      </section>
+    </div>
   </section>
   <section id="gallery-view" class="view-panel" hidden>
     <div class="gallery-note"><b>미리보기 전용</b> · 실제 승인 카드의 정보 구조를 보여줍니다. 아래 버튼과 선택지는 작동하지 않습니다.</div>
@@ -616,11 +728,27 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     </section>
   </section>
 </main>
+</div>
+</div>
 <script>
 (function () {
   var pageDashboardRevision = "__C2CT_ACTIVITY_DASHBOARD_REVISION__";
   var initialParams = new URLSearchParams(window.location.search);
-  var selectedView = initialParams.get("view") === "cards" ? "cards" : "activity";
+  var dashboardHostname = String(window.location.hostname || "").toLowerCase();
+  var isLocalDashboard = dashboardHostname === "127.0.0.1"
+    || dashboardHostname === "localhost"
+    || dashboardHostname === "::1"
+    || dashboardHostname === "[::1]";
+  var settingsEnabled = isLocalDashboard;
+  var devCardsEnabled = isLocalDashboard && initialParams.get("devCards") === "1";
+  var initialView = initialParams.get("view");
+  function normalizedView(value) {
+    if (value === "cards" && devCardsEnabled) return "cards";
+    if (value === "settings" && settingsEnabled) return "settings";
+    if (["activity", "approvals", "connection", "diagnostics"].indexOf(value) >= 0) return value;
+    return "activity";
+  }
+  var selectedView = normalizedView(initialView);
   var selectedProject = "all";
   var latest = [];
   var latestApprovals = [];
@@ -631,8 +759,10 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   var expandedOperationDetails = new Set();
   var lastFilterSignature = "";
   var reducedMotion = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
-  var embeddedHint = initialParams.get("embedded") === "mac";
-  if (embeddedHint) document.documentElement.classList.add("embedded-mac");
+  var embeddedPlatform = initialParams.get("embedded");
+  if (embeddedPlatform === "mac" || embeddedPlatform === "windows") {
+    document.documentElement.classList.add("embedded-" + embeddedPlatform);
+  }
   var macBridge = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.c2ctMacApp
     ? window.webkit.messageHandlers.c2ctMacApp
     : null;
@@ -655,28 +785,226 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   var liveDot = document.getElementById("live-dot");
   var liveText = document.getElementById("live-text");
   var activityView = document.getElementById("activity-view");
+  var approvalsView = document.getElementById("approvals-view");
+  var connectionView = document.getElementById("connection-view");
+  var diagnosticsView = document.getElementById("diagnostics-view");
   var galleryView = document.getElementById("gallery-view");
+  var settingsView = document.getElementById("settings-view");
   var activityViewButton = document.getElementById("view-activity");
-  var galleryViewButton = document.getElementById("view-gallery");
+  var approvalsViewButton = document.getElementById("view-approvals");
+  var connectionViewButton = document.getElementById("view-connection");
+  var settingsViewButton = document.getElementById("view-settings");
+  var diagnosticsViewButton = document.getElementById("view-diagnostics");
+  var approvalsEmpty = document.getElementById("approvals-empty");
+  var diagnosticsEmpty = document.getElementById("diagnostics-empty");
+  var settingsLoaded = false;
+  var mutableControlsAvailable = false;
+  var restartPending = false;
+  var restartRequestedAt = 0;
+  var restartSawDisconnect = false;
+  settingsViewButton.hidden = !settingsEnabled;
 
   function setDashboardView(nextView, updateLocation) {
-    selectedView = nextView === "cards" ? "cards" : "activity";
+    selectedView = normalizedView(nextView);
     activityView.hidden = selectedView !== "activity";
+    approvalsView.hidden = selectedView !== "approvals";
+    connectionView.hidden = selectedView !== "connection";
+    diagnosticsView.hidden = selectedView !== "diagnostics";
     galleryView.hidden = selectedView !== "cards";
+    settingsView.hidden = selectedView !== "settings";
     activityViewButton.classList.toggle("active", selectedView === "activity");
-    galleryViewButton.classList.toggle("active", selectedView === "cards");
+    approvalsViewButton.classList.toggle("active", selectedView === "approvals");
+    connectionViewButton.classList.toggle("active", selectedView === "connection");
+    settingsViewButton.classList.toggle("active", selectedView === "settings");
+    diagnosticsViewButton.classList.toggle("active", selectedView === "diagnostics");
     activityViewButton.setAttribute("aria-pressed", selectedView === "activity" ? "true" : "false");
-    galleryViewButton.setAttribute("aria-pressed", selectedView === "cards" ? "true" : "false");
+    approvalsViewButton.setAttribute("aria-pressed", selectedView === "approvals" ? "true" : "false");
+    connectionViewButton.setAttribute("aria-pressed", selectedView === "connection" ? "true" : "false");
+    settingsViewButton.setAttribute("aria-pressed", selectedView === "settings" ? "true" : "false");
+    diagnosticsViewButton.setAttribute("aria-pressed", selectedView === "diagnostics" ? "true" : "false");
     if (updateLocation && window.history && window.history.replaceState) {
       var url = new URL(window.location.href);
-      if (selectedView === "cards") url.searchParams.set("view", "cards");
-      else url.searchParams.delete("view");
+      if (selectedView === "activity") url.searchParams.delete("view");
+      else url.searchParams.set("view", selectedView);
       window.history.replaceState(null, "", url);
     }
+    if (selectedView === "settings" && !settingsLoaded) loadSettings();
   }
   activityViewButton.addEventListener("click", function () { setDashboardView("activity", true); });
-  galleryViewButton.addEventListener("click", function () { setDashboardView("cards", true); });
+  approvalsViewButton.addEventListener("click", function () { setDashboardView("approvals", true); });
+  connectionViewButton.addEventListener("click", function () { setDashboardView("connection", true); });
+  settingsViewButton.addEventListener("click", function () { setDashboardView("settings", true); });
+  diagnosticsViewButton.addEventListener("click", function () { setDashboardView("diagnostics", true); });
   setDashboardView(selectedView, false);
+
+  function setting(id) { return document.getElementById(id); }
+  function settingsStatus(text, kind) {
+    var node = setting("settings-status");
+    node.textContent = text;
+    node.classList.toggle("success", kind === "success");
+    node.classList.toggle("error", kind === "error");
+  }
+  function setMutableControlsAvailable(available) {
+    mutableControlsAvailable = Boolean(available);
+    var disabled = !mutableControlsAvailable || restartPending;
+    ["setting-language", "setting-project", "setting-launch", "setting-start-mcp", "setting-updates", "setting-lanes", "setting-tunnel", "setting-host", "setting-port", "setting-allowlist", "settings-save", "settings-restart-mcp"].forEach(function (id) {
+      var node = setting(id);
+      if (node) node.disabled = disabled;
+    });
+    document.querySelectorAll(".approval-actions button").forEach(function (button) {
+      button.disabled = disabled;
+    });
+    document.querySelectorAll(".command-grant-revoke").forEach(function (button) {
+      button.disabled = disabled;
+    });
+  }
+  function applySettingsForm(value) {
+    value = value || {};
+    setting("setting-language").value = value.language || "auto";
+    setting("setting-project").value = value.projectFolder || "";
+    setting("setting-launch").checked = Boolean(value.launchAtStartup);
+    setting("setting-start-mcp").checked = Boolean(value.startMcpOnOpen);
+    setting("setting-updates").checked = Boolean(value.autoCheckUpdates);
+    setting("setting-lanes").checked = value.multiProjectLanesEnabled !== false;
+    setting("setting-tunnel").checked = Boolean(value.enablePublicTunnel);
+    setting("setting-host").value = value.publicHostname || "";
+    setting("setting-port").value = String(value.port || 7979);
+    setting("setting-allowlist").value = Array.isArray(value.controlAllowlist) ? value.controlAllowlist.join(", ") : "";
+  }
+  function renderCommandGrants(grants) {
+    var container = setting("command-grants");
+    if (!container) return;
+    container.textContent = "";
+    if (!Array.isArray(grants) || grants.length === 0) {
+      container.appendChild(el("div", "command-grant-empty", "저장된 프로젝트 명령 승인이 없습니다."));
+      return;
+    }
+    grants.forEach(function (grant) {
+      var item = el("div", "command-grant-item");
+      var main = el("div", "command-grant-main");
+      var argv = Array.isArray(grant.argv) ? grant.argv.map(function (value) { return JSON.stringify(String(value)); }) : [];
+      var command = [String(grant.resolvedExecutable || "")].concat(argv).filter(Boolean).join(" ");
+      main.appendChild(el("div", "command-grant-command", command || String(grant.commandId || grant.grantId || "승인된 명령")));
+      var metaParts = [String(grant.projectId || "프로젝트 미상"), String(grant.risk || "risk 미상")];
+      if (grant.cwd) metaParts.push("cwd " + String(grant.cwd));
+      if (grant.createdAt) metaParts.push("승인 " + new Date(grant.createdAt).toLocaleString("ko-KR"));
+      main.appendChild(el("div", "command-grant-meta", metaParts.join(" · ")));
+      var button = el("button", "command-grant-revoke", "회수");
+      button.type = "button";
+      button.disabled = !mutableControlsAvailable || restartPending;
+      button.addEventListener("click", function () { revokeCommandGrant(grant, button); });
+      item.appendChild(main);
+      item.appendChild(button);
+      container.appendChild(item);
+    });
+  }
+  async function loadCommandGrants() {
+    try {
+      var response = await fetch("/activity/api/command-grants", { cache: "no-store" });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      var payload = await response.json();
+      renderCommandGrants(payload.grants);
+    } catch (error) {
+      var container = setting("command-grants");
+      if (container) {
+        container.textContent = "";
+        container.appendChild(el("div", "command-grant-empty", "프로젝트 명령 승인 목록을 불러오지 못했습니다."));
+      }
+    }
+  }
+  async function revokeCommandGrant(grant, button) {
+    if (!mutableControlsAvailable || restartPending || !grant || !grant.projectId || !grant.grantId) return;
+    button.disabled = true;
+    button.textContent = "회수 중…";
+    try {
+      var response = await fetch("/activity/api/command-grants/revoke", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ projectId: grant.projectId, grantId: grant.grantId })
+      });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      await loadCommandGrants();
+      settingsStatus("프로젝트 명령 승인을 회수했습니다.", "success");
+    } catch (error) {
+      button.textContent = "회수";
+      button.disabled = !mutableControlsAvailable || restartPending;
+      settingsStatus("프로젝트 명령 승인을 회수하지 못했습니다.", "error");
+    }
+  }
+  async function loadSettings() {
+    settingsStatus("이 PC의 설정을 불러오는 중…");
+    loadCommandGrants();
+    try {
+      var response = await fetch("/activity/api/settings", { cache: "no-store" });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      var payload = await response.json();
+      applySettingsForm(payload.settings);
+      settingsLoaded = true;
+      settingsStatus((payload.platform || "desktop") + " 설정과 연결됨", "success");
+    } catch (error) {
+      settingsStatus("설정 변경은 ChatGPT To Codex가 실행 중인 PC에서만 사용할 수 있습니다.", "error");
+    }
+  }
+  async function saveSettings() {
+    if (!mutableControlsAvailable || restartPending) return;
+    var button = setting("settings-save");
+    var parsedPort = Number(setting("setting-port").value);
+    var body = {
+      language: setting("setting-language").value,
+      projectFolder: setting("setting-project").value.trim() || null,
+      launchAtStartup: setting("setting-launch").checked,
+      startMcpOnOpen: setting("setting-start-mcp").checked,
+      autoCheckUpdates: setting("setting-updates").checked,
+      multiProjectLanesEnabled: setting("setting-lanes").checked,
+      enablePublicTunnel: setting("setting-tunnel").checked,
+      publicHostname: setting("setting-host").value.trim() || null,
+      port: Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535 ? parsedPort : 7979,
+      controlAllowlist: setting("setting-allowlist").value.split(",").map(function (item) { return item.trim(); }).filter(Boolean)
+    };
+    button.disabled = true;
+    settingsStatus("저장 중…");
+    try {
+      var response = await fetch("/activity/api/settings", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      var payload = await response.json();
+      applySettingsForm(payload.settings);
+      settingsLoaded = true;
+      settingsStatus("저장됨 · 네이티브 적용 중", "success");
+      if (macBridge) macBridge.postMessage({ action: "settingsSaved" });
+    } catch (error) {
+      settingsStatus("설정을 저장하지 못했습니다.", "error");
+    } finally {
+      setMutableControlsAvailable(mutableControlsAvailable);
+    }
+  }
+  setting("settings-save").addEventListener("click", saveSettings);
+  async function restartMcp() {
+    if (!mutableControlsAvailable || restartPending) return;
+    restartPending = true;
+    restartRequestedAt = Date.now();
+    restartSawDisconnect = false;
+    setMutableControlsAvailable(mutableControlsAvailable);
+    settingsStatus("MCP 재시작 요청 중…");
+    try {
+      if (macBridge) {
+        macBridge.postMessage({ action: "restartMcp" });
+      } else {
+        var response = await fetch("/activity/api/native/restart-mcp", { method: "POST" });
+        if (!response.ok) throw new Error("HTTP " + response.status);
+      }
+      settingsStatus("MCP 재시작 중 · 재연결을 기다리는 중…");
+    } catch (error) {
+      restartPending = false;
+      settingsStatus("MCP 재시작 요청을 전달하지 못했습니다.", "error");
+      setMutableControlsAvailable(Boolean(latestMcpHealth && latestMcpHealth.state !== "unhealthy"));
+    }
+  }
+  setting("settings-restart-mcp").addEventListener("click", restartMcp);
+  setMutableControlsAvailable(false);
 
   function el(tag, cls, text) {
     var node = document.createElement(tag);
@@ -944,6 +1272,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   }
   function renderApprovals(items, now) {
     approvalLabel.textContent = items.length + "건";
+    approvalsEmpty.hidden = items.length > 0;
     if (!items.length) {
       approvalBox.classList.add("hidden");
       window.setTimeout(function () {
@@ -960,7 +1289,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       var macCanDecide = Boolean(macBridge && item.channel === "mac" && item.kind === "operation");
       var channelText = item.channel === "mobile"
         ? (item.canDecide ? "iPhone 승인 가능" : "Tailscale에서 승인")
-        : (macCanDecide ? "Mac에서 바로 승인 가능" : "Mac에서 승인 필요");
+        : (macCanDecide ? "이 앱에서 바로 승인 가능" : "로컬 앱에서 승인 필요");
       top.appendChild(el("div", "approval-channel " + (item.channel === "mobile" ? "mobile" : "mac"), channelText));
       row.appendChild(top);
       row.appendChild(el("div", "approval-summary", item.summary || "보호 작업 승인 요청"));
@@ -971,13 +1300,15 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       meta.appendChild(el("span", "", "만료까지 " + Math.max(0, Math.ceil((item.expiresAt - now) / 1000)) + "초"));
       row.appendChild(meta);
       if (item.canDecide || macCanDecide) {
-        var detail = el("div", "approval-meta", macCanDecide ? "이 Mac에서 바로 처리 가능" : "이 화면에서 바로 처리 가능");
+        var detail = el("div", "approval-meta", macCanDecide ? "이 앱에서 바로 처리 가능" : "이 화면에서 바로 처리 가능");
         row.appendChild(detail);
         var actions = el("div", "approval-actions");
         var approve = el("button", "approve", item.tool === "runtime_apply_local" ? "런타임 교체 허용" : "승인");
         var reject = el("button", "reject", "거절");
         approve.type = "button";
         reject.type = "button";
+        approve.disabled = !mutableControlsAvailable || restartPending;
+        reject.disabled = !mutableControlsAvailable || restartPending;
         var buttons = [approve, reject];
         approve.onclick = function () {
           if (macCanDecide) decideMacApproval(item, "approve", buttons, detail);
@@ -993,8 +1324,9 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       }
       if (macBridge) {
         var nativeActions = el("div", "approval-actions");
-        var nativeButton = el("button", "native", "Mac 승인창 열기");
+        var nativeButton = el("button", "native", "로컬 승인창 열기");
         nativeButton.type = "button";
+        nativeButton.disabled = !mutableControlsAvailable || restartPending;
         nativeButton.onclick = openNativeApprovalInbox;
         nativeActions.appendChild(nativeButton);
         row.appendChild(nativeActions);
@@ -1258,6 +1590,7 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     renderDeployments(latestDeployments, now);
     renderMcpHealth(latestMcpHealth, now);
     renderWidgetLoads(latestWidgetLoads);
+    diagnosticsEmpty.hidden = latestDeployments.length > 0 || latestWidgetLoads.length > 0;
     renderFilters(retained);
     var visible = retained.filter(function (chat) {
       return selectedProject === "all" || projectSet(chat).indexOf(selectedProject) >= 0;
@@ -1284,10 +1617,22 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       liveText.textContent = latestMcpHealth
         ? "MCP " + (latestMcpHealth.label || latestMcpHealth.state) + " · " + age(payload.generatedAt || Date.now(), Date.now())
         : "갱신 " + age(payload.generatedAt || Date.now(), Date.now());
+      var connected = Boolean(latestMcpHealth && latestMcpHealth.state !== "unhealthy");
+      if (restartPending) {
+        if (!connected) restartSawDisconnect = true;
+        if (connected && (restartSawDisconnect || Date.now() - restartRequestedAt >= 3000)) {
+          restartPending = false;
+          restartSawDisconnect = false;
+          if (settingsLoaded) settingsStatus("MCP 재연결 완료", "success");
+        }
+      }
+      setMutableControlsAvailable(connected);
       render();
     } catch (error) {
       liveDot.classList.add("offline");
       liveText.textContent = "연결 끊김";
+      if (restartPending) restartSawDisconnect = true;
+      setMutableControlsAvailable(false);
     }
   }
   refresh();
