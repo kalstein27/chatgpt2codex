@@ -18,7 +18,7 @@ implemented yet, so `Agent Arm` remains unavailable by design.
 
 | Area | Windows status |
 | --- | --- |
-| Windows 10 / 11 desktop | Intended source-run target; a release still needs real-Windows acceptance |
+| Windows 10 / 11 desktop | Native x64/ARM64 CI covers the source/portable path; a published signed release still needs release acceptance |
 | Node runtime | Node.js 22 or newer is required for the public source-run path; the portable bundle carries its own runtime |
 | npm | `packageManager` records npm 11.19.0 as the validated release-tooling version; the portable bundle carries its own npm CLI |
 | PowerShell | Required; launch scripts use `powershell.exe -NoProfile -ExecutionPolicy Bypass` |
@@ -218,20 +218,23 @@ launch. Do not clone as Administrator and then build as a different user. If Git
 reports dubious ownership, prefer a fresh clone owned by the intended user; do
 not silence the boundary globally with `safe.directory=*`.
 
-### 4. Start the Windows tray UI
+### 4. Start the Windows desktop app
 
-For the closest Windows equivalent to the desktop app experience, launch:
+For a source checkout, launch:
 
 ```powershell
 .\windows\Start-ChatGPTToCodexTray.cmd
 ```
 
 You can also double-click `windows\Start-ChatGPTToCodexTray.cmd` in Explorer.
-That entry point runs the prerequisite helper and then starts the PowerShell tray
-UI. Node.js is the default prerequisite. `cloudflared` is checked/installed only
-when `CHATGPT2CODEX_TUNNEL_MODE` explicitly selects a Cloudflare tunnel mode.
+That entry point bootstraps the native launcher/tray and opens the same shared
+desktop shell used on macOS. On Windows the shell is rendered in Edge app mode,
+with Chrome app mode and then the system browser as fallbacks. The tray remains
+a secondary lifecycle/recovery surface rather than a separate main UI. Node.js
+is the default source prerequisite. `cloudflared` is checked/installed only when
+`CHATGPT2CODEX_TUNNEL_MODE` explicitly selects a Cloudflare tunnel mode.
 
-If you only want the runtime without the tray UI, use:
+If you only want the runtime without the desktop launcher, use:
 
 ```powershell
 npm run chatgpt:windows
@@ -239,17 +242,17 @@ npm run chatgpt:windows
 
 ### 5. Select the project you want ChatGPT to work on
 
-Open the tray icon, choose **Settings...**, and select the project folder. The
+Open **Settings** in the shared desktop shell and select the project folder. The
 selected folder becomes the default project root shown to the runtime. You can
-change it later; if MCP is already running the tray restarts the runtime against
-the new selection.
+change it later. If the shared window is closed, use the tray only to reopen
+**ChatGPT To Codex** or access platform-native lifecycle/recovery shortcuts.
 
 ### 6. Start MCP and verify local health
 
-1. Click **Start MCP**.
-2. Confirm the tray reports the runtime as running.
-3. Open **Open Local Health**.
-4. Confirm the configured local health page is healthy.
+1. Open **MCP / Connection** in the shared desktop shell.
+2. Click **Start MCP**.
+3. Confirm the local MCP health/status becomes healthy.
+4. Use the native tray status only as a secondary mirror/recovery surface.
 
 Administrator mode is not normally required for ChatGPT To Codex itself. Keep the
 tray and any PowerShell window at the same privilege level unless a separately
@@ -261,15 +264,16 @@ ChatGPT web cannot reach a loopback-only MCP URL on the Windows PC. Enable the
 web connector and use an externally reachable HTTPS connector URL.
 
 The currently guaranteed built-in public-tunnel path on Windows is Cloudflare.
-For Quick/Named Tunnel modes, `cloudflared` is required. The tray prerequisite
-helper installs it through WinGet when needed.
+For Quick/Named Tunnel modes, `cloudflared` is required. The native launcher
+prerequisite helper installs it through WinGet when needed.
 
 A Quick Tunnel `trycloudflare.com` URL can change after restart. If it changes,
 update or reconnect the ChatGPT connector. For regular use, prefer a stable HTTPS
 hostname that you control.
 
-Copy the `/mcp` connector URL from the tray and register it in ChatGPT Apps /
-Connectors. Keep the Owner Token private. Treat it like a password.
+Copy the `/mcp` connector URL from **MCP / Connection** in the shared desktop
+shell and register it in ChatGPT Apps / Connectors. Keep the Owner Token private.
+Treat it like a password.
 
 ## Tailscale recommendation
 
@@ -398,11 +402,12 @@ therefore warns that Funnel configuration may remain enabled separately.
 
 ## Runtime behavior
 
-- Loopback port: use the value currently configured/shown by the tray runtime; do not treat a historical default as process identity.
+- Loopback port: use the value currently configured/shown by **MCP / Connection** or the native runtime status; do not treat a historical default as process identity.
 - Starting MCP is loopback-only unless the web connector is enabled.
 - Temporary Quick Tunnel URLs may change after restart.
-- The tray shows MCP state, selected project, local port, active sessions,
-  pending approvals, Settings, diagnostics, and start/stop/restart actions.
+- The shared desktop shell is the normal UI for Activity, Approvals, MCP /
+  Connection, Settings, and Diagnostics. The tray is secondary and provides
+  reopen/quit plus platform-native lifecycle/recovery shortcuts and status hints.
 - The launcher cleans stale runtime processes before restart.
 - The native launcher starts `start-chatgpt.ps1` through `powershell.exe` without
   a console window and captures stdout/stderr in its logs.

@@ -330,9 +330,23 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     .gallery-actions button.allow { color: var(--blue); border-color: color-mix(in srgb, var(--blue) 45%, var(--line)); }
     .gallery-actions button.deny { color: var(--red); }
     .gallery-actions button:disabled, .gallery-choice:disabled { opacity: 1; }
+    .gallery-actions button:not(:disabled), .gallery-choice:not(:disabled) { cursor: pointer; transition: transform var(--motion-fast) var(--motion-ease), background var(--motion-fast) var(--motion-ease), border-color var(--motion-fast) var(--motion-ease); }
+    .gallery-actions button:not(:disabled):hover, .gallery-choice:not(:disabled):hover { background: color-mix(in srgb, var(--blue) 6%, var(--panel2)); border-color: color-mix(in srgb, var(--blue) 36%, var(--line)); }
+    .gallery-actions button:not(:disabled):active, .gallery-choice:not(:disabled):active { transform: translateY(1px); }
     .gallery-choice-list { display: grid; gap: 7px; margin-top: 9px; }
     .gallery-choice { text-align: left; padding: 8px 10px; }
     .gallery-choice small { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.4; font-weight: 500; }
+    .gallery-flow { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+    .gallery-flow-title, .gallery-button-guide-title { color: var(--muted); font-size: 10.5px; font-weight: 760; letter-spacing: .01em; }
+    .gallery-flow-steps { display: flex; flex-wrap: wrap; gap: 5px 4px; align-items: center; margin-top: 7px; }
+    .gallery-flow-step { display: inline-flex; align-items: center; min-height: 25px; border: 1px solid var(--line); border-radius: 999px; padding: 3px 7px; background: var(--panel2); color: color-mix(in srgb, var(--text) 76%, var(--muted)); font-size: 10.5px; font-weight: 620; line-height: 1.35; }
+    .gallery-flow-arrow { color: var(--muted); font-size: 11px; opacity: .72; }
+    .gallery-button-guide { margin-top: 10px; border-radius: 9px; padding: 9px 10px; background: color-mix(in srgb, var(--blue) 3%, var(--panel2)); }
+    .gallery-button-guide-row { display: grid; grid-template-columns: minmax(72px, auto) minmax(0, 1fr); gap: 8px; margin-top: 6px; font-size: 10.8px; line-height: 1.45; }
+    .gallery-button-guide-label { color: var(--text); font-weight: 720; }
+    .gallery-button-guide-effect { color: var(--muted); }
+    .gallery-sim-result { display: none; margin-top: 9px; border: 1px solid color-mix(in srgb, var(--blue) 26%, var(--line)); border-radius: 9px; padding: 9px 10px; background: color-mix(in srgb, var(--blue) 5%, var(--panel)); color: var(--blue); font-size: 11px; font-weight: 650; line-height: 1.45; white-space: pre-wrap; }
+    .gallery-sim-result.visible { display: block; }
     .gallery-activity { display: grid; gap: 8px; }
     .gallery-activity .card { pointer-events: none; }
     .approval-box { max-height: 1600px; overflow: hidden; background: color-mix(in srgb, var(--orange) 5%, var(--panel)); border: 1px solid color-mix(in srgb, var(--orange) 30%, var(--line)); border-radius: 13px; padding: 11px 12px; margin-bottom: 10px; opacity: 1; transform: translateY(0); transition: max-height var(--motion-layout) var(--motion-ease), opacity var(--motion-fast) ease, transform var(--motion-layout) var(--motion-ease), margin-bottom var(--motion-layout) var(--motion-ease), padding var(--motion-layout) var(--motion-ease), border-width var(--motion-layout) var(--motion-ease); }
@@ -636,19 +650,19 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     </div>
   </section>
   <section id="gallery-view" class="view-panel" hidden>
-    <div class="gallery-note"><b>미리보기 전용</b> · 실제 승인 카드의 정보 구조를 보여줍니다. 아래 버튼과 선택지는 작동하지 않습니다.</div>
+    <div class="gallery-note"><b>미리보기 전용</b> · 실제 승인 카드의 정보 구조를 보여줍니다. 버튼과 선택지는 실제 작업을 실행하지 않고, 클릭 뒤 어떤 상태로 이어지는지만 이 페이지 안에서 시뮬레이션합니다.</div>
     <section class="gallery-section">
       <div class="section-head"><h2>인라인 승인 카드</h2><span>실제 표시 정보</span></div>
       <div class="gallery-grid">
-        <article class="gallery-card">
+        <article class="gallery-card" data-gallery-flow="보호 작업 요청 생성|서버에 pending 승인 저장|presenter 준비|카드 표시|사용자 결정|receipt 상태 확인">
           <div class="gallery-title-row"><div class="gallery-title">확인</div><span class="gallery-state orange">승인 대기</span></div>
           <div class="gallery-preview">프로젝트 chatgpt2codex · 보호 작업 “command_run” 1회 수행</div>
           <div class="gallery-time">생성: 2026. 09. 05. 10:58:12 · 만료: 2026. 09. 05. 11:03:12</div>
           <div class="gallery-impact">영향: 검증 범위 로컬 파일 변경</div>
           <details class="gallery-details"><summary>상세 명령 및 파라미터</summary><div class="gallery-detail-command">tool: command_run\nprojectId: chatgpt2codex\ncommandId: npm:activity-dashboard:apply\nwritesWorkspace: false\nwritesExternalLocalPath: true</div></details>
-          <div class="gallery-actions"><button class="deny" disabled>거절</button><button class="allow" disabled>허용</button></div>
+          <div class="gallery-actions"><button class="deny" data-preview-label="거절" data-preview-effect="서버에 denied 결정을 저장하고 보호 작업은 실행하지 않습니다. 후속 대화에는 거절 의도만 전달됩니다.">거절</button><button class="allow" data-preview-label="허용" data-preview-effect="정확히 이 요청의 one-shot 승인을 저장하고, 원래 작업은 승인 receipt를 확인한 뒤 1회만 재개됩니다.">허용</button></div>
         </article>
-        <article class="gallery-card critical">
+        <article class="gallery-card critical" data-gallery-flow="고위험 작업 preflight|exact 요청 봉인|Critical Approval 준비|카드 표시|사용자 결정|worker 시작 또는 종료|health / rollback 확인">
           <div class="gallery-title-row"><div class="gallery-title">⚠️ 고위험 승인</div><span class="gallery-state red">승인 대기</span></div>
           <div class="gallery-critical-badge">Mac 시스템 변경</div>
           <div class="gallery-warning">실행 중인 runtime을 실제로 교체합니다. 정상 적용 후 필요하면 ChatGPT 도구 목록을 자동 갱신합니다.</div>
@@ -658,46 +672,46 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
           <div class="gallery-impact">영향: 파일 교체·삭제·작업 취소 등 되돌리기 어려운 변경 가능</div>
           <details class="gallery-details"><summary>상세 명령 및 파라미터</summary><div class="gallery-detail-command">tool: runtime_apply_local\nprojectId: chatgpt2codex\nexpectedCurrentFingerprint: 69dcc3e66222…\ntargetFingerprint: 84f2c71b12aa…\npreserveConnector: true\nrollbackOnHealthFailure: true</div></details>
           <details class="gallery-details"><summary>기술 원문</summary><div class="gallery-detail-command">CRITICAL: replace the live C2CT runtime; preserve connector/tunnel; automatic rollback on failed runtime health checks</div></details>
-          <div class="gallery-actions"><button class="deny" disabled>거절</button><button class="allow" disabled>위험을 이해하고 승인</button></div>
+          <div class="gallery-actions"><button class="deny" data-preview-label="거절" data-preview-effect="고위험 작업을 시작하지 않고 요청을 거절 상태로 종료합니다. runtime / connector에는 변경이 없습니다.">거절</button><button class="allow" data-preview-label="위험을 이해하고 승인" data-preview-effect="봉인된 exact runtime 교체 작업만 시작합니다. 새 runtime health check가 실패하면 기존 runtime으로 자동 롤백하고, 성공 시 고정된 후속 검증만 진행합니다.">위험을 이해하고 승인</button></div>
         </article>
-        <article class="gallery-card success">
+        <article class="gallery-card success" data-gallery-flow="승인 카드 표시|허용 클릭|서버에 allowed 저장|one-shot 소비 대기|후속 대화가 receipt 확인">
           <div class="gallery-title-row"><div class="gallery-title">확인</div><span class="gallery-state green">승인 완료</span></div>
           <div class="gallery-preview">승인 상태가 서버에 저장되었습니다.</div>
           <div class="gallery-time">생성: 10:58:12 · 승인: 10:58:31 · 소비 유효시간 내</div>
           <div class="gallery-impact">영향: 승인된 정확한 작업 1회만 재개 가능</div>
           <div class="gallery-status-message">후속 대화는 서버 상태를 최종 기준으로 확인 · token은 카드에 표시하지 않음</div>
         </article>
-        <article class="gallery-card denied">
+        <article class="gallery-card denied" data-gallery-flow="승인 카드 표시|거절 클릭|서버에 denied 저장|원래 작업 중단|terminal 상태 표시">
           <div class="gallery-title-row"><div class="gallery-title">확인</div><span class="gallery-state red">거절 완료</span></div>
           <div class="gallery-preview">요청이 거절되어 보호 작업은 실행되지 않습니다.</div>
           <div class="gallery-time">생성: 10:58:12 · 거절: 10:58:26</div>
           <div class="gallery-status-message">새 승인이 필요하면 새 요청으로 다시 시작 · 기존 one-shot token 재사용 금지</div>
         </article>
-        <article class="gallery-card">
+        <article class="gallery-card" data-gallery-flow="사용자 결정 수신|결정 저장 요청|서버 receipt 대기|후속 대화 연결|최종 상태로 전환">
           <div class="gallery-title-row"><div class="gallery-title">확인</div><span class="gallery-state blue">처리 중</span></div>
           <div class="gallery-preview">승인 결정을 서버에 저장하고 후속 대화를 연결하는 중입니다.</div>
           <div class="gallery-time">생성: 10:58:12 · 현재: 10:58:31</div>
           <div class="gallery-impact">영향: 아직 보호 작업의 실행 권한으로 간주하지 않음</div>
           <div class="gallery-actions"><button disabled>거절</button><button disabled>허용</button></div>
         </article>
-        <article class="gallery-card muted">
+        <article class="gallery-card muted" data-gallery-flow="pending 카드 표시|TTL 경과|서버에서 expired 판정|버튼 비활성|새 요청 필요">
           <div class="gallery-title-row"><div class="gallery-title">확인</div><span class="gallery-state gray">만료</span></div>
           <div class="gallery-preview">승인 유효 시간이 지나 카드가 비활성화되었습니다.</div>
           <div class="gallery-time">생성: 10:50:00 · 만료: 10:55:00</div>
           <div class="gallery-status-message">만료된 token은 재사용하지 않음 · 새 승인 요청 필요</div>
         </article>
-        <article class="gallery-card">
+        <article class="gallery-card" data-gallery-flow="카드 표시|상태 저장 또는 전달 시도|응답 불명확|버튼 비활성|persisted receipt 확인 필요">
           <div class="gallery-title-row"><div class="gallery-title">확인</div><span class="gallery-state orange">확인 불가</span></div>
           <div class="gallery-preview">승인 상태 저장 또는 후속 대화 전달을 확인할 수 없습니다.</div>
           <div class="gallery-status-message">승인 상태 확인 불가 · 카드 비활성 · 실제 서버 receipt를 확인한 뒤 재시도 여부 판단</div>
         </article>
-        <article class="gallery-card denied">
+        <article class="gallery-card denied" data-gallery-flow="카드 처리 시작|서버 처리 오류|실행 권한 부여 안 함|실패 상태 표시|receipt 확인 후 재시도 판단">
           <div class="gallery-title-row"><div class="gallery-title">확인</div><span class="gallery-state red">처리 실패</span></div>
           <div class="gallery-preview">승인 상태 저장 또는 카드 처리 중 오류가 발생했습니다.</div>
           <div class="gallery-impact">영향: 실패 상태 자체로는 보호 작업을 실행하지 않음</div>
           <div class="gallery-status-message">재시도 전 persisted approval / receipt 확인 필요</div>
         </article>
-        <article class="gallery-card success">
+        <article class="gallery-card success" data-gallery-flow="승인 receipt 확인|one-shot 작업 시작|작업 완료|승인 소비 확정|terminal 완료 표시">
           <div class="gallery-title-row"><div class="gallery-title">확인</div><span class="gallery-state green">처리 완료</span></div>
           <div class="gallery-preview">승인된 one-shot 작업이 소비되어 처리가 완료되었습니다.</div>
           <div class="gallery-status-message">동일 승인으로 재실행 불가 · 다음 변경은 새 승인 필요</div>
@@ -706,24 +720,24 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     </section>
     <section class="gallery-section">
       <div class="section-head"><h2>선택 카드</h2><span>Widget Shell</span></div>
-      <article class="gallery-card">
+      <article class="gallery-card" data-gallery-flow="선택 카드 state 생성|Widget Shell presenter 준비|카드 표시|사용자 옵션 선택|선택 intent가 후속 대화 입력으로 전달">
         <div class="gallery-title-row"><div class="gallery-title">다음 작업 선택</div><span class="gallery-state blue">선택 대기</span></div>
         <div class="gallery-preview">여러 안전한 경로 중 하나를 선택하는 카드입니다.</div>
         <div class="gallery-choice-list">
-          <button class="gallery-choice" disabled>상태만 확인<small>읽기 전용으로 현재 상태를 다시 확인합니다.</small></button>
-          <button class="gallery-choice" disabled>검증 진행<small>테스트와 빌드를 실행해 변경을 검증합니다.</small></button>
-          <button class="gallery-choice" disabled>나중에 하기<small>아무 변경 없이 카드를 닫습니다.</small></button>
+          <button class="gallery-choice" data-preview-label="상태만 확인" data-preview-effect="선택 intent가 다음 사용자 입력처럼 전달되고, 후속 대화는 읽기 전용 상태 확인 경로를 이어갑니다.">상태만 확인<small>읽기 전용으로 현재 상태를 다시 확인합니다.</small></button>
+          <button class="gallery-choice" data-preview-label="검증 진행" data-preview-effect="선택 intent가 다음 사용자 입력처럼 전달되고, 후속 대화는 테스트·빌드 같은 검증 단계로 이어갑니다.">검증 진행<small>테스트와 빌드를 실행해 변경을 검증합니다.</small></button>
+          <button class="gallery-choice" data-preview-label="나중에 하기" data-preview-effect="추가 작업을 시작하지 않고 선택 카드 흐름을 종료합니다. 보호 작업 승인으로 간주되지 않습니다.">나중에 하기<small>아무 변경 없이 카드를 닫습니다.</small></button>
         </div>
       </article>
     </section>
     <section class="gallery-section">
       <div class="section-head"><h2>Activity 작업 카드</h2><span>대표 상태</span></div>
       <div class="gallery-grid gallery-activity">
-        <article class="card status-blue"><div class="card-primary"><span class="project-badge">chatgpt2codex</span><div class="title">승인 UX 수정</div><span class="start-time">10:42</span><span class="status blue">작업 중</span></div></article>
-        <article class="card status-orange"><div class="card-primary"><span class="project-badge">chatgpt2codex</span><div class="title">런타임 교체</div><span class="start-time">10:44</span><span class="status orange">승인 대기</span></div></article>
-        <article class="card status-green"><div class="card-primary"><span class="project-badge">chatgpt2codex</span><div class="title">전체 테스트</div><span class="start-time">10:46</span><span class="status green">완료</span></div></article>
-        <article class="card status-red"><div class="card-primary"><span class="project-badge">chatgpt2codex</span><div class="title">도구 호출</div><span class="start-time">10:47</span><span class="status red">실패</span></div></article>
-        <article class="card status-gray"><div class="card-primary"><span class="project-badge">chatgpt2codex</span><div class="title provisional">이전 실패 기록</div><span class="start-time">09:12</span><span class="status gray">이전 실패</span></div></article>
+        <article class="card status-blue" data-gallery-flow="activity event 기록|dashboard poll 수신|프로젝트/상태 정규화|작업 중 카드 렌더"><div class="card-primary"><span class="project-badge">chatgpt2codex</span><div class="title">승인 UX 수정</div><span class="start-time">10:42</span><span class="status blue">작업 중</span></div></article>
+        <article class="card status-orange" data-gallery-flow="보호 작업이 approval 대기 진입|activity event 갱신|dashboard poll 수신|승인 대기 카드 렌더"><div class="card-primary"><span class="project-badge">chatgpt2codex</span><div class="title">런타임 교체</div><span class="start-time">10:44</span><span class="status orange">승인 대기</span></div></article>
+        <article class="card status-green" data-gallery-flow="검증 작업 시작|완료 event 기록|dashboard poll 수신|완료 카드 렌더"><div class="card-primary"><span class="project-badge">chatgpt2codex</span><div class="title">전체 테스트</div><span class="start-time">10:46</span><span class="status green">완료</span></div></article>
+        <article class="card status-red" data-gallery-flow="도구 실행 시작|실패 event 기록|dashboard poll 수신|실패 카드 렌더"><div class="card-primary"><span class="project-badge">chatgpt2codex</span><div class="title">도구 호출</div><span class="start-time">10:47</span><span class="status red">실패</span></div></article>
+        <article class="card status-gray" data-gallery-flow="과거 terminal event 보존|현재 세션과 분리|dashboard history 분류|이전 실패 카드 렌더"><div class="card-primary"><span class="project-badge">chatgpt2codex</span><div class="title provisional">이전 실패 기록</div><span class="start-time">09:12</span><span class="status gray">이전 실패</span></div></article>
       </div>
     </section>
   </section>
@@ -803,6 +817,78 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   var restartRequestedAt = 0;
   var restartSawDisconnect = false;
   settingsViewButton.hidden = !settingsEnabled;
+
+  function renderGalleryPreviewGuides() {
+    document.querySelectorAll("[data-gallery-flow]").forEach(function (card) {
+      if (card.getAttribute("data-gallery-enhanced") === "1") return;
+      card.setAttribute("data-gallery-enhanced", "1");
+
+      var flow = document.createElement("div");
+      flow.className = "gallery-flow";
+      var flowTitle = document.createElement("div");
+      flowTitle.className = "gallery-flow-title";
+      flowTitle.textContent = "카드 로딩 과정";
+      var flowSteps = document.createElement("div");
+      flowSteps.className = "gallery-flow-steps";
+      String(card.getAttribute("data-gallery-flow") || "")
+        .split("|")
+        .filter(Boolean)
+        .forEach(function (label, index) {
+          if (index > 0) {
+            var arrow = document.createElement("span");
+            arrow.className = "gallery-flow-arrow";
+            arrow.textContent = "→";
+            flowSteps.appendChild(arrow);
+          }
+          var step = document.createElement("span");
+          step.className = "gallery-flow-step";
+          step.textContent = label;
+          flowSteps.appendChild(step);
+        });
+      flow.append(flowTitle, flowSteps);
+      card.appendChild(flow);
+
+      var buttons = Array.from(card.querySelectorAll("[data-preview-effect]"));
+      if (!buttons.length) return;
+
+      var guide = document.createElement("div");
+      guide.className = "gallery-button-guide";
+      var guideTitle = document.createElement("div");
+      guideTitle.className = "gallery-button-guide-title";
+      guideTitle.textContent = "버튼을 누르면";
+      guide.appendChild(guideTitle);
+      buttons.forEach(function (button) {
+        var row = document.createElement("div");
+        row.className = "gallery-button-guide-row";
+        var label = document.createElement("div");
+        label.className = "gallery-button-guide-label";
+        label.textContent = button.getAttribute("data-preview-label") || button.textContent.trim();
+        var effect = document.createElement("div");
+        effect.className = "gallery-button-guide-effect";
+        effect.textContent = button.getAttribute("data-preview-effect") || "";
+        row.append(label, effect);
+        guide.appendChild(row);
+      });
+      card.appendChild(guide);
+
+      var result = document.createElement("div");
+      result.className = "gallery-sim-result";
+      result.setAttribute("role", "status");
+      result.setAttribute("aria-live", "polite");
+      card.appendChild(result);
+      buttons.forEach(function (button) {
+        if (button.disabled) return;
+        button.addEventListener("click", function (event) {
+          event.preventDefault();
+          event.stopPropagation();
+          var label = button.getAttribute("data-preview-label") || button.textContent.trim();
+          result.textContent = "미리보기 결과 · " + label + "\n" + (button.getAttribute("data-preview-effect") || "");
+          result.classList.add("visible");
+        });
+      });
+    });
+  }
+  renderGalleryPreviewGuides();
 
   function setDashboardView(nextView, updateLocation) {
     selectedView = normalizedView(nextView);
