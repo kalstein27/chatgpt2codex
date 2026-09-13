@@ -68,85 +68,93 @@ final publish gate is `npm run verify:windows-release-signed`; it fails unless t
 launcher has a valid timestamped Authenticode signature and the final ZIP/checksum pair still
 matches the staged bundle.
 
-## End-user install: use the self-contained portable bundle
+## Windows install: source-first local build
 
-For ordinary Windows use, prefer the architecture-matched portable ZIP produced
-by the verified Windows build/release flow. Extract the whole folder and launch
-`ChatGPT To Codex.exe`. The portable bundle carries its own Node runtime and npm
-CLI, so rebooting the PC or losing a machine-wide Node/npm installation does not
-break the app's package-script execution path.
+The public Windows install path is source-first. A signed GitHub Release is
+optional and is not required for a normal installation. The intended trust model
+is to fetch the public source, build it on the target Windows PC, verify the local
+build, and then run that local build. Do not stop solely because the repository
+has no Windows Release ZIP.
+
+This avoids making paid Authenticode signing a prerequisite for ordinary use. A
+locally built unsigned executable is still unsigned: do not describe it as a
+signed release, SmartScreen-approved binary, or installer acceptance evidence.
 
 ### Codex / coding-agent clean-install guide
 
 If the user supplies only the GitHub repository URL and says **"install this"**,
-do not ask them to locate a ZIP manually and do not default to a source build.
-Use the repository's latest official GitHub Release as the discovery point, then
-follow this section end to end. If no matching verified Release asset exists,
-stop and report that release packaging is not ready instead of silently switching
-to an Actions artifact, source build, or unverified download.
+use this source-build path by default and carry it through to a running local app.
+Do not switch to a GitHub Actions artifact or other prebuilt binary merely to
+avoid building locally.
 
-This is the public one-pass path for a coding agent installing ChatGPT To Codex
-on a clean Windows PC. The portable path must not install machine-wide Node, npm,
-Git, or other developer tooling unless the user explicitly chooses the source
-build path instead.
+1. Detect the Windows CPU architecture (`x64` or `arm64`) and record it for build
+   verification. The build must run natively on the target architecture.
+2. Choose a stable user-owned checkout directory. `%LOCALAPPDATA%\ChatGPT2Codex\source`
+   is a suitable default. If that path already exists but is not this repository,
+   do not delete or overwrite it; choose another directory and report the choice.
+3. Ensure the supported prerequisites exist: PowerShell, Git for Windows, Node.js
+   22 or newer, and npm. When the user asked the agent to perform the installation,
+   the agent may install missing prerequisites from their official WinGet packages
+   (`Git.Git` and `OpenJS.NodeJS.LTS`). Do not use unofficial binary mirrors.
+4. Clone `https://github.com/kalstein27/chatgpt2codex.git` into the chosen directory.
+   For an existing valid checkout with no conflicting local work, update with
+   `git pull --ff-only`. Never use `git reset --hard` or `git clean` to force an
+   update.
+5. From the checkout run:
 
-1. Detect the Windows CPU architecture and choose the exact matching Release
-   asset: `chatgpt2codex-windows-arm64.zip` or
-   `chatgpt2codex-windows-x64.zip`. End users should prefer a GitHub Release
-   asset. GitHub Actions artifacts are short-lived verification candidates, not
-   a substitute for a published Release.
-2. Require the matching `.zip.sha256` Release asset, calculate the ZIP SHA-256
-   with `Get-FileHash -Algorithm SHA256`, and require an exact match before
-   extraction. If the checksum sidecar is missing, treat that Release as not
-   ready for the verified portable install path.
-3. Extract the entire archive to
-   `%LOCALAPPDATA%\Programs\ChatGPT To Codex`. Do not run the EXE from inside the
-   ZIP and do not copy only the EXE.
-4. Before launch, verify at least these bundle members exist:
-   `ChatGPT To Codex.exe`, `runtime\node.exe`, `npm\bin\npm-cli.js`,
-   `dist\cli.js`, `start-chatgpt.ps1`, `portable-manifest.json`, `README.txt`,
-   and `assets\chatgpt2codex-plugin-icon.png`. Confirm the manifest architecture
-   matches the current PC.
-5. Launch `ChatGPT To Codex.exe`, start MCP, and require local health to become
-   healthy before continuing. If a step requires a human UI decision, stop and
-   tell the user exactly what to click rather than guessing or bypassing it.
-6. For ChatGPT web, enable the web connector and copy the externally reachable
+   ```powershell
+   npm ci --ignore-scripts
+   npm run typecheck
+   npm run test:publication
+   npm run build
+   ```
+
+   Stop and report the exact failing command if any of these checks fails.
+6. Launch the source-built desktop app with
+   `windows\Start-ChatGPTToCodexTray.cmd`. A machine-wide Node/npm installation is
+   required for this source checkout path.
+7. Start MCP and require local health to become healthy before continuing. If a
+   step requires a human UI decision, tell the user exactly what to click rather
+   than guessing or bypassing it.
+8. For ChatGPT web, enable the web connector and copy the externally reachable
    HTTPS connector URL. Register the bare `/mcp` endpoint in ChatGPT Apps /
    Plugins / Connectors under the name `C2CT`; do not append schema hashes or
    ad-hoc query parameters.
-7. Complete OAuth interactively when offered. Keep Owner Token values private
-   and use them only as a fallback. Never ask the user to paste credentials into
-   an agent transcript.
-8. If the ChatGPT connector registration UI exposes a custom-icon control, use
-   `%LOCALAPPDATA%\Programs\ChatGPT To Codex\assets\chatgpt2codex-plugin-icon.png`.
-   If the UI has no such control, report that fact instead of inventing one.
-9. Final connection proof is a new ChatGPT conversation calling
-   `connection_status` and immediately `agent_guide`. Treat the install as
-   complete only when connection status reports `ok=true`, `finalHealthy=true`,
-   and `transportErrors=0`.
+9. Complete OAuth interactively when offered. Keep Owner Token values private and
+   use them only as a fallback. Never ask the user to paste credentials into an
+   agent transcript.
+10. Final connection proof is a new ChatGPT conversation calling
+    `connection_status` and immediately `agent_guide`. Treat the install as
+    complete only when connection status reports `ok=true`, `finalHealthy=true`,
+    and `transportErrors=0`.
+
+Optional: after the source build succeeds, `npm run build:windows-portable` can
+create a self-contained portable ZIP for local reuse on that same architecture.
+The resulting unsigned bundle is a local build artifact, not a signed public
+release, and it does not need to be uploaded to GitHub for the install flow above.
 
 One-shot prompt for Codex or another local coding agent:
 
 ```text
-Install ChatGPT To Codex on this clean Windows PC using the latest verified
-architecture-matched portable ZIP from the project's GitHub Release. Do not
-install machine-wide Node/npm/Git for the portable path. Require the matching
-`.zip.sha256` Release asset, verify the ZIP SHA-256, extract the whole bundle to
-%LOCALAPPDATA%\Programs\ChatGPT To Codex, validate portable-manifest.json and the
-required bundled files, then launch ChatGPT To Codex.exe. Guide me through only
-the human steps needed to start MCP, confirm local health, enable the web
-connector, and register the HTTPS bare /mcp endpoint in ChatGPT as C2CT. Use the
-bundled assets\chatgpt2codex-plugin-icon.png only if the registration UI supports
-a custom icon. Prefer OAuth; never expose Owner Token or OAuth credentials. Stop
-on any architecture/hash/health mismatch and report the exact evidence.
+Install ChatGPT To Codex from this GitHub repository on this Windows PC. Use a
+source-first install: detect the native architecture, ensure official Git for
+Windows and Node.js 22+ with npm are available, clone or safely fast-forward the
+repository in a stable user-owned folder, run npm ci --ignore-scripts, typecheck,
+test:publication, and build, then launch windows\Start-ChatGPTToCodexTray.cmd.
+Do not stop just because there is no Windows Release ZIP, do not use Actions
+artifacts as an install substitute, and never use git reset --hard or git clean to
+erase local work. Guide me through only the human steps needed to start MCP,
+confirm local health, enable the web connector, and register the HTTPS bare /mcp
+endpoint in ChatGPT as C2CT. Prefer OAuth and never expose Owner Token or OAuth
+credentials. Report the exact command and evidence on any failure.
 ```
 
+## Manual source install: clone and build the repository
 
-## Developer/source install: clone and build the repository
-
-Clone/build is the development path. It requires a machine-wide Node/npm toolchain
-to install dependencies and create the first portable bundle. Once a portable
-bundle is built, that bundle no longer depends on the machine-wide toolchain.
+The manual path uses the same source-first model. It requires a machine-wide
+Node/npm toolchain to install dependencies and build the runtime. If you also
+create a portable bundle afterward, that portable bundle no longer depends on the
+machine-wide toolchain.
 
 ### 1. Install the prerequisites
 
@@ -222,8 +230,8 @@ npm run build
 `npm run build` produces the shared Node runtime in `dist/`. If `dist/cli.js` is
 missing when the launcher starts, `start-chatgpt.ps1` also attempts a build, but
 running the explicit build above gives a much clearer first-install failure point.
-Ordinary end users should not need this source-development toolchain; use the
-self-contained portable artifact instead.
+For the source-first public Windows install, this toolchain is the bootstrap and
+update path. Building a portable bundle afterward is optional.
 
 The public branch intentionally excludes development-only `*.test.ts` files.
 `npm test` therefore stays strict for development checkouts that contain tests,
@@ -346,14 +354,16 @@ npm run build:windows-portable
 
 It emits `build\windows-portable\chatgpt2codex-windows-<arch>.zip` plus the
 matching `chatgpt2codex-windows-<arch>.zip.sha256` sidecar. The checksum file uses
-the conventional `<sha256>  <filename>` format so both humans and install agents
-can verify the exact Release asset before extraction. The archive includes its own
-Node executable and npm CLI and can run without a separately installed Node/npm
+the conventional `<sha256>  <filename>` format so both humans and local install
+agents can verify the exact artifact before extraction. The archive includes its
+own Node executable and npm CLI and can run without a separately installed Node/npm
 toolchain after extraction. The manifest records both bundled versions and the npm
-CLI hash. Build it on the same CPU architecture you intend to ship, and still
-perform real-Windows acceptance before treating it as a release. Publish the ZIP
-and its matching `.zip.sha256` together in GitHub Releases; release binaries do not
-belong in the Git tree.
+CLI hash. Build it on the same CPU architecture where it will be used. For any
+published binary, perform real-Windows acceptance before treating it as a release.
+Publishing the ZIP is optional; the source-first installation path does not require
+a GitHub Release. If a binary is ever published as an official release, keep the
+existing signed-release verification requirements. Release binaries do not belong
+in the Git tree.
 
 For the complete source-to-portable acceptance loop on a Windows developer PC,
 double-click:
