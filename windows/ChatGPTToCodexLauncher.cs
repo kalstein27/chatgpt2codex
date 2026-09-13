@@ -444,7 +444,7 @@ internal sealed class LauncherForm : Form
         port = ResolvePort();
         publicTunnelEnabled = false;
         githubRepoUrl = Environment.GetEnvironmentVariable("CHATGPT2CODEX_UPDATE_REPO_URL");
-        if (string.IsNullOrWhiteSpace(githubRepoUrl)) githubRepoUrl = "https://github.com/ezBuilder/chatgpt2codex";
+        if (string.IsNullOrWhiteSpace(githubRepoUrl)) githubRepoUrl = "https://github.com/kalstein27/chatgpt2codex";
         LoadSettings();
         if (string.IsNullOrEmpty(selectedProjectPath)) selectedProjectPath = LoadSelectedProjectPath();
         SeedOrLoadSharedSettings();
@@ -1640,7 +1640,7 @@ internal sealed class LauncherForm : Form
             publicTunnelEnabled = tunnelCheck.Checked;
             configuredPublicHost = string.IsNullOrWhiteSpace(hostBox.Text) ? null : hostBox.Text.Trim();
             port = (int)portBox.Value;
-            githubRepoUrl = string.IsNullOrWhiteSpace(repoBox.Text) ? "https://github.com/ezBuilder/chatgpt2codex" : repoBox.Text.Trim();
+            githubRepoUrl = string.IsNullOrWhiteSpace(repoBox.Text) ? "https://github.com/kalstein27/chatgpt2codex" : repoBox.Text.Trim();
             preferredLanguage = LanguageOptionCodes[Math.Max(0, languageBox.SelectedIndex)];
             SaveSettings();
             RefreshTrayState();

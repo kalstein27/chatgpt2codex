@@ -22,10 +22,13 @@
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json && node dist/runtime/chatgpt-widget-check.js && node dist/runtime/chatgpt-widget-asset-build.js && node dist/runtime/runtime-manifest.js --seal --root .",
     "build:macos-app": "bash scripts/build-macos-app.sh",
     "build:windows-portable": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Build-Portable.ps1",
+    "finalize:windows-signed-portable": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Finalize-Signed-Portable.ps1",
     "verify:windows-owner-token-ui": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Verify-First-Install-UI.ps1",
     "verify:windows-oauth-wiring": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Verify-OAuth-Approval-Wiring.ps1",
     "verify:windows-portable": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Verify-Portable.ps1",
     "verify:windows-portable-first-install-ui": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Verify-Portable-First-Install-UI.ps1",
+    "verify:windows-release-candidate": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Verify-Release-Candidate.ps1",
+    "verify:windows-release-signed": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Verify-Release-Candidate.ps1 -RequireSignedLauncher",
     "verify:windows-tailscale-path": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Verify-Tailscale-Path.ps1",
     "verify:windows-unified-dashboard-ui": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File windows/Verify-Unified-Dashboard-UI.ps1",
     "macos-app:bootstrap-local": "node dist/cli.js macos-app-bootstrap-local",
@@ -108,6 +111,39 @@
       "activity:remote:status": {
         "sideEffects": {
           "needsNetwork": true,
+          "writesWorkspace": false,
+          "writesExternalLocalPath": false,
+          "launchesProcess": true,
+          "destructive": false,
+          "fixedDestination": true,
+          "localApproval": "none"
+        }
+      },
+      "finalize:windows-signed-portable": {
+        "sideEffects": {
+          "needsNetwork": false,
+          "writesWorkspace": true,
+          "writesExternalLocalPath": false,
+          "launchesProcess": true,
+          "destructive": false,
+          "fixedDestination": true,
+          "localApproval": "none"
+        }
+      },
+      "verify:windows-release-candidate": {
+        "sideEffects": {
+          "needsNetwork": false,
+          "writesWorkspace": false,
+          "writesExternalLocalPath": false,
+          "launchesProcess": true,
+          "destructive": false,
+          "fixedDestination": true,
+          "localApproval": "none"
+        }
+      },
+      "verify:windows-release-signed": {
+        "sideEffects": {
+          "needsNetwork": false,
           "writesWorkspace": false,
           "writesExternalLocalPath": false,
           "launchesProcess": true,

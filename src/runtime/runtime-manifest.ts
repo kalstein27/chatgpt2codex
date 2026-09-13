@@ -106,7 +106,6 @@ function sourceFingerprint(root: string): string | null {
     "tsconfig.json",
     "start-chatgpt.sh",
     "start-chatgpt.ps1",
-    "macos/ChatGPTToCodexStatusBar/runtime-updater.swift",
     ...sourceFiles,
   ];
   return fingerprintRuntimeFiles(root, files);

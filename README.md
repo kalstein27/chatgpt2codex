@@ -5,6 +5,7 @@ A local bridge that lets ChatGPT work safely inside projects on your Mac or Wind
 ChatGPT To Codex connects ChatGPT to a local MCP runtime so it can inspect files, edit code, run tests, check Git state, and report results without uploading your whole repository.
 
 > This repository is a development fork of [ezBuilder/chatgpt2codex](https://github.com/ezBuilder/chatgpt2codex).
+> Upstream `ezBuilder/chatgpt2codex` releases are not release artifacts for this fork. For Windows, use this repository's source-first install path below rather than installing an upstream prebuilt binary.
 
 [Releases](https://github.com/kalstein27/chatgpt2codex/releases)
 
@@ -29,34 +30,39 @@ The macOS menu/status item and Windows tray are secondary surfaces for reopening
 
 | Platform | Current status |
 | --- | --- |
-| macOS | Local coding workflow, shared desktop UI, native screenshot/E2E and desktop control supported. Public release should use a signed and notarized DMG. |
+| macOS | Local coding workflow, shared desktop UI, native screenshot/E2E and desktop control supported. The normal install path is source-first and built locally on the target Mac. |
 | Windows x64 / ARM64 | Shared runtime and desktop UI supported. Native Windows CI verifies the portable bundle. Native screenshot/click/type/UI Automation is not implemented yet. |
 | Linux | Developer/runtime path only. No packaged desktop release. |
 
 ## Install
 
-Use an official release asset only when the matching verified package is attached to the GitHub Release. Do not silently substitute an Actions artifact or source build for an end-user install.
+macOS and Windows use source-first install paths. Prebuilt GitHub Release installers are not required for normal installation. When a user gives a coding agent only this repository URL and asks to install it, the agent should clone the repository, prepare the supported toolchain, build locally on that computer, and launch the local build. Do not switch to an upstream or third-party prebuilt binary to avoid the local build.
 
 ### macOS
 
-1. Download the signed and notarized DMG from an official release when available.
-2. Drag **ChatGPT To Codex** to **Applications**.
-3. Launch the app and open **Settings**.
+The recommended public macOS path is to build from source on the target Mac:
 
-If no verified release package is available, use the source-build path below only as a developer workflow.
+1. Clone this repository into a stable user-owned folder.
+2. Ensure Xcode Command Line Tools and Node.js 22+ with npm are available.
+3. Run `npm ci --ignore-scripts`, `npm run typecheck`, `npm run test:publication`, and `npm run build`.
+4. Run `CHATGPT2CODEX_SKIP_PKG=1 npm run build:macos-app` to create the local app bundle without producing an installer package.
+5. Move `build/macos/ChatGPT To Codex.app` to **Applications**, launch it, and verify local MCP health before connecting ChatGPT.
+
+A locally built app may be ad-hoc signed when no Apple Developer identity is installed. Do not describe a local build as a notarized or publicly signed release.
 
 ### Windows
 
-The recommended end-user path is the architecture-matched portable ZIP.
+The recommended public Windows path is to build from source on the target PC:
 
-1. Choose the ZIP for `x64` or `arm64`.
-2. Verify the published SHA-256 when provided.
-3. Extract the entire ZIP to a permanent user-writable folder.
-4. Launch `ChatGPT To Codex.exe` from the extracted folder.
+1. Clone this repository into a stable user-owned folder.
+2. Ensure Git for Windows and Node.js 22+ with npm are available. A coding agent may install the official packages when the user asked it to perform the installation.
+3. Run `npm ci --ignore-scripts`, `npm run typecheck`, `npm run test:publication`, and `npm run build`.
+4. Launch `windows\Start-ChatGPTToCodexTray.cmd`.
+5. Start MCP in the desktop UI and verify local health before connecting ChatGPT.
 
-The portable bundle includes its own Node.js and npm. A machine-wide Node/npm installation is not required for normal portable use.
+You can also run `npm run build:windows-portable` after the source build to create a self-contained local portable bundle. A locally built unsigned bundle is not a signed public release, and its existence must not be represented as Authenticode or SmartScreen acceptance.
 
-See [windows/README.md](windows/README.md) for the Windows install and verification details.
+See [windows/README.md](windows/README.md) for the one-pass Windows agent install flow, prerequisites, build, launch, and verification details.
 
 ## Connect ChatGPT
 
