@@ -84,8 +84,9 @@ signed release, SmartScreen-approved binary, or installer acceptance evidence.
 
 If the user supplies only the GitHub repository URL and says **"install this"**,
 use this source-build path by default and carry it through to a running local app.
-Do not switch to a GitHub Actions artifact or other prebuilt binary merely to
-avoid building locally.
+Do not switch to a GitHub Actions artifact, an upstream `ezBuilder/chatgpt2codex`
+Release, or any other prebuilt binary merely to avoid building locally. Upstream
+release assets are not release artifacts for this fork.
 
 1. Detect the Windows CPU architecture (`x64` or `arm64`) and record it for build
    verification. The build must run natively on the target architecture.
