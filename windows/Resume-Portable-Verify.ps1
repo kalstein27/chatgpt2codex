@@ -32,6 +32,7 @@ if (-not $nodeArch) { throw "Could not determine Node architecture." }
 
 $stage = Join-Path $outputBase ("chatgpt2codex-windows-" + $nodeArch)
 $zip = $stage + ".zip"
+$checksum = $zip + ".sha256"
 $stageManifest = Join-Path $stage "portable-manifest.json"
 $sourceSeal = Join-Path $repoRoot "dist\runtime-build-manifest.json"
 $stageSeal = Join-Path $stage "dist\runtime-build-manifest.json"
@@ -71,7 +72,10 @@ Write-Host "[chatgpt2codex] Reusing stage: $stage"
 
 $reuseZip = (Test-Path -LiteralPath $zip) -and
     ((Get-Item -LiteralPath $zip).Length -gt 0) -and
-    ((Get-Item -LiteralPath $zip).LastWriteTimeUtc -ge $stageBuiltAt)
+    ((Get-Item -LiteralPath $zip).LastWriteTimeUtc -ge $stageBuiltAt) -and
+    (Test-Path -LiteralPath $checksum) -and
+    ((Get-Item -LiteralPath $checksum).LastWriteTimeUtc -ge $stageBuiltAt) -and
+    ((Get-Item -LiteralPath $checksum).LastWriteTimeUtc -ge (Get-Item -LiteralPath $zip).LastWriteTimeUtc)
 if ($reuseZip) {
     Write-Host "[chatgpt2codex] Reusing existing non-empty portable ZIP: $zip"
 } else {

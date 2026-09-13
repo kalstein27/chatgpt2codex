@@ -50,7 +50,7 @@ If no verified release package is available, use the source-build path below onl
 The recommended end-user path is the architecture-matched portable ZIP.
 
 1. Choose the ZIP for `x64` or `arm64`.
-2. Verify the published SHA-256 when provided.
+2. Require the matching `.zip.sha256` Release asset and verify the ZIP SHA-256 before extraction.
 3. Extract the entire ZIP to a permanent user-writable folder.
 4. Launch `ChatGPT To Codex.exe` from the extracted folder.
 

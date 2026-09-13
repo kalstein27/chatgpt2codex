@@ -51,6 +51,23 @@ That workflow is strong source/runtime evidence, but it intentionally does not
 sign, publish a GitHub Release, or click through a Windows installer. Signing and
 SmartScreen acceptance therefore remain separate release evidence.
 
+The portable source build is intentionally signing-provider-neutral. For a real
+signed release, sign the staged `ChatGPT To Codex.exe` with the approved Windows
+code-signing provider **before** the final ZIP is published. Use a SHA-256 code
+signature and an RFC 3161 SHA-256 timestamp; a release signature without a
+timestamp is not accepted by the finalization gate. Then run
+`npm run finalize:windows-signed-portable`. That command refuses an invalid or
+missing/timestamp-free Authenticode signature, refreshes the launcher's manifest SHA-256, and
+recreates both the ZIP and its `.zip.sha256` sidecar. This keeps certificate or
+trusted-signing credentials outside the repository while still making the final
+packaging step reproducible.
+
+Use `npm run verify:windows-release-candidate` to report the current launcher
+signature status while enforcing all portable integrity/checksum checks. The
+final publish gate is `npm run verify:windows-release-signed`; it fails unless the
+launcher has a valid timestamped Authenticode signature and the final ZIP/checksum pair still
+matches the staged bundle.
+
 ## End-user install: use the self-contained portable bundle
 
 For ordinary Windows use, prefer the architecture-matched portable ZIP produced
@@ -78,9 +95,10 @@ build path instead.
    `chatgpt2codex-windows-x64.zip`. End users should prefer a GitHub Release
    asset. GitHub Actions artifacts are short-lived verification candidates, not
    a substitute for a published Release.
-2. If the matching `.zip.sha256` file is published, calculate the ZIP SHA-256
-   with `Get-FileHash -Algorithm SHA256` and require an exact match before
-   extraction.
+2. Require the matching `.zip.sha256` Release asset, calculate the ZIP SHA-256
+   with `Get-FileHash -Algorithm SHA256`, and require an exact match before
+   extraction. If the checksum sidecar is missing, treat that Release as not
+   ready for the verified portable install path.
 3. Extract the entire archive to
    `%LOCALAPPDATA%\Programs\ChatGPT To Codex`. Do not run the EXE from inside the
    ZIP and do not copy only the EXE.
@@ -112,8 +130,8 @@ One-shot prompt for Codex or another local coding agent:
 ```text
 Install ChatGPT To Codex on this clean Windows PC using the latest verified
 architecture-matched portable ZIP from the project's GitHub Release. Do not
-install machine-wide Node/npm/Git for the portable path. Verify the published
-SHA-256 when available, extract the whole bundle to
+install machine-wide Node/npm/Git for the portable path. Require the matching
+`.zip.sha256` Release asset, verify the ZIP SHA-256, extract the whole bundle to
 %LOCALAPPDATA%\Programs\ChatGPT To Codex, validate portable-manifest.json and the
 required bundled files, then launch ChatGPT To Codex.exe. Guide me through only
 the human steps needed to start MCP, confirm local health, enable the web
@@ -326,12 +344,16 @@ The portable builder is:
 npm run build:windows-portable
 ```
 
-It emits `build\windows-portable\chatgpt2codex-windows-<arch>.zip`. The archive
-includes its own Node executable and npm CLI and can run without a separately
-installed Node/npm toolchain after extraction. The manifest records both bundled
-versions and the npm CLI hash. Build it on the same CPU architecture you intend
-to ship, and still perform real-Windows acceptance before treating it as a release.
-Release binaries belong in GitHub Releases, not in the Git tree.
+It emits `build\windows-portable\chatgpt2codex-windows-<arch>.zip` plus the
+matching `chatgpt2codex-windows-<arch>.zip.sha256` sidecar. The checksum file uses
+the conventional `<sha256>  <filename>` format so both humans and install agents
+can verify the exact Release asset before extraction. The archive includes its own
+Node executable and npm CLI and can run without a separately installed Node/npm
+toolchain after extraction. The manifest records both bundled versions and the npm
+CLI hash. Build it on the same CPU architecture you intend to ship, and still
+perform real-Windows acceptance before treating it as a release. Publish the ZIP
+and its matching `.zip.sha256` together in GitHub Releases; release binaries do not
+belong in the Git tree.
 
 For the complete source-to-portable acceptance loop on a Windows developer PC,
 double-click:
@@ -354,11 +376,16 @@ Supported non-interactive Windows verification commands are:
 ```powershell
 npm run verify:windows-oauth-wiring
 npm run verify:windows-portable
+npm run verify:windows-release-candidate
+npm run verify:windows-release-signed
 ```
 
 The OAuth check verifies the launcher/local-control approval wiring from source.
 The portable check validates launcher, bundled Node, bundled npm CLI, manifest
-versions/hashes, architecture, brand assets, and the final non-empty ZIP. The
+versions/hashes, architecture, brand assets, and the final non-empty ZIP/checksum
+pair. The release-candidate check additionally rejects broken Authenticode states
+while still allowing a deliberately unsigned `NotSigned` CI candidate. The signed
+release check requires a valid timestamped launcher signature. The
 stronger `npm run verify:windows-portable-first-install-ui` test additionally
 launches the portable runtime in an isolated child environment with machine-wide
 Node/npm removed from PATH. `npm run verify:windows-owner-token-ui` remains an

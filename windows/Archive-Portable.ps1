@@ -73,6 +73,19 @@ try {
 $zipInfo = Get-Item -LiteralPath $zipPath
 if ($zipInfo.Length -le 0) { throw "Final portable ZIP archive is empty." }
 $zipHash = Get-C2ctSha256Hex $zipPath
+$checksumPath = $zipPath + ".sha256"
+$checksumPartial = $checksumPath + ".partial"
+$checksumLine = $zipHash + "  " + [System.IO.Path]::GetFileName($zipPath)
+Remove-Item -Force -ErrorAction SilentlyContinue $checksumPartial
+Remove-Item -Force -ErrorAction SilentlyContinue $checksumPath
+try {
+    $checksumLine | Set-Content -LiteralPath $checksumPartial -Encoding ASCII
+    Move-Item -LiteralPath $checksumPartial -Destination $checksumPath
+} catch {
+    Remove-Item -Force -ErrorAction SilentlyContinue $checksumPartial
+    throw
+}
 Write-Host "portable-bundle=$zipPath"
 Write-Host "portable-bytes=$($zipInfo.Length)"
 Write-Host "portable-sha256=$zipHash"
+Write-Host "portable-checksum=$checksumPath"
