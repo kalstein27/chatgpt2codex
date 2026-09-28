@@ -43,6 +43,7 @@ export interface ProjectLaneBinding {
   workLaneId: string;
   ownerScope?: string;
   now?: number;
+  allowContinuationActive?: boolean;
 }
 
 export interface SerialProjectLeaseCompatibilityInput {
@@ -66,7 +67,13 @@ export function projectLanesEnabled(env: NodeJS.ProcessEnv = process.env): boole
 
 export function projectLaneDigest(workLaneId: string): string {
   if (!WORK_LANE_ID_RE.test(workLaneId)) {
-    throw new DomainError(ErrorCode.INVALID_ARGUMENT, "Invalid project work lane identifier");
+    throw new DomainError(ErrorCode.INVALID_ARGUMENT, "Invalid project work lane identifier", {
+      reason: "invalid-work-lane-id",
+      recommendedAction: "project_lane_open",
+      recommendedTool: "project_lane_open",
+      retrySameWorkLaneId: false,
+      terminalForWorkLaneId: true,
+    });
   }
   return digest(LANE_DIGEST_DOMAIN, workLaneId);
 }
@@ -171,6 +178,11 @@ async function findLaneRecord(
   if (!record || record.projectId !== binding.project.projectId || record.projectRootDigest !== rootDigest) {
     throw new DomainError(ErrorCode.LEASE_REQUIRED, "No active project lane lease for the requested project", {
       projectId: binding.project.projectId,
+      leaseReason: "work-lane-unavailable",
+      recommendedAction: "project_lane_open",
+      recommendedTool: "project_lane_open",
+      retrySameWorkLaneId: false,
+      terminalForWorkLaneId: true,
     });
   }
   if (
@@ -180,6 +192,11 @@ async function findLaneRecord(
     throw new DomainError(ErrorCode.LEASE_REQUIRED, "Project lane belongs to another session", {
       projectId: binding.project.projectId,
       ownerMismatch: true,
+      leaseReason: "work-lane-unavailable",
+      recommendedAction: "project_lane_open",
+      recommendedTool: "project_lane_open",
+      retrySameWorkLaneId: false,
+      terminalForWorkLaneId: true,
     });
   }
   return { lanes, index, record };
@@ -191,6 +208,7 @@ async function resolveLaneRecord(
   const now = binding.now ?? Date.now();
   const found = await findLaneRecord(binding);
   if (found.record.expiresAt < now) {
+    const withinRenewalGrace = now <= found.record.expiresAt + LEASE_RENEWAL_GRACE_MS;
     throw new DomainError(ErrorCode.LEASE_EXPIRED, "Project lane lease expired before the requested operation started", {
       projectId: found.record.projectId,
       leaseId: found.record.leaseId,
@@ -198,10 +216,26 @@ async function resolveLaneRecord(
       expiresAt: found.record.expiresAt,
       expiredBySec: Math.max(0, Math.ceil((now - found.record.expiresAt) / 1_000)),
       renewalTool: "project_lane_renew",
+      recommendedAction: withinRenewalGrace ? "project_lane_renew" : "project_lane_open",
+      recommendedTool: withinRenewalGrace ? "project_lane_renew" : "project_lane_open",
+      retrySameWorkLaneId: false,
+      terminalForWorkLaneId: true,
       phase: "lease-preflight",
       actionStarted: false,
       receiptCreated: false,
       subprocessStarted: false,
+    });
+  }
+  if (found.record.continuationState === "active" && binding.allowContinuationActive !== true) {
+    throw new DomainError(ErrorCode.ACTIVE_OPERATION_IN_PROGRESS, "Project lane is temporarily delegated to an exact approved operation", {
+      projectId: found.record.projectId,
+      leaseId: found.record.leaseId,
+      leaseReason: "turnless-continuation-active",
+      approvalRequestId: found.record.continuationApprovalRequestId,
+      operationId: found.record.continuationOperationId,
+      recommendedAction: "wait-for-active-operation-to-finish",
+      retrySameWorkLaneId: true,
+      terminalForWorkLaneId: false,
     });
   }
   return found;
@@ -217,18 +251,27 @@ export async function openProjectLane(
   const canonicalRoot = await canonicalProjectRoot(input.project.root);
   const rootDigest = digest(ROOT_DIGEST_DOMAIN, canonicalRoot);
   const lanes = activeLanes(input.session, now);
+  const serialLease = input.session.lease;
+  const activePrivilegedCapability = lanes.some((lane) => lane.preset !== "read-only")
+    || Boolean(
+      serialLease
+      && serialLease.expiresAt >= now
+      && serialLease.preset !== "read-only",
+    );
   if (
     input.bindProject === true &&
     input.preset !== "read-only" &&
     input.session.boundProjectId &&
-    input.session.boundProjectId !== input.project.projectId
+    input.session.boundProjectId !== input.project.projectId &&
+    activePrivilegedCapability
   ) {
     throw new DomainError(
       ErrorCode.PERMISSION_DENIED,
-      "This session is already bound to another project for privileged work",
+      "This session still has an active privileged capability for another project",
       {
         projectId: input.project.projectId,
         boundProjectId: input.session.boundProjectId,
+        rebindBlockedBy: "active-capability",
       },
     );
   }
@@ -247,7 +290,6 @@ export async function openProjectLane(
       { projectId: input.project.projectId },
     );
   }
-  const serialLease = input.session.lease;
   if (
     input.preset !== "read-only" &&
     serialLease &&
@@ -291,7 +333,7 @@ export async function openProjectLane(
       [...lanes, record],
       input.bindProject !== true || input.preset === "read-only"
         ? input.session.boundProjectId
-        : input.session.boundProjectId ?? lease.projectId,
+        : lease.projectId,
     ),
     workLaneId,
     lease,
@@ -398,6 +440,248 @@ export async function releaseOwnedProjectLane(input: {
   const ownedLane = owned[0];
   if (!ownedLane) return undefined;
   const { record, index } = ownedLane;
+  return {
+    session: version2Session(
+      input.session,
+      lanes.filter((_, candidate) => candidate !== index),
+      input.session.boundProjectId,
+      releasedLaneTombstone(input.session, {
+        laneDigest: record.laneDigest,
+        projectId: record.projectId,
+        leaseId: record.leaseId,
+        releasedAt: now,
+      }),
+    ),
+    releasedLease: laneLease(record, canonicalRoot),
+  };
+}
+
+export async function suspendOwnedProjectLaneForContinuation(input: {
+  session: SessionDocument;
+  project: ProjectRegistryEntry;
+  ownerScope?: string;
+  leaseId: string;
+  approvalRequestId: string;
+  now?: number;
+}): Promise<{ session: SessionDocument; lease: Lease } | undefined> {
+  const now = input.now ?? Date.now();
+  const canonicalRoot = await canonicalProjectRoot(input.project.root);
+  const rootDigest = digest(ROOT_DIGEST_DOMAIN, canonicalRoot);
+  const ownerDigest = ownerScopeDigest(input.ownerScope);
+  const lanes = input.session.lanes ?? [];
+  const index = lanes.findIndex((record) =>
+    record.projectId === input.project.projectId
+    && record.projectRootDigest === rootDigest
+    && record.ownerScopeDigest === ownerDigest
+    && record.leaseId === input.leaseId,
+  );
+  if (index < 0) return undefined;
+  const record = lanes[index]!;
+  if (record.expiresAt < now) {
+    throw new DomainError(ErrorCode.LEASE_EXPIRED, "Project lane expired before approved continuation could start", {
+      projectId: record.projectId,
+      leaseId: record.leaseId,
+      expiresAt: record.expiresAt,
+      leaseReason: "turnless-continuation-expired",
+      retrySameWorkLaneId: false,
+      terminalForWorkLaneId: true,
+    });
+  }
+  if (record.continuationState === "active" && record.continuationApprovalRequestId !== input.approvalRequestId) {
+    throw new DomainError(ErrorCode.ACTIVE_OPERATION_IN_PROGRESS, "Project lane is already delegated to another exact approved operation", {
+      projectId: record.projectId,
+      leaseId: record.leaseId,
+      leaseReason: "turnless-continuation-active",
+      retrySameWorkLaneId: true,
+      terminalForWorkLaneId: false,
+    });
+  }
+  const updated: ProjectLaneRecord = {
+    ...record,
+    continuationState: "active",
+    continuationApprovalRequestId: input.approvalRequestId,
+    continuationStartedAt: record.continuationApprovalRequestId === input.approvalRequestId
+      ? (record.continuationStartedAt ?? now)
+      : now,
+    continuationOperationId: undefined,
+    continuationTerminalAt: undefined,
+    lastUsedAt: now,
+  };
+  const next = [...lanes];
+  next[index] = updated;
+  return {
+    session: version2Session(input.session, next),
+    lease: laneLease(updated, canonicalRoot),
+  };
+}
+
+export async function markOwnedProjectLaneContinuationTerminal(input: {
+  session: SessionDocument;
+  project: ProjectRegistryEntry;
+  ownerScope?: string;
+  leaseId: string;
+  approvalRequestId: string;
+  operationId: string;
+  now?: number;
+}): Promise<{ session: SessionDocument; lease: Lease } | undefined> {
+  const now = input.now ?? Date.now();
+  const canonicalRoot = await canonicalProjectRoot(input.project.root);
+  const rootDigest = digest(ROOT_DIGEST_DOMAIN, canonicalRoot);
+  const ownerDigest = ownerScopeDigest(input.ownerScope);
+  const lanes = input.session.lanes ?? [];
+  const index = lanes.findIndex((record) =>
+    record.projectId === input.project.projectId
+    && record.projectRootDigest === rootDigest
+    && record.ownerScopeDigest === ownerDigest
+    && record.leaseId === input.leaseId,
+  );
+  if (index < 0) return undefined;
+  const record = lanes[index]!;
+  if (record.continuationApprovalRequestId !== input.approvalRequestId) {
+    throw new DomainError(ErrorCode.LEASE_REQUIRED, "Project lane continuation binding does not match this exact approval", {
+      projectId: record.projectId,
+      leaseId: record.leaseId,
+      leaseReason: "turnless-continuation-binding-mismatch",
+      retrySameWorkLaneId: false,
+      terminalForWorkLaneId: false,
+    });
+  }
+  const updated: ProjectLaneRecord = {
+    ...record,
+    continuationState: "terminal-pending-resume",
+    continuationOperationId: input.operationId,
+    continuationTerminalAt: now,
+    lastUsedAt: now,
+  };
+  const next = [...lanes];
+  next[index] = updated;
+  return {
+    session: version2Session(input.session, next),
+    lease: laneLease(updated, canonicalRoot),
+  };
+}
+
+export async function setProjectLaneContinuationState(input: {
+  session: SessionDocument;
+  project: ProjectRegistryEntry;
+  ownerScope?: string;
+  leaseId: string;
+  approvalRequestId: string;
+  phase: "active" | "terminal" | "clear";
+  operationId?: string;
+  now?: number;
+}): Promise<{ session: SessionDocument; lease: Lease } | undefined> {
+  const now = input.now ?? Date.now();
+  const canonicalRoot = await canonicalProjectRoot(input.project.root);
+  const rootDigest = digest(ROOT_DIGEST_DOMAIN, canonicalRoot);
+  const ownerDigest = ownerScopeDigest(input.ownerScope);
+  const lanes = input.session.lanes ?? [];
+  const index = lanes.findIndex((record) =>
+    record.projectId === input.project.projectId
+    && record.projectRootDigest === rootDigest
+    && record.ownerScopeDigest === ownerDigest
+    && record.leaseId === input.leaseId,
+  );
+  if (index < 0) return undefined;
+  const record = lanes[index]!;
+  if (record.expiresAt < now) {
+    throw new DomainError(ErrorCode.LEASE_EXPIRED, "Project lane expired before approved continuation could be updated", {
+      projectId: record.projectId,
+      leaseId: record.leaseId,
+      expiresAt: record.expiresAt,
+      leaseReason: "turnless-continuation-expired",
+      retrySameWorkLaneId: false,
+      terminalForWorkLaneId: true,
+    });
+  }
+  if (input.phase === "active") {
+    if (record.continuationState === "active" && record.continuationApprovalRequestId !== input.approvalRequestId) {
+      throw new DomainError(ErrorCode.ACTIVE_OPERATION_IN_PROGRESS, "Project lane is already delegated to another exact approved operation", {
+        projectId: record.projectId,
+        leaseId: record.leaseId,
+        leaseReason: "turnless-continuation-active",
+        retrySameWorkLaneId: true,
+        terminalForWorkLaneId: false,
+      });
+    }
+    const updated: ProjectLaneRecord = {
+      ...record,
+      continuationState: "active",
+      continuationApprovalRequestId: input.approvalRequestId,
+      continuationStartedAt: record.continuationApprovalRequestId === input.approvalRequestId
+        ? (record.continuationStartedAt ?? now)
+        : now,
+      continuationOperationId: input.operationId,
+      continuationTerminalAt: undefined,
+      lastUsedAt: now,
+    };
+    const next = [...lanes];
+    next[index] = updated;
+    return { session: version2Session(input.session, next), lease: laneLease(updated, canonicalRoot) };
+  }
+  if (record.continuationApprovalRequestId !== input.approvalRequestId) {
+    throw new DomainError(ErrorCode.LEASE_REQUIRED, "Project lane continuation binding does not match this exact approval", {
+      projectId: record.projectId,
+      leaseId: record.leaseId,
+      leaseReason: "turnless-continuation-binding-mismatch",
+      retrySameWorkLaneId: false,
+      terminalForWorkLaneId: false,
+    });
+  }
+  if (input.phase === "terminal") {
+    if (!input.operationId) {
+      throw new DomainError(ErrorCode.INVALID_ARGUMENT, "Terminal project lane continuation requires the exact operation id");
+    }
+    const updated: ProjectLaneRecord = {
+      ...record,
+      continuationState: "terminal-pending-resume",
+      continuationOperationId: input.operationId,
+      continuationTerminalAt: now,
+      lastUsedAt: now,
+    };
+    const next = [...lanes];
+    next[index] = updated;
+    return { session: version2Session(input.session, next), lease: laneLease(updated, canonicalRoot) };
+  }
+  const updated: ProjectLaneRecord = { ...record, lastUsedAt: now };
+  delete updated.continuationState;
+  delete updated.continuationApprovalRequestId;
+  delete updated.continuationOperationId;
+  delete updated.continuationStartedAt;
+  delete updated.continuationTerminalAt;
+  const next = [...lanes];
+  next[index] = updated;
+  return { session: version2Session(input.session, next), lease: laneLease(updated, canonicalRoot) };
+}
+
+
+
+/**
+ * Retire one exact same-session lane by persisted lease identity when the raw
+ * workLaneId is no longer available. This is cleanup-only: it verifies the
+ * project root and owner scope, never accepts a foreign lane, and never grants
+ * a replacement capability.
+ */
+export async function retireOwnedProjectLaneByLeaseIdentity(input: {
+  session: SessionDocument;
+  project: ProjectRegistryEntry;
+  ownerScope?: string;
+  leaseId: string;
+  now?: number;
+}): Promise<{ session: SessionDocument; releasedLease: Lease } | undefined> {
+  const now = input.now ?? Date.now();
+  const canonicalRoot = await canonicalProjectRoot(input.project.root);
+  const rootDigest = digest(ROOT_DIGEST_DOMAIN, canonicalRoot);
+  const ownerDigest = ownerScopeDigest(input.ownerScope);
+  const lanes = input.session.lanes ?? [];
+  const index = lanes.findIndex((record) =>
+    record.projectId === input.project.projectId
+    && record.projectRootDigest === rootDigest
+    && record.ownerScopeDigest === ownerDigest
+    && record.leaseId === input.leaseId,
+  );
+  if (index < 0) return undefined;
+  const record = lanes[index]!;
   return {
     session: version2Session(
       input.session,

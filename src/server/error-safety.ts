@@ -21,6 +21,8 @@ const PUBLIC_DOMAIN_MESSAGES: Partial<Record<ErrorCode, string>> = {
   [ErrorCode.CONCURRENT_MUTATION]: "The file changed while the edit was being prepared.",
   [ErrorCode.LEASE_REQUIRED]: "An active project lease is required.",
   [ErrorCode.LEASE_EXPIRED]: "The project lease has expired.",
+  [ErrorCode.HOST_MANAGEMENT_REQUIRED]: "Host management authorization is required.",
+  [ErrorCode.HOST_MANAGEMENT_EXPIRED]: "The host management authorization has expired.",
   [ErrorCode.COMMAND_NOT_ALLOWED]: "The requested command is not allowed.",
   [ErrorCode.ARBITRARY_SHELL_DENIED]: "Arbitrary shell execution is not allowed.",
   [ErrorCode.APPROVAL_REQUIRED]: "Local approval is required.",
@@ -69,6 +71,20 @@ const SAFE_APPROVAL_REASONS = new Set([
 ]);
 const SAFE_PROJECT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const SAFE_REQUEST_ID_RE = /^arm_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u;
+const SAFE_OPERATION_APPROVAL_REQUEST_ID_RE = /^op_[0-9a-fA-F-]{36}$/u;
+const SAFE_WIDGET_APPROVAL_REASONS = new Set([
+  "WIDGET_APPROVAL_TOKEN_INVALID",
+  "WIDGET_APPROVAL_TOKEN_EXPIRED",
+  "WIDGET_APPROVAL_ALREADY_SUBMITTED",
+  "WIDGET_APPROVAL_SCOPE_MISMATCH",
+  "WIDGET_APPROVAL_REQUEST_SCOPE_MISMATCH",
+]);
+const PERMISSION_DENIED_HANDLING = Object.freeze({
+  classificationRequired: true,
+  terminalByCodeAlone: false,
+  sameCallRetry: "do-not-replay",
+  nextStep: "follow-specific-recovery-or-inspect-live-contract",
+});
 const SAFE_UPDATE_OPERATION_ID_RE = /^(?:rt|app)_[A-Za-z0-9][A-Za-z0-9._:-]{6,155}$/u;
 const SAFE_LEASE_PRESETS = new Set(["read-only", "tests-only", "full-write", "image-only", "control"]);
 const SAFE_LEASE_CAPABILITIES = new Set(["read", "verify", "write", "image", "remote", "control"]);
@@ -79,12 +95,18 @@ const SAFE_ROOT_OVERLAP_RELATIONS = new Set(["ancestor", "descendant"]);
 const SAFE_ROOT_RELATIONS = new Set(["same-root", "ancestor", "descendant"]);
 const SAFE_LEASE_HINT_ACTIONS = new Set([
   "project_lane_open",
+  "project_lane_renew",
   "release-current-blocking-lease",
   "wait-for-blocking-owner-release",
   "start-new-session-for-other-project",
   "register-explicit-workspace-root",
   "use-required-project-id",
   "workspace_refresh_index",
+]);
+const SAFE_WORK_LANE_RECOVERY_TOOLS = new Set([
+  "project_lane_open",
+  "project_lane_renew",
+  "project_lane_recover",
 ]);
 const SAFE_BLOCKER_KINDS = new Set(["work-lane", "serial-admin-lease", "control-lease", "stale-orphan-root-lock"]);
 const SAFE_OWNER_RELATIONS = new Set(["current", "foreign"]);
@@ -108,6 +130,15 @@ const SAFE_RECOVERY_ACTIONS = new Set([
   "wait-for-owner-release-or-expiry",
   "wait-for-active-operation-to-finish",
 ]);
+const POST_RUNTIME_BOOTSTRAP_ORDER = [
+  "connection_status",
+  "agent_guide",
+  "project_rules",
+  "project_status",
+  "project_lane_open",
+] as const;
+const SAFE_POST_RUNTIME_BOOTSTRAP_STEPS = new Set<string>(POST_RUNTIME_BOOTSTRAP_ORDER);
+
 const SAFE_EDIT_RECOVERY: Partial<Record<ErrorCode, Record<string, string>>> = {
   [ErrorCode.STALE_FILE_HASH]: {
     reason: "stale_file_hash",
@@ -136,7 +167,71 @@ const SAFE_EDIT_RECOVERY: Partial<Record<ErrorCode, Record<string, string>>> = {
 function safeRemoteDetails(code: ErrorCode, details: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
   const editRecovery = SAFE_EDIT_RECOVERY[code];
   if (editRecovery) return { ...editRecovery };
-  if (!details) return undefined;
+  if (!details) {
+    return code === ErrorCode.PERMISSION_DENIED
+      ? { permissionHandling: PERMISSION_DENIED_HANDLING }
+      : undefined;
+  }
+
+  if (code === ErrorCode.HOST_MANAGEMENT_REQUIRED || code === ErrorCode.HOST_MANAGEMENT_EXPIRED) {
+    const out: Record<string, unknown> = {
+      authorizationBoundary: "host-management",
+      reason: code === ErrorCode.HOST_MANAGEMENT_REQUIRED
+        ? "host-management-required"
+        : "host-management-expired",
+    };
+    if (details.requiredHostManagementLevel === "tools" || details.requiredHostManagementLevel === "admin") {
+      out.requiredHostManagementLevel = details.requiredHostManagementLevel;
+    }
+    if (details.currentHostManagementLevel === "tools" || details.currentHostManagementLevel === "admin") {
+      out.currentHostManagementLevel = details.currentHostManagementLevel;
+    }
+    if (typeof details.expiresAt === "number" && Number.isFinite(details.expiresAt)) out.expiresAt = details.expiresAt;
+    if (details.recommendedTool === "host_management_acquire") out.recommendedTool = details.recommendedTool;
+    return out;
+  }
+
+  if (code === ErrorCode.INVALID_ARGUMENT && details.reason === "invalid-work-lane-id") {
+    const out: Record<string, unknown> = { reason: "invalid-work-lane-id" };
+    if (typeof details.projectId === "string" && SAFE_PROJECT_ID_RE.test(details.projectId)) {
+      out.projectId = redact(details.projectId);
+    }
+    if (typeof details.recommendedAction === "string" && SAFE_LEASE_HINT_ACTIONS.has(details.recommendedAction)) {
+      out.recommendedAction = details.recommendedAction;
+    }
+    if (typeof details.recommendedTool === "string" && SAFE_WORK_LANE_RECOVERY_TOOLS.has(details.recommendedTool)) {
+      out.recommendedTool = details.recommendedTool;
+    }
+    if (typeof details.retrySameWorkLaneId === "boolean") out.retrySameWorkLaneId = details.retrySameWorkLaneId;
+    if (typeof details.terminalForWorkLaneId === "boolean") out.terminalForWorkLaneId = details.terminalForWorkLaneId;
+    return out;
+  }
+
+  if (code === ErrorCode.WORKSPACE_NOT_READY && details.postRuntimeBootstrapRequired === true) {
+    const missing = Array.isArray(details.missing)
+      ? details.missing.filter(
+          (item): item is string => typeof item === "string" && SAFE_POST_RUNTIME_BOOTSTRAP_STEPS.has(item),
+        )
+      : [];
+    const recommendedAction =
+      typeof details.recommendedAction === "string" && SAFE_POST_RUNTIME_BOOTSTRAP_STEPS.has(details.recommendedAction)
+        ? details.recommendedAction
+        : "connection_status";
+    const out: Record<string, unknown> = {
+      postRuntimeBootstrapRequired: true,
+      recoveryMode: "rebootstrap-before-retry",
+      requiredOrder: [...POST_RUNTIME_BOOTSTRAP_ORDER],
+      missing,
+      recommendedAction,
+      retryOriginalCall: false,
+      recoveryInstruction:
+        "Run the missing bootstrap steps in order before retrying the failed call. After a reconnect or runtime change, start with connection_status and immediately agent_guide. If a mutation may have dispatched, inspect its exact status or receipt before any replay.",
+    };
+    if (typeof details.projectId === "string" && SAFE_PROJECT_ID_RE.test(details.projectId)) {
+      out.projectId = redact(details.projectId);
+    }
+    return out;
+  }
 
   if (code === ErrorCode.PROJECT_NOT_FOUND) {
     const out: Record<string, unknown> = {};
@@ -175,11 +270,39 @@ function safeRemoteDetails(code: ErrorCode, details: Record<string, unknown> | u
       out.requiredCapability = details.requiredCapability;
     }
     if (details.required === "workLaneId") out.required = details.required;
-    if (details.leaseReason === "work-lane-required") out.leaseReason = details.leaseReason;
+    if (details.leaseReason === "work-lane-required" || details.leaseReason === "work-lane-unavailable") {
+      out.leaseReason = details.leaseReason;
+    }
     if (typeof details.recommendedAction === "string" && SAFE_LEASE_HINT_ACTIONS.has(details.recommendedAction)) {
       out.recommendedAction = details.recommendedAction;
     }
+    if (typeof details.recommendedTool === "string" && SAFE_WORK_LANE_RECOVERY_TOOLS.has(details.recommendedTool)) {
+      out.recommendedTool = details.recommendedTool;
+    }
+    if (typeof details.retrySameWorkLaneId === "boolean") out.retrySameWorkLaneId = details.retrySameWorkLaneId;
+    if (typeof details.terminalForWorkLaneId === "boolean") out.terminalForWorkLaneId = details.terminalForWorkLaneId;
     if (details.ownerMismatch === true) out.ownerMismatch = true;
+    return Object.keys(out).length > 0 ? out : undefined;
+  }
+
+  if (code === ErrorCode.LEASE_EXPIRED) {
+    const out: Record<string, unknown> = {};
+    if (typeof details.projectId === "string" && SAFE_PROJECT_ID_RE.test(details.projectId)) {
+      out.projectId = redact(details.projectId);
+    }
+    if (typeof details.preset === "string" && SAFE_LEASE_PRESETS.has(details.preset)) out.preset = details.preset;
+    if (typeof details.expiresAt === "number" && Number.isFinite(details.expiresAt)) out.expiresAt = details.expiresAt;
+    if (typeof details.expiredBySec === "number" && Number.isFinite(details.expiredBySec)) {
+      out.expiredBySec = Math.max(0, Math.floor(details.expiredBySec));
+    }
+    if (typeof details.recommendedAction === "string" && SAFE_LEASE_HINT_ACTIONS.has(details.recommendedAction)) {
+      out.recommendedAction = details.recommendedAction;
+    }
+    if (typeof details.recommendedTool === "string" && SAFE_WORK_LANE_RECOVERY_TOOLS.has(details.recommendedTool)) {
+      out.recommendedTool = details.recommendedTool;
+    }
+    if (typeof details.retrySameWorkLaneId === "boolean") out.retrySameWorkLaneId = details.retrySameWorkLaneId;
+    if (typeof details.terminalForWorkLaneId === "boolean") out.terminalForWorkLaneId = details.terminalForWorkLaneId;
     return Object.keys(out).length > 0 ? out : undefined;
   }
 
@@ -211,10 +334,26 @@ function safeRemoteDetails(code: ErrorCode, details: Record<string, unknown> | u
   }
 
   if (code === ErrorCode.PERMISSION_DENIED) {
+    const permissionHandling = PERMISSION_DENIED_HANDLING;
     const projectId = details.projectId;
     const preset = details.preset;
     const requiredCapability = details.requiredCapability;
     const recommendedPreset = details.recommendedPreset;
+    const widgetApprovalReason = details.widgetApprovalReason;
+    if (typeof widgetApprovalReason === "string" && SAFE_WIDGET_APPROVAL_REASONS.has(widgetApprovalReason)) {
+      const out: Record<string, unknown> = {
+        permissionHandling,
+        widgetApprovalReason,
+        recommendedAction: "check-exact-approval-status-and-session-binding",
+        ...(widgetApprovalReason === "WIDGET_APPROVAL_TOKEN_EXPIRED" || widgetApprovalReason === "WIDGET_APPROVAL_ALREADY_SUBMITTED"
+          ? { recoveryMode: "status-only", mutationReplayAllowed: false, recommendedTool: "chatgpt_operation_approval_decide", recommendedDecision: "status" }
+          : {}),
+      };
+      if (typeof details.requestId === "string" && SAFE_OPERATION_APPROVAL_REQUEST_ID_RE.test(details.requestId)) {
+        out.requestId = details.requestId;
+      }
+      return out;
+    }
     if (
       typeof projectId === "string"
       && SAFE_PROJECT_ID_RE.test(projectId)
@@ -232,6 +371,7 @@ function safeRemoteDetails(code: ErrorCode, details: Record<string, unknown> | u
       && details.confirmSwitchRelevant === false
     ) {
       return {
+        permissionHandling,
         projectId: redact(projectId),
         multiProjectLanesEnabled: true,
         attemptedPreset: details.attemptedPreset,
@@ -253,6 +393,7 @@ function safeRemoteDetails(code: ErrorCode, details: Record<string, unknown> | u
       && SAFE_LEASE_PRESETS.has(recommendedPreset)
     ) {
       return {
+        permissionHandling,
         projectId: redact(projectId),
         preset,
         requiredCapability,
@@ -265,14 +406,26 @@ function safeRemoteDetails(code: ErrorCode, details: Record<string, unknown> | u
       && typeof details.boundProjectId === "string"
       && SAFE_PROJECT_ID_RE.test(details.boundProjectId)
     ) {
+      const rebindBlockedBy = details.rebindBlockedBy === "active-capability"
+        || details.rebindBlockedBy === "active-work"
+        || details.rebindBlockedBy === "binding-state"
+        ? details.rebindBlockedBy
+        : "binding-state";
+      const recommendedAction = rebindBlockedBy === "active-capability"
+        ? "release-current-project-capability"
+        : rebindBlockedBy === "active-work"
+          ? "wait-for-bound-project-work-to-finish"
+          : "inspect-current-session-binding";
       return {
+        permissionHandling,
         projectId: redact(projectId),
         boundProjectId: redact(details.boundProjectId),
         reason: "session-bound-to-project",
-        recommendedAction: "start-new-session-for-other-project",
+        rebindBlockedBy,
+        recommendedAction,
       };
     }
-    return undefined;
+    return { permissionHandling };
   }
 
   if (code === ErrorCode.RUNTIME_UPDATE_IN_PROGRESS) {

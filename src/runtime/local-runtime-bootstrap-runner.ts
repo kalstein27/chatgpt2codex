@@ -121,22 +121,52 @@ export async function runLocalRuntimeBootstrap(input: {
   }
   const openClient = dependencies.openClient ?? defaultOpenClient;
   const client = await openClient({ plan: input.plan, stateDir: input.stateDir, port: input.port });
+  let hostGrantId: string | null = null;
   try {
-    if (input.phase === "begin") {
-      const selected = toolPayload(await client.callTool({
-        name: "project_select",
-        arguments: {
-          projectId: input.plan.projectId,
-          reason: "maintenance",
-          preset: "full-write",
-          confirmSwitch: true,
-        },
-      }), "project_select");
-      const lease = asRecord(selected.lease);
-      if (!lease || lease.projectId !== input.plan.projectId || lease.preset !== "full-write") {
-        throw new Error("project_select did not establish the expected local full-write lease");
-      }
+    const hostManagement = toolPayload(await client.callTool({
+      name: "host_management_acquire",
+      arguments: {
+        level: "admin",
+        reason: "maintenance",
+      },
+    }), "host_management_acquire");
+    const hostGrant = asRecord(hostManagement.grant);
+    if (!hostGrant || hostGrant.level !== "admin" || typeof hostGrant.grantId !== "string") {
+      throw new Error(`runtime-bootstrap-local ${input.phase} did not establish host admin authorization`);
     }
+    hostGrantId = hostGrant.grantId;
+
+    const selected = toolPayload(await client.callTool({
+      name: "project_select",
+      arguments: {
+        projectId: input.plan.projectId,
+        reason: "maintenance",
+        preset: "full-write",
+        purpose: "legacy-admin",
+        confirmSwitch: true,
+      },
+    }), "project_select");
+    const lease = asRecord(selected.lease);
+    if (!lease || lease.projectId !== input.plan.projectId || lease.preset !== "full-write") {
+      throw new Error(`runtime-bootstrap-local ${input.phase} did not establish the expected local full-write lease`);
+    }
+
+    // Older live runtimes reconstructed the selected-project session without
+    // preserving hostManagement. Reacquire after project_select so this fixed
+    // migration bridge can cross that exact compatibility boundary once.
+    const postSelectHostManagement = toolPayload(await client.callTool({
+      name: "host_management_acquire",
+      arguments: {
+        level: "admin",
+        reason: "maintenance",
+      },
+    }), "host_management_acquire");
+    const postSelectHostGrant = asRecord(postSelectHostManagement.grant);
+    if (!postSelectHostGrant || postSelectHostGrant.level !== "admin" || typeof postSelectHostGrant.grantId !== "string") {
+      throw new Error(`runtime-bootstrap-local ${input.phase} did not restore host admin authorization after project selection`);
+    }
+    hostGrantId = postSelectHostGrant.grantId;
+
 
     const result = toolPayload(await client.callTool({
       name: "runtime_apply_local",
@@ -174,6 +204,12 @@ export async function runLocalRuntimeBootstrap(input: {
       recommendedAction,
     };
   } finally {
+    if (hostGrantId) {
+      await client.callTool({
+        name: "host_management_release",
+        arguments: { grantId: hostGrantId },
+      }).catch(() => undefined);
+    }
     await client.close().catch(() => undefined);
   }
 }

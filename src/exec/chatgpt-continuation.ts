@@ -1,6 +1,6 @@
-export type ChatGptContinuationSource = "widget-shell" | "operation-approval";
+export type ChatGptContinuationSource = "operation-approval";
 export type ChatGptContinuationStatus = "pending" | "ready" | "denied";
-export type ChatGptContinuationRecoveryMode = "status-only" | "resume-objective" | "exact-replay" | "stop";
+export type ChatGptContinuationRecoveryMode = "status-only" | "exact-replay" | "stop";
 
 export interface ChatGptContinuationRecovery {
   mode: ChatGptContinuationRecoveryMode;
@@ -25,10 +25,6 @@ export interface ChatGptContinuationSnapshot {
   createdAt: number;
   expiresAt: number;
   resolvedAt?: number;
-  cardId?: string;
-  receiptId?: string;
-  choiceId?: string;
-  choiceLabel?: string;
   operation?: ChatGptContinuationOperation;
   continuationStarted?: boolean;
   continuationDeferred?: boolean;
@@ -61,14 +57,6 @@ const STATUS_ONLY_RECOVERY: ChatGptContinuationRecovery = Object.freeze({
   pollAfterMs: 0,
 });
 
-const RESUME_RECOVERY: ChatGptContinuationRecovery = Object.freeze({
-  mode: "resume-objective",
-  statusOnly: false,
-  mutationReplayAllowed: false,
-  maxStatusPolls: 0,
-  pollAfterMs: 0,
-});
-
 const STOP_RECOVERY: ChatGptContinuationRecovery = Object.freeze({
   mode: "stop",
   statusOnly: true,
@@ -84,7 +72,6 @@ const EXACT_REPLAY_RECOVERY: ChatGptContinuationRecovery = Object.freeze({
   maxStatusPolls: 0,
   pollAfterMs: 0,
 });
-
 function trimmed(value: string): string {
   return value.trim();
 }
@@ -115,48 +102,6 @@ function current(sessionScope: string, now: number): StoredContinuation | undefi
     return undefined;
   }
   return state;
-}
-
-export function rememberChatGptShellContinuation(input: {
-  sessionScope: string;
-  cardId: string;
-  objective: string;
-  createdAt: number;
-  expiresAt: number;
-}): void {
-  const objective = trimmed(input.objective);
-  if (!input.sessionScope || !input.cardId || !objective) return;
-  continuations.set(input.sessionScope, {
-    sessionScope: input.sessionScope,
-    source: "widget-shell",
-    status: "pending",
-    objective,
-    instruction: "Wait for the exact Widget Shell receipt. Do not execute or replay any mutation while the receipt is pending.",
-    createdAt: input.createdAt,
-    expiresAt: input.expiresAt,
-    cardId: input.cardId,
-    recovery: copyRecovery(PENDING_RECOVERY),
-  });
-}
-
-export function resolveChatGptShellContinuation(input: {
-  sessionScope: string;
-  cardId: string;
-  receiptId: string;
-  choiceId: string;
-  choiceLabel: string;
-  resolvedAt: number;
-}): boolean {
-  const state = current(input.sessionScope, input.resolvedAt);
-  if (!state || state.source !== "widget-shell" || state.cardId !== input.cardId) return false;
-  state.status = "ready";
-  state.receiptId = input.receiptId;
-  state.choiceId = input.choiceId;
-  state.choiceLabel = input.choiceLabel;
-  state.resolvedAt = input.resolvedAt;
-  state.instruction = "Resume the stored objective immediately in this assistant turn. Do not answer with an acknowledgement only and do not ask the user to repeat the objective.";
-  state.recovery = copyRecovery(RESUME_RECOVERY);
-  return true;
 }
 
 export function rememberChatGptApprovalContinuation(input: {
@@ -234,6 +179,33 @@ export function resolveChatGptApprovalContinuation(input: {
     state.recovery = copyRecovery(EXACT_REPLAY_RECOVERY);
   }
   return true;
+}
+
+export function failChatGptContinuation(input: {
+  sessionScope: string;
+  requestId: string;
+  resolvedAt: number;
+  instruction?: string;
+}): boolean {
+  const state = current(input.sessionScope, input.resolvedAt);
+  if (!state || state.source !== "operation-approval" || state.operation?.requestId !== input.requestId) return false;
+  state.resolvedAt = input.resolvedAt;
+  state.status = "denied";
+  state.instruction = input.instruction?.trim() || "The approved operation could not start because its bound continuation is unavailable. Do not replay the protected mutation.";
+  state.recovery = copyRecovery(STOP_RECOVERY);
+  return true;
+}
+
+export function consumeChatGptContinuation(input: {
+  sessionScope: string;
+  now?: number;
+}): ChatGptContinuationSnapshot | undefined {
+  if (!input.sessionScope) return undefined;
+  const state = current(input.sessionScope, input.now ?? Date.now());
+  if (!state) return undefined;
+  const snapshot = publicSnapshot(state);
+  if (state.status !== "pending") continuations.delete(input.sessionScope);
+  return snapshot;
 }
 
 export function getChatGptContinuation(input: {

@@ -751,7 +751,7 @@ export function hasCommandRequestContinuation(input: {
 export async function runCommandRequestContinuation(input: {
   requestId: string;
   sessionScope: string;
-}): Promise<CommandRequestContinuationResult | undefined> {
+}) {
   pruneCommandRequestContinuations();
   const entry = commandRequestContinuations.get(input.requestId);
   if (!entry || entry.sessionScope !== input.sessionScope) return undefined;
@@ -759,6 +759,18 @@ export async function runCommandRequestContinuation(input: {
   const resultPromise = entry.resultPromise;
   try {
     return await resultPromise;
+  } catch (error) {
+    return {
+      turnlessContinuation: true,
+      continuationStarted: false,
+      fallbackRequiresExactReplay: false,
+      actionStarted: false,
+      subprocessStarted: false,
+      continuationFailed: true,
+      continuationErrorCode: error instanceof DomainError ? error.code : "UNEXPECTED_ERROR",
+      approvalRequestId: input.requestId,
+      sideEffects: "none",
+    };
   } finally {
     if (commandRequestContinuations.get(input.requestId)?.resultPromise === resultPromise) {
       commandRequestContinuations.delete(input.requestId);

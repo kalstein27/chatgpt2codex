@@ -93,6 +93,8 @@ id_ed25519
 
 # Development-only tests, automation, packaging helpers, and measurements.
 *.test.ts
+*.process-fixture.ts
+/src/mcp/fixtures/
 /vitest.config.ts
 /.github/workflows/*
 !/.github/workflows/verify-windows.yml

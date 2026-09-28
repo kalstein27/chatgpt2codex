@@ -234,18 +234,22 @@ export async function updateMutationTransaction(
 
 export async function getMutationTransaction(
   stateDir: string,
-  query: { transactionId?: string; requestId?: string; laneDigest?: string },
+  query: { transactionId?: string; requestId?: string; laneDigest?: string; projectId?: string },
 ): Promise<MutationTransactionPublicReceipt | null> {
+  if ((query.requestId ? 1 : 0) + (query.transactionId ? 1 : 0) !== 1) throw new DomainError(ErrorCode.INVALID_ARGUMENT, "Provide exactly one mutation identifier");
+  if (query.transactionId && !/^mut_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(query.transactionId)) throw new DomainError(ErrorCode.INVALID_ARGUMENT, "Invalid mutation transaction identifier");
   if (query.requestId) assertRequestId(query.requestId);
+  const belongsToQuery = (record: MutationTransactionRecord): boolean => record.laneDigest === query.laneDigest
+    && (query.projectId === undefined || record.projectId === query.projectId);
   if (query.requestId) {
     const file = requestReceiptPath(stateDir, query.requestId);
     const loaded = await readRecord(file);
-    const record = loaded ? await normalizeInterruptedRecord(file, loaded) : null;
-    return record && record.laneDigest === query.laneDigest ? toPublicReceipt(record) : null;
+    if (!loaded || !belongsToQuery(loaded)) return null;
+    return toPublicReceipt(await normalizeInterruptedRecord(file, loaded));
   }
   if (!query.transactionId) return null;
   const rows = await listRecords(stateDir);
   const row = rows.find((candidate) => candidate.record.transactionId === query.transactionId);
-  const record = row ? await normalizeInterruptedRecord(row.file, row.record) : null;
-  return record && record.laneDigest === query.laneDigest ? toPublicReceipt(record) : null;
+  if (!row || !belongsToQuery(row.record)) return null;
+  return toPublicReceipt(await normalizeInterruptedRecord(row.file, row.record));
 }

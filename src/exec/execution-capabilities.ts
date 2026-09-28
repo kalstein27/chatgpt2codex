@@ -1,7 +1,16 @@
-export type ExecutionNetworkPolicy = "none" | "fixed-official-download" | "caller-declared-denied" | "tailnet-control" | "openai-codex-service" | "chatgpt-host-ui";
+export type ExecutionNetworkPolicy =
+  | "none"
+  | "fixed-official-download"
+  | "caller-declared-denied"
+  | "github-repository-install"
+  | "third-party-mcp-unrestricted"
+  | "tailnet-control"
+  | "openai-codex-service"
+  | "chatgpt-host-ui";
 export type ExecutionApprovalPolicy =
   | "none"
   | "project-lease"
+  | "explicit-trust-project-lease"
   | "local-human-operation"
   | "local-human-control"
   | "external-search-local-approval"
@@ -26,6 +35,57 @@ export interface ExecutionCapabilityDefinition {
 }
 
 const definitions = [
+  {
+    capabilityId: "managed-mcp-installer-subprocess",
+    purpose: "Clone an explicitly trusted GitHub MCP repository and perform its bounded managed dependency/build installation steps.",
+    platforms: ["darwin", "linux", "win32"],
+    callSites: ["src/mcp/managed-mcp.ts"],
+    binaryPolicy: "git and npm executables resolved from the safe runtime PATH; repository origin is restricted to HTTPS github.com owner/repo URLs",
+    allowedArgvGrammar: "fixed git clone/rev-parse argv and fixed npm ci/install/build argv; no shell wrapper or caller-supplied shell expression",
+    allowedCwdRoot: "private ChatGPT2Codex managed-MCP staging/repository directory",
+    allowedReadRoots: "managed MCP repository plus executable/package metadata needed for installation",
+    allowedWriteRoots: "private ChatGPT2Codex managed-MCP staging and installed server directories only",
+    networkPolicy: "github-repository-install",
+    environmentProfile: "safe-child-env with no caller-supplied environment values",
+    approvalPolicy: "explicit-trust-project-lease",
+    leasePreset: "full-write/remote capability plus trustRepository=true",
+    maxRuntimeMs: 120_000,
+    outputPolicy: "bounded subprocess status; repository URL and pinned commit may be logged, secret environment values are never returned",
+  },
+  {
+    capabilityId: "managed-mcp-stdio-child",
+    purpose: "Launch an explicitly installed third-party MCP server over stdio and communicate with it through the MCP client protocol.",
+    platforms: ["darwin", "linux", "win32"],
+    callSites: ["src/mcp/managed-mcp.ts"],
+    binaryPolicy: "launch command recorded in the managed MCP registry after repository-confined validation; shell wrappers and inline shell dispatch are rejected",
+    allowedArgvGrammar: "installed launch argv captured at trusted registration time, with at most 64 bounded arguments",
+    allowedCwdRoot: "the installed managed MCP repository only",
+    allowedReadRoots: "installed managed MCP repository plus explicitly named inherited environment variables at process launch",
+    allowedWriteRoots: "third-party MCP behavior is not filesystem-sandboxed; owner trust is required before installation/use",
+    networkPolicy: "third-party-mcp-unrestricted",
+    environmentProfile: "safe-child-env plus explicitly named inherited environment variables",
+    approvalPolicy: "explicit-trust-project-lease",
+    leasePreset: "full-write/remote capability after explicit repository trust",
+    maxRuntimeMs: 900_000,
+    outputPolicy: "MCP protocol messages only, proxied result capped to 1 MiB; stderr retained only as a bounded internal diagnostic tail",
+  },
+  {
+    capabilityId: "managed-mcp-service",
+    purpose: "Launch the optional managed service declared by an explicitly trusted managed MCP repository and verify its bounded HTTP health endpoint.",
+    platforms: ["darwin", "linux", "win32"],
+    callSites: ["src/mcp/managed-mcp.ts"],
+    binaryPolicy: "repository-declared launch command validated with the same managed MCP executable policy; shell wrappers and inline shell dispatch are rejected",
+    allowedArgvGrammar: "repository-declared managed service argv with at most 64 bounded arguments",
+    allowedCwdRoot: "the installed managed MCP repository only",
+    allowedReadRoots: "installed managed MCP repository plus explicitly named inherited environment variables at process launch",
+    allowedWriteRoots: "managed service behavior is repository-defined and runs only after explicit repository trust",
+    networkPolicy: "third-party-mcp-unrestricted",
+    environmentProfile: "safe-child-env plus explicitly named inherited environment variables",
+    approvalPolicy: "explicit-trust-project-lease",
+    leasePreset: "full-write/remote capability after explicit repository trust",
+    maxRuntimeMs: 900_000,
+    outputPolicy: "bounded health status and stderr diagnostic tail; secret environment values are never returned",
+  },
   {
     capabilityId: "macos-open-chatgpt-images",
     purpose: "Open the fixed ChatGPT Images URL in Safari or Google Chrome without prompt automation.",
@@ -350,38 +410,21 @@ const definitions = [
     outputPolicy: "bounded Tailscale CLI stdout/stderr retained only on failure",
   },
   {
-    capabilityId: "chatgpt-host-catalog-refresh",
-    purpose: "Request a fixed C2CT host catalog refresh and bounded tool scan through the locally installed chatgpt-send helper.",
+    capabilityId: "chatgpt-scan-tools",
+    purpose: "Run only the fixed C2CT Scan Tools action through the locally installed chatgpt-send helper after the owner has already completed the manual Settings refresh.",
     platforms: ["darwin"],
-    callSites: ["src/exec/chatgpt-host-catalog-refresh.ts"],
+    callSites: ["src/exec/chatgpt-host-catalog-refresh.ts", "src/exec/chatgpt-c2ct-command.mjs"],
     binaryPolicy: "first executable chatgpt-send from the fixed sibling, user-local, Homebrew, or /usr/local candidate list",
-    allowedArgvGrammar: "only plugin catalog-refresh C2CT --json or plugin scan-tools C2CT --json",
+    allowedArgvGrammar: "only plugin scan-tools C2CT --json",
     allowedCwdRoot: "none",
-    allowedReadRoots: "ChatGPT host plugin/catalog metadata exposed by the fixed helper only",
-    allowedWriteRoots: "ChatGPT host catalog/UI state only; no project, runtime, app, connector, or tunnel files",
+    allowedReadRoots: "ChatGPT host plugin/tool metadata exposed by the fixed helper only",
+    allowedWriteRoots: "ChatGPT host tool snapshot state only; no project, runtime, app, connector, tunnel, chat message, or catalog-refresh mutation",
     networkPolicy: "chatgpt-host-ui",
     environmentProfile: "minimal HOME/PATH/TMPDIR/locale allowlist",
     approvalPolicy: "caller-authorized-fixed-action",
-    leasePreset: "direct ChatGPT host confirmation, explicit local Settings click, or the already-consumed exact parent runtime-apply approval",
-    maxRuntimeMs: 20_000,
-    outputPolicy: "bounded helper output is parsed and reduced to generic refresh/scan status fields",
-  },
-  {
-    capabilityId: "chatgpt-recovery-wake",
-    purpose: "Resolve one exact ChatGPT conversation title and send one fixed status-only C2CT recovery wake through chatgpt-send.",
-    platforms: ["darwin"],
-    callSites: ["src/exec/chatgpt-recovery-wake.ts"],
-    binaryPolicy: "first executable chatgpt-send from the fixed sibling, user-local, Homebrew, or /usr/local candidate list",
-    allowedArgvGrammar: "exact-title chat resolve --json followed only by one send to the in-memory resolved server chat id with a fixed C2CT recovery message and exact request id",
-    allowedCwdRoot: "none",
-    allowedReadRoots: "ChatGPT host chat identity metadata exposed by the fixed helper only",
-    allowedWriteRoots: "one ChatGPT conversation message only; raw server chat id is never persisted or returned by C2CT",
-    networkPolicy: "chatgpt-host-ui",
-    environmentProfile: "minimal HOME/PATH/TMPDIR/locale allowlist",
-    approvalPolicy: "caller-authorized-fixed-action",
-    leasePreset: "runtime recovery worker after exact runtime apply reaches healthy APPLIED state",
-    maxRuntimeMs: 40_000,
-    outputPolicy: "bounded helper output is reduced to resolve/send status plus a one-way target digest",
+    leasePreset: "manual Settings refresh already completed; scan-tools only",
+    maxRuntimeMs: 180_000,
+    outputPolicy: "bounded helper output is parsed and reduced to generic scan status fields",
   },
   {
     capabilityId: "git-readonly-argv",
@@ -433,6 +476,23 @@ const definitions = [
     leasePreset: "nested local full-write serial lease plus exact menu-bar runtime approval; wrapper itself grants no mutation authority",
     maxRuntimeMs: 30_000,
     outputPolicy: "structured project-select/runtime-apply status only; no arbitrary child stdout is exposed",
+  },
+  {
+    capabilityId: "runtime-candidate-http-child",
+    purpose: "Launch one isolated loopback-only candidate runtime generation for readiness probing while the active runtime remains untouched.",
+    platforms: ["darwin", "linux", "win32"],
+    callSites: ["src/runtime/runtime-candidate.ts"],
+    binaryPolicy: "Node executable resolved from the exact immutable candidate runtime root, with process.execPath allowed only as a verified runtime fallback",
+    allowedArgvGrammar: "fixed candidate dist/cli.js serve --http with loopback host, allocated private port, matching loopback public URL, and canonical workspace root",
+    allowedCwdRoot: "canonical candidate workspace root",
+    allowedReadRoots: "immutable candidate runtime root, canonical candidate workspace root, and caller-provided private candidate state directory",
+    allowedWriteRoots: "caller-provided private candidate state directory only; active runtime pointer, connector topology, and live routing are never modified",
+    networkPolicy: "none",
+    environmentProfile: "default MCP-safe environment plus fixed private-candidate, runtime-root, generation-id, state-dir, loopback-port, lane-mode, and control-disabled variables",
+    approvalPolicy: "project-lease",
+    leasePreset: "full-write runtime-maintenance source workflow; candidate launch itself grants no cutover or apply authority",
+    maxRuntimeMs: 120_000,
+    outputPolicy: "bounded private stderr tail plus readiness identity only; candidate is terminated on readiness failure",
   },
   {
     capabilityId: "local-macos-app-bootstrap-stdio",

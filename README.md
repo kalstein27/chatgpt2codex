@@ -75,13 +75,17 @@ See [windows/README.md](windows/README.md) for the one-pass Windows agent instal
 
 A loopback-only MCP endpoint is local to the computer. ChatGPT web needs an externally reachable HTTPS endpoint.
 
-For a new ChatGPT conversation, start with:
+For a normal new ChatGPT conversation, start with the compact bootstrap:
 
 ```text
-@C2CT connection_status
+@C2CT agent_bootstrap
 ```
 
-Then call `agent_guide` before project work. The live guide is the source of truth for the current runtime contract.
+Pass `projectId` when it is already known. `agent_bootstrap` is lease-neutral and combines the
+runtime/schema snapshot, project rules/status, repository state, and capability plan in one
+bounded response. After a runtime/app replacement, long disconnect, or an unexpected first
+C2CT error, use the detailed recovery sequence `connection_status` followed immediately by
+`agent_guide`; the live guide remains the source of truth for the current runtime contract.
 
 ## Safety
 

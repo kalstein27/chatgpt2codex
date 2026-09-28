@@ -1317,8 +1317,13 @@ private final class ServiceController {
         effectiveRuntimeRoot.appendingPathComponent("dist").appendingPathComponent("cli.js")
     }
 
-    private func runCli(_ arguments: [String], stdin: String? = nil) throws -> (status: Int32, stdout: String, stderr: String) {
-        let activeRoot = effectiveRuntimeRoot
+    private func runCli(
+        _ arguments: [String],
+        stdin: String? = nil,
+        preferBundledRuntime: Bool = false
+    ) throws -> (status: Int32, stdout: String, stderr: String) {
+        let activeRoot = preferBundledRuntime ? runtimeRoot : effectiveRuntimeRoot
+        let activeCliScript = activeRoot.appendingPathComponent("dist").appendingPathComponent("cli.js")
         let nodeCandidates = [
             activeRoot.appendingPathComponent("bin/node"),
             activeRoot.appendingPathComponent("node/bin/node"),
@@ -1330,7 +1335,7 @@ private final class ServiceController {
         }
         let process = Process()
         process.executableURL = bundledNode ?? URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = bundledNode == nil ? ["node", cliScript.path] + arguments : [cliScript.path] + arguments
+        process.arguments = bundledNode == nil ? ["node", activeCliScript.path] + arguments : [activeCliScript.path] + arguments
 
         var environment = ProcessInfo.processInfo.environment
         environment["PATH"] = [
@@ -1371,6 +1376,47 @@ private final class ServiceController {
         let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         return (process.terminationStatus, stdout, stderr)
+    }
+
+    func inspectPreviousRuntimeRollback(completion: @escaping ([String: Any]?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = try? self.runCli([
+                "runtime-rollback-previous-local",
+                "--port", "\(self.port)",
+            ], preferBundledRuntime: true)
+            let json: [String: Any]?
+            if let result,
+               result.status == 0,
+               let data = result.stdout.data(using: .utf8) {
+                json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            } else {
+                json = nil
+            }
+            DispatchQueue.main.async { completion(json) }
+        }
+    }
+
+    func rollbackPreviousRuntime(expectedCurrentFingerprint: String, completion: @escaping (Bool, String) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = try? self.runCli([
+                "runtime-rollback-previous-local",
+                "--apply",
+                "--expected-current", expectedCurrentFingerprint,
+                "--port", "\(self.port)",
+            ], preferBundledRuntime: true)
+            guard let result,
+                  let data = result.stdout.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                DispatchQueue.main.async { completion(false, "이전 런타임 복구 CLI가 유효한 결과를 반환하지 않았습니다.") }
+                return
+            }
+            let ok = result.status == 0 && json["ok"] as? Bool == true
+            let state = json["state"] as? String ?? (ok ? "ACTIVATION_REQUESTED" : "rollback-failed")
+            DispatchQueue.main.async { completion(ok, state) }
+        }
     }
 
     func forceChatGptCatalogRefresh(completion: @escaping (ChatGptCatalogRefreshOutcome) -> Void) {
@@ -2869,6 +2915,20 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.minY - 4), in: sender)
     }
 
+    private func showNativeApprovalInbox() {
+        guard let window = activityWindow,
+              let anchor = window.contentView
+        else {
+            showApprovalsSection()
+            return
+        }
+        let menu = makeNativeApprovalMenu()
+        let screenPoint = NSEvent.mouseLocation
+        let windowPoint = window.convertPoint(fromScreen: screenPoint)
+        let anchorPoint = anchor.convert(windowPoint, from: nil)
+        menu.popUp(positioning: nil, at: anchorPoint, in: anchor)
+    }
+
     private func makeServiceMenu() -> NSMenu {
         let menu = NSMenu()
         let running = latestHealth || controller.isManagedProcessRunning
@@ -3381,6 +3441,16 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         detail.maximumNumberOfLines = 2
         stack.addArrangedSubview(detail)
 
+        let revive = NSButton(
+            title: controller.effectiveLanguageCode == "ko" ? "MCP 되살리기" : "Revive MCP",
+            target: self,
+            action: #selector(reviveMcpFromFallback)
+        )
+        revive.bezelStyle = .rounded
+        revive.image = symbol("arrow.clockwise.circle")
+        revive.imagePosition = .imageLeading
+        stack.addArrangedSubview(revive)
+
         let retry = NSButton(
             title: controller.effectiveLanguageCode == "ko" ? "다시 시도" : "Retry",
             target: self,
@@ -3399,6 +3469,10 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             stack.trailingAnchor.constraint(lessThanOrEqualTo: fallback.trailingAnchor, constant: -24),
         ])
         return fallback
+    }
+
+    @objc private func reviveMcpFromFallback() {
+        restartServer()
     }
 
     @objc private func retryActivityDashboard() {
@@ -3520,19 +3594,48 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         else { return }
 
         if action == "openApprovals" {
-            showIntegratedMenuSection(
-                id: "approvals",
-                title: controller.effectiveLanguageCode == "ko" ? "승인" : "Approvals",
-                menu: makeNativeApprovalMenu()
-            )
+            showNativeApprovalInbox()
             return
         }
 
         if action == "restartMcp" {
-            if latestHealth || controller.isManagedProcessRunning {
-                restartServer()
-            } else {
-                refreshStatus()
+            restartServer()
+            return
+        }
+
+        if action == "rollbackPreviousRuntime" {
+            controller.inspectPreviousRuntimeRollback { [weak self] candidate in
+                guard let self else { return }
+                guard let candidate,
+                      candidate["available"] as? Bool == true,
+                      let currentFingerprint = candidate["currentFingerprint"] as? String,
+                      let previousFingerprint = candidate["previousFingerprint"] as? String
+                else {
+                    let alert = NSAlert()
+                    alert.messageText = "이전 런타임 복구 불가"
+                    alert.informativeText = "현재 런타임과 정확히 연결된 이전 정상 스냅샷을 찾지 못했습니다. 새 런타임 health 실패는 기존 자동 롤백 경로가 처리합니다."
+                    alert.alertStyle = .warning
+                    alert.runModal()
+                    return
+                }
+                let alert = NSAlert()
+                alert.messageText = "이전 정상 런타임으로 복구할까요?"
+                alert.informativeText = "현재 \(String(currentFingerprint.prefix(12)))… → 이전 \(String(previousFingerprint.prefix(12)))…\n\n보존된 직전 immutable snapshot만 사용합니다. 적용 후 health 검증에 실패하면 기존 runtime apply 롤백 안전장치가 다시 동작합니다."
+                alert.alertStyle = .critical
+                alert.addButton(withTitle: "이전 런타임으로 복구")
+                alert.addButton(withTitle: "취소")
+                guard alert.runModal() == .alertFirstButtonReturn else { return }
+                self.controller.rollbackPreviousRuntime(expectedCurrentFingerprint: currentFingerprint) { [weak self] ok, state in
+                    guard let self else { return }
+                    let resultAlert = NSAlert()
+                    resultAlert.messageText = ok ? "런타임 복구 시작됨" : "런타임 복구 시작 실패"
+                    resultAlert.informativeText = ok
+                        ? "이전 정상 런타임으로의 교체 worker가 시작되었습니다. 상태: \(state)"
+                        : "안전 조건을 통과하지 못해 복구를 시작하지 않았습니다. 상태: \(state)"
+                    resultAlert.alertStyle = ok ? .informational : .warning
+                    resultAlert.runModal()
+                    self.refreshStatus()
+                }
             }
             return
         }

@@ -1,3 +1,4 @@
+import { runtimeSchemaRefreshRequired } from "./runtime-schema-identity.js";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
@@ -10,11 +11,10 @@ import {
   getRuntimeManifestForRoot,
   type RuntimeManifest,
 } from "./runtime-manifest.js";
-import {
-  refreshChatGptHostCatalog,
-  type ChatGptHostCatalogRefreshResult,
+import type {
+  ChatGptHostCatalogProgress,
+  ChatGptHostCatalogRefreshResult,
 } from "../exec/chatgpt-host-catalog-refresh.js";
-import { sendRegisteredChatGptRecoveryWake } from "../exec/chatgpt-recovery-wake.js";
 import {
   readReplacementReconnectPlan,
   recordReplacementReconnectSample,
@@ -22,6 +22,7 @@ import {
   type ReplacementReconnectOutcome,
 } from "./replacement-reconnect-timing.js";
 import { inspectChatGptWidgetPreapplyGate } from "./chatgpt-widget-preapply.js";
+import { applyRuntimeActivityDashboardAsset } from "./activity-dashboard-assets.js";
 
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -51,6 +52,7 @@ export type RuntimeApplyPhase =
   | "approval"
   | "activation"
   | "health"
+  | "dashboard-refresh"
   | "catalog-refresh"
   | "rollback"
   | "complete";
@@ -120,12 +122,22 @@ export interface RuntimeApplyReceipt {
   reconnectObservedAt?: string;
   reconnectDurationMs?: number;
   reconnectPlan?: ReplacementReconnectPlan;
+  activityDashboardRefreshAttempted?: boolean;
+  activityDashboardRefreshStatus?: "not-started" | "in-progress" | "applied" | "unavailable" | "failed";
+  activityDashboardRevision?: string | null;
+  activityDashboardRefreshErrorCode?: string | null;
+  activityDashboardRefreshMessage?: string | null;
+  activityDashboardRefreshCompletedAt?: string | null;
   hostCatalogRefreshAttempted?: boolean;
   hostCatalogRefreshStatus?: "not-needed" | "not-started" | "in-progress" | ChatGptHostCatalogRefreshResult["status"];
   hostCatalogRefreshRequested?: boolean;
   hostCatalogScanCompleted?: boolean;
   hostCatalogRefreshErrorCode?: string | null;
   hostCatalogRefreshMessage?: string | null;
+  hostCatalogRefreshProgressPhase?: ChatGptHostCatalogProgress["phase"] | null;
+  hostCatalogRefreshProgressState?: ChatGptHostCatalogProgress["state"] | null;
+  hostCatalogRefreshProgressVerified?: boolean | null;
+  hostCatalogRefreshProgressUpdatedAt?: string | null;
   hostCatalogRefreshRecommendedAction?: string;
   hostCatalogRefreshCompletedAt?: string | null;
   externalIdentityBefore: RuntimeExternalIdentity;
@@ -159,24 +171,11 @@ export interface RuntimeApplyWorkerDependencies {
   probeHealth?: (port: number) => Promise<RuntimeHealthSnapshot>;
   probeActivationHealth?: (port: number) => Promise<RuntimeHealthSnapshot>;
   requestReload?: (stateDir: string, operationId: string) => Promise<void>;
-  refreshHostCatalog?: () => Promise<ChatGptHostCatalogRefreshResult>;
-  sendRecoveryWake?: typeof sendRegisteredChatGptRecoveryWake;
   sleep?: (ms: number) => Promise<void>;
   pidAlive?: (pid: number) => boolean;
   now?: () => Date;
 }
 
-function runtimeSchemaRefreshRequired(previous: RuntimeManifest, target: RuntimeManifest): boolean {
-  const hostCatalogChanged =
-    typeof previous.hostCatalogRevision === "string"
-    && typeof target.hostCatalogRevision === "string"
-    && previous.hostCatalogRevision !== target.hostCatalogRevision;
-  const uiResourceChanged =
-    typeof previous.uiResourceRevision === "string"
-    && typeof target.uiResourceRevision === "string"
-    && previous.uiResourceRevision !== target.uiResourceRevision;
-  return previous.toolSchemaRevision !== target.toolSchemaRevision || hostCatalogChanged || uiResourceChanged;
-}
 
 function receiptRoot(stateDir: string): string {
   return path.join(stateDir, "runtime-updates");
@@ -562,13 +561,23 @@ function newReceipt(input: {
     diagnosticId: `diag_runtime_${randomUUID()}`,
     failurePhase: null,
     recommendedAction: input.recommendedAction,
+    activityDashboardRefreshAttempted: false,
+    activityDashboardRefreshStatus: "not-started",
+    activityDashboardRevision: null,
+    activityDashboardRefreshErrorCode: null,
+    activityDashboardRefreshMessage: null,
+    activityDashboardRefreshCompletedAt: null,
     hostCatalogRefreshAttempted: false,
-    hostCatalogRefreshStatus: schemaRefreshRequired ? "not-started" : "not-needed",
+    hostCatalogRefreshStatus: schemaRefreshRequired ? "manual-action-required" : "not-needed",
     hostCatalogRefreshRequested: false,
     hostCatalogScanCompleted: false,
     hostCatalogRefreshErrorCode: null,
     hostCatalogRefreshMessage: null,
-    hostCatalogRefreshRecommendedAction: schemaRefreshRequired ? "automatic-refresh-pending-runtime-apply" : "none",
+    hostCatalogRefreshProgressPhase: null,
+    hostCatalogRefreshProgressState: null,
+    hostCatalogRefreshProgressVerified: null,
+    hostCatalogRefreshProgressUpdatedAt: null,
+    hostCatalogRefreshRecommendedAction: schemaRefreshRequired ? "use-settings-force-refresh" : "none",
     hostCatalogRefreshCompletedAt: null,
     externalIdentityBefore,
     history: [{ at: now, state: input.state, phase: input.phase }],
@@ -737,7 +746,7 @@ export function latestAppliedSchemaChangingRuntimeApplyReceipt(
 ): RuntimeApplyReceipt | null {
   return [...receipts].reverse().find((receipt) =>
     (receipt.state === "APPLIED" || receipt.state === "ALREADY_APPLIED")
-    && receipt.previousManifest.toolSchemaRevision !== receipt.targetManifest.toolSchemaRevision,
+    && runtimeSchemaRefreshRequired(receipt.previousManifest, receipt.targetManifest),
   ) ?? null;
 }
 
@@ -959,6 +968,43 @@ export async function startAuthorizedRuntimeApplyWorker(
   }
 }
 
+/**
+ * Starts an already-prepared runtime apply after an explicit local/native
+ * confirmation. This helper is intentionally not exposed as a remote MCP
+ * operation; the caller must be a local operator surface such as the bundled
+ * macOS app or CLI. All target validation, live fingerprint checks, update
+ * locking, widget preflight, and active-apply checks happen in prepareRuntimeApply.
+ */
+export async function startLocallyConfirmedRuntimeApply(
+  stateDir: string,
+  operationId: string,
+): Promise<{ receipt: RuntimeApplyReceipt; workerStarted: boolean }> {
+  const reconnectPlan = await readReplacementReconnectPlan(stateDir, "runtime").catch(() => undefined);
+  const activation = await updateRuntimeApplyReceipt(stateDir, operationId, (receipt) => {
+    if (receipt.state !== "APPROVAL_REQUIRED") {
+      throw new DomainError(
+        ErrorCode.INVALID_ARGUMENT,
+        `Runtime apply ${operationId} is not awaiting local confirmation`,
+        { operationId, state: receipt.state, actionStarted: receipt.state === "ACTIVATION_REQUESTED" },
+      );
+    }
+    const next = transition(receipt, "ACTIVATION_REQUESTED", "activation");
+    if (reconnectPlan) next.reconnectPlan = reconnectPlan;
+    next.recommendedAction = "wait-then-poll-runtime-apply-status";
+    return next;
+  });
+  try {
+    const workerPid = launchRuntimeApplyWorker(stateDir, activation.operationId);
+    const started = await recordRuntimeApplyWorkerPid(stateDir, activation.operationId, workerPid);
+    return { receipt: started, workerStarted: true };
+  } catch {
+    return {
+      receipt: await markRuntimeApplyStartFailed(stateDir, activation.operationId),
+      workerStarted: false,
+    };
+  }
+}
+
 function manifestFromHealth(value: unknown): RuntimeManifest | null {
   if (!value || typeof value !== "object") return null;
   const candidate = value as Partial<RuntimeManifest>;
@@ -1149,8 +1195,6 @@ export async function runRuntimeApplyWorker(input: {
   const probe = dependencies.probeHealth ?? probeRuntimeHealth;
   const probeActivationHealth = dependencies.probeActivationHealth ?? probe;
   const reload = dependencies.requestReload ?? requestRuntimeReload;
-  const refreshHostCatalog = dependencies.refreshHostCatalog ?? refreshChatGptHostCatalog;
-  const sendRecoveryWake = dependencies.sendRecoveryWake ?? sendRegisteredChatGptRecoveryWake;
   const sleep = dependencies.sleep ?? delay;
   const pidAlive = dependencies.pidAlive ?? processAlive;
   const now = dependencies.now ?? (() => new Date());
@@ -1275,7 +1319,7 @@ export async function runRuntimeApplyWorker(input: {
         const preserved = preservation(receipt, health, pidAlive);
         const schemaRefreshRequired = runtimeSchemaRefreshRequired(receipt.previousManifest, receipt.targetManifest);
         const applied = await updateRuntimeApplyReceipt(input.stateDir, input.operationId, (value) => {
-          const next = transition(value, "APPLIED", schemaRefreshRequired ? "catalog-refresh" : "complete", now());
+          const next = transition(value, "APPLIED", "dashboard-refresh", now());
           next.currentRuntimePid = health.runtimePid;
           next.currentRuntimeRoot = health.manifest?.runtimeRoot ?? value.targetManifest.runtimeRoot;
           next.activeRuntimePointer = pointer;
@@ -1287,61 +1331,68 @@ export async function runRuntimeApplyWorker(input: {
           next.rollbackSucceeded = null;
           next.previousRuntimeRestored = false;
           next.finalHealthy = true;
-          next.hostCatalogRefreshAttempted = schemaRefreshRequired;
-          next.hostCatalogRefreshStatus = schemaRefreshRequired ? "in-progress" : "not-needed";
+          next.activityDashboardRefreshAttempted = true;
+          next.activityDashboardRefreshStatus = "in-progress";
+          next.activityDashboardRevision = null;
+          next.activityDashboardRefreshErrorCode = null;
+          next.activityDashboardRefreshMessage = null;
+          next.activityDashboardRefreshCompletedAt = null;
+          next.hostCatalogRefreshAttempted = false;
+          next.hostCatalogRefreshStatus = schemaRefreshRequired ? "manual-action-required" : "not-needed";
           next.hostCatalogRefreshRequested = false;
           next.hostCatalogScanCompleted = false;
           next.hostCatalogRefreshErrorCode = null;
           next.hostCatalogRefreshMessage = null;
-          next.hostCatalogRefreshRecommendedAction = schemaRefreshRequired ? "automatic-refresh-in-progress" : "none";
+          next.hostCatalogRefreshProgressPhase = null;
+          next.hostCatalogRefreshProgressState = null;
+          next.hostCatalogRefreshProgressVerified = null;
+          next.hostCatalogRefreshProgressUpdatedAt = null;
+          next.hostCatalogRefreshRecommendedAction = schemaRefreshRequired ? "use-settings-force-refresh" : "none";
           next.hostCatalogRefreshCompletedAt = null;
-          next.recommendedAction = schemaRefreshRequired ? "wait-for-automatic-host-catalog-refresh" : "none";
+          next.recommendedAction = "wait-for-activity-dashboard-refresh";
           return next;
         });
-        if (!schemaRefreshRequired) return applied;
 
-        let refreshResult: ChatGptHostCatalogRefreshResult;
+        let dashboardStatus: "applied" | "unavailable" | "failed" = "unavailable";
+        let dashboardRevision: string | null = null;
+        let dashboardErrorCode: string | null = null;
+        let dashboardMessage: string | null = null;
         try {
-          refreshResult = await refreshHostCatalog();
-        } catch {
-          refreshResult = {
-            ok: false,
-            status: "failed",
-            catalogRefreshRequested: false,
-            hostScanCompleted: false,
-            hostCatalogRebindVerified: null,
-            errorCode: "CATALOG_REFRESH_UNEXPECTED_FAILURE",
-            message: "Automatic ChatGPT catalog refresh failed unexpectedly.",
-            recommendedAction: "inspect-chatgpt-send-failure",
-            runtimeRestarted: false,
-            connectorChanged: false,
-            projectFilesChanged: false,
-          };
+          const dashboard = await applyRuntimeActivityDashboardAsset({
+            runtimeRoot: receipt.targetManifest.runtimeRoot,
+            stateDir: input.stateDir,
+          });
+          if (dashboard) {
+            dashboardStatus = "applied";
+            dashboardRevision = dashboard.revision;
+            dashboardMessage = `Activity dashboard refreshed to ${dashboard.revision}.`;
+          } else {
+            dashboardStatus = "unavailable";
+            dashboardMessage = "Target runtime does not contain a bundled activity dashboard asset.";
+          }
+        } catch (error) {
+          dashboardStatus = "failed";
+          dashboardErrorCode = "ACTIVITY_DASHBOARD_REFRESH_FAILED";
+          dashboardMessage = error instanceof Error ? error.message : "Activity dashboard refresh failed unexpectedly.";
         }
-        const completed = await updateRuntimeApplyReceipt(input.stateDir, input.operationId, (value) => {
+
+        const dashboardCompleted = await updateRuntimeApplyReceipt(input.stateDir, input.operationId, (value) => {
           const next = transition(value, "APPLIED", "complete", now());
-          next.hostCatalogRefreshAttempted = true;
-          next.hostCatalogRefreshStatus = refreshResult.status;
-          next.hostCatalogRefreshRequested = refreshResult.catalogRefreshRequested;
-          next.hostCatalogScanCompleted = refreshResult.hostScanCompleted;
-          next.hostCatalogRefreshErrorCode = refreshResult.errorCode ?? null;
-          next.hostCatalogRefreshMessage = refreshResult.message ?? null;
-          next.hostCatalogRefreshRecommendedAction = refreshResult.recommendedAction;
-          next.hostCatalogRefreshCompletedAt = now().toISOString();
-          next.recommendedAction = refreshResult.ok
-            ? "requery-current-chat-direct-named-mount"
-            : refreshResult.recommendedAction;
+          next.activityDashboardRefreshAttempted = true;
+          next.activityDashboardRefreshStatus = dashboardStatus;
+          next.activityDashboardRevision = dashboardRevision;
+          next.activityDashboardRefreshErrorCode = dashboardErrorCode;
+          next.activityDashboardRefreshMessage = dashboardMessage;
+          next.activityDashboardRefreshCompletedAt = now().toISOString();
+          next.recommendedAction = schemaRefreshRequired
+            ? "use-settings-force-refresh"
+            : dashboardStatus === "failed"
+              ? "run-activity-dashboard-apply"
+              : "none";
           return next;
         });
-        if (refreshResult.ok && typeof completed.targetManifest.hostCatalogRevision === "string") {
-          await sendRecoveryWake({
-            stateDir: input.stateDir,
-            operationId: input.operationId,
-            runtimeFingerprint: completed.targetFingerprint,
-            hostCatalogRevision: completed.targetManifest.hostCatalogRevision,
-          }).catch(() => null);
-        }
-        return completed;
+        return dashboardCompleted;
+
       }
     } else {
       stableTargetProbes = 0;
@@ -1486,6 +1537,15 @@ export function runtimeApplyPublicReceipt(receipt: RuntimeApplyReceipt): Record<
     reconnectObservedAt: receipt.reconnectObservedAt ?? null,
     reconnectDurationMs: receipt.reconnectDurationMs ?? null,
     reconnectPlan: receipt.reconnectPlan ?? null,
+    automaticActivityDashboardRefresh: {
+      attempted: receipt.activityDashboardRefreshAttempted ?? false,
+      status: receipt.activityDashboardRefreshStatus ?? "not-started",
+      revision: receipt.activityDashboardRevision ?? null,
+      errorCode: receipt.activityDashboardRefreshErrorCode ?? null,
+      message: receipt.activityDashboardRefreshMessage ?? null,
+      completedAt: receipt.activityDashboardRefreshCompletedAt ?? null,
+      openPageAutoReload: true,
+    },
     schemaRefreshRequired,
     previousToolSchemaRevision: receipt.previousManifest.toolSchemaRevision,
     targetToolSchemaRevision: receipt.targetManifest.toolSchemaRevision,
@@ -1495,9 +1555,8 @@ export function runtimeApplyPublicReceipt(receipt: RuntimeApplyReceipt): Record<
     targetUiResourceRevision: receipt.targetManifest.uiResourceRevision ?? null,
     connectorReregistrationRequired: false,
     connectorEndpointPolicy: "stable-bare-mcp",
-    hostCatalogRebindVerified: null,
     hostCatalogRefreshRequired: schemaRefreshRequired,
-    automaticHostCatalogRefresh: schemaRefreshRequired
+    automaticHostCatalogRefresh: false
       ? {
           approvalCoveredByRuntimeApply: true,
           attempted: receipt.hostCatalogRefreshAttempted ?? false,
@@ -1506,11 +1565,19 @@ export function runtimeApplyPublicReceipt(receipt: RuntimeApplyReceipt): Record<
           hostScanCompleted: receipt.hostCatalogScanCompleted ?? false,
           errorCode: receipt.hostCatalogRefreshErrorCode ?? null,
           message: receipt.hostCatalogRefreshMessage ?? null,
-          recommendedAction: receipt.hostCatalogRefreshRecommendedAction ?? "automatic-refresh-pending-runtime-apply",
+          progress: {
+            phase: receipt.hostCatalogRefreshProgressPhase ?? null,
+            state: receipt.hostCatalogRefreshProgressState ?? null,
+            verified: receipt.hostCatalogRefreshProgressVerified ?? null,
+            updatedAt: receipt.hostCatalogRefreshProgressUpdatedAt ?? null,
+          },
+          pipelineTerminal: receipt.phase === "complete",
+          failureAssessmentAllowed: receipt.phase === "complete",
+          recommendedAction: receipt.hostCatalogRefreshRecommendedAction ?? "use-settings-force-refresh",
           completedAt: receipt.hostCatalogRefreshCompletedAt ?? null,
         }
       : null,
-    hostCatalogRefresh: schemaRefreshRequired
+    hostCatalogRefresh: false
       ? {
           surface: "host-app-server",
           method: "app/installed",
@@ -1521,7 +1588,7 @@ export function runtimeApplyPublicReceipt(receipt: RuntimeApplyReceipt): Record<
         }
       : null,
     schemaRefreshFallback: schemaRefreshRequired
-      ? "a successful schema-changing runtime apply automatically attempts the fixed C2CT catalog-refresh and scan-tools actions under the same exact runtime approval; re-query the direct named mount in the current chat to verify host rebind; if the automatic attempt fails, use the Settings catalog force-refresh button or the direct chatgpt_catalog_refresh recovery tool; keep the registered bare /mcp endpoint and never re-register the connector"
+      ? "runtime apply never refreshes the ChatGPT host catalog automatically; use the Settings C2CT force-refresh path manually, then run scan-tools and verify the exact live generation marker; keep the registered bare /mcp endpoint and never re-register the connector"
       : "none",
     approvalRequestId: receipt.approvalRequestId ?? null,
     createdAt: receipt.createdAt,

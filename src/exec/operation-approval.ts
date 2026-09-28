@@ -2,6 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { DomainError, ErrorCode, type Lease } from "../types.js";
+import {
+  classifyTerminalState,
+  normalizeCardState,
+  type ChatGptCardLifecycleState,
+} from "./chatgpt-card-lifecycle.js";
 
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -23,6 +28,15 @@ export type OperationApprovalScope = "once" | "project";
 export type OperationApprovalStatus = "pending" | "approved" | "rejected" | "expired" | "consumed";
 export type OperationApprovalVia = "local-control-api" | "menu-bar-ui" | "mobile-ntfy" | "mobile-web" | "chatgpt-widget" | "chatgpt-widget-critical";
 export type OperationApprovalSurface = "local" | "chatgpt-widget" | "chatgpt-widget-critical";
+export type OperationApprovalDecisionSource =
+  | "local-control-api"
+  | "menu-bar-ui"
+  | "mobile-ntfy"
+  | "mobile-web"
+  | "chatgpt-widget-human-pointer"
+  | "chatgpt-widget-human-keyboard"
+  | "chatgpt-widget-unattributed"
+  | "unknown";
 
 export function isChatGptWidgetApprovalSurface(surface: OperationApprovalSurface | undefined): boolean {
   return surface === "chatgpt-widget" || surface === "chatgpt-widget-critical";
@@ -54,6 +68,8 @@ export interface OperationApprovalRequest {
   impact?: string;
   details?: string;
   originOperationId?: string;
+  /** Exact persisted operation that this approval authorizes or resumes. */
+  exactOperationId?: string;
   approvalSurface?: OperationApprovalSurface;
   chatGptSessionScopeDigest?: string;
   createdAt: number;
@@ -62,11 +78,53 @@ export interface OperationApprovalRequest {
   resolvedAt?: number;
   consumedAt?: number;
   approvedVia?: OperationApprovalVia;
+  decisionSource?: OperationApprovalDecisionSource;
   approvalScope?: OperationApprovalScope;
   projectScopeAllowed?: boolean;
+  /** Exact-request transport evidence; not a capability or reusable consent. */
+  widgetDecisionReceipt?: {
+    receivedAt: number;
+    decision: "approve" | "reject";
+    decisionSource: "human-pointer" | "human-keyboard" | "unattributed";
+    interactionProof?: {
+      trusted: true;
+      userActivation: true;
+      armedAt: number;
+      decidedAt: number;
+    };
+    appliedAt?: number;
+  };
 }
 
-function chatGptSessionScopeDigest(sessionScope: string): string {
+const OPERATION_APPROVAL_TERMINAL_STATUSES = {
+  approved: "allowed",
+  rejected: "denied",
+  expired: "expired",
+  consumed: "consumed",
+} as const;
+
+export function operationApprovalCardLifecycle(
+  request: Pick<OperationApprovalRequest, "requestId" | "status" | "expiresAt">,
+  input: { presented?: boolean; resolving?: boolean; now?: number } = {},
+): ChatGptCardLifecycleState {
+  const now = input.now ?? Date.now();
+  const expired = request.status === "pending" && request.expiresAt <= now;
+  const terminalReason = expired
+    ? "expired"
+    : classifyTerminalState(request.status, OPERATION_APPROVAL_TERMINAL_STATUSES);
+  const phase = input.resolving ? "resolving" : input.presented ? "waiting-user" : "presentable";
+  return normalizeCardState({
+    identityKey: `operation-approval:${request.requestId}`,
+    phase,
+    terminalReason,
+    expiresAt: request.expiresAt,
+    statusSource: "server-authoritative",
+    presentationRequired: phase === "presentable",
+    pollMode: phase === "resolving" ? "bounded-status-only" : "none",
+  });
+}
+
+export function chatGptSessionScopeDigest(sessionScope: string): string {
   return createHash("sha256")
     .update("chatgpt-operation-approval-session\0")
     .update(sessionScope)
@@ -74,6 +132,13 @@ function chatGptSessionScopeDigest(sessionScope: string): string {
 }
 
 export function operationApprovalBelongsToChatGptSession(
+  request: OperationApprovalRequest,
+  sessionScope: string,
+): boolean {
+  return request.chatGptSessionScopeDigest === chatGptSessionScopeDigest(sessionScope);
+}
+
+export function operationApprovalMatchesChatGptSessionScope(
   request: OperationApprovalRequest,
   sessionScope: string,
 ): boolean {
@@ -256,6 +321,7 @@ function validRequest(value: unknown): value is OperationApprovalRequest {
     (request.impact === undefined || typeof request.impact === "string") &&
     (request.details === undefined || typeof request.details === "string") &&
     (request.originOperationId === undefined || typeof request.originOperationId === "string") &&
+    (request.exactOperationId === undefined || typeof request.exactOperationId === "string") &&
     (request.approvalSurface === undefined || request.approvalSurface === "local" || request.approvalSurface === "chatgpt-widget" || request.approvalSurface === "chatgpt-widget-critical") &&
     (request.chatGptSessionScopeDigest === undefined || /^[a-f0-9]{64}$/u.test(request.chatGptSessionScopeDigest)) &&
     (request.approvalScope === undefined || request.approvalScope === "once" || request.approvalScope === "project") &&
@@ -268,7 +334,16 @@ function validRequest(value: unknown): value is OperationApprovalRequest {
       request.approvedVia === "mobile-ntfy" ||
       request.approvedVia === "mobile-web" ||
       request.approvedVia === "chatgpt-widget" ||
-      request.approvedVia === "chatgpt-widget-critical")
+      request.approvedVia === "chatgpt-widget-critical") &&
+    (request.decisionSource === undefined ||
+      request.decisionSource === "local-control-api" ||
+      request.decisionSource === "menu-bar-ui" ||
+      request.decisionSource === "mobile-ntfy" ||
+      request.decisionSource === "mobile-web" ||
+      request.decisionSource === "chatgpt-widget-human-pointer" ||
+      request.decisionSource === "chatgpt-widget-human-keyboard" ||
+      request.decisionSource === "chatgpt-widget-unattributed" ||
+      request.decisionSource === "unknown")
   );
 }
 
@@ -288,7 +363,8 @@ export async function bindOperationApprovalToChatGptSession(input: {
       throw new DomainError(ErrorCode.OPERATION_NOT_FOUND, `Operation approval request not found: ${input.requestId}`);
     }
     const approvalSurface = request.approvalSurface ?? "local";
-    if (request.status !== "pending" ||
+    const lifecycle = operationApprovalCardLifecycle(request, { now });
+    if (lifecycle.phase === "terminal" ||
         (approvalSurface !== "chatgpt-widget" && approvalSurface !== "chatgpt-widget-critical")) {
       if (changed) await writeState(input.stateDir, state);
       throw new DomainError(ErrorCode.APPROVAL_REQUIRED, "Operation approval is not pending on a ChatGPT widget surface", {
@@ -362,6 +438,45 @@ async function withStateLock<T>(stateDir: string, operation: () => Promise<T>): 
   }
 }
 
+export async function bindOperationApprovalExactOperation(input: {
+  stateDir: string;
+  requestId: string;
+  exactOperationId: string;
+  now?: number;
+}): Promise<OperationApprovalRequest> {
+  const exactOperationId = input.exactOperationId.trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{1,119}$/u.test(exactOperationId)) {
+    throw new DomainError(ErrorCode.INVALID_ARGUMENT, "Invalid exact operation identity", {
+      requestId: input.requestId,
+    });
+  }
+  return withStateLock(input.stateDir, async () => {
+    const now = input.now ?? Date.now();
+    const state = await readState(input.stateDir);
+    const changed = cleanupState(state, now);
+    const request = state.requests.find((entry) => entry.requestId === input.requestId);
+    if (!request) {
+      if (changed) await writeState(input.stateDir, state);
+      throw new DomainError(ErrorCode.OPERATION_NOT_FOUND, `Operation approval request not found: ${input.requestId}`);
+    }
+    if (request.exactOperationId && request.exactOperationId !== exactOperationId) {
+      if (changed) await writeState(input.stateDir, state);
+      throw new DomainError(
+        ErrorCode.PERMISSION_DENIED,
+        "Operation approval is already bound to a different exact operation",
+        { requestId: request.requestId },
+      );
+    }
+    if (request.exactOperationId !== exactOperationId) {
+      request.exactOperationId = exactOperationId;
+      await writeState(input.stateDir, state);
+    } else if (changed) {
+      await writeState(input.stateDir, state);
+    }
+    return request;
+  });
+}
+
 function cleanupState(state: OperationApprovalState, now: number): boolean {
   let changed = false;
   for (const request of state.requests) {
@@ -409,6 +524,7 @@ function requestDetails(request: OperationApprovalRequest, created: boolean): Re
     impact: display.impact,
     details: display.details,
     ...(request.originOperationId ? { originOperationId: request.originOperationId } : {}),
+    ...(request.exactOperationId ? { exactOperationId: request.exactOperationId } : {}),
     createdAt: request.createdAt,
     expiresAt: request.status === "approved" ? (request.consumeExpiresAt ?? request.expiresAt) : request.expiresAt,
     pendingExpiresAt: request.expiresAt,
@@ -711,6 +827,55 @@ export async function listOperationApprovalRequests(
   });
 }
 
+export async function expireOperationApprovalRequest(input: {
+  stateDir: string;
+  requestId: string;
+  now?: number;
+}): Promise<OperationApprovalRequest> {
+  return withStateLock(input.stateDir, async () => {
+    const now = input.now ?? Date.now();
+    const state = await readState(input.stateDir);
+    const changed = cleanupState(state, now);
+    const request = state.requests.find((entry) => entry.requestId === input.requestId);
+    if (!request) throw new DomainError(ErrorCode.OPERATION_NOT_FOUND, `Operation approval request not found: ${input.requestId}`);
+    if (request.status === "pending" || request.status === "approved" || request.status === "consumed") {
+      request.status = "expired";
+      request.resolvedAt = now;
+      request.consumeExpiresAt = undefined;
+      await writeState(input.stateDir, state);
+    } else if (changed) {
+      await writeState(input.stateDir, state);
+    }
+    return request;
+  });
+}
+
+export async function recordOperationApprovalDecisionReceived(input: {
+  stateDir: string;
+  requestId: string;
+  decision: "approve" | "reject";
+  decisionSource?: "human-pointer" | "human-keyboard" | "unattributed";
+  interactionProof?: {
+    trusted: true;
+    userActivation: true;
+    armedAt: number;
+    decidedAt: number;
+  };
+}): Promise<void> {
+  await withStateLock(input.stateDir, async () => {
+    const state = await readState(input.stateDir);
+    const request = state.requests.find((entry) => entry.requestId === input.requestId);
+    if (!request || request.status !== "pending" || request.widgetDecisionReceipt) return;
+    request.widgetDecisionReceipt = {
+      receivedAt: Date.now(),
+      decision: input.decision,
+      decisionSource: input.decisionSource ?? "unattributed",
+      ...(input.interactionProof ? { interactionProof: input.interactionProof } : {}),
+    };
+    await writeState(input.stateDir, state);
+  });
+}
+
 export async function resolveOperationApprovalRequest(input: {
   stateDir: string;
   requestId: string;
@@ -738,6 +903,14 @@ export async function resolveOperationApprovalRequest(input: {
       : approvalSurface === "chatgpt-widget"
         ? "chatgpt-widget"
         : null;
+    const decisionSource: OperationApprovalDecisionSource =
+      approvalVia === "chatgpt-widget" || approvalVia === "chatgpt-widget-critical"
+        ? request.widgetDecisionReceipt?.decisionSource === "human-pointer"
+          ? "chatgpt-widget-human-pointer"
+          : request.widgetDecisionReceipt?.decisionSource === "human-keyboard"
+            ? "chatgpt-widget-human-keyboard"
+            : "chatgpt-widget-unattributed"
+        : approvalVia;
     const localOwnerReject = input.decision === "reject" && approvalVia === "local-control-api";
     if (widgetApprovalVia && approvalVia !== widgetApprovalVia && !localOwnerReject) {
       throw new DomainError(
@@ -801,12 +974,20 @@ export async function resolveOperationApprovalRequest(input: {
       );
     }
     request.status = input.decision === "approve" ? "approved" : "rejected";
+    request.decisionSource = decisionSource;
     if (input.decision === "approve") {
       request.approvedVia = approvalVia;
       request.approvalScope = approvalScope;
       request.consumeExpiresAt = Math.min(now + DEFAULT_APPROVED_CONSUME_TTL_MS, request.leaseExpiresAt);
     }
     request.resolvedAt = now;
+    if (request.widgetDecisionReceipt && (approvalVia === "chatgpt-widget" || approvalVia === "chatgpt-widget-critical")) {
+      request.widgetDecisionReceipt = {
+        ...request.widgetDecisionReceipt,
+        decision: input.decision,
+        appliedAt: now,
+      };
+    }
     await writeState(input.stateDir, state);
     return request;
   });
@@ -826,12 +1007,13 @@ export function operationApprovalSummary(request: OperationApprovalRequest): Rec
     details: display.details,
     approvalSurface: request.approvalSurface ?? "local",
     ...(request.originOperationId ? { originOperationId: request.originOperationId } : {}),
+    ...(request.exactOperationId ? { exactOperationId: request.exactOperationId } : {}),
     createdAt: request.createdAt,
     expiresAt: request.status === "approved" ? (request.consumeExpiresAt ?? request.expiresAt) : request.expiresAt,
     pendingExpiresAt: request.expiresAt,
     consumeExpiresAt: request.consumeExpiresAt,
-    resolvedAt: request.resolvedAt,
     approvedVia: request.approvedVia,
+    decisionSource: request.decisionSource ?? "unknown",
     approvalScope: request.approvalScope,
     projectScopeAllowed: request.projectScopeAllowed === true,
   };

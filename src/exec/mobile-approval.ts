@@ -29,6 +29,19 @@ import {
 import { listAllApprovedCommandGrants, revokeApprovedCommandGrant } from "./command-request.js";
 import { patchDesktopSettings, readDesktopSettings } from "../runtime/desktop-settings.js";
 import { activityMcpHealth } from "../server/activity-mcp-health.js";
+import {
+  checkManagedMcpUpdate,
+  getManagedMcpStatus,
+  installManagedMcp,
+  listManagedMcps,
+  listManagedMcpTools,
+  readManagedMcpLogs,
+  removeManagedMcp,
+  restartManagedMcp,
+  startManagedMcp,
+  stopManagedMcp,
+  updateManagedMcp,
+} from "../mcp/managed-mcp.js";
 import { DomainError } from "../types.js";
 
 const DIR_MODE = 0o700;
@@ -376,13 +389,17 @@ function isLoopbackRequest(req: IncomingMessage): boolean {
 }
 
 function localActivityOriginMatches(req: IncomingMessage): boolean {
-  const origin = req.headers.origin;
   const host = req.headers.host;
-  if (typeof origin !== "string" || typeof host !== "string") return false;
+  if (typeof host !== "string") return false;
+  const source = typeof req.headers.origin === "string"
+    ? req.headers.origin
+    : typeof req.headers.referer === "string"
+      ? req.headers.referer
+      : null;
+  if (!source) return false;
   try {
-    const parsed = new URL(origin);
-    if (parsed.protocol !== "http:") return false;
-    if (parsed.host !== host) return false;
+    const parsed = new URL(source);
+    if (parsed.protocol !== "http:" || parsed.host !== host) return false;
     return parsed.hostname === "localhost" ||
       parsed.hostname === "127.0.0.1" ||
       parsed.hostname === "::1" ||
@@ -1074,6 +1091,46 @@ export class MobileApprovalBridge {
         sendJson(res, 200, { ok: true, platform: process.platform, settings });
         return;
       }
+      if (requestPath === "/activity/api/managed-mcp") {
+        if (!isLoopbackRequest(req)) {
+          sendJson(res, 403, { ok: false, error: "managed_mcp_loopback_only" });
+          return;
+        }
+        if (!localActivityOriginMatches(req)) {
+          sendJson(res, 403, { ok: false, error: "managed_mcp_same_origin_required" });
+          return;
+        }
+        const servers = await listManagedMcps(this.stateDir);
+        sendJson(res, 200, {
+          ok: true,
+          servers: servers.map((server) => ({
+            id: server.id,
+            name: server.name,
+            repositoryUrl: server.repositoryUrl,
+            ref: server.ref,
+            commit: server.commit,
+            runBuild: server.runBuild !== false,
+            installedAt: server.installedAt,
+            updatedAt: server.updatedAt,
+            status: server.status,
+            running: server.running,
+            pid: server.pid,
+            startedAt: server.startedAt,
+            mcpLastExit: server.mcpLastExit ? { closedAt: server.mcpLastExit.closedAt } : null,
+            serviceConfigured: server.serviceConfigured,
+            serviceRunning: server.serviceRunning,
+            servicePid: server.servicePid,
+            serviceStartedAt: server.serviceStartedAt,
+            serviceHealthUrl: server.serviceHealthUrl,
+            serviceLastExit: server.serviceLastExit ? {
+              exitedAt: server.serviceLastExit.exitedAt,
+              exitCode: server.serviceLastExit.exitCode,
+              signal: server.serviceLastExit.signal,
+            } : null,
+          })),
+        });
+        return;
+      }
       if (requestPath === "/activity/api/activity") {
         const now = Date.now();
         const dashboard = await activityDashboardDocument(this.stateDir);
@@ -1189,6 +1246,153 @@ export class MobileApprovalBridge {
         });
       } catch {
         sendJson(res, 400, { ok: false, error: "invalid_desktop_settings" });
+      }
+      return;
+    }
+    if (req.method === "POST" && requestPath === "/activity/api/managed-mcp/action") {
+      if (!this.activityTracker) {
+        sendJson(res, 404, { ok: false });
+        return;
+      }
+      setDashboardHeaders(res);
+      if (!isLoopbackRequest(req)) {
+        sendJson(res, 403, { ok: false, error: "managed_mcp_loopback_only" });
+        return;
+      }
+      if (!localActivityOriginMatches(req)) {
+        sendJson(res, 403, { ok: false, error: "managed_mcp_same_origin_required" });
+        return;
+      }
+      const contentType = req.headers["content-type"];
+      if (typeof contentType !== "string" || !contentType.toLowerCase().startsWith("application/json")) {
+        sendJson(res, 415, { ok: false, error: "managed_mcp_json_required" });
+        return;
+      }
+      try {
+        const body = await readJsonBody(req);
+        const action = typeof body.action === "string" ? body.action : "";
+        if (action === "install") {
+          if (body.trustRepository !== true) {
+            sendJson(res, 400, { ok: false, error: "managed_mcp_trust_required" });
+            return;
+          }
+          const repositoryUrl = typeof body.repositoryUrl === "string" ? body.repositoryUrl.trim() : "";
+          const ref = typeof body.ref === "string" && body.ref.trim() ? body.ref.trim() : undefined;
+          const result = await installManagedMcp({
+            stateDir: this.stateDir,
+            repositoryUrl,
+            ref,
+            runBuild: body.runBuild !== false,
+          });
+          await this.ledgerAppend?.({
+            type: "runtime.managed-mcp.desktop-installed",
+            serverId: result.record.id,
+            repositoryUrl: result.record.repositoryUrl,
+            commit: result.record.commit,
+            reusedExisting: result.reusedExisting,
+          }).catch(() => undefined);
+          sendJson(res, 200, {
+            ok: true,
+            action,
+            server: {
+              id: result.record.id,
+              name: result.record.name,
+              repositoryUrl: result.record.repositoryUrl,
+              ref: result.record.ref,
+              commit: result.record.commit,
+            },
+            reusedExisting: result.reusedExisting,
+            autoDetected: result.autoDetected,
+          });
+          return;
+        }
+
+        const serverId = typeof body.serverId === "string" ? body.serverId.trim() : "";
+        if (!/^[a-z0-9._-]{1,120}$/u.test(serverId)) {
+          sendJson(res, 400, { ok: false, error: "managed_mcp_invalid_server_id" });
+          return;
+        }
+        if (action === "start") {
+          const result = await startManagedMcp(this.stateDir, serverId);
+          await this.ledgerAppend?.({ type: "runtime.managed-mcp.desktop-started", serverId }).catch(() => undefined);
+          sendJson(res, 200, { ok: true, action, result });
+          return;
+        }
+        if (action === "restart") {
+          const result = await restartManagedMcp(this.stateDir, serverId);
+          await this.ledgerAppend?.({ type: "runtime.managed-mcp.desktop-restarted", serverId }).catch(() => undefined);
+          sendJson(res, 200, { ok: true, action, result });
+          return;
+        }
+        if (action === "status") {
+          const result = await getManagedMcpStatus(this.stateDir, serverId);
+          sendJson(res, 200, { ok: true, action, result });
+          return;
+        }
+        if (action === "logs") {
+          const requestedMaxBytes = typeof body.maxBytes === "number" ? body.maxBytes : 8 * 1024;
+          const result = await readManagedMcpLogs(this.stateDir, serverId, requestedMaxBytes);
+          sendJson(res, 200, { ok: true, action, result });
+          return;
+        }
+        if (action === "tools") {
+          const result = await listManagedMcpTools(this.stateDir, serverId);
+          sendJson(res, 200, { ok: true, action, result });
+          return;
+        }
+        if (action === "check-update") {
+          const result = await checkManagedMcpUpdate(this.stateDir, serverId);
+          await this.ledgerAppend?.({
+            type: "runtime.managed-mcp.desktop-update-checked",
+            serverId,
+            currentCommit: result.currentCommit,
+            latestCommit: result.latestCommit,
+            updateAvailable: result.updateAvailable,
+          }).catch(() => undefined);
+          sendJson(res, 200, { ok: true, action, result });
+          return;
+        }
+        if (action === "update") {
+          if (body.confirmUpdate !== true) {
+            sendJson(res, 400, { ok: false, error: "managed_mcp_update_confirmation_required" });
+            return;
+          }
+          const result = await updateManagedMcp(this.stateDir, serverId);
+          await this.ledgerAppend?.({
+            type: "runtime.managed-mcp.desktop-updated",
+            serverId,
+            previousCommit: result.previousCommit,
+            commit: result.record.commit,
+            updated: result.updated,
+            restarted: result.restarted,
+            mcpRestarted: result.mcpRestarted,
+            serviceRestarted: result.serviceRestarted,
+          }).catch(() => undefined);
+          sendJson(res, 200, { ok: true, action, result });
+          return;
+        }
+        if (action === "stop") {
+          const result = await stopManagedMcp(this.stateDir, serverId);
+          await this.ledgerAppend?.({ type: "runtime.managed-mcp.desktop-stopped", serverId, stopped: result.stopped }).catch(() => undefined);
+          sendJson(res, 200, { ok: true, action, result });
+          return;
+        }
+        if (action === "remove") {
+          if (body.confirmRemove !== true) {
+            sendJson(res, 400, { ok: false, error: "managed_mcp_remove_confirmation_required" });
+            return;
+          }
+          const result = await removeManagedMcp(this.stateDir, serverId);
+          await this.ledgerAppend?.({ type: "runtime.managed-mcp.desktop-removed", serverId, removed: result.removed }).catch(() => undefined);
+          sendJson(res, 200, { ok: true, action, result });
+          return;
+        }
+        sendJson(res, 400, { ok: false, error: "managed_mcp_unknown_action" });
+      } catch (error) {
+        sendJson(res, error instanceof DomainError ? 400 : 500, {
+          ok: false,
+          error: error instanceof DomainError ? error.message : "managed_mcp_action_failed",
+        });
       }
       return;
     }

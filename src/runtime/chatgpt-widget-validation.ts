@@ -1,6 +1,8 @@
 import { Script } from "node:vm";
 import {
+  CHATGPT_CONSENT_WIDGET_DIRECT_URI,
   CHATGPT_CONSENT_WIDGET_HTML,
+  CHATGPT_CONSENT_WIDGET_LEGACY_URI,
   CHATGPT_CONSENT_WIDGET_LOADER_HTML,
   CHATGPT_CONSENT_WIDGET_URI,
   CHATGPT_OPERATION_APPROVAL_WIDGET_HTML,
@@ -11,6 +13,10 @@ import {
   CHATGPT_WIDGET_CAPABILITY_LAB_URI,
 } from "../server/chatgpt-widget-capability-lab.js";
 import { E2E_SCREENSHOT_WIDGET_HTML, E2E_SCREENSHOT_WIDGET_URI } from "../server/e2e-screenshot-widget.js";
+import {
+  CHATGPT_VISION_IMAGE_WIDGET_HTML,
+  CHATGPT_VISION_IMAGE_WIDGET_URI,
+} from "../server/chatgpt-vision-image-widget.js";
 
 export interface ChatGptWidgetValidationTarget {
   name: string;
@@ -31,11 +37,13 @@ const LITERAL_DOM_ID_REFERENCE_PATTERNS = [
 ] as const;
 
 export const SHIPPED_CHATGPT_WIDGETS: readonly ChatGptWidgetValidationTarget[] = [
-  { name: "consent-loader", html: CHATGPT_CONSENT_WIDGET_LOADER_HTML, resourceUri: CHATGPT_CONSENT_WIDGET_URI },
-  { name: "shared-consent-and-shell", html: CHATGPT_CONSENT_WIDGET_HTML, resourceUri: CHATGPT_CONSENT_WIDGET_URI },
+  { name: "legacy-consent-loader", html: CHATGPT_CONSENT_WIDGET_LOADER_HTML, resourceUri: CHATGPT_CONSENT_WIDGET_LEGACY_URI },
+  { name: "shared-consent-and-shell-loader", html: CHATGPT_CONSENT_WIDGET_LOADER_HTML, resourceUri: CHATGPT_CONSENT_WIDGET_URI },
+  { name: "shared-consent-direct", html: CHATGPT_CONSENT_WIDGET_HTML, resourceUri: CHATGPT_CONSENT_WIDGET_DIRECT_URI },
   { name: "operation-approval", html: CHATGPT_OPERATION_APPROVAL_WIDGET_HTML, resourceUri: CHATGPT_OPERATION_APPROVAL_WIDGET_URI },
   { name: "capability-lab", html: CHATGPT_WIDGET_CAPABILITY_LAB_HTML, resourceUri: CHATGPT_WIDGET_CAPABILITY_LAB_URI },
   { name: "e2e-screenshot", html: E2E_SCREENSHOT_WIDGET_HTML, resourceUri: E2E_SCREENSHOT_WIDGET_URI },
+  { name: "vision-image", html: CHATGPT_VISION_IMAGE_WIDGET_HTML, resourceUri: CHATGPT_VISION_IMAGE_WIDGET_URI },
 ] as const;
 
 export function extractInlineWidgetScripts(html: string): string[] {

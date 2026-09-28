@@ -39,12 +39,13 @@ import {
   inspectConnectorRegistration,
 } from "./connector/registration-assistant.js";
 import { MobileApprovalBridge } from "./exec/mobile-approval.js";
-import { refreshChatGptHostCatalog } from "./exec/chatgpt-host-catalog-refresh.js";
 import { reapplyCurrentRuntimeAndRefresh } from "./runtime/runtime-reapply-refresh.js";
 import { recoverStalledRuntimeApply } from "./runtime/runtime-apply.js";
-import { loadLocalRuntimeBootstrapPlan } from "./runtime/local-runtime-bootstrap.js";
+import { inspectPreviousRuntimeRollback, rollbackToPreviousRuntimeLocally } from "./runtime/runtime-manual-rollback.js";
+import { loadExplicitLocalRuntimeBootstrapPlan, loadLocalRuntimeBootstrapPlan } from "./runtime/local-runtime-bootstrap.js";
 import { runLocalRuntimeBootstrap, type LocalRuntimeBootstrapPhase } from "./runtime/local-runtime-bootstrap-runner.js";
 import { runLocalMacosAppBootstrap, type LocalMacosAppBootstrapPhase } from "./runtime/local-macos-app-bootstrap-runner.js";
+import { drainManagedMcpOwnedChildren, reconcileManagedMcpDesiredState } from "./mcp/managed-mcp.js";
 
 // execution-capability: cli-runtime-doctor
 const execFileAsync = promisify(execFile);
@@ -128,7 +129,8 @@ async function buildToolContext(workspace: string): Promise<ToolContext> {
   const ledger = new Ledger(stateDir);
 
   const registry = await scanWorkspaces(workspaceRoots);
-  await store.saveProjects(registry);
+  const privateRuntimeCandidate = process.env.CHATGPT2CODEX_PRIVATE_CANDIDATE === "1";
+  if (!privateRuntimeCandidate) await store.saveProjects(registry);
 
   const config = defaultConfig(workspaceRoot, workspaceRoots, stateDir);
 
@@ -216,6 +218,13 @@ async function cmdServeStdio(flags: Record<string, string | boolean>): Promise<v
 async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<void> {
   const workspace = typeof flags.workspace === "string" ? flags.workspace : process.cwd();
   const ctx = await buildToolContext(workspace);
+  const privateRuntimeCandidate = process.env.CHATGPT2CODEX_PRIVATE_CANDIDATE === "1";
+  const managedMcpReconcile = privateRuntimeCandidate
+    ? []
+    : await reconcileManagedMcpDesiredState(ctx.stateDir);
+  for (const result of managedMcpReconcile) {
+    if (result.reconciled !== true) console.error("chatgpt2codex managed MCP reconcile degraded", result);
+  }
 
   if (!(await hasOwnerToken(ctx.stateDir))) {
     console.error(
@@ -235,7 +244,7 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
   const idleShutdownMs =
     Number.isFinite(idleShutdownMinutes) && idleShutdownMinutes > 0 ? idleShutdownMinutes * 60 * 1000 : undefined;
   await applyStartupProjectSelection(ctx, flags);
-  if (isControlEnabled()) startExecutor(ctx);
+  if (!privateRuntimeCandidate && isControlEnabled()) startExecutor(ctx);
 
   let httpServer: ReturnType<ReturnType<typeof createHttpServer>["app"]["listen"]> | undefined;
   let closeHttpServer: () => Promise<void> = async () => undefined;
@@ -263,6 +272,13 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
 
       await mobileApprovalBridge?.close().catch(() => undefined);
       await closeHttpServer().catch(() => undefined);
+      const managedMcpDrain = privateRuntimeCandidate
+        ? []
+        : await drainManagedMcpOwnedChildren(ctx.stateDir).catch((error) => {
+          console.error("chatgpt2codex managed MCP generation drain failed", error);
+          return [];
+        });
+      for (const result of managedMcpDrain) console.error("chatgpt2codex managed MCP generation drain", result);
       if (server) {
         const forceClose = setTimeout(() => server.closeAllConnections(), 2_000);
         forceClose.unref();
@@ -291,7 +307,7 @@ async function cmdServeHttp(flags: Record<string, string | boolean>): Promise<vo
   // fixed mobile/activity callback port. They still expose their own MCP/health
   // endpoint, but cannot steal :7980 from the live runtime if they outlive a
   // diagnostic run or overlap a runtime handoff.
-  if (process.env.CHATGPT2CODEX_E2E_CHILD !== "1") {
+  if (!privateRuntimeCandidate && process.env.CHATGPT2CODEX_E2E_CHILD !== "1") {
     mobileApprovalBridge = new MobileApprovalBridge({
       stateDir: ctx.stateDir,
       activityTracker,
@@ -662,12 +678,6 @@ async function cmdConnectorAssistant(flags: Record<string, string | boolean>): P
   if (report.state !== "READY") process.exitCode = 1;
 }
 
-async function cmdChatGptCatalogRefresh(): Promise<void> {
-  const result = await refreshChatGptHostCatalog();
-  console.log(JSON.stringify(result));
-  if (!result.ok) process.exitCode = 3;
-}
-
 async function cmdRuntimeReapplyRefresh(flags: Record<string, string | boolean>): Promise<void> {
   const rawPort = typeof flags.port === "string" ? flags.port : process.env.PORT ?? "7979";
   const port = Number.parseInt(rawPort, 10);
@@ -680,6 +690,32 @@ async function cmdRuntimeReapplyRefresh(flags: Record<string, string | boolean>)
   });
   console.log(JSON.stringify(result));
   if (!result.ok) process.exitCode = 4;
+}
+
+async function cmdRuntimeRollbackPreviousLocal(flags: Record<string, string | boolean>): Promise<void> {
+  const stateDir = defaultStateDir();
+  const rawPort = typeof flags.port === "string" ? flags.port : process.env.PORT ?? "7979";
+  const port = Number.parseInt(rawPort, 10);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+    throw new Error("runtime-rollback-previous-local requires a valid --port");
+  }
+  if (flags.apply !== true) {
+    console.log(JSON.stringify(await inspectPreviousRuntimeRollback(stateDir, port)));
+    return;
+  }
+  const expectedCurrent = typeof flags["expected-current"] === "string"
+    ? flags["expected-current"].trim().toLowerCase()
+    : "";
+  if (!/^[a-f0-9]{64}$/u.test(expectedCurrent)) {
+    throw new Error("runtime-rollback-previous-local --apply requires --expected-current <64-hex-fingerprint>");
+  }
+  const result = await rollbackToPreviousRuntimeLocally({
+    stateDir,
+    expectedCurrentFingerprint: expectedCurrent,
+    port,
+  });
+  console.log(JSON.stringify(result));
+  if (!result.ok) process.exitCode = 6;
 }
 
 async function cmdRuntimeApplyRecoverStalledLocal(flags: Record<string, string | boolean>): Promise<void> {
@@ -715,11 +751,43 @@ async function cmdRuntimeBootstrapLocal(flags: Record<string, string | boolean>)
   if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
     throw new Error("runtime-bootstrap-local requires a valid --port");
   }
-  const stateDir = defaultStateDir();
-  const plan = await loadLocalRuntimeBootstrapPlan({
-    stateDir,
-    ...(prepareRequestId ? { prepareRequestId } : { prepareOperationId }),
-  });
+  const rawStateDir = flags["state-dir"];
+  if (rawStateDir === true) {
+    throw new Error("runtime-bootstrap-local requires --state-dir <path> when the flag is present");
+  }
+  const stateDir = typeof rawStateDir === "string" && rawStateDir.trim()
+    ? path.resolve(rawStateDir.trim())
+    : defaultStateDir();
+  let plan;
+  try {
+    plan = await loadLocalRuntimeBootstrapPlan({
+      stateDir,
+      ...(prepareRequestId ? { prepareRequestId } : { prepareOperationId }),
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const explicitProjectId = typeof flags["project-id"] === "string" ? flags["project-id"].trim() : "";
+    const explicitProjectRoot = typeof flags["project-root"] === "string" ? flags["project-root"].trim() : "";
+    const explicitCurrentRuntimeRoot = typeof flags["current-runtime-root"] === "string" ? flags["current-runtime-root"].trim() : "";
+    const explicitExpectedCurrent = typeof flags["expected-current"] === "string" ? flags["expected-current"].trim() : "";
+    const explicitTargetRuntimeRoot = typeof flags["target-runtime-root"] === "string" ? flags["target-runtime-root"].trim() : "";
+    const explicitTargetFingerprint = typeof flags["target-fingerprint"] === "string" ? flags["target-fingerprint"].trim() : "";
+    const explicitFallbackReady = Boolean(
+      prepareRequestId && explicitProjectId && explicitProjectRoot && explicitCurrentRuntimeRoot &&
+      explicitExpectedCurrent && explicitTargetRuntimeRoot && explicitTargetFingerprint,
+    );
+    if (!message.startsWith("Prepared runtime receipt not found:") || !explicitFallbackReady) throw error;
+    plan = await loadExplicitLocalRuntimeBootstrapPlan({
+      stateDir,
+      prepareRequestId,
+      projectId: explicitProjectId,
+      projectRoot: explicitProjectRoot,
+      currentRuntimeRoot: explicitCurrentRuntimeRoot,
+      expectedCurrentFingerprint: explicitExpectedCurrent,
+      targetRuntimeRoot: explicitTargetRuntimeRoot,
+      targetFingerprint: explicitTargetFingerprint,
+    });
+  }
   const result = await runLocalRuntimeBootstrap({ plan, stateDir, phase, port });
   console.log(JSON.stringify(result));
 }
@@ -788,11 +856,11 @@ async function main(): Promise<void> {
     case "connector-assistant":
       await cmdConnectorAssistant(flags);
       break;
-    case "chatgpt-catalog-refresh":
-      await cmdChatGptCatalogRefresh();
-      break;
     case "runtime-reapply-refresh":
       await cmdRuntimeReapplyRefresh(flags);
+      break;
+    case "runtime-rollback-previous-local":
+      await cmdRuntimeRollbackPreviousLocal(flags);
       break;
     case "runtime-apply-recover-stalled-local":
       await cmdRuntimeApplyRecoverStalledLocal(flags);
@@ -814,7 +882,7 @@ async function main(): Promise<void> {
       break;
     default:
       console.error(
-        "usage: chatgpt2codex <serve|init|doctor|connector-assistant|chatgpt-catalog-refresh|runtime-reapply-refresh|runtime-apply-recover-stalled-local|runtime-bootstrap-local|macos-app-bootstrap-local|owner-token|control|workspace-root> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
+        "usage: chatgpt2codex <serve|init|doctor|connector-assistant|chatgpt-catalog-refresh|runtime-reapply-refresh|runtime-rollback-previous-local|runtime-apply-recover-stalled-local|runtime-bootstrap-local|macos-app-bootstrap-local|owner-token|control|workspace-root> [--workspace <path>] [--active-project-root <path>] [--stdio | --http [--port 7979] [--public-url <origin>]]",
       );
       process.exitCode = 1;
   }

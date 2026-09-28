@@ -95,3 +95,67 @@ export async function loadLocalRuntimeBootstrapPlan(input: {
     runtimeSnapshotId: receipt.runtimeSnapshotId,
   };
 }
+
+export async function loadExplicitLocalRuntimeBootstrapPlan(input: {
+  stateDir: string;
+  prepareRequestId: string;
+  projectId: string;
+  projectRoot: string;
+  currentRuntimeRoot: string;
+  expectedCurrentFingerprint: string;
+  targetRuntimeRoot: string;
+  targetFingerprint: string;
+}): Promise<LocalRuntimeBootstrapPlan> {
+  if (!PREPARE_REQUEST_ID_PATTERN.test(input.prepareRequestId)) {
+    throw new Error("runtime-bootstrap-local explicit fallback requires a valid prepare request id");
+  }
+  if (!input.projectId.trim()) {
+    throw new Error("runtime-bootstrap-local explicit fallback requires a project id");
+  }
+  const expectedCurrentFingerprint = input.expectedCurrentFingerprint.trim().toLowerCase();
+  const targetFingerprint = input.targetFingerprint.trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/u.test(expectedCurrentFingerprint) || !/^[a-f0-9]{64}$/u.test(targetFingerprint)) {
+    throw new Error("runtime-bootstrap-local explicit fallback requires valid runtime fingerprints");
+  }
+
+  const releaseRoot = await fs.realpath(path.join(input.stateDir, "local-runtime-releases"));
+  const [projectRoot, currentRuntimeRoot, targetRuntimeRoot] = await Promise.all([
+    fs.realpath(input.projectRoot),
+    fs.realpath(input.currentRuntimeRoot),
+    fs.realpath(input.targetRuntimeRoot),
+  ]);
+  const isManagedRuntime = (candidate: string): boolean =>
+    candidate === releaseRoot || candidate.startsWith(`${releaseRoot}${path.sep}`);
+  if (!isManagedRuntime(currentRuntimeRoot) || !isManagedRuntime(targetRuntimeRoot)) {
+    throw new Error("runtime-bootstrap-local explicit fallback runtime roots must stay inside the managed release root");
+  }
+
+  const rawActivePointer = (await fs.readFile(path.join(input.stateDir, "active-runtime"), "utf8")).trim();
+  if (!rawActivePointer) throw new Error("runtime-bootstrap-local explicit fallback active-runtime pointer is empty");
+  const activeRuntimeRoot = await fs.realpath(rawActivePointer);
+  if (activeRuntimeRoot !== currentRuntimeRoot) {
+    throw new Error("runtime-bootstrap-local explicit fallback current runtime is not the active runtime");
+  }
+
+  const currentManifest = getRuntimeManifestForRoot(currentRuntimeRoot);
+  const targetManifest = getRuntimeManifestForRoot(targetRuntimeRoot);
+  if (currentManifest.runtimeFingerprint !== expectedCurrentFingerprint) {
+    throw new Error("runtime-bootstrap-local explicit fallback current runtime fingerprint mismatch");
+  }
+  if (targetManifest.runtimeFingerprint !== targetFingerprint || !targetManifest.runtimeSnapshotId?.startsWith("sha256:")) {
+    throw new Error("runtime-bootstrap-local explicit fallback target runtime identity mismatch");
+  }
+
+  const digest = createHash("sha256").update(input.prepareRequestId).digest("hex").slice(0, 24);
+  return {
+    prepareRequestId: input.prepareRequestId,
+    applyRequestId: `local-bootstrap-${digest}`,
+    projectId: input.projectId.trim(),
+    projectRoot,
+    currentRuntimeRoot,
+    expectedCurrentFingerprint,
+    targetFingerprint,
+    targetRuntimeRoot,
+    runtimeSnapshotId: targetManifest.runtimeSnapshotId,
+  };
+}

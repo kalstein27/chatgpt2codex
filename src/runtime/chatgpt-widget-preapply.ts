@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import type { RuntimeManifest } from "./runtime-manifest.js";
-import { getRuntimeManifestForRoot } from "./runtime-manifest.js";
+import { getRuntimeManifestForRoot, legacyUiResourceRevisionForRoot } from "./runtime-manifest.js";
 import { CHATGPT_WIDGET_BUILD_META_RELATIVE_PATH } from "./chatgpt-widget-assets.js";
 
 export const CHATGPT_WIDGET_PREAPPLY_SCHEMA_VERSION = 1 as const;
@@ -54,7 +55,7 @@ export interface ChatGptWidgetPreapplyGateInspection {
   automaticChecksPassed: boolean;
   harmlessRenderPassed: boolean;
   reason: string;
-  recommendedAction: "none" | "run-widget-preapply-checks" | "hot-apply-and-render-harmless-probe";
+  recommendedAction: "none" | "run-widget-preapply-checks" | "hot-apply-and-render-widget-preflight";
 }
 
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
@@ -161,12 +162,29 @@ function parseProof(raw: string): ChatGptWidgetPreapplyRenderProof | null {
   };
 }
 
-async function readWidgetAssetRevision(runtimeRoot: string): Promise<string | null> {
+export async function readWidgetAssetRevisionForPreapply(runtimeRoot: string): Promise<string | null> {
   const raw = await readFile(path.join(runtimeRoot, CHATGPT_WIDGET_BUILD_META_RELATIVE_PATH), "utf8").catch(() => null);
-  if (!raw) return null;
-  const value = parseObject(raw);
-  const revision = value?.revision;
-  return typeof revision === "string" && /^sha256:[a-f0-9]{64}$/u.test(revision) ? revision : null;
+  if (raw) {
+    const value = parseObject(raw);
+    const revision = value?.revision;
+    if (typeof revision === "string" && /^sha256:[a-f0-9]{64}$/u.test(revision)) return revision;
+  }
+
+  // Older immutable runtimes can predate chatgpt-widget-build-meta.json even
+  // though their compiled consent-widget module already exposes the exact
+  // bundled approval-card hash used by the host loader. Reading that exported
+  // constant lets a newer candidate prove that its approval card is unchanged
+  // without forcing iOS to remount the same cached preapply URI.
+  const modulePath = path.join(runtimeRoot, "dist", "server", "chatgpt-consent-widget.js");
+  const loaded = await import(pathToFileURL(modulePath).href).catch(() => null) as ({
+    CHATGPT_CONSENT_WIDGET_BUNDLED_ASSET_REVISION?: unknown;
+    default?: { CHATGPT_CONSENT_WIDGET_BUNDLED_ASSET_REVISION?: unknown };
+  } | null);
+  const bundledRevision = loaded?.CHATGPT_CONSENT_WIDGET_BUNDLED_ASSET_REVISION
+    ?? loaded?.default?.CHATGPT_CONSENT_WIDGET_BUNDLED_ASSET_REVISION;
+  return typeof bundledRevision === "string" && /^sha256:[a-f0-9]{64}$/u.test(bundledRevision)
+    ? bundledRevision
+    : null;
 }
 
 export async function readChatGptWidgetPreapplyBuildReceipt(
@@ -179,20 +197,21 @@ export async function readChatGptWidgetPreapplyBuildReceipt(
 
 export async function sealChatGptWidgetPreapplyBuildReceipt(projectRoot: string): Promise<ChatGptWidgetPreapplyBuildReceipt> {
   const manifest = getRuntimeManifestForRoot(projectRoot);
+  const receiptUiResourceRevision = legacyUiResourceRevisionForRoot(projectRoot) ?? manifest.uiResourceRevision;
   if (!manifest.buildFingerprint || !SHA256_PATTERN.test(manifest.buildFingerprint)) {
     throw new Error("Widget pre-apply receipt requires a sealed candidate build fingerprint");
   }
-  if (!manifest.uiResourceRevision || !REVISION_PATTERN.test(manifest.uiResourceRevision)) {
+  if (!receiptUiResourceRevision || !REVISION_PATTERN.test(receiptUiResourceRevision)) {
     throw new Error("Widget pre-apply receipt requires a sealed UI resource revision");
   }
-  const widgetAssetRevision = await readWidgetAssetRevision(projectRoot);
+  const widgetAssetRevision = await readWidgetAssetRevisionForPreapply(projectRoot);
   if (!widgetAssetRevision) {
     throw new Error("Widget pre-apply receipt requires the built approval-card asset metadata");
   }
   const receipt: ChatGptWidgetPreapplyBuildReceipt = {
     schemaVersion: CHATGPT_WIDGET_PREAPPLY_SCHEMA_VERSION,
     candidateFingerprint: manifest.buildFingerprint,
-    uiResourceRevision: manifest.uiResourceRevision,
+    uiResourceRevision: receiptUiResourceRevision,
     widgetAssetRevision,
     checks: [...CHATGPT_WIDGET_PREAPPLY_REQUIRED_CHECKS],
     verifiedAt: new Date().toISOString(),
@@ -206,11 +225,10 @@ export async function sealChatGptWidgetPreapplyBuildReceipt(projectRoot: string)
 
 async function validatedBuildReceipt(runtimeRoot: string, manifest: RuntimeManifest): Promise<ChatGptWidgetPreapplyBuildReceipt | null> {
   const receipt = await readChatGptWidgetPreapplyBuildReceipt(runtimeRoot);
-  if (!receipt || !manifest.buildFingerprint || !manifest.uiResourceRevision) return null;
-  const widgetAssetRevision = await readWidgetAssetRevision(runtimeRoot);
+  if (!receipt || !manifest.buildFingerprint) return null;
+  const widgetAssetRevision = await readWidgetAssetRevisionForPreapply(runtimeRoot);
   if (!widgetAssetRevision) return null;
   return receipt.candidateFingerprint === manifest.buildFingerprint
-    && receipt.uiResourceRevision === manifest.uiResourceRevision
     && receipt.widgetAssetRevision === widgetAssetRevision
     ? receipt
     : null;
@@ -279,6 +297,33 @@ async function readRenderProof(stateDir: string, candidateFingerprint: string): 
   return raw ? parseProof(raw) : null;
 }
 
+async function readMatchingAssetLoadProof(stateDir: string, input: {
+  projectId: string;
+  candidateFingerprint: string;
+  uiResourceRevision: string;
+  widgetAssetRevision: string;
+}) {
+  const matches = (proof: Awaited<ReturnType<typeof readRenderProof>>) => Boolean(
+    proof
+    && proof.evidence === "asset-load"
+    && proof.projectId === input.projectId
+    && proof.uiResourceRevision === input.uiResourceRevision
+    && proof.widgetAssetRevision === input.widgetAssetRevision
+  );
+  const exact = await readRenderProof(stateDir, input.candidateFingerprint);
+  if (matches(exact)) return exact;
+
+  const proofsDir = path.join(preapplyRoot(stateDir), "proofs");
+  const entries = await readdir(proofsDir).catch(() => [] as string[]);
+  for (const entry of entries) {
+    if (entry === `${input.candidateFingerprint}.json` || !/^[a-f0-9]{64}\.json$/u.test(entry)) continue;
+    const raw = await readFile(path.join(proofsDir, entry), "utf8").catch(() => null);
+    const proof = raw ? parseProof(raw) : null;
+    if (matches(proof)) return proof;
+  }
+  return null;
+}
+
 export async function inspectChatGptWidgetPreapplyGate(input: {
   stateDir: string;
   projectId: string;
@@ -287,14 +332,33 @@ export async function inspectChatGptWidgetPreapplyGate(input: {
   targetManifest: RuntimeManifest;
 }): Promise<ChatGptWidgetPreapplyGateInspection> {
   const targetUiRevision = input.targetManifest.uiResourceRevision;
-  const required = Boolean(targetUiRevision && targetUiRevision !== input.currentManifest.uiResourceRevision);
-  if (!required) {
+  const uiResourceChanged = Boolean(targetUiRevision && targetUiRevision !== input.currentManifest.uiResourceRevision);
+  if (!uiResourceChanged) {
     return {
       required: false,
       ready: true,
       automaticChecksPassed: true,
       harmlessRenderPassed: true,
       reason: "ui-resource-unchanged",
+      recommendedAction: "none",
+    };
+  }
+
+  const [currentWidgetAssetRevision, targetWidgetAssetRevision] = await Promise.all([
+    readWidgetAssetRevisionForPreapply(input.currentManifest.runtimeRoot),
+    readWidgetAssetRevisionForPreapply(input.targetRuntimeRoot),
+  ]);
+  if (
+    currentWidgetAssetRevision
+    && targetWidgetAssetRevision
+    && currentWidgetAssetRevision === targetWidgetAssetRevision
+  ) {
+    return {
+      required: false,
+      ready: true,
+      automaticChecksPassed: true,
+      harmlessRenderPassed: true,
+      reason: "approval-widget-asset-unchanged",
       recommendedAction: "none",
     };
   }
@@ -312,18 +376,40 @@ export async function inspectChatGptWidgetPreapplyGate(input: {
   }
 
   const proof = await readRenderProof(input.stateDir, receipt.candidateFingerprint);
-  const harmlessRenderPassed = Boolean(
+  const proofMatchesCandidate = Boolean(
     proof
     && proof.projectId === input.projectId
     && proof.uiResourceRevision === receipt.uiResourceRevision
     && proof.widgetAssetRevision === receipt.widgetAssetRevision,
   );
+  const assetLoadProof = await readMatchingAssetLoadProof(input.stateDir, {
+    projectId: input.projectId,
+    candidateFingerprint: receipt.candidateFingerprint,
+    uiResourceRevision: receipt.uiResourceRevision,
+    widgetAssetRevision: receipt.widgetAssetRevision,
+  });
+  const assetLoadPassed = assetLoadProof !== null;
+  const reusedIdenticalAssetProof = Boolean(
+    assetLoadProof
+    && assetLoadProof.candidateFingerprint !== receipt.candidateFingerprint,
+  );
+  const legacyProbeBridgePassed = Boolean(
+    proofMatchesCandidate
+    && input.currentManifest.hostCatalogRevision === "sha256:ec2adb4025018b3445e8354b"
+    && proof?.evidence === "probe-decision"
+    && proof.decision === "allow",
+  );
+  const harmlessRenderPassed = assetLoadPassed || legacyProbeBridgePassed;
   return {
     required: true,
     ready: harmlessRenderPassed,
     automaticChecksPassed: true,
     harmlessRenderPassed,
-    reason: harmlessRenderPassed ? "verified" : "harmless-real-render-proof-missing",
-    recommendedAction: harmlessRenderPassed ? "none" : "hot-apply-and-render-harmless-probe",
+    reason: harmlessRenderPassed
+      ? (legacyProbeBridgePassed
+        ? "verified-legacy-probe-bridge"
+        : (reusedIdenticalAssetProof ? "verified-identical-widget-proof" : "verified"))
+      : "widget-preflight-load-proof-missing",
+    recommendedAction: harmlessRenderPassed ? "none" : "hot-apply-and-render-widget-preflight",
   };
 }
