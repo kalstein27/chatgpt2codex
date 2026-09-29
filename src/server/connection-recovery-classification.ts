@@ -89,8 +89,8 @@ const CAPABILITY_RECOVERY_TOOLS = new Set([
 const CRITICAL_MUTATION_RECOVERY_TOOLS = new Set([
   "runtime_apply_local", "macos_app_apply_local", "verified_local_file_apply",
 ]);
+const VERSIONED_OPERATION_APPROVAL_PRESENTER_RE = /^chatgpt_operation_approval_presenter_v\d+$/u;
 const PRESENTATION_RECOVERY_TOOLS = new Set([
-  "chatgpt_operation_approval_presenter_v28",
   "chatgpt_manual_refresh_presenter_v1",
   "chatgpt_catalog_reentry_presenter_v1",
   "chatgpt_widget_preapply_presenter_v1",
@@ -104,7 +104,7 @@ function toolRecoveryPolicy(failedTool: string | undefined): {
   toolRecoveryFirst: string | null;
 } {
   if (!failedTool) return { toolRecoveryClass: "unknown", toolRecoveryPolicy: "inspect-before-action", toolRecoveryFirst: null };
-  if (PRESENTATION_RECOVERY_TOOLS.has(failedTool)) {
+  if (PRESENTATION_RECOVERY_TOOLS.has(failedTool) || VERSIONED_OPERATION_APPROVAL_PRESENTER_RE.test(failedTool)) {
     return { toolRecoveryClass: "presentation", toolRecoveryPolicy: "retry-presentation-only-after-route-recovery", toolRecoveryFirst: failedTool };
   }
   if (READ_ONLY_RECOVERY_TOOLS.has(failedTool)) {

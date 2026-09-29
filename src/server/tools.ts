@@ -12224,10 +12224,10 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           const operationActive = ["approval-wait", "queued", "spawning", "running", "cleanup"].includes(responseSnapshot.state);
           const pollAfterMs = operationActive ? recommendedOperationPollAfterMs(responseSnapshot) : undefined;
           await progress?.update(
-            operationActive ? "running" : "completed",
+            operationActive ? "running" : "serialize",
             operationActive
               ? "Background command still running; operation_status fallback required"
-              : "Background command completed within the original tool call",
+              : "Background command terminal; preparing result",
           );
           return makeResult(
             {
@@ -12270,14 +12270,14 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           commandId: input.commandId,
         });
         const observeLifecycle = (event: CommandLifecycleEvent) => {
-            void progress?.update(
-              event.phase,
-              event.phase === "running"
-                ? "Project command is running"
-                : event.phase === "cleanup"
-                  ? "Cleaning up project command"
-                  : "Project command completed",
-            );
+            if (event.phase !== "completed") {
+              void progress?.update(
+                event.phase,
+                event.phase === "running"
+                  ? "Project command is running"
+                  : "Cleaning up project command",
+              );
+            }
             void ctx.diagnostics?.record({
               event: "command.lifecycle",
               outcome: "info",
@@ -13167,10 +13167,10 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           const screenshot = "screenshot" in screenshotOutcome ? screenshotOutcome.screenshot : undefined;
           const screenshotDeferred = operationActive && input.captureScreenshot === true;
           await progress?.update(
-            operationActive ? "running" : "completed",
+            operationActive ? "running" : "finalizing",
             operationActive
               ? "Remote E2E command still running; operation_status fallback required"
-              : `Remote E2E command terminal; screenshot ${screenshotOutcome.screenshotStatus}`,
+              : `Remote E2E command terminal; screenshot ${screenshotOutcome.screenshotStatus}; preparing result`,
           );
           return withE2eImageContent(
             makeResult(

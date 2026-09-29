@@ -669,6 +669,8 @@ export class MobileApprovalBridge {
   private readonly sentLocalNoticeKeys = new Set<string>();
   private readonly localNoticeLastAttemptAt = new Map<string, number>();
   private polling = false;
+  private closing = false;
+  private pollDrain: Promise<void> | undefined;
   private pollFailureCount = 0;
   private nextPollAttemptAt = 0;
 
@@ -716,6 +718,7 @@ export class MobileApprovalBridge {
   }
 
   private async publishLocalOnlyNotice(config: MobileApprovalConfig, notice: LocalOnlyApprovalNotice, now: number): Promise<void> {
+    if (this.closing) return;
     if (this.sentLocalNoticeKeys.has(notice.key)) return;
     const lastAttemptAt = this.localNoticeLastAttemptAt.get(notice.key) ?? 0;
     if (now - lastAttemptAt < RETRY_INTERVAL_MS) return;
@@ -800,6 +803,7 @@ export class MobileApprovalBridge {
   }
 
   private async pollNtfyResponses(config: MobileApprovalConfig, now: number): Promise<void> {
+    if (this.closing) return;
     if (![...this.byToken.values()].some((challenge) => challenge.sent && challenge.expiresAt > now)) return;
     const url = `${config.ntfyBaseUrl}/${responseTopic(config)}/json?poll=1&since=30s`;
     try {
@@ -808,9 +812,11 @@ export class MobileApprovalBridge {
         headers: { accept: "application/x-ndjson" },
         signal: AbortSignal.timeout(PUBLISH_TIMEOUT_MS),
       });
+      if (this.closing) return;
       if (!response.ok) return;
       const body = await response.text();
       for (const line of body.split(/\r?\n/u)) {
+        if (this.closing) return;
         if (!line.trim()) continue;
         let event: unknown;
         try {
@@ -831,7 +837,7 @@ export class MobileApprovalBridge {
   }
 
   private async ensureCallbackServer(): Promise<void> {
-    if (this.server) return;
+    if (this.closing || this.server) return;
     const server = createServer((req, res) => {
       void this.handleCallback(req, res).catch(() => sendJson(res, 500, { ok: false }));
     });
@@ -848,7 +854,14 @@ export class MobileApprovalBridge {
       server.once("error", onError);
       server.once("listening", onListening);
       server.listen(this.callbackPort, CALLBACK_HOST);
-    }).then(() => {
+    }).then(async () => {
+      if (this.closing) {
+        if (this.server === server) this.server = undefined;
+        server.closeAllConnections?.();
+        await new Promise<void>((resolve) => server.close(() => resolve())).catch(() => undefined);
+        this.state().listening = false;
+        return;
+      }
       this.state().listening = true;
       this.state().error = null;
       server.unref();
@@ -860,7 +873,9 @@ export class MobileApprovalBridge {
   }
 
   async start(): Promise<void> {
+    if (this.closing) return;
     await this.ensureCallbackServer();
+    if (this.closing) return;
 
     this.timer = setInterval(() => {
       void this.poll();
@@ -870,8 +885,10 @@ export class MobileApprovalBridge {
   }
 
   async close(): Promise<void> {
+    this.closing = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = undefined;
+    await this.pollDrain?.catch(() => undefined);
     const server = this.server;
     this.server = undefined;
     if (server) {
@@ -887,14 +904,21 @@ export class MobileApprovalBridge {
   }
 
   async poll(now = Date.now()): Promise<void> {
-    if (this.polling || now < this.nextPollAttemptAt) return;
+    if (this.closing || this.polling || now < this.nextPollAttemptAt) return;
     this.polling = true;
+    let resolvePollDrain!: () => void;
+    const pollDrain = new Promise<void>((resolve) => {
+      resolvePollDrain = resolve;
+    });
+    this.pollDrain = pollDrain;
     try {
+      if (this.closing) return;
       if (!this.state().listening) {
         await this.ensureCallbackServer();
-        if (!this.state().listening) return;
+        if (this.closing || !this.state().listening) return;
       }
       const config = await readMobileApprovalConfig(this.stateDir);
+      if (this.closing) return;
       const requests = await listOperationApprovalRequests(this.stateDir, now);
       let pending = new Map(
         requests
@@ -923,6 +947,7 @@ export class MobileApprovalBridge {
       }
 
       await this.pollNtfyResponses(config, now);
+      if (this.closing) return;
       const refreshedRequests = await listOperationApprovalRequests(this.stateDir, now);
       const pendingOperations = refreshedRequests
         .filter((request) => request.status === "pending" && request.expiresAt > now);
@@ -948,10 +973,12 @@ export class MobileApprovalBridge {
       const localOnlyNotices = [...localOnlyOperationNotices, ...rgNotices, ...armNotices];
       this.cleanupLocalNoticeTracking(new Set(localOnlyNotices.map((notice) => notice.key)));
       for (const notice of localOnlyNotices) {
+        if (this.closing) return;
         await this.publishLocalOnlyNotice(config, notice, now);
       }
 
       for (const request of pending.values()) {
+        if (this.closing) return;
         let challenge: MobileApprovalChallenge | undefined;
         const existingToken = this.tokenByRequest.get(request.requestId);
         if (existingToken) challenge = this.byToken.get(existingToken);
@@ -973,6 +1000,7 @@ export class MobileApprovalBridge {
         if (challenge.sent || now - challenge.lastAttemptAt < RETRY_INTERVAL_MS) continue;
         challenge.lastAttemptAt = now;
         try {
+          if (this.closing) return;
           await publishNtfy(this.fetchImpl, config, request, challenge.token);
           challenge.sent = true;
           this.state().lastPublishAt = now;
@@ -1004,6 +1032,8 @@ export class MobileApprovalBridge {
       }).catch(() => undefined);
     } finally {
       this.polling = false;
+      resolvePollDrain();
+      if (this.pollDrain === pollDrain) this.pollDrain = undefined;
     }
   }
 
