@@ -426,15 +426,12 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     }
     * { box-sizing: border-box; }
     body { margin: 0; background: var(--bg); color: var(--text); }
-    .desktop-shell { min-height: 100vh; display: grid; grid-template-columns: 220px minmax(0,1fr); }
-    .app-sidebar { position: sticky; top: 0; height: 100vh; padding: 18px 12px 14px; border-right: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 94%, var(--bg)); }
-    .sidebar-brand { padding: 2px 8px 16px; }
-    .sidebar-eyebrow { color: var(--muted); font-size: 9px; font-weight: 780; letter-spacing: .12em; }
-    .sidebar-title { margin-top: 4px; font-size: 19px; font-weight: 790; letter-spacing: -.02em; }
+    .desktop-shell { min-height: 100vh; display: grid; grid-template-columns: 168px minmax(0,1fr); }
+    .app-sidebar { position: sticky; top: 0; height: 100vh; padding: 12px 8px; border-right: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 94%, var(--bg)); }
     .sidebar-nav { display: grid; gap: 4px; }
-    .sidebar-nav .view-tab { width: 100%; min-height: 40px; display: flex; align-items: center; justify-content: flex-start; border: 1px solid transparent; border-radius: 10px; padding: 8px 10px; background: transparent; color: var(--muted); font-size: 12px; font-weight: 690; text-align: left; }
+    .sidebar-nav .view-tab { width: 100%; min-height: 36px; display: flex; align-items: center; justify-content: flex-start; border: 1px solid transparent; border-radius: 8px; padding: 7px 8px; background: transparent; color: var(--muted); font-size: 11.5px; font-weight: 690; text-align: left; }
+    .sidebar-nav .view-tab[hidden] { display: none; }
     .sidebar-nav .view-tab.active { background: color-mix(in srgb, var(--blue) 9%, var(--panel)); border-color: color-mix(in srgb, var(--blue) 18%, var(--line)); color: var(--blue); box-shadow: none; }
-    .sidebar-meta { position: absolute; left: 20px; right: 20px; bottom: 15px; color: var(--muted); font-size: 9.5px; line-height: 1.45; }
     .app-main { min-width: 0; }
     main { width: min(1120px, 100%); margin: 0 auto; padding: max(12px, env(safe-area-inset-top)) 18px max(28px, env(safe-area-inset-bottom)); }
     header { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 44px; margin: 0 2px 11px; }
@@ -766,10 +763,6 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
 <!-- activity-dashboard-hot-override-enabled -->
 <div class="desktop-shell">
 <aside class="app-sidebar" aria-label="ChatGPT To Codex 탐색">
-  <div class="sidebar-brand">
-    <div class="sidebar-eyebrow">CHATGPT TO CODEX</div>
-    <div class="sidebar-title">Local Agent</div>
-  </div>
   <nav class="sidebar-nav" aria-label="데스크톱 보기">
     <button id="view-activity" class="view-tab active" type="button">작업 현황</button>
     <button id="view-approvals" class="view-tab" type="button">승인</button>
@@ -778,7 +771,6 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     <button id="view-settings" class="view-tab" type="button">설정</button>
     <button id="view-diagnostics" class="view-tab" type="button">진단</button>
   </nav>
-  <div class="sidebar-meta">Mac · Windows 공통 데스크톱 UI</div>
 </aside>
 <div class="app-main">
 <main>
