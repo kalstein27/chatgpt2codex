@@ -41,11 +41,14 @@ const FINALIZATION_INSTRUCTION = [
   "Never use c2ct_invoke to render a Widget Shell card or any approval presenter.",
 ] .join(" ");
 
+const PHASE_BOUNDARY_INSTRUCTION =
+  "When substantive tool work continues across a real work-phase change (for example inspect/analysis -> edit -> verify/apply/recovery), treat that change as a user-visible boundary: emit one short, truthful assistant commentary immediately before the first tool call of the new phase, even when the previous heartbeat was recent. Keep consecutive calls within the same phase quiet so the host may group them naturally. Approval, blocker, and error surfaces already form visible boundaries, so do not add duplicate commentary around them. Describe only observable work such as '관련 코드 확인 중…', '수정 반영 중…', '검증 중…', or '복구 확인 중…'; never claim model-internal thinking or use '생각중…' as if C2CT could observe it. Do not create empty messages, no-op/separator tools, or synthetic conversation turns merely to force a visual split. ";
+
 const QUIET_INSTRUCTION =
-  "Keep tool-by-tool chatter hidden, but do not leave the user staring at a silent 'thinking' state during multi-step C2CT work. Emit one short user-visible progress heartbeat before the first substantive project operation, then only when the work changes phase (for example inspect -> edit -> verify/apply) or after roughly 20-30 seconds / 4-6 consecutive C2CT calls without visible text. Use one compact sentence such as '관련 코드 확인 중…', '수정 반영 중…', or '검증 중…'. Do not enumerate tool names or repeat tool results. Approval, blocker, and error messages remain immediately visible. " + FINALIZATION_INSTRUCTION;
+  "Keep tool-by-tool chatter hidden, but do not leave the user staring at a silent 'thinking' state during multi-step C2CT work. Emit one short user-visible progress heartbeat before the first substantive project operation. " + PHASE_BOUNDARY_INSTRUCTION + "When no real phase change occurs, use roughly 20-30 seconds / 4-6 consecutive C2CT calls without visible text only as a fallback heartbeat cadence. Do not enumerate tool names or repeat tool results. " + FINALIZATION_INSTRUCTION;
 
 const VERBOSE_INSTRUCTION =
-  "Intermediate commentary is allowed when it materially helps the user follow the work. Keep it concise and avoid repeating tool results. Approval, blocker, error, and final completion messages remain visible. " + FINALIZATION_INSTRUCTION;
+  "Intermediate commentary is allowed when it materially helps the user follow the work. Keep it concise and avoid repeating tool results. " + PHASE_BOUNDARY_INSTRUCTION + "Approval, blocker, error, and final completion messages remain visible. " + FINALIZATION_INSTRUCTION;
 
 let revision = 1;
 let state: OutputPolicySnapshot = snapshot(
