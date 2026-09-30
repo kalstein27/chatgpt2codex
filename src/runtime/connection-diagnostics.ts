@@ -129,6 +129,8 @@ export interface TurnLossRecoveryEvidence {
   leasePreset?: "read-only" | "tests-only" | "full-write" | "image-only" | "control";
   triggerTool?: string;
   idleMs?: number;
+  previousToolCompletedAt?: string;
+  postToolSilenceMs?: number;
   previousToolSucceeded: boolean;
   transportErrorObserved: boolean;
   unreleasedPrivilegedLaneObserved: true;
@@ -422,6 +424,10 @@ function turnLossRecoveries(
       ...(cleanup.tool ? { triggerTool: cleanup.tool } : {}),
       ...(Number.isFinite(cleanup.durationMs) ? { idleMs: Math.max(0, cleanup.durationMs ?? 0) } : {}),
       previousToolSucceeded: previousToolCall?.outcome === "success",
+      ...(previousToolCall ? { previousToolCompletedAt: previousToolCall.at } : {}),
+      ...(Number.isFinite(previousAt) && Number.isFinite(cleanupAt)
+        ? { postToolSilenceMs: Math.max(0, cleanupAt - previousAt) }
+        : {}),
       transportErrorObserved,
       unreleasedPrivilegedLaneObserved: true,
       automaticRetrySafe: false,

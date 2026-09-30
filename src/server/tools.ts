@@ -10746,7 +10746,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Read multiple file slices",
       description:
-        "Read up to 12 project file slices in one host call. Each slice keeps the same secret-path, redaction, line-range, and hash semantics as file_read_slice. Per-slice failures are returned independently so one missing or denied file does not discard the other reads. The combined response is byte-bounded to reduce host backpressure.",
+        "Read up to 12 project file slices in one host call. Each slice keeps the same secret-path, redaction, line-range, and hash semantics as file_read_slice. Remote ChatGPT defaults to compact whole-file hashes and a smaller response budget; request line hashes or a larger maxTotalBytes only when needed. Per-slice failures are returned independently so one missing or denied file does not discard the other reads.",
       annotations: READ_ONLY_ANNOTATIONS,
       _meta: chatGptToolMeta("Reading file batch...", "File batch loaded"),
       inputSchema: {
@@ -10773,7 +10773,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           await requireProjectLease(ctx, input.projectId, "read", input.workLaneId);
         }
         const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
-        const maxTotalBytes = input.maxTotalBytes ?? 256 * 1024;
+        const maxTotalBytes = input.maxTotalBytes ?? (ctx.remote === true ? 64 * 1024 : 256 * 1024);
         let bytesUsed = 0;
         let truncated = false;
         const results: Array<Record<string, unknown>> = [];
@@ -10793,7 +10793,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             const abs = await resolveInProject(entry.root, request.path, { allowSymlink: false });
             await guardSecretPath(ctx, abs, "file_read_batch");
             const start = request.start ?? (request.offset !== undefined ? request.offset + 1 : undefined);
-            const hashMode = request.hashMode ?? "lines";
+            const hashMode = request.hashMode ?? (ctx.remote === true ? "file" : "lines");
             const slice = await readSlice(entry.root, request.path, start, request.end, hashMode);
             const content = redact(slice.content);
             const redactionApplied = content !== slice.content;
