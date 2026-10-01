@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { getRuntimeManifestForRoot, type RuntimeManifest } from "./runtime-manifest.js";
@@ -13,13 +13,30 @@ const FILE_MODE = 0o600;
 const PREPARE_SCHEMA_VERSION = 1 as const;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/u;
+const PREPARE_POLL_MS = 25;
+
+type RuntimeUpdatePrepareInput = {
+  stateDir: string;
+  projectId: string;
+  currentRuntimeRoot: string;
+  candidateRuntimeRoot: string;
+  expectedCurrentFingerprint: string;
+  expectedCandidateFingerprint: string;
+  requestId: string;
+  retentionOptions?: RuntimeSnapshotInventoryOptions;
+};
+
+const activePrepareWorkers = new Map<string, Promise<void>>();
 
 export type RuntimeUpdatePrepareState =
+  | "PREPARING"
   | "PREPARED"
   | "ALREADY_PREPARED"
   | "PRECONDITION_FAILED"
   | "CANDIDATE_INVALID"
-  | "REQUEST_CONFLICT";
+  | "REQUEST_CONFLICT"
+  | "FAILED"
+  | "INTERRUPTED";
 
 export interface RuntimeUpdateCheckResult {
   currentManifest: RuntimeManifest;
@@ -53,6 +70,10 @@ export interface RuntimeUpdatePrepareReceipt {
     remainingSnapshotCount: number | null;
     warning: "automatic-prune-failed" | "running-process-scan-unavailable" | null;
   };
+  phase?: string;
+  workerRuntimePid?: number;
+  errorCode?: string;
+  automaticRetrySafe?: false;
   recommendedAction: string;
 }
 
@@ -161,14 +182,91 @@ export async function getRuntimeUpdatePrepareReceipt(
         if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
         throw error;
       });
-    return parsed !== null && isPrepareReceipt(parsed) ? parsed : null;
+    return parsed !== null && isPrepareReceipt(parsed) ? reconcilePrepareReceipt(stateDir, parsed) : null;
   }
   if (!lookup.requestId || !REQUEST_ID_PATTERN.test(lookup.requestId)) return null;
-  return (await readPrepareReceipts(stateDir)).find((entry) => entry.requestId === lookup.requestId) ?? null;
+  const found = (await readPrepareReceipts(stateDir)).find((entry) => entry.requestId === lookup.requestId) ?? null;
+  return found ? reconcilePrepareReceipt(stateDir, found) : null;
 }
 
 async function writePrepareReceipt(stateDir: string, receipt: RuntimeUpdatePrepareReceipt): Promise<void> {
   await atomicWriteJson(path.join(prepareRoot(stateDir), `${receipt.operationId}.json`), receipt);
+}
+
+function deterministicPrepareOperationId(projectId: string, requestId: string): string {
+  const hex = createHash("sha256").update(projectId).update("\0").update(requestId).digest("hex").slice(0, 32);
+  return `prep_${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+async function createPrepareReceiptIfAbsent(
+  stateDir: string,
+  receipt: RuntimeUpdatePrepareReceipt,
+): Promise<boolean> {
+  const root = prepareRoot(stateDir);
+  await ensurePrivateDirectory(root);
+  const file = path.join(root, `${receipt.operationId}.json`);
+  try {
+    await fs.writeFile(file, `${JSON.stringify(receipt, null, 2)}\n`, {
+      encoding: "utf8",
+      mode: FILE_MODE,
+      flag: "wx",
+    });
+    await fs.chmod(file, FILE_MODE).catch(() => undefined);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+}
+
+async function updatePreparePhase(
+  stateDir: string,
+  current: RuntimeUpdatePrepareReceipt,
+  phase: string,
+): Promise<RuntimeUpdatePrepareReceipt> {
+  const updated: RuntimeUpdatePrepareReceipt = {
+    ...current,
+    state: "PREPARING",
+    phase,
+    updatedAt: new Date().toISOString(),
+    workerRuntimePid: process.pid,
+    automaticRetrySafe: false,
+    recommendedAction: "runtime_update_prepare_status",
+  };
+  await writePrepareReceipt(stateDir, updated);
+  return updated;
+}
+
+function processAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function reconcilePrepareReceipt(
+  stateDir: string,
+  current: RuntimeUpdatePrepareReceipt,
+): Promise<RuntimeUpdatePrepareReceipt> {
+  if (
+    current.state !== "PREPARING"
+    || !current.workerRuntimePid
+    || current.workerRuntimePid === process.pid
+    || processAlive(current.workerRuntimePid)
+  ) return current;
+  const interrupted: RuntimeUpdatePrepareReceipt = {
+    ...current,
+    state: "INTERRUPTED",
+    phase: "worker-lost",
+    updatedAt: new Date().toISOString(),
+    errorCode: "RUNTIME_PREPARE_WORKER_LOST",
+    automaticRetrySafe: false,
+    recommendedAction: "inspect-before-retry",
+  };
+  await writePrepareReceipt(stateDir, interrupted);
+  return interrupted;
 }
 
 async function copyIfPresent(source: string, destination: string): Promise<boolean> {
@@ -236,6 +334,8 @@ async function prepareSnapshot(input: {
 }
 
 function receipt(input: {
+  operationId?: string;
+  createdAt?: string;
   requestId: string;
   projectId: string;
   state: RuntimeUpdatePrepareState;
@@ -247,16 +347,19 @@ function receipt(input: {
   snapshotRuntimeRoot?: string | null;
   reusedSnapshot?: boolean;
   automaticRetention?: RuntimeUpdatePrepareReceipt["automaticRetention"];
+  phase?: string;
+  workerRuntimePid?: number;
+  errorCode?: string;
   recommendedAction: string;
 }): RuntimeUpdatePrepareReceipt {
   const now = new Date().toISOString();
   return {
     schemaVersion: PREPARE_SCHEMA_VERSION,
     requestId: input.requestId,
-    operationId: `prep_${randomUUID()}`,
+    operationId: input.operationId ?? `prep_${randomUUID()}`,
     projectId: input.projectId,
     state: input.state,
-    createdAt: now,
+    createdAt: input.createdAt ?? now,
     updatedAt: now,
     expectedCurrentFingerprint: input.expectedCurrentFingerprint,
     expectedCandidateFingerprint: input.expectedCandidateFingerprint,
@@ -266,94 +369,100 @@ function receipt(input: {
     candidateManifest: input.candidateManifest,
     reusedSnapshot: input.reusedSnapshot ?? false,
     ...(input.automaticRetention ? { automaticRetention: input.automaticRetention } : {}),
+    ...(input.phase ? { phase: input.phase } : {}),
+    ...(input.workerRuntimePid ? { workerRuntimePid: input.workerRuntimePid } : {}),
+    ...(input.errorCode ? { errorCode: input.errorCode } : {}),
+    automaticRetrySafe: false,
     recommendedAction: input.recommendedAction,
   };
 }
 
-export async function prepareRuntimeUpdateSnapshot(input: {
-  stateDir: string;
-  projectId: string;
+function prepareRequestConflicts(existing: RuntimeUpdatePrepareReceipt, input: RuntimeUpdatePrepareInput): boolean {
+  return existing.expectedCurrentFingerprint !== input.expectedCurrentFingerprint.toLowerCase()
+    || existing.expectedCandidateFingerprint !== input.expectedCandidateFingerprint.toLowerCase()
+    || existing.projectId !== input.projectId;
+}
+
+function prepareConflict(existing: RuntimeUpdatePrepareReceipt): RuntimeUpdatePrepareReceipt {
+  return {
+    ...existing,
+    state: "REQUEST_CONFLICT",
+    updatedAt: new Date().toISOString(),
+    automaticRetrySafe: false,
+    recommendedAction: "use-a-new-requestId",
+  };
+}
+
+async function existingPrepareForInput(input: RuntimeUpdatePrepareInput): Promise<RuntimeUpdatePrepareReceipt | null> {
+  const existing = (await readPrepareReceipts(input.stateDir)).find((entry) => entry.requestId === input.requestId);
+  if (!existing) return null;
+  const reconciled = await reconcilePrepareReceipt(input.stateDir, existing);
+  return prepareRequestConflicts(reconciled, input) ? prepareConflict(reconciled) : reconciled;
+}
+
+async function runRuntimeUpdatePrepareWorker(input: {
+  request: RuntimeUpdatePrepareInput;
   currentRuntimeRoot: string;
   candidateRuntimeRoot: string;
-  expectedCurrentFingerprint: string;
-  expectedCandidateFingerprint: string;
-  requestId: string;
-  retentionOptions?: RuntimeSnapshotInventoryOptions;
-}): Promise<RuntimeUpdatePrepareReceipt> {
-  if (!REQUEST_ID_PATTERN.test(input.requestId)) throw new Error("Invalid runtime prepare requestId");
-  if (!SHA256_PATTERN.test(input.expectedCurrentFingerprint) || !SHA256_PATTERN.test(input.expectedCandidateFingerprint)) {
-    throw new Error("Invalid runtime prepare fingerprint");
-  }
-  const existing = (await readPrepareReceipts(input.stateDir)).find((entry) => entry.requestId === input.requestId);
-  if (existing) {
-    if (existing.expectedCurrentFingerprint !== input.expectedCurrentFingerprint ||
-        existing.expectedCandidateFingerprint !== input.expectedCandidateFingerprint ||
-        existing.projectId !== input.projectId) {
-      return { ...existing, state: "REQUEST_CONFLICT", recommendedAction: "use-a-new-requestId" };
+  currentManifest: RuntimeManifest;
+  candidateManifest: RuntimeManifest;
+  preparing: RuntimeUpdatePrepareReceipt;
+}): Promise<void> {
+  const { request, currentRuntimeRoot, candidateRuntimeRoot, currentManifest, candidateManifest } = input;
+  let current = input.preparing;
+  try {
+    current = await updatePreparePhase(request.stateDir, current, "inspect-snapshot");
+    const candidateSnapshotId = candidateManifest.runtimeSnapshotId;
+    if (!candidateSnapshotId) throw new Error("Candidate runtime snapshot identity is incomplete");
+    const candidateSnapshotPath = path.join(
+      snapshotRoot(request.stateDir),
+      `runtime-${candidateSnapshotId.slice("sha256:".length)}`,
+    );
+    const existingCandidateSnapshotRoot = await fs.realpath(candidateSnapshotPath).catch(() => null);
+    if (existingCandidateSnapshotRoot) {
+      const existingManifest = getRuntimeManifestForRoot(existingCandidateSnapshotRoot);
+      if (existingManifest.runtimeSnapshotId !== candidateSnapshotId ||
+          existingManifest.runtimeFingerprint !== candidateManifest.runtimeFingerprint) {
+        throw new Error("Existing runtime snapshot path contains a different artifact");
+      }
     }
-    return existing;
-  }
 
-  const currentRuntimeRoot = await fs.realpath(input.currentRuntimeRoot);
-  const candidateRuntimeRoot = await fs.realpath(input.candidateRuntimeRoot);
-  const currentManifest = getRuntimeManifestForRoot(currentRuntimeRoot);
-  const candidateManifest = getRuntimeManifestForRoot(candidateRuntimeRoot);
-
-  if (currentManifest.runtimeFingerprint !== input.expectedCurrentFingerprint.toLowerCase()) {
-    const result = receipt({
-      requestId: input.requestId,
-      projectId: input.projectId,
-      state: "PRECONDITION_FAILED",
-      expectedCurrentFingerprint: input.expectedCurrentFingerprint.toLowerCase(),
-      expectedCandidateFingerprint: input.expectedCandidateFingerprint.toLowerCase(),
-      currentManifest,
-      candidateManifest,
-      recommendedAction: "refresh-runtime-update-check",
-    });
-    await writePrepareReceipt(input.stateDir, result);
-    return result;
-  }
-
-  if (candidateManifest.runtimeFingerprint !== input.expectedCandidateFingerprint.toLowerCase() ||
-      runtimeIdentityWarnings(candidateManifest).length > 0) {
-    const result = receipt({
-      requestId: input.requestId,
-      projectId: input.projectId,
-      state: "CANDIDATE_INVALID",
-      expectedCurrentFingerprint: input.expectedCurrentFingerprint.toLowerCase(),
-      expectedCandidateFingerprint: input.expectedCandidateFingerprint.toLowerCase(),
-      currentManifest,
-      candidateManifest,
-      recommendedAction: "rebuild-canonical-runtime-candidate",
-    });
-    await writePrepareReceipt(input.stateDir, result);
-    return result;
-  }
-
-  const candidateSnapshotId = candidateManifest.runtimeSnapshotId;
-  if (!candidateSnapshotId) throw new Error("Candidate runtime snapshot identity is incomplete");
-  const candidateSnapshotPath = path.join(
-    snapshotRoot(input.stateDir),
-    `runtime-${candidateSnapshotId.slice("sha256:".length)}`,
-  );
-  const existingCandidateSnapshotRoot = await fs.realpath(candidateSnapshotPath).catch(() => null);
-  if (existingCandidateSnapshotRoot) {
-    const existingManifest = getRuntimeManifestForRoot(existingCandidateSnapshotRoot);
-    if (existingManifest.runtimeSnapshotId !== candidateSnapshotId ||
-        existingManifest.runtimeFingerprint !== candidateManifest.runtimeFingerprint) {
-      throw new Error("Existing runtime snapshot path contains a different artifact");
+    const removedSnapshotNames = new Set<string>();
+    let retentionPolicy: RuntimeSnapshotRetentionPolicy | null = null;
+    let retentionWarning: "automatic-prune-failed" | "running-process-scan-unavailable" | null = null;
+    let remainingSnapshotCount: number | null = null;
+    if (!existingCandidateSnapshotRoot) {
+      current = await updatePreparePhase(request.stateDir, current, "retention-before-copy");
+      try {
+        const pruned = await pruneRuntimeSnapshots(request.stateDir, { maxSnapshots: 9 }, request.retentionOptions);
+        pruned.removed.forEach((name) => removedSnapshotNames.add(name));
+        retentionPolicy = pruned.after.policy;
+        remainingSnapshotCount = pruned.after.snapshotCount;
+        if (pruned.after.snapshots.some((entry) => entry.protectedReasons.includes("running-process-scan-unavailable"))) {
+          retentionWarning = "running-process-scan-unavailable";
+        }
+      } catch {
+        retentionWarning = "automatic-prune-failed";
+      }
     }
-  }
 
-  const removedSnapshotNames = new Set<string>();
-  let retentionPolicy: RuntimeSnapshotRetentionPolicy | null = null;
-  let retentionWarning: "automatic-prune-failed" | "running-process-scan-unavailable" | null = null;
-  let remainingSnapshotCount: number | null = null;
-  if (!existingCandidateSnapshotRoot) {
+    current = await updatePreparePhase(request.stateDir, current, "snapshot-copy");
+    const snapshot = await prepareSnapshot({
+      stateDir: request.stateDir,
+      currentRuntimeRoot,
+      candidateRuntimeRoot,
+      candidateManifest,
+    });
+
+    current = await updatePreparePhase(request.stateDir, current, "retention-after-copy");
     try {
-      // Reserve one slot only when a new copy is actually required. Reusing an
-      // already-verified snapshot must not discard an extra rollback candidate.
-      const pruned = await pruneRuntimeSnapshots(input.stateDir, { maxSnapshots: 9 }, input.retentionOptions);
+      const pruned = await pruneRuntimeSnapshots(request.stateDir, {}, {
+        ...request.retentionOptions,
+        protectedSnapshotRoots: [
+          ...(request.retentionOptions?.protectedSnapshotRoots ?? []),
+          snapshot.snapshotRuntimeRoot,
+        ],
+      });
       pruned.removed.forEach((name) => removedSnapshotNames.add(name));
       retentionPolicy = pruned.after.policy;
       remainingSnapshotCount = pruned.after.snapshotCount;
@@ -363,44 +472,141 @@ export async function prepareRuntimeUpdateSnapshot(input: {
     } catch {
       retentionWarning = "automatic-prune-failed";
     }
-  }
-  const snapshot = await prepareSnapshot({ stateDir: input.stateDir, currentRuntimeRoot, candidateRuntimeRoot, candidateManifest });
-  try {
-    const pruned = await pruneRuntimeSnapshots(input.stateDir, {}, {
-      ...input.retentionOptions,
-      protectedSnapshotRoots: [
-        ...(input.retentionOptions?.protectedSnapshotRoots ?? []),
-        snapshot.snapshotRuntimeRoot,
-      ],
+
+    const result = receipt({
+      operationId: current.operationId,
+      createdAt: current.createdAt,
+      requestId: request.requestId,
+      projectId: request.projectId,
+      state: snapshot.reusedSnapshot ? "ALREADY_PREPARED" : "PREPARED",
+      expectedCurrentFingerprint: request.expectedCurrentFingerprint.toLowerCase(),
+      expectedCandidateFingerprint: request.expectedCandidateFingerprint.toLowerCase(),
+      currentManifest,
+      candidateManifest,
+      runtimeSnapshotId: candidateManifest.runtimeSnapshotId,
+      snapshotRuntimeRoot: snapshot.snapshotRuntimeRoot,
+      reusedSnapshot: snapshot.reusedSnapshot,
+      automaticRetention: {
+        policy: retentionPolicy,
+        removedSnapshotIds: [...removedSnapshotNames].map((name) => `sha256:${name.slice("runtime-".length)}`),
+        remainingSnapshotCount,
+        warning: retentionWarning,
+      },
+      phase: "completed",
+      recommendedAction: "runtime_apply_local",
     });
-    pruned.removed.forEach((name) => removedSnapshotNames.add(name));
-    retentionPolicy = pruned.after.policy;
-    remainingSnapshotCount = pruned.after.snapshotCount;
-    if (pruned.after.snapshots.some((entry) => entry.protectedReasons.includes("running-process-scan-unavailable"))) {
-      retentionWarning = "running-process-scan-unavailable";
-    }
+    await writePrepareReceipt(request.stateDir, result);
   } catch {
-    retentionWarning = "automatic-prune-failed";
+    const failed: RuntimeUpdatePrepareReceipt = {
+      ...current,
+      state: "FAILED",
+      phase: "failed",
+      updatedAt: new Date().toISOString(),
+      errorCode: "RUNTIME_PREPARE_FAILED",
+      automaticRetrySafe: false,
+      recommendedAction: "inspect-before-retry",
+    };
+    await writePrepareReceipt(request.stateDir, failed).catch(() => undefined);
   }
-  const result = receipt({
+}
+
+export async function startRuntimeUpdateSnapshotPrepare(
+  input: RuntimeUpdatePrepareInput,
+): Promise<RuntimeUpdatePrepareReceipt> {
+  if (!REQUEST_ID_PATTERN.test(input.requestId)) throw new Error("Invalid runtime prepare requestId");
+  if (!SHA256_PATTERN.test(input.expectedCurrentFingerprint) || !SHA256_PATTERN.test(input.expectedCandidateFingerprint)) {
+    throw new Error("Invalid runtime prepare fingerprint");
+  }
+  const existing = await existingPrepareForInput(input);
+  if (existing) return existing;
+
+  const currentRuntimeRoot = await fs.realpath(input.currentRuntimeRoot);
+  const candidateRuntimeRoot = await fs.realpath(input.candidateRuntimeRoot);
+  const currentManifest = getRuntimeManifestForRoot(currentRuntimeRoot);
+  const candidateManifest = getRuntimeManifestForRoot(candidateRuntimeRoot);
+  const operationId = deterministicPrepareOperationId(input.projectId, input.requestId);
+
+  if (currentManifest.runtimeFingerprint !== input.expectedCurrentFingerprint.toLowerCase()) {
+    const result = receipt({
+      operationId,
+      requestId: input.requestId,
+      projectId: input.projectId,
+      state: "PRECONDITION_FAILED",
+      expectedCurrentFingerprint: input.expectedCurrentFingerprint.toLowerCase(),
+      expectedCandidateFingerprint: input.expectedCandidateFingerprint.toLowerCase(),
+      currentManifest,
+      candidateManifest,
+      recommendedAction: "refresh-runtime-update-check",
+    });
+    if (await createPrepareReceiptIfAbsent(input.stateDir, result)) return result;
+    const raced = await getRuntimeUpdatePrepareReceipt(input.stateDir, { operationId });
+    if (!raced) throw new Error("Runtime prepare receipt reservation was lost");
+    return prepareRequestConflicts(raced, input) ? prepareConflict(raced) : raced;
+  }
+
+  if (candidateManifest.runtimeFingerprint !== input.expectedCandidateFingerprint.toLowerCase() ||
+      runtimeIdentityWarnings(candidateManifest).length > 0) {
+    const result = receipt({
+      operationId,
+      requestId: input.requestId,
+      projectId: input.projectId,
+      state: "CANDIDATE_INVALID",
+      expectedCurrentFingerprint: input.expectedCurrentFingerprint.toLowerCase(),
+      expectedCandidateFingerprint: input.expectedCandidateFingerprint.toLowerCase(),
+      currentManifest,
+      candidateManifest,
+      recommendedAction: "rebuild-canonical-runtime-candidate",
+    });
+    if (await createPrepareReceiptIfAbsent(input.stateDir, result)) return result;
+    const raced = await getRuntimeUpdatePrepareReceipt(input.stateDir, { operationId });
+    if (!raced) throw new Error("Runtime prepare receipt reservation was lost");
+    return prepareRequestConflicts(raced, input) ? prepareConflict(raced) : raced;
+  }
+
+  const preparing = receipt({
+    operationId,
     requestId: input.requestId,
     projectId: input.projectId,
-    state: snapshot.reusedSnapshot ? "ALREADY_PREPARED" : "PREPARED",
+    state: "PREPARING",
     expectedCurrentFingerprint: input.expectedCurrentFingerprint.toLowerCase(),
     expectedCandidateFingerprint: input.expectedCandidateFingerprint.toLowerCase(),
     currentManifest,
     candidateManifest,
-    runtimeSnapshotId: candidateManifest.runtimeSnapshotId,
-    snapshotRuntimeRoot: snapshot.snapshotRuntimeRoot,
-    reusedSnapshot: snapshot.reusedSnapshot,
-    automaticRetention: {
-      policy: retentionPolicy,
-      removedSnapshotIds: [...removedSnapshotNames].map((name) => `sha256:${name.slice("runtime-".length)}`),
-      remainingSnapshotCount,
-      warning: retentionWarning,
-    },
-    recommendedAction: "runtime_apply_local",
+    phase: "queued",
+    workerRuntimePid: process.pid,
+    recommendedAction: "runtime_update_prepare_status",
   });
-  await writePrepareReceipt(input.stateDir, result);
-  return result;
+  if (!(await createPrepareReceiptIfAbsent(input.stateDir, preparing))) {
+    const raced = await getRuntimeUpdatePrepareReceipt(input.stateDir, { operationId });
+    if (!raced) throw new Error("Runtime prepare receipt reservation was lost");
+    return prepareRequestConflicts(raced, input) ? prepareConflict(raced) : raced;
+  }
+
+  const worker = runRuntimeUpdatePrepareWorker({
+    request: input,
+    currentRuntimeRoot,
+    candidateRuntimeRoot,
+    currentManifest,
+    candidateManifest,
+    preparing,
+  }).finally(() => {
+    activePrepareWorkers.delete(operationId);
+  });
+  activePrepareWorkers.set(operationId, worker);
+  return preparing;
+}
+
+export async function prepareRuntimeUpdateSnapshot(
+  input: RuntimeUpdatePrepareInput,
+): Promise<RuntimeUpdatePrepareReceipt> {
+  const started = await startRuntimeUpdateSnapshotPrepare(input);
+  if (started.state !== "PREPARING") return started;
+  const localWorker = activePrepareWorkers.get(started.operationId);
+  if (localWorker) await localWorker;
+  while (true) {
+    const current = await getRuntimeUpdatePrepareReceipt(input.stateDir, { operationId: started.operationId });
+    if (!current) throw new Error("Runtime prepare receipt disappeared");
+    if (current.state !== "PREPARING") return current;
+    await new Promise((resolve) => setTimeout(resolve, PREPARE_POLL_MS));
+  }
 }

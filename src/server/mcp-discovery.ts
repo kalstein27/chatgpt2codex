@@ -15,7 +15,7 @@ export const MCP_SERVER_INFO_META_KEY = "io.modelcontextprotocol/serverInfo";
 export const MCP_SCHEMA_CACHE_TTL_MS = 0;
 export const MCP_DISCOVERY_TTL_MS = MCP_SCHEMA_CACHE_TTL_MS;
 export const MCP_TOOL_LIST_TTL_MS = MCP_SCHEMA_CACHE_TTL_MS;
-export const MCP_SCHEMA_CONTRACT_VERSION = 4;
+export const MCP_SCHEMA_CONTRACT_VERSION = 5;
 export const MCP_SCHEMA_REVISION_META_KEY = "io.ezbuilder.chatgpt2codex/schemaRevision";
 export const MCP_SCHEMA_EXPIRED_META_KEY = "io.ezbuilder.chatgpt2codex/schemaExpired";
 export const MCP_SCHEMA_REVALIDATE_META_KEY = "io.ezbuilder.chatgpt2codex/schemaMustRevalidate";
@@ -55,6 +55,7 @@ export const MCP_CORE_TOOL_NAMES = [
   "project_status",
   "project_rules",
   "operation_status",
+  "operation_result",
   "runtime_apply_status",
   "macos_app_apply_status",
   "runtime_snapshot_status",

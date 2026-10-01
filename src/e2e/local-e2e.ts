@@ -221,6 +221,7 @@ export async function startE2eServer(
     label?: string;
     waitUrl?: string;
     waitTimeoutSec?: number;
+    onPhase?: (phase: "spawned" | "readiness") => void | Promise<void>;
   },
 ): Promise<{
   runId: string;
@@ -254,7 +255,9 @@ export async function startE2eServer(
   });
   child.unref();
   await out.close();
+  await input.onPhase?.("spawned");
 
+  if (input.waitUrl) await input.onPhase?.("readiness");
   const wait = input.waitUrl ? await waitForUrl(input.waitUrl, input.waitTimeoutSec ?? 30) : undefined;
   return {
     runId,

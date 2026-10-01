@@ -304,12 +304,12 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <style>
   html { color-scheme: light dark; }
-  html, body { margin: 0; padding: 0; background: transparent; }
-  body { --c2ct-surface: #ffffff; --c2ct-critical-surface: #fff4f1; --c2ct-control-surface: #f8fafc; --c2ct-control-fg: #0a63c9; display: block; box-sizing: border-box; padding: 6px 4px 4px; font-family: -apple-system, system-ui, sans-serif; color: #111827; overflow: visible; }
+  html, body { margin: 0; padding: 0; width: 100%; max-width: 100%; min-width: 0; background: transparent; }
+  body { --c2ct-surface: #ffffff; --c2ct-critical-surface: #fff4f1; --c2ct-control-surface: #f8fafc; --c2ct-control-fg: #0a63c9; display: block; box-sizing: border-box; padding: 6px 4px 4px; font-family: -apple-system, system-ui, sans-serif; color: #111827; }
   @media (prefers-color-scheme: dark) { body { --c2ct-surface: #1c1c1e; --c2ct-critical-surface: #2b1d1b; --c2ct-control-surface: #2a2a2c; --c2ct-control-fg: #62a9ff; color: #f5f5f5; } }
   body[data-host-theme="light"] { --c2ct-surface: #ffffff; --c2ct-critical-surface: #fff4f1; --c2ct-control-surface: #f8fafc; --c2ct-control-fg: #0a63c9; color: #111827; }
   body[data-host-theme="dark"] { --c2ct-surface: #1c1c1e; --c2ct-critical-surface: #2b1d1b; --c2ct-control-surface: #2a2a2c; --c2ct-control-fg: #62a9ff; color: #f5f5f5; }
-  .card { box-sizing: border-box; border: 1px solid rgba(128,128,128,.35); border-radius: 13px; padding: 14px 15px 15px; margin: 0; color: inherit; background: var(--c2ct-surface); }
+  .card { box-sizing: border-box; width: 100%; max-width: 100%; min-width: 0; overflow: hidden; border: 1px solid rgba(128,128,128,.35); border-radius: 13px; padding: 14px 15px 15px; margin: 0; color: inherit; background: var(--c2ct-surface); }
   .card.critical { border-color: rgba(220,72,48,.78); background: var(--c2ct-critical-surface); box-shadow: inset 0 0 0 1px rgba(220,72,48,.12); }
   .title-row { display: flex; gap: 8px; align-items: center; justify-content: space-between; margin-bottom: 9px; }
   .title { min-width: 0; font-weight: 760; font-size: 16px; line-height: 1.35; }
@@ -319,27 +319,27 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
   .card.preapply-minimal .title-state { padding: 0; background: transparent; font-size: 13.5px; opacity: .72; }
   .card.preapply-minimal #approval { display: none; }
   .critical-badge { display: inline-block; margin-bottom: 8px; border: 1px solid rgba(220,72,48,.72); border-radius: 999px; padding: 5px 9px; font-size: 12.5px; font-weight: 760; letter-spacing: .01em; }
-  .critical-warning { margin-bottom: 10px; border-radius: 9px; padding: 10px 11px; background: rgba(220,72,48,.12); font-size: 13.5px; font-weight: 680; line-height: 1.5; }
-  .critical-meta { margin: 8px 0 10px; border: 1px solid rgba(220,72,48,.24); border-radius: 9px; padding: 9px 10px; background: rgba(220,72,48,.05); font-size: 12.5px; line-height: 1.55; }
-  .critical-meta-row { display: flex; gap: 8px; justify-content: space-between; }
+  .critical-warning { margin-bottom: 10px; border-radius: 9px; padding: 10px 11px; background: rgba(220,72,48,.12); font-size: 13.5px; font-weight: 680; line-height: 1.5; overflow-wrap: anywhere; word-break: break-word; }
+  .critical-meta { min-width: 0; margin: 8px 0 10px; border: 1px solid rgba(220,72,48,.24); border-radius: 9px; padding: 9px 10px; background: rgba(220,72,48,.05); font-size: 12.5px; line-height: 1.55; overflow-wrap: anywhere; word-break: break-word; }
+  .critical-meta-row { display: flex; min-width: 0; gap: 8px; align-items: flex-start; justify-content: space-between; }
   .critical-meta-key { opacity: .68; }
-  .critical-meta-value { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 650; text-align: right; }
-  .entry-head { display: flex; gap: 8px; align-items: flex-start; justify-content: space-between; }
-  .preview { min-width: 0; font-size: 15.5px; font-weight: 700; line-height: 1.5; white-space: pre-wrap; }
+  .critical-meta-value { min-width: 0; max-width: 72%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 650; text-align: right; overflow-wrap: anywhere; word-break: break-word; }
+  .entry-head { display: flex; min-width: 0; max-width: 100%; gap: 8px; align-items: flex-start; justify-content: space-between; }
+  .preview { min-width: 0; max-width: 100%; font-size: 15.5px; font-weight: 700; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
   .state { flex: none; font-size: 12px; font-weight: 650; opacity: .78; white-space: nowrap; }
-  .approval-time { margin-top: 7px; font-size: 12.5px; line-height: 1.45; opacity: .66; }
-  .impact { margin-top: 8px; border-radius: 8px; padding: 8px 10px; background: rgba(128,128,128,.08); font-size: 13.5px; font-weight: 600; line-height: 1.5; opacity: .9; }
-  .approval-details { margin-top: 9px; border: 1px solid rgba(128,128,128,.20); border-radius: 10px; padding: 0 10px; background: rgba(128,128,128,.035); }
+  .approval-time { margin-top: 7px; font-size: 12.5px; line-height: 1.45; opacity: .66; overflow-wrap: anywhere; word-break: break-word; }
+  .impact { margin-top: 8px; border-radius: 8px; padding: 8px 10px; background: rgba(128,128,128,.08); font-size: 13.5px; font-weight: 600; line-height: 1.5; opacity: .9; overflow-wrap: anywhere; word-break: break-word; }
+  .approval-details { box-sizing: border-box; min-width: 0; max-width: 100%; margin-top: 9px; border: 1px solid rgba(128,128,128,.20); border-radius: 10px; padding: 0 10px; background: rgba(128,128,128,.035); }
   .approval-details summary { cursor: pointer; user-select: none; min-height: 44px; display: flex; align-items: center; list-style: none; padding: 9px 0; font-size: 13px; font-weight: 650; line-height: 1.4; opacity: .76; }
   .approval-details summary::-webkit-details-marker { display: none; }
   .approval-details summary::before { content: "›"; flex: 0 0 auto; margin-right: 7px; font-size: 20px; font-weight: 500; line-height: 1; transform: rotate(0deg); transform-origin: center; transition: transform 180ms ease; }
   .approval-details[open] summary::before { transform: rotate(90deg); }
-  .detail-command { box-sizing: border-box; max-height: 240px; overflow: auto; margin: 0 0 9px; padding: 9px 10px; border-radius: 7px; background: rgba(128,128,128,.10); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .detail-command { box-sizing: border-box; min-width: 0; max-width: 100%; max-height: 240px; overflow-y: auto; overflow-x: hidden; margin: 0 0 9px; padding: 9px 10px; border-radius: 7px; background: rgba(128,128,128,.10); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
   .actions { display: flex; gap: 8px; margin-top: 12px; }
   button { flex: 1; min-height: 46px; border-radius: 10px; border: 1px solid rgba(128,128,128,.35); background: var(--c2ct-control-surface); color: var(--c2ct-control-fg); font: inherit; font-size: 15px; font-weight: 700; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
   button.critical-allow { border-color: rgba(220,72,48,.85); background: rgba(220,72,48,.16); font-weight: 760; }
   button:disabled { opacity: .5; cursor: default; }
-  .status { font-size: 13px; line-height: 1.45; opacity: .74; margin-top: 8px; }
+  .status { font-size: 13px; line-height: 1.45; opacity: .74; margin-top: 8px; overflow-wrap: anywhere; word-break: break-word; }
   .shell-prompt { font-size: 13px; line-height: 1.5; opacity: .86; white-space: pre-wrap; }
   .shell-options { display: grid; gap: 8px; margin-top: 11px; }
   .shell-option { display: block; width: 100%; min-height: 48px; padding: 9px 11px; text-align: left; background: var(--c2ct-control-surface); color: var(--c2ct-control-fg); }
@@ -2516,10 +2516,11 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
     var minimalApprovalMode = Boolean(entry && !labMode && !shellMode && !preapplyMode && !approvalStillNeeded);
     if (reentryMode) minimalApprovalMode = false;
     var cardNode = document.querySelector(".card");
-    var criticalMode = Boolean(entry && entry.approvalSeverity === "critical" && !labMode && !shellMode && !preapplyMode && !reentryMode && !minimalApprovalMode);
+    var criticalSurfaceMode = Boolean(entry && entry.approvalSeverity === "critical" && !labMode && !shellMode && !preapplyMode && !reentryMode);
+    var criticalMode = Boolean(criticalSurfaceMode && !minimalApprovalMode);
     var shellCompactMode = Boolean(shellMode && out.card && out.card.compact === true && Array.isArray(out.card.options) && out.card.options.length === 1);
     var shellAutoMode = Boolean(shellMode && isAutoContinuationCard(out.card));
-    if (cardNode) cardNode.classList.toggle("critical", criticalMode);
+    if (cardNode) cardNode.classList.toggle("critical", criticalSurfaceMode);
     if (cardNode) cardNode.classList.toggle("shell-compact", shellCompactMode);
     if (cardNode) cardNode.classList.toggle("shell-auto", shellAutoMode);
     if (cardNode) cardNode.classList.toggle("preapply-minimal", preapplyMode);

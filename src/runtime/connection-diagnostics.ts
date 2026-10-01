@@ -67,6 +67,12 @@ export interface ConnectionDiagnosticInput {
   requestCount?: number;
   reusedRequestCount?: number;
   activeSessionCount?: number;
+  dispatchToResponseMs?: number;
+  workerDurationMs?: number;
+  inlineFastPath?: boolean;
+  handoffReason?: string;
+  coalescedReplay?: boolean;
+  restartInterrupted?: boolean;
   operationId?: string;
   phase?: ConnectionDiagnosticPhase;
   actionStarted?: boolean;
@@ -296,6 +302,16 @@ function safeEvent(input: ConnectionDiagnosticInput): ConnectionDiagnosticEvent 
     ...(Number.isFinite(input.activeSessionCount)
       ? { activeSessionCount: Math.max(0, Math.round(input.activeSessionCount ?? 0)) }
       : {}),
+    ...(Number.isFinite(input.dispatchToResponseMs)
+      ? { dispatchToResponseMs: Math.max(0, Math.round(input.dispatchToResponseMs ?? 0)) }
+      : {}),
+    ...(Number.isFinite(input.workerDurationMs)
+      ? { workerDurationMs: Math.max(0, Math.round(input.workerDurationMs ?? 0)) }
+      : {}),
+    ...(typeof input.inlineFastPath === "boolean" ? { inlineFastPath: input.inlineFastPath } : {}),
+    ...(bounded(input.handoffReason) ? { handoffReason: bounded(input.handoffReason) } : {}),
+    ...(typeof input.coalescedReplay === "boolean" ? { coalescedReplay: input.coalescedReplay } : {}),
+    ...(typeof input.restartInterrupted === "boolean" ? { restartInterrupted: input.restartInterrupted } : {}),
     ...(bounded(input.operationId) ? { operationId: bounded(input.operationId) } : {}),
     ...(input.phase && SAFE_DIAGNOSTIC_PHASES.has(input.phase) ? { phase: input.phase } : {}),
     ...(typeof input.actionStarted === "boolean" ? { actionStarted: input.actionStarted } : {}),
