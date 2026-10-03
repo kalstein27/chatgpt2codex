@@ -16,7 +16,6 @@ const MAX_GLOBAL_ACTIVE = 2;
 const MAX_PROJECT_ACTIVE = 1;
 const CROSS_PROCESS_LOCK_RETRY_MS = 10;
 const CROSS_PROCESS_LOCK_TIMEOUT_MS = 15_000;
-const CROSS_PROCESS_MALFORMED_LOCK_STALE_MS = 5_000;
 
 export type BackgroundOperationState =
   | "approval-wait"
@@ -243,6 +242,14 @@ function crossProcessLockPath(stateDir: string): string {
   return path.join(stateDir, "background-operations.lock");
 }
 
+function crossProcessLockIdentity(raw: string, stat: { dev: number; ino: number; size: number; mtimeMs: number }): string {
+  return digest(`${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${raw}`);
+}
+
+function crossProcessReclaimPath(lockFile: string, identity: string): string {
+  return `${lockFile}.reclaim.${identity.slice(0, 32)}`;
+}
+
 function emptyState(): OperationStateFile {
   return { schemaVersion: STATE_SCHEMA_VERSION, operations: [] };
 }
@@ -357,23 +364,86 @@ export class BackgroundOperationManager {
     } catch {
       // A creator can die between O_EXCL creation and writing metadata.
     }
-    if (lockRecord) {
-      if (defaultProcessAlive(lockRecord.pid)) return false;
-      const confirmation = await fs.readFile(lockFile, "utf8").catch(() => "");
-      if (confirmation !== raw) return false;
-      await fs.unlink(lockFile).catch((error) => {
+    const observedStat = await fs.stat(lockFile).catch(() => undefined);
+    if (!observedStat) return true;
+    if (!lockRecord) {
+      // Ownership/liveness cannot be proven from malformed metadata. Never
+      // reclaim solely because the path is old: an older live runtime may be
+      // stalled between creating the canonical lock and publishing metadata.
+      // New runtimes publish complete metadata before linking the canonical
+      // path, so malformed canonical locks require explicit/manual recovery.
+      return false;
+    }
+    if (defaultProcessAlive(lockRecord.pid)) return false;
+
+    const identity = crossProcessLockIdentity(raw, observedStat);
+    const reclaimPath = crossProcessReclaimPath(lockFile, identity);
+    try {
+      await fs.mkdir(reclaimPath, { mode: DIR_MODE });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw error;
+    }
+
+    const quarantine = `${lockFile}.stale.${process.pid}.${randomUUID()}`;
+    try {
+      const [currentRaw, currentStat] = await Promise.all([
+        fs.readFile(lockFile, "utf8").catch(() => undefined),
+        fs.stat(lockFile).catch(() => undefined),
+      ]);
+      if (currentRaw === undefined || !currentStat) return true;
+      if (crossProcessLockIdentity(currentRaw, currentStat) !== identity) return false;
+
+      let currentRecord: z.infer<typeof CrossProcessLockSchema> | undefined;
+      try {
+        const parsed = CrossProcessLockSchema.safeParse(JSON.parse(currentRaw || "null"));
+        if (parsed.success) currentRecord = parsed.data;
+      } catch {
+        // Malformed ownership remains fail-closed because liveness is unknown.
+      }
+      if (!currentRecord) return false;
+      if (defaultProcessAlive(currentRecord.pid)) return false;
+
+      // Never unlink the canonical path after stale authorization. The rename
+      // transfers the exact revalidated stale identity to a unique quarantine
+      // while the identity-scoped reclaim guard serializes competing cleaners.
+      // A later cleaner must revalidate the canonical path after the guard and
+      // therefore cannot delete a successor owner's replacement lock.
+      await fs.rename(lockFile, quarantine);
+      await fs.unlink(quarantine).catch((error) => {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       });
       return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+      throw error;
+    } finally {
+      await fs.rm(reclaimPath, { recursive: true, force: true }).catch(() => undefined);
+      await fs.unlink(quarantine).catch(() => undefined);
     }
-    const stat = await fs.stat(lockFile).catch(() => undefined);
-    if (!stat || now - stat.mtimeMs < CROSS_PROCESS_MALFORMED_LOCK_STALE_MS) return false;
-    const confirmation = await fs.readFile(lockFile, "utf8").catch(() => "");
-    if (confirmation !== raw) return false;
-    await fs.unlink(lockFile).catch((error) => {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    });
-    return true;
+  }
+
+  private async tryCreateCrossProcessLock(lockFile: string, token: string): Promise<boolean> {
+    const candidate = `${lockFile}.candidate.${process.pid}.${token}`;
+    let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+    try {
+      handle = await fs.open(candidate, "wx", FILE_MODE);
+      await handle.writeFile(
+        `${JSON.stringify({ schemaVersion: 1, pid: process.pid, token, acquiredAt: Date.now() })}\n`,
+        "utf8",
+      );
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      await fs.link(candidate, lockFile);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw error;
+    } finally {
+      await handle?.close().catch(() => undefined);
+      await fs.unlink(candidate).catch(() => undefined);
+    }
   }
 
   private async acquireCrossProcessLock(): Promise<string> {
@@ -383,28 +453,17 @@ export class BackgroundOperationManager {
     const token = randomUUID();
     const deadline = Date.now() + CROSS_PROCESS_LOCK_TIMEOUT_MS;
     while (true) {
-      let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
       try {
-        handle = await fs.open(lockFile, "wx", FILE_MODE);
-        await handle.writeFile(`${JSON.stringify({ schemaVersion: 1, pid: process.pid, token, acquiredAt: Date.now() })}\n`, "utf8");
-        await handle.sync();
-        await handle.close();
-        handle = undefined;
-        return token;
+        if (await this.tryCreateCrossProcessLock(lockFile, token)) return token;
       } catch (error) {
-        const createdLock = handle !== undefined;
-        await handle?.close().catch(() => undefined);
         const code = (error as NodeJS.ErrnoException).code;
-        if (code !== "EEXIST") {
-          if (createdLock) await fs.unlink(lockFile).catch(() => undefined);
-          throw error;
-        }
-        if (await this.clearStaleFileLock(lockFile, Date.now())) continue;
-        if (Date.now() >= deadline) {
-          throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "Background operation persistence lock timed out");
-        }
-        await new Promise((resolve) => setTimeout(resolve, CROSS_PROCESS_LOCK_RETRY_MS));
+        if (code !== "ENOENT") throw error;
       }
+      if (await this.clearStaleFileLock(lockFile, Date.now())) continue;
+      if (Date.now() >= deadline) {
+        throw new DomainError(ErrorCode.NOT_IMPLEMENTED, "Background operation persistence lock timed out");
+      }
+      await new Promise((resolve) => setTimeout(resolve, CROSS_PROCESS_LOCK_RETRY_MS));
     }
   }
 
