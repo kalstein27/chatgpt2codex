@@ -16,6 +16,33 @@ export type RuntimeSemanticActivityKind =
   | "waiting-approval"
   | "other";
 
+export type RuntimeActivityPhaseId =
+  | "plan"
+  | "inspect"
+  | "edit"
+  | "verify"
+  | "build"
+  | "runtime"
+  | "control"
+  | "approval"
+  | "other";
+
+export type RuntimeToolFamily = RuntimeActivityPhaseId;
+
+export interface RuntimeWorkGroupSummary {
+  workGroupId: string;
+  phaseId: RuntimeActivityPhaseId;
+  toolFamily: RuntimeToolFamily;
+  displayLabel: string;
+  currentActivity: string;
+  state: Exclude<RuntimeOperationState, "idle">;
+  startedAt: number;
+  finishedAt?: number;
+  elapsedMs: number;
+  stepCount: number;
+  tools: string[];
+}
+
 export interface RuntimeSessionHandle {
   readonly internalId: string;
 }
@@ -50,6 +77,8 @@ interface SessionRecord {
   clientName?: string;
   connectedAt: number;
   lastActiveAt: number;
+  lastMeaningfulActiveAt?: number;
+  lastForegroundToolAt?: number;
   closedAt?: number;
   operations: OperationRecord[];
 }
@@ -59,6 +88,7 @@ interface ConversationRecord {
   taskLabel?: string;
   displayTitle?: string;
   displayTitleSource?: "host" | "dashboard";
+  boundProjectId?: string;
   firstSeenAt: number;
   lastActiveAt: number;
   operations: OperationRecord[];
@@ -115,6 +145,7 @@ export interface RuntimeConversationSummary {
   taskLabel?: string;
   displayTitle?: string;
   displayTitleSource?: "host" | "dashboard";
+  boundProjectId?: string;
   firstSeenAt: number;
   lastActiveAt: number;
   state: RuntimeOperationState;
@@ -125,6 +156,7 @@ export interface RuntimeConversationSummary {
     startedAt: number;
     finishedAt?: number;
   }>;
+  workGroups: RuntimeWorkGroupSummary[];
   operations: Array<{
     operationId: string;
     tool: string;
@@ -140,6 +172,12 @@ export interface RuntimeConversationSummary {
     lastProgressAt?: number;
     progress?: number;
     semanticKind: RuntimeSemanticActivityKind;
+    workGroupId: string;
+    phaseId: RuntimeActivityPhaseId;
+    stepOrdinal: number;
+    toolFamily: RuntimeToolFamily;
+    displayLabel: string;
+    currentActivity: string;
     clientCancellation?: {
       observedAt: number;
       operationContinues: boolean;
@@ -166,6 +204,17 @@ const MAX_CONVERSATION_OPERATIONS = 32;
 export const DASHBOARD_COMPLETED_TTL_MS = 5 * 60 * 1000;
 export const DASHBOARD_FAILED_TTL_MS = 5 * 60 * 1000;
 const MAX_ACTIVITY_HIGHLIGHTS = 5;
+
+const OBSERVATION_ONLY_ACTIVITY_TOOLS = new Set([
+  "connection_status",
+  "project_lane_status",
+  "operation_status",
+  "output_read",
+]);
+
+function isMeaningfulProjectActivity(tool: string, projectId: string | undefined): boolean {
+  return Boolean(projectId) && !OBSERVATION_ONLY_ACTIVITY_TOOLS.has(tool);
+}
 
 function boundedLabel(value: string | undefined, fallback: string): string {
   const normalized = value?.replace(/[^\p{L}\p{N} ._:-]/gu, "").trim();
@@ -231,8 +280,12 @@ function semanticActivityKind(
   if (tool.startsWith("computer_") || tool.includes("control")) return "controlling";
   if (tool.includes("connection") || tool.includes("connector") || tool.includes("health")) return "connecting";
   if (tool.startsWith("file_apply") || tool.startsWith("file_edit") || tool === "file_create" || tool === "checkpoint_restore") return "editing";
-  if (/\b(build|compile|package|bundle|seal)\b/u.test(combined)) return "building";
-  if (tool.startsWith("e2e_") || /\b(test|typecheck|lint|verify|validation|check)\b/u.test(combined)) return "verifying";
+  if (/\b(build|compile|package|bundle|seal)\b/u.test(combined) || /빌드|컴파일|패키지|번들/u.test(combined)) return "building";
+  if (
+    tool.startsWith("e2e_")
+    || /\b(test|typecheck|lint|verify|validation|check)\b/u.test(combined)
+    || /테스트|타입 검사|린트|검증/u.test(combined)
+  ) return "verifying";
   if (
     tool.includes("search")
     || tool.startsWith("file_read")
@@ -244,6 +297,85 @@ function semanticActivityKind(
     || tool.includes("show")
   ) return "inspecting";
   return "other";
+}
+
+function activityPhaseId(kind: RuntimeSemanticActivityKind): RuntimeActivityPhaseId {
+  if (kind === "planning") return "plan";
+  if (kind === "inspecting") return "inspect";
+  if (kind === "editing") return "edit";
+  if (kind === "verifying") return "verify";
+  if (kind === "building") return "build";
+  if (kind === "installing" || kind === "applying" || kind === "connecting") return "runtime";
+  if (kind === "controlling") return "control";
+  if (kind === "waiting-approval") return "approval";
+  return "other";
+}
+
+function activityDisplayLabel(phaseId: RuntimeActivityPhaseId): string {
+  if (phaseId === "plan") return "작업 계획";
+  if (phaseId === "inspect") return "프로젝트 조사";
+  if (phaseId === "edit") return "소스 수정";
+  if (phaseId === "verify") return "검증";
+  if (phaseId === "build") return "빌드";
+  if (phaseId === "runtime") return "런타임";
+  if (phaseId === "control") return "원격 제어";
+  if (phaseId === "approval") return "승인";
+  return "C2CT 작업";
+}
+
+function defaultToolActivity(tool: string, phaseId: RuntimeActivityPhaseId): string {
+  const labels: Record<string, string> = {
+    agent_bootstrap: "C2CT 빠른 작업 준비 중",
+    connection_status: "C2CT 연결 상태 확인 중",
+    agent_guide: "현재 C2CT 작업 규칙 확인 중",
+    project_rules: "프로젝트 작업 규칙 확인 중",
+    project_status: "프로젝트 상태 확인 중",
+    repo_status: "Git 저장소 상태 확인 중",
+    git_status: "Git 상태 확인 중",
+    code_search: "관련 코드 검색 중",
+    rg_search: "프로젝트 전체 검색 중",
+    file_read_slice: "파일 내용 확인 중",
+    file_read_batch: "관련 파일 여러 개 확인 중",
+    file_apply_patch: "코드 변경 반영 중",
+    file_edit_lines: "코드 줄 단위 수정 중",
+    file_create: "새 파일 작성 중",
+    repo_diff_summary: "변경 내용 확인 중",
+    git_diff_summary: "변경 내용 확인 중",
+    command_list: "실행 가능한 명령 확인 중",
+    command_run: "명령 실행 중",
+    e2e_run_command: "E2E 검증 실행 중",
+    e2e_test_and_show_screenshot: "E2E 검증과 화면 확인 중",
+    operation_status: "백그라운드 작업 상태 확인 중",
+    output_read: "작업 결과 확인 중",
+    runtime_update_check: "새 런타임 빌드 확인 중",
+    runtime_update_prepare: "런타임 교체 준비 중",
+    runtime_apply_local: "새 런타임 적용 중",
+    runtime_apply_status: "런타임 적용 상태 확인 중",
+    macos_app_apply_local: "Mac 앱 업데이트 적용 중",
+    macos_app_apply_status: "Mac 앱 업데이트 상태 확인 중",
+  };
+  return labels[tool] ?? `${activityDisplayLabel(phaseId)} 진행 중`;
+}
+
+function activityPresentation(operation: OperationRecord): {
+  semanticKind: RuntimeSemanticActivityKind;
+  phaseId: RuntimeActivityPhaseId;
+  toolFamily: RuntimeToolFamily;
+  displayLabel: string;
+  currentActivity: string;
+} {
+  const semanticKind = semanticActivityKind(operation);
+  const phaseId = activityPhaseId(semanticKind);
+  const meaningfulMessage = operation.message && !/^Operation finished(?: with an error)?$/iu.test(operation.message)
+    ? boundedTaskLabel(operation.message)
+    : undefined;
+  return {
+    semanticKind,
+    phaseId,
+    toolFamily: phaseId,
+    displayLabel: activityDisplayLabel(phaseId),
+    currentActivity: meaningfulMessage ?? operation.activityHint ?? defaultToolActivity(operation.tool, phaseId),
+  };
 }
 
 function dashboardVisibleUntil(
@@ -332,6 +464,14 @@ export class RuntimeActivityTracker {
   touch(handle: RuntimeSessionHandle, now = Date.now()): void {
     const session = this.sessions.get(handle.internalId);
     if (session) session.lastActiveAt = now;
+  }
+
+  setConversationBoundProject(handle: RuntimeSessionHandle, projectId: string): void {
+    const session = this.sessions.get(handle.internalId);
+    if (!session?.conversationLabel) return;
+    const conversation = this.conversations.get(session.conversationLabel);
+    if (!conversation) return;
+    conversation.boundProjectId = boundedLabel(projectId, "project");
   }
 
   setConversationTaskLabel(
@@ -460,6 +600,10 @@ export class RuntimeActivityTracker {
     if (!session) return undefined;
     const operationId = randomUUID();
     session.lastActiveAt = now;
+    if (isMeaningfulProjectActivity(tool, projectId)) {
+      session.lastMeaningfulActiveAt = now;
+      session.lastForegroundToolAt = now;
+    }
     const operation: OperationRecord = {
       operationId,
       tool: boundedLabel(tool, "tool"),
@@ -489,12 +633,16 @@ export class RuntimeActivityTracker {
     if (!session || !operation || operation.finishedAt !== undefined) return;
     const now = input.now ?? Date.now();
     if (input.phase) operation.phase = boundedLabel(input.phase, "running");
-    if (input.message) operation.message = boundedLabel(input.message, "Working");
+    if (input.message) operation.message = boundedTaskLabel(input.message) ?? "Working";
     if (typeof input.progress === "number" && Number.isFinite(input.progress)) {
       operation.progress = Math.max(operation.progress ?? 0, Math.max(0, input.progress));
     }
     operation.lastProgressAt = now;
     session.lastActiveAt = now;
+    if (isMeaningfulProjectActivity(operation.tool, operation.projectId)) {
+      session.lastMeaningfulActiveAt = now;
+      session.lastForegroundToolAt = now;
+    }
     this.touchConversation(session.conversationLabel, now);
   }
 
@@ -517,6 +665,10 @@ export class RuntimeActivityTracker {
           : "completed";
     if (input.errorCode) operation.errorCode = boundedLabel(input.errorCode, "ERROR");
     session.lastActiveAt = now;
+    if (isMeaningfulProjectActivity(operation.tool, operation.projectId)) {
+      session.lastMeaningfulActiveAt = now;
+      session.lastForegroundToolAt = now;
+    }
     this.touchConversation(session.conversationLabel, now);
   }
 
@@ -595,7 +747,14 @@ export class RuntimeActivityTracker {
     now?: number;
     recentWithinMs?: number;
     excludeTools?: readonly string[];
-  }): { present: boolean; active: boolean; recent: boolean; lastActiveAt?: number } {
+  }): {
+    present: boolean;
+    active: boolean;
+    recent: boolean;
+    lastActiveAt?: number;
+    lastMeaningfulActiveAt?: number;
+    lastForegroundToolAt?: number;
+  } {
     const now = input.now ?? Date.now();
     const recentWithinMs = Math.max(0, input.recentWithinMs ?? RECENT_OPERATION_TTL_MS);
     const excludedTools = new Set(input.excludeTools ?? []);
@@ -604,20 +763,30 @@ export class RuntimeActivityTracker {
     let active = false;
     let recent = false;
     let lastActiveAt: number | undefined;
+    let lastMeaningfulActiveAt: number | undefined;
+    let lastForegroundToolAt: number | undefined;
     for (const session of this.sessions.values()) {
       if (!session.capabilityScope || !input.matchesScope(session.capabilityScope)) continue;
       present = true;
       active ||= session.operations.some(
         (operation) => operation.finishedAt === undefined && !excludedTools.has(operation.tool),
       );
-      recent ||= now - session.lastActiveAt <= recentWithinMs;
+      if (session.lastMeaningfulActiveAt !== undefined) {
+        recent ||= now - session.lastMeaningfulActiveAt <= recentWithinMs;
+        lastMeaningfulActiveAt = Math.max(lastMeaningfulActiveAt ?? 0, session.lastMeaningfulActiveAt);
+      }
       lastActiveAt = Math.max(lastActiveAt ?? 0, session.lastActiveAt);
+      if (session.lastForegroundToolAt !== undefined) {
+        lastForegroundToolAt = Math.max(lastForegroundToolAt ?? 0, session.lastForegroundToolAt);
+      }
     }
     return {
       present,
       active,
       recent,
       ...(lastActiveAt !== undefined ? { lastActiveAt } : {}),
+      ...(lastMeaningfulActiveAt !== undefined ? { lastMeaningfulActiveAt } : {}),
+      ...(lastForegroundToolAt !== undefined ? { lastForegroundToolAt } : {}),
     };
   }
 
@@ -690,12 +859,58 @@ export class RuntimeActivityTracker {
       .map((conversation) => {
         const operations = [...conversation.operations]
           .sort((a, b) => a.startedAt - b.startedAt || a.operationId.localeCompare(b.operationId));
+        const operationActivity = operations.map((operation) => ({ operation, ...activityPresentation(operation) }));
+        const workGroups: RuntimeWorkGroupSummary[] = [];
+        const operationGroupMeta = new Map<string, {
+          workGroupId: string;
+          stepOrdinal: number;
+          phaseId: RuntimeActivityPhaseId;
+          toolFamily: RuntimeToolFamily;
+          displayLabel: string;
+          currentActivity: string;
+          semanticKind: RuntimeSemanticActivityKind;
+        }>();
+        for (const item of operationActivity) {
+          const { operation } = item;
+          let group = workGroups.at(-1);
+          if (!group || group.phaseId !== item.phaseId) {
+            group = {
+              workGroupId: `WG-${shortHash(operation.operationId).toUpperCase()}`,
+              phaseId: item.phaseId,
+              toolFamily: item.toolFamily,
+              displayLabel: item.displayLabel,
+              currentActivity: item.currentActivity,
+              state: operation.state,
+              startedAt: operation.startedAt,
+              ...(operation.finishedAt !== undefined ? { finishedAt: operation.finishedAt } : {}),
+              elapsedMs: Math.max(0, (operation.finishedAt ?? now) - operation.startedAt),
+              stepCount: 0,
+              tools: [],
+            };
+            workGroups.push(group);
+          }
+          group.stepCount += 1;
+          group.currentActivity = item.currentActivity;
+          group.state = operation.state;
+          group.elapsedMs = Math.max(0, (operation.finishedAt ?? now) - group.startedAt);
+          if (operation.finishedAt !== undefined) group.finishedAt = operation.finishedAt;
+          else delete group.finishedAt;
+          if (!group.tools.includes(operation.tool)) group.tools.push(operation.tool);
+          operationGroupMeta.set(operation.operationId, {
+            workGroupId: group.workGroupId,
+            stepOrdinal: group.stepCount,
+            phaseId: item.phaseId,
+            toolFamily: item.toolFamily,
+            displayLabel: item.displayLabel,
+            currentActivity: item.currentActivity,
+            semanticKind: item.semanticKind,
+          });
+        }
         const active = [...operations].reverse().find((operation) => operation.finishedAt === undefined);
         const latest = operations.at(-1);
         const state = active?.state ?? latest?.state ?? "idle";
         const activityHighlights: RuntimeConversationSummary["activityHighlights"] = [];
-        for (const operation of operations) {
-          const kind = semanticActivityKind(operation);
+        for (const { operation, semanticKind: kind } of operationActivity) {
           if (kind === "other") continue;
           const highlight = {
             kind,
@@ -718,12 +933,25 @@ export class RuntimeActivityTracker {
           ...(conversation.taskLabel ? { taskLabel: conversation.taskLabel } : {}),
           ...(conversation.displayTitle ? { displayTitle: conversation.displayTitle } : {}),
           ...(conversation.displayTitleSource ? { displayTitleSource: conversation.displayTitleSource } : {}),
+          ...(conversation.boundProjectId ? { boundProjectId: conversation.boundProjectId } : {}),
           firstSeenAt: conversation.firstSeenAt,
           lastActiveAt: conversation.lastActiveAt,
           state,
           ...(visibleUntil !== undefined ? { dashboardVisibleUntil: visibleUntil } : {}),
           activityHighlights,
+          workGroups,
           operations: operations.map((operation) => ({
+            ...(() => {
+              const meta = operationGroupMeta.get(operation.operationId)!;
+              return {
+                workGroupId: meta.workGroupId,
+                phaseId: meta.phaseId,
+                stepOrdinal: meta.stepOrdinal,
+                toolFamily: meta.toolFamily,
+                displayLabel: meta.displayLabel,
+                currentActivity: meta.currentActivity,
+              };
+            })(),
             operationId: operation.operationId,
             tool: operation.tool,
             ...(operation.projectId ? { projectId: operation.projectId } : {}),
@@ -746,7 +974,7 @@ export class RuntimeActivityTracker {
                   },
                 }
               : {}),
-            semanticKind: semanticActivityKind(operation),
+            semanticKind: operationGroupMeta.get(operation.operationId)!.semanticKind,
           })),
         };
       });

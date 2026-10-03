@@ -54,7 +54,7 @@ function Assert-View([string]$Dom, [string]$ExpectedView) {
         "approvals" { "view-approvals" }
         "connection" { "view-connection" }
         "diagnostics" { "view-diagnostics" }
-        "cards" { $null }
+        "cards" { "view-cards" }
         "settings" { "view-settings" }
     }
     if ($Dom -notmatch ('id="' + [regex]::Escape($expectedId) + '"')) { throw "Expected view $ExpectedView was not rendered." }
@@ -78,7 +78,7 @@ $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 -Uri $windowsUrl
 if ($response.StatusCode -ne 200) { throw "Activity dashboard HTTP status was $($response.StatusCode)." }
 $html = [string]$response.Content
 if ($html -notmatch 'c2ct-activity-dashboard-contract" content="1"') { throw "Activity dashboard contract marker is missing." }
-foreach ($requiredId in @("view-activity", "view-approvals", "view-connection", "view-settings", "view-diagnostics", "approvals-view", "connection-view", "diagnostics-view", "approval-box", "mcp-health-box", "cards")) {
+foreach ($requiredId in @("view-activity", "view-approvals", "view-connection", "view-cards", "view-settings", "view-diagnostics", "approvals-view", "connection-view", "diagnostics-view", "approval-box", "mcp-health-box", "cards")) {
     if ($html -notmatch ('id="' + [regex]::Escape($requiredId) + '"')) { throw "Activity dashboard is missing #$requiredId." }
 }
 if ($html -notmatch 'class="desktop-shell"') { throw "Shared desktop shell is missing." }
@@ -115,6 +115,8 @@ if ($macLauncherSource -notmatch 'http://127\.0\.0\.1:7980/activity/\?embedded=m
 $macNativeSidebar = $macLauncherSource -match 'sidebar\.widthAnchor\.constraint\(equalToConstant: 210\)'
 if ($macNativeSidebar) { throw "macOS still installs the legacy native sidebar instead of the shared desktop shell." }
 if ($macLauncherSource -notmatch 'showSharedDashboardSection\(id: "approvals", view: "approvals"\)') { throw "macOS approvals no longer route through the shared desktop shell." }
+if ($macLauncherSource -notmatch 'if action == "openApprovals" \{\s*showNativeApprovalInbox\(\)') { throw "macOS native approval inbox no longer preserves the shared dashboard shell." }
+if ($macLauncherSource -match '(?s)if action == "openApprovals" \{.{0,500}showIntegratedMenuSection') { throw "macOS native approval inbox still replaces the shared desktop shell." }
 if ($dashboardSource -notmatch 'settingsViewButton\.hidden = !settingsEnabled') { throw "Local-only settings visibility guard is missing." }
 
 $proofRoot = Join-Path $env:TEMP "c2ct-unified-dashboard-ui-proof"

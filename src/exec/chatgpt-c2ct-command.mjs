@@ -6,8 +6,6 @@ import { fileURLToPath } from "node:url";
 
 const commandName = process.argv[2] ?? "";
 const fixedCommands = new Map([
-  ["plugin-refresh", ["plugin", "refresh", "C2CT", "--json"]],
-  ["catalog-refresh", ["plugin", "catalog-refresh", "C2CT", "--json"]],
   ["scan-tools", ["plugin", "scan-tools", "C2CT", "--json"]],
 ]);
 const commandArgs = fixedCommands.get(commandName);
@@ -24,7 +22,7 @@ if (process.platform !== "darwin") {
 if (!commandArgs || process.argv.length !== 3) {
   fail(
     "INVALID_FIXED_COMMAND",
-    "Use one fixed command with no forwarded arguments: plugin-refresh, catalog-refresh, or scan-tools.",
+    "Only the fixed scan-tools command is supported; other chatgpt-send boundaries are retired.",
   );
 }
 

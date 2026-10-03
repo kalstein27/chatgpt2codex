@@ -77,34 +77,45 @@ export async function startToolProgressReporter(
   let progress = 0;
   let stopped = false;
   let emittingHeartbeat = false;
+  let emissionTail: Promise<void> = Promise.resolve();
+  const sendNotification = options.extra?.sendNotification;
 
-  const emit = async (heartbeat: boolean): Promise<void> => {
-    if (stopped) return;
+  const emit = async (heartbeat: boolean, allowStopped = false): Promise<void> => {
+    if (stopped && !allowStopped) return;
     progress += 1;
     const at = now();
     const elapsedSeconds = Math.max(0, Math.floor((at - startedAt) / 1_000));
     const visibleMessage = boundedMessage(
       heartbeat && elapsedSeconds > 0 ? `${message} · ${elapsedSeconds}s elapsed` : message,
     );
-    try {
-      options.onProgress?.({ phase, message: visibleMessage, progress, at, heartbeat });
-    } catch {
-      // Local observation must never be able to fail the tool call.
-    }
-    if (progressToken === undefined || !options.extra?.sendNotification) return;
-    try {
-      await options.extra.sendNotification({
-        method: "notifications/progress",
-        params: {
-          progressToken,
-          progress,
-          message: visibleMessage,
-        },
-      });
-    } catch {
-      // Progress is best-effort. A client that ignores or rejects progress
-      // notifications must not change the underlying tool result.
-    }
+    const event: ToolProgressEvent = { phase, message: visibleMessage, progress, at, heartbeat };
+    const notification = progressToken === undefined || !sendNotification
+      ? undefined
+      : {
+          method: "notifications/progress" as const,
+          params: {
+            progressToken,
+            progress,
+            message: visibleMessage,
+          },
+        };
+
+    const pending = emissionTail.then(async () => {
+      try {
+        options.onProgress?.(event);
+      } catch {
+        // Local observation must never be able to fail the tool call.
+      }
+      if (!notification || !sendNotification) return;
+      try {
+        await sendNotification(notification);
+      } catch {
+        // Progress is best-effort. A client that ignores or rejects progress
+        // notifications must not change the underlying tool result.
+      }
+    });
+    emissionTail = pending.catch(() => undefined);
+    await pending;
   };
 
   await emit(false);
@@ -126,11 +137,11 @@ export async function startToolProgressReporter(
     },
     async stop(finalMessage) {
       if (stopped) return;
+      stopped = true;
       clearInterval(timer);
       phase = "completed";
       message = boundedMessage(finalMessage);
-      await emit(false);
-      stopped = true;
+      await emit(false, true);
     },
   };
 }

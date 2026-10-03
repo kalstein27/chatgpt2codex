@@ -73,6 +73,33 @@ export interface ExternalWatchdogFailureSummary {
   diagnosticId: string | null;
 }
 
+export type ExternalWatchdogNetworkLayer =
+  | "internet"
+  | "local-runtime"
+  | "tailscale"
+  | "funnel-local"
+  | "public-tls"
+  | "public-dns"
+  | "public-http"
+  | "public-edge"
+  | "unknown";
+
+export interface ExternalWatchdogIncidentSummary {
+  incidentId: string;
+  startedAt: string;
+  lastFailureAt: string;
+  recoveredAt: string | null;
+  active: boolean;
+  durationMs: number;
+  latestFailureLayer: ExternalWatchdogNetworkLayer;
+  latestProbeClass: string;
+  stages: Array<{
+    at: string;
+    layer: ExternalWatchdogNetworkLayer | "healthy";
+    probeClass: string;
+  }>;
+}
+
 export interface ExternalWatchdogStatus {
   available: boolean;
   watchdogVersion: number | null;
@@ -85,9 +112,64 @@ export interface ExternalWatchdogStatus {
   probeFresh: boolean | null;
   lastEventAt: string | null;
   recentFailure: ExternalWatchdogFailureSummary | null;
+  incident: ExternalWatchdogIncidentSummary | null;
   probeWindow: ExternalWatchdogProbeWindow;
   observationScope: "external-tunnel-probe";
   hostExceptionBodyObservable: false;
+}
+
+function probeNetworkLayer(sample: ExternalWatchdogProbeSample): ExternalWatchdogNetworkLayer | "healthy" {
+  if (!sample.internetOk) return "internet";
+  if (!sample.localRuntimeOk) return "local-runtime";
+  if (!sample.tailscaleOk) return "tailscale";
+  if (!sample.funnelOk) return "funnel-local";
+  if (sample.publicFunnelOk) return "healthy";
+  if (sample.publicProbeClass === "tls_handshake" || sample.publicProbeClass === "certificate") return "public-tls";
+  if (sample.publicProbeClass === "dns" || sample.publicProbeClass === "dns_no_a_records") return "public-dns";
+  if (/^http_[0-9]{3}$/u.test(sample.publicProbeClass)) return "public-http";
+  if (["connect", "timeout", "edge_unreachable"].includes(sample.publicProbeClass)) return "public-edge";
+  return "unknown";
+}
+
+export function summarizeExternalWatchdogIncident(
+  samples: ExternalWatchdogProbeSample[],
+): ExternalWatchdogIncidentSummary | null {
+  let lastFailureIndex = -1;
+  for (let index = samples.length - 1; index >= 0; index -= 1) {
+    if (probeNetworkLayer(samples[index]!) !== "healthy") {
+      lastFailureIndex = index;
+      break;
+    }
+  }
+  if (lastFailureIndex < 0) return null;
+
+  let startIndex = lastFailureIndex;
+  while (startIndex > 0 && probeNetworkLayer(samples[startIndex - 1]!) !== "healthy") startIndex -= 1;
+  const start = samples[startIndex]!;
+  const lastFailure = samples[lastFailureIndex]!;
+  const recovery = samples.slice(lastFailureIndex + 1).find((sample) => probeNetworkLayer(sample) === "healthy") ?? null;
+  const latest = samples.at(-1)!;
+  const active = probeNetworkLayer(latest) !== "healthy";
+  const endAt = recovery?.at ?? lastFailure.at;
+  const startMs = Date.parse(start.at);
+  const endMs = Date.parse(endAt);
+  const stages: ExternalWatchdogIncidentSummary["stages"] = [];
+  for (const sample of samples.slice(startIndex, recovery ? samples.indexOf(recovery) + 1 : undefined)) {
+    const layer = probeNetworkLayer(sample);
+    if (stages.at(-1)?.layer === layer) continue;
+    stages.push({ at: sample.at, layer, probeClass: sample.publicProbeClass });
+  }
+  return {
+    incidentId: `net_${start.diagnosticId}_${Math.max(0, startMs).toString(36)}`,
+    startedAt: start.at,
+    lastFailureAt: lastFailure.at,
+    recoveredAt: recovery?.at ?? null,
+    active,
+    durationMs: Number.isFinite(startMs) && Number.isFinite(endMs) ? Math.max(0, endMs - startMs) : 0,
+    latestFailureLayer: probeNetworkLayer(lastFailure) as ExternalWatchdogNetworkLayer,
+    latestProbeClass: lastFailure.publicProbeClass,
+    stages: stages.slice(-8),
+  };
 }
 
 interface PrivateTail {
@@ -314,6 +396,7 @@ async function loadExternalWatchdogStatus(
       probeFresh: null,
       lastEventAt: null,
       recentFailure: null,
+      incident: null,
       probeWindow: emptyProbeWindow(),
       observationScope: "external-tunnel-probe",
       hostExceptionBodyObservable: false,
@@ -331,6 +414,7 @@ async function loadExternalWatchdogStatus(
   const parsedLog = parseLog(logRaw);
   const probeSamples = parseProbeSamples(probeLogFile.raw);
   const recentProbeWindow = probeWindow(probeSamples, null, null, DEFAULT_RECENT_PROBES);
+  const incident = summarizeExternalWatchdogIncident(recentProbeWindow.recentSamples);
   const statusValue = state.get("last_status") ?? "unknown";
   const failureReason = state.get("last_failure_reason") ?? "";
   const lastProbeMs = stateFile.modifiedAt ? Date.parse(stateFile.modifiedAt) : Number.NaN;
@@ -347,6 +431,7 @@ async function loadExternalWatchdogStatus(
     probeFresh: probeAgeMs === null ? null : probeAgeMs <= PROBE_STALE_AFTER_MS,
     lastEventAt: parsedLog.lastEventAt,
     recentFailure: parsedLog.recentFailure,
+    incident,
     probeWindow: recentProbeWindow,
     observationScope: "external-tunnel-probe",
     hostExceptionBodyObservable: false,

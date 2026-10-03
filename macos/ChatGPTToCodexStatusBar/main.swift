@@ -16,26 +16,9 @@ private func appleScriptString(_ value: String) -> String {
     "\"" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
 }
 
-private func versionIsNewer(_ candidate: String, than current: String) -> Bool {
-    let candidateParts = candidate.split(separator: ".").map { Int($0.prefix { $0.isNumber }) ?? 0 }
-    let currentParts = current.split(separator: ".").map { Int($0.prefix { $0.isNumber }) ?? 0 }
-    let count = max(candidateParts.count, currentParts.count)
-    for index in 0..<count {
-        let left = index < candidateParts.count ? candidateParts[index] : 0
-        let right = index < currentParts.count ? currentParts[index] : 0
-        if left != right { return left > right }
-    }
-    return false
-}
-
 private struct LanguageOption {
     let code: String
     let name: String
-}
-
-private struct RuntimeUpdate {
-    let version: String
-    let dmgURL: URL
 }
 
 private final class FlippedView: NSView {
@@ -241,6 +224,7 @@ private let desktopLocalizationRows: [String: [String]] = [
     "aboutTitle": ["ChatGPT To Codex by ezBuilder", "ezBuilder의 ChatGPT To Codex", "ezBuilder による ChatGPT To Codex", "ezBuilder 出品 ChatGPT To Codex", "ezBuilder 製作 ChatGPT To Codex", "ChatGPT To Codex de ezBuilder", "ChatGPT To Codex par ezBuilder", "ChatGPT To Codex von ezBuilder", "ChatGPT To Codex por ezBuilder", "ChatGPT To Codex di ezBuilder", "ChatGPT To Codex door ezBuilder", "ChatGPT To Codex od ezBuilder", "ChatGPT To Codex от ezBuilder", "ezBuilder tarafından ChatGPT To Codex", "ChatGPT To Codex bởi ezBuilder", "ChatGPT To Codex oleh ezBuilder", "ChatGPT To Codex โดย ezBuilder", "ChatGPT To Codex من ezBuilder", "ezBuilder द्वारा ChatGPT To Codex", "ChatGPT To Codex від ezBuilder"],
     "aboutInfo": ["Copyright 2026 ezBuilder. All rights reserved.\nLocal MCP runtime for ChatGPT, Codex-compatible agents, and trusted local projects.", "Copyright 2026 ezBuilder. All rights reserved.\nChatGPT, Codex 호환 에이전트, 신뢰한 로컬 프로젝트를 위한 로컬 MCP 런타임입니다.", "Copyright 2026 ezBuilder. All rights reserved.\nChatGPT、Codex 互換エージェント、信頼済みローカルプロジェクト向けのローカル MCP ランタイムです。", "Copyright 2026 ezBuilder. All rights reserved.\n面向 ChatGPT、Codex 兼容代理和受信任本地项目的本地 MCP 运行时。", "Copyright 2026 ezBuilder. All rights reserved.\n供 ChatGPT、Codex 相容代理與受信任本機專案使用的本機 MCP 執行階段。", "Copyright 2026 ezBuilder. All rights reserved.\nRuntime MCP local para ChatGPT, agentes compatibles con Codex y proyectos locales de confianza.", "Copyright 2026 ezBuilder. All rights reserved.\nRuntime MCP local pour ChatGPT, agents compatibles Codex et projets locaux fiables.", "Copyright 2026 ezBuilder. All rights reserved.\nLokale MCP-Laufzeit für ChatGPT, Codex-kompatible Agents und vertrauenswürdige lokale Projekte.", "Copyright 2026 ezBuilder. All rights reserved.\nRuntime MCP local para ChatGPT, agentes compatíveis com Codex e projetos locais confiáveis.", "Copyright 2026 ezBuilder. All rights reserved.\nRuntime MCP locale per ChatGPT, agent compatibili con Codex e progetti locali attendibili.", "Copyright 2026 ezBuilder. All rights reserved.\nLokale MCP-runtime voor ChatGPT, Codex-compatibele agents en vertrouwde lokale projecten.", "Copyright 2026 ezBuilder. All rights reserved.\nLokalny runtime MCP dla ChatGPT, agentów zgodnych z Codex i zaufanych projektów lokalnych.", "Copyright 2026 ezBuilder. All rights reserved.\nЛокальная среда MCP для ChatGPT, Codex-совместимых агентов и доверенных локальных проектов.", "Copyright 2026 ezBuilder. All rights reserved.\nChatGPT, Codex uyumlu ajanlar ve güvenilir yerel projeler için yerel MCP çalışma zamanı.", "Copyright 2026 ezBuilder. All rights reserved.\nRuntime MCP cục bộ cho ChatGPT, tác nhân tương thích Codex và dự án cục bộ tin cậy.", "Copyright 2026 ezBuilder. All rights reserved.\nRuntime MCP lokal untuk ChatGPT, agen kompatibel Codex, dan proyek lokal tepercaya.", "Copyright 2026 ezBuilder. All rights reserved.\nรันไทม์ MCP ภายในสำหรับ ChatGPT, เอเจนต์ที่เข้ากันได้กับ Codex และโปรเจกต์ภายในที่เชื่อถือได้", "Copyright 2026 ezBuilder. All rights reserved.\nتشغيل MCP المحلي لـ ChatGPT والوكلاء المتوافقين مع Codex والمشاريع المحلية الموثوقة.", "Copyright 2026 ezBuilder. All rights reserved.\nChatGPT, Codex-संगत एजेंट और भरोसेमंद स्थानीय प्रोजेक्ट के लिए स्थानीय MCP रनटाइम।", "Copyright 2026 ezBuilder. All rights reserved.\nЛокальний runtime MCP для ChatGPT, Codex-сумісних агентів і довірених локальних проєктів."],
     "updatePageReady": ["Update page is ready.", "업데이트 페이지를 열 수 있습니다.", "更新ページを開けます。", "更新页面已准备好。", "更新頁面已就緒。", "La página de actualizaciones está lista.", "La page des mises à jour est prête.", "Die Update-Seite ist bereit.", "A página de atualizações está pronta.", "La pagina aggiornamenti è pronta.", "De updatepagina is klaar.", "Strona aktualizacji jest gotowa.", "Страница обновлений готова.", "Güncelleme sayfası hazır.", "Trang cập nhật đã sẵn sàng.", "Halaman pembaruan siap.", "หน้าการอัปเดตพร้อมแล้ว", "صفحة التحديث جاهزة.", "अपडेट पेज तैयार है।", "Сторінка оновлень готова."],
+    "sourceUpdateReady": ["Source-first updates are used. Open GitHub, pull the latest source, and rebuild locally.", "소스 우선 업데이트를 사용합니다. GitHub에서 최신 소스를 받은 뒤 로컬에서 다시 빌드하세요."],
     "updateCheckFailed": ["Could not check releases automatically. Open the releases page instead.", "릴리즈를 자동 확인하지 못했습니다. 릴리즈 페이지를 여세요.", "リリースを自動確認できませんでした。リリースページを開いてください。", "无法自动检查发布。请打开发布页面。", "無法自動檢查發行版。請開啟發行頁。", "No se pudieron comprobar releases automáticamente. Abre la página de releases.", "Impossible de vérifier les versions automatiquement. Ouvrez la page des versions.", "Releases konnten nicht automatisch geprüft werden. Öffne die Releases-Seite.", "Não foi possível verificar releases automaticamente. Abra a página de releases.", "Impossibile controllare le release automaticamente. Apri la pagina release.", "Kan releases niet automatisch controleren. Open de releases-pagina.", "Nie można automatycznie sprawdzić wydań. Otwórz stronę wydań.", "Не удалось автоматически проверить релизы. Откройте страницу релизов.", "Sürümler otomatik denetlenemedi. Sürümler sayfasını açın.", "Không thể tự động kiểm tra bản phát hành. Hãy mở trang phát hành.", "Tidak dapat memeriksa rilis otomatis. Buka halaman rilis.", "ตรวจสอบ releases อัตโนมัติไม่ได้ ให้เปิดหน้า releases", "تعذر التحقق من الإصدارات تلقائيا. افتح صفحة الإصدارات.", "रिलीज़ अपने-आप नहीं जांच सके। रिलीज़ पेज खोलें।", "Не вдалося автоматично перевірити релізи. Відкрийте сторінку релізів."],
     "upToDate": ["ChatGPT To Codex is up to date (%@).", "ChatGPT To Codex가 최신입니다 (%@).", "ChatGPT To Codex は最新です (%@)。", "ChatGPT To Codex 已是最新版本（%@）。", "ChatGPT To Codex 已是最新版本（%@）。", "ChatGPT To Codex está actualizado (%@).", "ChatGPT To Codex est à jour (%@).", "ChatGPT To Codex ist aktuell (%@).", "ChatGPT To Codex está atualizado (%@).", "ChatGPT To Codex è aggiornato (%@).", "ChatGPT To Codex is up-to-date (%@).", "ChatGPT To Codex jest aktualny (%@).", "ChatGPT To Codex обновлен (%@).", "ChatGPT To Codex güncel (%@).", "ChatGPT To Codex đã mới nhất (%@).", "ChatGPT To Codex sudah terbaru (%@).", "ChatGPT To Codex เป็นเวอร์ชันล่าสุด (%@)", "ChatGPT To Codex محدث (%@).", "ChatGPT To Codex अप टू डेट है (%@)।", "ChatGPT To Codex оновлено (%@)."],
     "updateAvailable": ["Update available: %@. Installed: %@.", "업데이트 가능: %@. 설치됨: %@.", "更新があります: %@。インストール済み: %@。", "有可用更新：%@。已安装：%@。", "有可用更新：%@。已安裝：%@。", "Actualización disponible: %@. Instalado: %@.", "Mise à jour disponible : %@. Installé : %@.", "Update verfügbar: %@. Installiert: %@.", "Atualização disponível: %@. Instalado: %@.", "Aggiornamento disponibile: %@. Installato: %@.", "Update beschikbaar: %@. Geïnstalleerd: %@.", "Dostępna aktualizacja: %@. Zainstalowano: %@.", "Доступно обновление: %@. Установлено: %@.", "Güncelleme var: %@. Kurulu: %@.", "Có bản cập nhật: %@. Đã cài: %@.", "Pembaruan tersedia: %@. Terpasang: %@.", "มีอัปเดต: %@ ติดตั้งอยู่: %@", "يتوفر تحديث: %@. المثبت: %@.", "अपडेट उपलब्ध: %@. इंस्टॉल: %@.", "Доступне оновлення: %@. Встановлено: %@."],
@@ -314,7 +298,6 @@ private final class ServiceController {
     private let showIntermediateCommentaryKey = "showIntermediateCommentary"
     private let controlAllowlistKey = "controlAllowlist"
     private let autoCheckUpdatesKey = "autoCheckUpdates"
-    private let appliedRuntimeVersionKey = "appliedRuntimeVersion"
     private(set) var process: Process?
     private var chatGptRemoteControlSessionOverride: Bool?
     private var activeScreenshotRequestIds = Set<String>()
@@ -606,7 +589,7 @@ private final class ServiceController {
 
     var githubRepoURL: URL {
         let configured = environment["CHATGPT2CODEX_UPDATE_REPO_URL"]?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return URL(string: configured?.isEmpty == false ? configured! : "https://github.com/ezBuilder/chatgpt2codex")!
+        return URL(string: configured?.isEmpty == false ? configured! : "https://github.com/kalstein27/chatgpt2codex")!
     }
 
     var preferredLanguage: String {
@@ -1334,8 +1317,13 @@ private final class ServiceController {
         effectiveRuntimeRoot.appendingPathComponent("dist").appendingPathComponent("cli.js")
     }
 
-    private func runCli(_ arguments: [String], stdin: String? = nil) throws -> (status: Int32, stdout: String, stderr: String) {
-        let activeRoot = effectiveRuntimeRoot
+    private func runCli(
+        _ arguments: [String],
+        stdin: String? = nil,
+        preferBundledRuntime: Bool = false
+    ) throws -> (status: Int32, stdout: String, stderr: String) {
+        let activeRoot = preferBundledRuntime ? runtimeRoot : effectiveRuntimeRoot
+        let activeCliScript = activeRoot.appendingPathComponent("dist").appendingPathComponent("cli.js")
         let nodeCandidates = [
             activeRoot.appendingPathComponent("bin/node"),
             activeRoot.appendingPathComponent("node/bin/node"),
@@ -1347,7 +1335,7 @@ private final class ServiceController {
         }
         let process = Process()
         process.executableURL = bundledNode ?? URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = bundledNode == nil ? ["node", cliScript.path] + arguments : [cliScript.path] + arguments
+        process.arguments = bundledNode == nil ? ["node", activeCliScript.path] + arguments : [activeCliScript.path] + arguments
 
         var environment = ProcessInfo.processInfo.environment
         environment["PATH"] = [
@@ -1388,6 +1376,47 @@ private final class ServiceController {
         let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         return (process.terminationStatus, stdout, stderr)
+    }
+
+    func inspectPreviousRuntimeRollback(completion: @escaping ([String: Any]?) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = try? self.runCli([
+                "runtime-rollback-previous-local",
+                "--port", "\(self.port)",
+            ], preferBundledRuntime: true)
+            let json: [String: Any]?
+            if let result,
+               result.status == 0,
+               let data = result.stdout.data(using: .utf8) {
+                json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            } else {
+                json = nil
+            }
+            DispatchQueue.main.async { completion(json) }
+        }
+    }
+
+    func rollbackPreviousRuntime(expectedCurrentFingerprint: String, completion: @escaping (Bool, String) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = try? self.runCli([
+                "runtime-rollback-previous-local",
+                "--apply",
+                "--expected-current", expectedCurrentFingerprint,
+                "--port", "\(self.port)",
+            ], preferBundledRuntime: true)
+            guard let result,
+                  let data = result.stdout.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                DispatchQueue.main.async { completion(false, "이전 런타임 복구 CLI가 유효한 결과를 반환하지 않았습니다.") }
+                return
+            }
+            let ok = result.status == 0 && json["ok"] as? Bool == true
+            let state = json["state"] as? String ?? (ok ? "ACTIVATION_REQUESTED" : "rollback-failed")
+            DispatchQueue.main.async { completion(ok, state) }
+        }
     }
 
     func forceChatGptCatalogRefresh(completion: @escaping (ChatGptCatalogRefreshOutcome) -> Void) {
@@ -1472,10 +1501,6 @@ private final class ServiceController {
                 NSLocalizedDescriptionKey: result.stderr.isEmpty ? "Owner token update failed." : result.stderr
             ])
         }
-    }
-
-    var releasesURL: URL {
-        githubRepoURL.appendingPathComponent("releases")
     }
 
     var selectedProjectFolder: URL? {
@@ -1951,108 +1976,8 @@ private final class ServiceController {
         return URL(string: String(text[matchRange]))
     }
 
-    func checkForUpdates(completion: @escaping (String, RuntimeUpdate?) -> Void) {
-        let currentVersion = defaults.string(forKey: appliedRuntimeVersionKey) ?? appVersion
-        let apiPath = githubRepoURL.path
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            .replacingOccurrences(of: ".git", with: "")
-        guard let apiURL = URL(string: "https://api.github.com/repos/\(apiPath)/releases/latest") else {
-            completion(localized("updatePageReady"), nil)
-            return
-        }
-        var request = URLRequest(url: apiURL)
-        request.timeoutInterval = 5
-        request.setValue("chatgpt2codex", forHTTPHeaderField: "User-Agent")
-        URLSession.shared.dataTask(with: request) { data, response, _ in
-            let status = (response as? HTTPURLResponse)?.statusCode
-            let json = data.flatMap {
-                try? JSONSerialization.jsonObject(with: $0) as? [String: Any]
-            }
-            let latest = json.flatMap { json in
-                (json["tag_name"] as? String) ?? (json["name"] as? String)
-            }?.trimmingCharacters(in: CharacterSet(charactersIn: "vV "))
-            let dmgURL = (json?["assets"] as? [[String: Any]])?
-                .first(where: { asset in
-                    (asset["name"] as? String)?.lowercased().hasSuffix(".dmg") == true
-                })
-                .flatMap { asset in
-                    (asset["browser_download_url"] as? String).flatMap(URL.init(string:))
-                }
-            DispatchQueue.main.async {
-                guard status == 200, let latest, !latest.isEmpty else {
-                    completion(self.localized("updateCheckFailed"), nil)
-                    return
-                }
-                if !versionIsNewer(latest, than: currentVersion) {
-                    completion(String(format: self.localized("upToDate"), currentVersion), nil)
-                } else {
-                    let update = dmgURL.map { RuntimeUpdate(version: latest, dmgURL: $0) }
-                    completion(String(format: self.localized("updateAvailable"), latest, currentVersion), update)
-                }
-            }
-        }.resume()
-    }
-
-    func applyRuntimeUpdate(
-        _ update: RuntimeUpdate,
-        completion: @escaping (Bool, String) -> Void
-    ) {
-        guard let executableDirectory = Bundle.main.executableURL?.deletingLastPathComponent() else {
-            completion(false, "Could not locate the application executable directory.")
-            return
-        }
-        let updater = executableDirectory.appendingPathComponent("chatgpt2codex-runtime-updater")
-        guard FileManager.default.isExecutableFile(atPath: updater.path) else {
-            completion(false, "Runtime updater helper is missing. Install this release's DMG once, then retry.")
-            return
-        }
-
-        let process = Process()
-        process.executableURL = updater
-        process.arguments = [
-            "--dmg-url", update.dmgURL.absoluteString,
-            "--version", update.version,
-            "--port", "\(port)",
-            "--current-app", Bundle.main.bundleURL.path,
-        ]
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = output
-        process.terminationHandler = { [weak self] process in
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            let text = String(data: data, encoding: .utf8) ?? ""
-            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            let message = json?["message"] as? String
-                ?? text.trimmingCharacters(in: .whitespacesAndNewlines)
-            let ok = process.terminationStatus == 0
-            if ok, let self {
-                self.defaults.set(update.version, forKey: self.appliedRuntimeVersionKey)
-            }
-            DispatchQueue.main.async {
-                completion(ok, message.isEmpty ? "Runtime updater did not return a result." : message)
-            }
-        }
-        do {
-            try process.run()
-        } catch {
-            completion(false, error.localizedDescription)
-        }
-    }
-
-    func applyRuntimeUpdateAndRefresh(
-        _ update: RuntimeUpdate,
-        completion: @escaping (Bool, String, ChatGptCatalogRefreshOutcome?) -> Void
-    ) {
-        applyRuntimeUpdate(update) { [weak self] ok, message in
-            guard let self else { return }
-            guard ok else {
-                completion(false, message, nil)
-                return
-            }
-            self.forceChatGptCatalogRefresh { outcome in
-                completion(true, message, outcome)
-            }
-        }
+    func checkForUpdates(completion: @escaping (String) -> Void) {
+        completion(localized("sourceUpdateReady"))
     }
 
     func runDoctor(repair: Bool = true) -> String {
@@ -2492,7 +2417,7 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             }
         }
         if controller.autoCheckUpdates {
-            controller.checkForUpdates { [weak self] message, _ in
+            controller.checkForUpdates { [weak self] message in
                 self?.statusMenuItem.title = message
             }
         }
@@ -2988,6 +2913,20 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
 
     private func popUpCommandMenu(_ menu: NSMenu, from sender: NSButton) {
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.minY - 4), in: sender)
+    }
+
+    private func showNativeApprovalInbox() {
+        guard let window = activityWindow,
+              let anchor = window.contentView
+        else {
+            showApprovalsSection()
+            return
+        }
+        let menu = makeNativeApprovalMenu()
+        let screenPoint = NSEvent.mouseLocation
+        let windowPoint = window.convertPoint(fromScreen: screenPoint)
+        let anchorPoint = anchor.convert(windowPoint, from: nil)
+        menu.popUp(positioning: nil, at: anchorPoint, in: anchor)
     }
 
     private func makeServiceMenu() -> NSMenu {
@@ -3502,6 +3441,16 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         detail.maximumNumberOfLines = 2
         stack.addArrangedSubview(detail)
 
+        let revive = NSButton(
+            title: controller.effectiveLanguageCode == "ko" ? "MCP 되살리기" : "Revive MCP",
+            target: self,
+            action: #selector(reviveMcpFromFallback)
+        )
+        revive.bezelStyle = .rounded
+        revive.image = symbol("arrow.clockwise.circle")
+        revive.imagePosition = .imageLeading
+        stack.addArrangedSubview(revive)
+
         let retry = NSButton(
             title: controller.effectiveLanguageCode == "ko" ? "다시 시도" : "Retry",
             target: self,
@@ -3520,6 +3469,10 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
             stack.trailingAnchor.constraint(lessThanOrEqualTo: fallback.trailingAnchor, constant: -24),
         ])
         return fallback
+    }
+
+    @objc private func reviveMcpFromFallback() {
+        restartServer()
     }
 
     @objc private func retryActivityDashboard() {
@@ -3641,19 +3594,48 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
         else { return }
 
         if action == "openApprovals" {
-            showIntegratedMenuSection(
-                id: "approvals",
-                title: controller.effectiveLanguageCode == "ko" ? "승인" : "Approvals",
-                menu: makeNativeApprovalMenu()
-            )
+            showNativeApprovalInbox()
             return
         }
 
         if action == "restartMcp" {
-            if latestHealth || controller.isManagedProcessRunning {
-                restartServer()
-            } else {
-                refreshStatus()
+            restartServer()
+            return
+        }
+
+        if action == "rollbackPreviousRuntime" {
+            controller.inspectPreviousRuntimeRollback { [weak self] candidate in
+                guard let self else { return }
+                guard let candidate,
+                      candidate["available"] as? Bool == true,
+                      let currentFingerprint = candidate["currentFingerprint"] as? String,
+                      let previousFingerprint = candidate["previousFingerprint"] as? String
+                else {
+                    let alert = NSAlert()
+                    alert.messageText = "이전 런타임 복구 불가"
+                    alert.informativeText = "현재 런타임과 정확히 연결된 이전 정상 스냅샷을 찾지 못했습니다. 새 런타임 health 실패는 기존 자동 롤백 경로가 처리합니다."
+                    alert.alertStyle = .warning
+                    alert.runModal()
+                    return
+                }
+                let alert = NSAlert()
+                alert.messageText = "이전 정상 런타임으로 복구할까요?"
+                alert.informativeText = "현재 \(String(currentFingerprint.prefix(12)))… → 이전 \(String(previousFingerprint.prefix(12)))…\n\n보존된 직전 immutable snapshot만 사용합니다. 적용 후 health 검증에 실패하면 기존 runtime apply 롤백 안전장치가 다시 동작합니다."
+                alert.alertStyle = .critical
+                alert.addButton(withTitle: "이전 런타임으로 복구")
+                alert.addButton(withTitle: "취소")
+                guard alert.runModal() == .alertFirstButtonReturn else { return }
+                self.controller.rollbackPreviousRuntime(expectedCurrentFingerprint: currentFingerprint) { [weak self] ok, state in
+                    guard let self else { return }
+                    let resultAlert = NSAlert()
+                    resultAlert.messageText = ok ? "런타임 복구 시작됨" : "런타임 복구 시작 실패"
+                    resultAlert.informativeText = ok
+                        ? "이전 정상 런타임으로의 교체 worker가 시작되었습니다. 상태: \(state)"
+                        : "안전 조건을 통과하지 못해 복구를 시작하지 않았습니다. 상태: \(state)"
+                    resultAlert.alertStyle = ok ? .informational : .warning
+                    resultAlert.runModal()
+                    self.refreshStatus()
+                }
             }
             return
         }
@@ -5636,49 +5618,17 @@ private final class StatusBarAppDelegate: NSObject, NSApplicationDelegate, NSMen
     }
 
     @objc private func checkForUpdates() {
-        controller.checkForUpdates { [weak self] message, update in
+        controller.checkForUpdates { [weak self] message in
             guard let self else { return }
             let alert = NSAlert()
             alert.messageText = self.t("updatesTitle")
-            alert.informativeText = update == nil
-                ? message
-                : "\(message)\n\n\(self.t("updateRuntimeExplanation"))"
-            if update != nil {
-                alert.addButton(withTitle: self.t("installRuntimeUpdate"))
-                alert.addButton(withTitle: self.t("openReleases"))
-                alert.addButton(withTitle: self.t("close"))
-            } else {
-                alert.addButton(withTitle: self.t("ok"))
-                alert.addButton(withTitle: self.t("openReleases"))
-            }
+            alert.informativeText = message
+            alert.addButton(withTitle: self.t("openGithubButton"))
+            alert.addButton(withTitle: self.t("close"))
             NSApp.activate(ignoringOtherApps: true)
             let response = alert.runModal()
-            if response == .alertFirstButtonReturn, let update {
-                self.statusMenuItem.title = self.t("updateDownloading")
-                self.controller.applyRuntimeUpdateAndRefresh(update) { [weak self] ok, result, refreshOutcome in
-                    guard let self else { return }
-                    var detail = result
-                    if let refreshOutcome {
-                        switch refreshOutcome {
-                        case .refreshed:
-                            detail += "\n\n\(self.t("catalogRecoveryDone"))"
-                        case .manualActionRequired:
-                            detail += "\n\n\(self.t("catalogRecoveryManual"))"
-                        case .helperMissing:
-                            detail += "\n\n\(self.t("catalogRecoveryMissing"))"
-                        case .failed:
-                            detail += "\n\n\(self.t("catalogRecoveryFailed"))"
-                        }
-                    }
-                    self.showInfo(
-                        ok ? self.t("updateApplyComplete") : self.t("updateApplyFailed"),
-                        detail
-                    )
-                    self.refreshStatus()
-                }
-            } else if (update != nil && response == .alertSecondButtonReturn)
-                        || (update == nil && response == .alertSecondButtonReturn) {
-                NSWorkspace.shared.open(self.controller.releasesURL)
+            if response == .alertFirstButtonReturn {
+                NSWorkspace.shared.open(self.controller.githubRepoURL)
             }
             self.refreshStatus()
         }

@@ -71,13 +71,32 @@ function collectFiles(root: string, relative: string, predicate: (relativePath: 
   return result;
 }
 
+type RuntimeFileReader = (relative: string) => Buffer | null;
+
+// A reader lives for one manifest calculation only. Independent candidate and
+// snapshot validations always read the bytes again, even if paths/mtimes match.
+function runtimeFileReader(root: string): RuntimeFileReader {
+  const contents = new Map<string, Buffer | null>();
+  return (relative) => {
+    if (!contents.has(relative)) {
+      const absolute = path.join(root, relative);
+      contents.set(relative, existsSync(absolute) && statSync(absolute).isFile() ? readFileSync(absolute) : null);
+    }
+    return contents.get(relative)!;
+  };
+}
+
 export function fingerprintRuntimeFiles(root: string, relativeFiles: readonly string[]): string | null {
+  return fingerprintFiles(relativeFiles, runtimeFileReader(root));
+}
+
+function fingerprintFiles(relativeFiles: readonly string[], read: RuntimeFileReader): string | null {
   const normalized = [...new Set(relativeFiles.map((entry) => entry.split(path.sep).join(path.posix.sep)))].sort();
-  const existing = normalized.filter((entry) => existsSync(path.join(root, entry)) && statSync(path.join(root, entry)).isFile());
+  const existing = normalized.filter((entry) => read(entry) !== null);
   if (existing.length === 0) return null;
   const hash = createHash("sha256");
   for (const relative of existing) {
-    const content = readFileSync(path.join(root, relative));
+    const content = read(relative)!;
     hash.update(relative, "utf8");
     hash.update("\0", "utf8");
     hash.update(String(content.byteLength), "utf8");
@@ -93,7 +112,7 @@ function configuredSourceFingerprint(): string | null {
   return value && SHA256_PATTERN.test(value) ? value.toLowerCase() : null;
 }
 
-function sourceFingerprint(root: string): string | null {
+function sourceFingerprint(root: string, read: RuntimeFileReader): string | null {
   const configured = configuredSourceFingerprint();
   if (configured) return configured;
   const sourceFiles = collectFiles(root, "src", (entry) =>
@@ -106,13 +125,12 @@ function sourceFingerprint(root: string): string | null {
     "tsconfig.json",
     "start-chatgpt.sh",
     "start-chatgpt.ps1",
-    "macos/ChatGPTToCodexStatusBar/runtime-updater.swift",
     ...sourceFiles,
   ];
-  return fingerprintRuntimeFiles(root, files);
+  return fingerprintFiles(files, read);
 }
 
-function buildFingerprint(root: string): string | null {
+function buildFingerprint(root: string, read: RuntimeFileReader): string | null {
   const files = [
     "package.json",
     "package-lock.json",
@@ -122,23 +140,15 @@ function buildFingerprint(root: string): string | null {
       entry !== SEALED_MANIFEST_RELATIVE_PATH,
     ),
   ];
-  return fingerprintRuntimeFiles(root, files);
+  return fingerprintFiles(files, read);
 }
 
-function sha256File(file: string): string | null {
-  try {
-    if (!statSync(file).isFile()) return null;
-    return createHash("sha256").update(readFileSync(file)).digest("hex");
-  } catch {
-    return null;
-  }
+function cliSha256(read: RuntimeFileReader): string | null {
+  const bytes = read("dist/cli.js");
+  return bytes ? createHash("sha256").update(bytes).digest("hex") : null;
 }
 
-function cliSha256(root: string): string | null {
-  return sha256File(path.join(root, "dist", "cli.js"));
-}
-
-function toolSchemaRevision(root: string): string | null {
+function toolSchemaRevision(root: string, read: RuntimeFileReader): string | null {
   const compiled = [
     "dist/server/tools.js",
     "dist/server/actions.js",
@@ -150,15 +160,49 @@ function toolSchemaRevision(root: string): string | null {
     "src/server/mcp-discovery.ts",
   ];
   const selected = compiled.every((entry) => existsSync(path.join(root, entry))) ? compiled : source;
-  const fingerprint = fingerprintRuntimeFiles(root, selected);
+  const fingerprint = fingerprintFiles(selected, read);
   return fingerprint ? `sha256:${fingerprint.slice(0, 24)}` : null;
 }
 
-function hostCatalogRevision(root: string): string | null {
+// Conservatively include every quoted relative module path, including re-exports
+// and literal dynamic imports. Extra matches in comments/UI strings only cause
+// extra invalidation; no module is evaluated. Computed or escaped module paths
+// use the complete runtime tree so an unresolvable import cannot hide a change.
+function catalogDependencyFiles(root: string, entries: readonly string[], read: RuntimeFileReader): string[] {
+  const tree = entries[0]!.startsWith("dist/") ? "dist" : "src";
+  const files = new Set<string>();
+  const pending = [...entries];
+  const allRuntimeFiles = () => collectFiles(root, tree, (entry) =>
+    /\.(?:[cm]?js|ts|json)$/u.test(entry) && !entry.endsWith(".test.ts") && !entry.includes("/__tests__/"));
+  while (pending.length > 0) {
+    const file = pending.pop()!;
+    if (files.has(file)) continue;
+    files.add(file);
+    const bytes = read(file);
+    if (!bytes || file.endsWith(".json")) continue;
+    const source = bytes.toString("utf8");
+    if (/\b(?:import|require)\s*\(\s*(?![\s'"])/u.test(source)
+        || /\b(?:from|import|require)\s*(?:\(\s*)?['"][^'"\n]*\\/u.test(source)) {
+      return [...files, ...allRuntimeFiles(), "package.json", "package-lock.json"];
+    }
+    for (const match of source.matchAll(/(['"])(\.{1,2}\/[^'"\\\n]+)\1/gu)) {
+      const relative = path.posix.normalize(path.posix.join(path.posix.dirname(file), match[2]!));
+      if (!relative.startsWith(tree + "/")) continue;
+      const candidates = tree === "src"
+        ? [relative.replace(/\.js$/u, ".ts"), relative]
+        : [relative];
+      const resolved = candidates.find((candidate) => /\.(?:[cm]?js|ts|json)$/u.test(candidate) && read(candidate) !== null);
+      if (resolved) pending.push(resolved);
+    }
+  }
+  return [...files, "package.json", "package-lock.json"];
+}
+
+function hostCatalogRevision(root: string, read: RuntimeFileReader): string | null {
   // Preserve toolSchemaRevision as the legacy runtime-update compatibility
-  // identity. The host catalog has additional direct dependencies because
-  // presenter names and static _meta/outputTemplate values are imported from
-  // widget descriptor modules. Track those bytes in a separate generation so
+  // identity. The host catalog includes transitive local dependencies because
+  // presenter names and static _meta/outputTemplate values can be imported from
+  // helper modules. Track those bytes in a separate generation so
   // old runtimes can still validate a newly built candidate while new runtimes
   // can detect every host-visible catalog change.
   const compiled = [
@@ -168,6 +212,7 @@ function hostCatalogRevision(root: string): string | null {
     "dist/server/chatgpt-consent-widget.js",
     "dist/server/chatgpt-widget-capability-lab.js",
     "dist/server/e2e-screenshot-widget.js",
+    "dist/server/chatgpt-vision-image-widget.js",
   ];
   const source = [
     "src/server/tools.ts",
@@ -176,27 +221,49 @@ function hostCatalogRevision(root: string): string | null {
     "src/server/chatgpt-consent-widget.ts",
     "src/server/chatgpt-widget-capability-lab.ts",
     "src/server/e2e-screenshot-widget.ts",
+    "src/server/chatgpt-vision-image-widget.ts",
+  ];
+  const selected = compiled.every((entry) => existsSync(path.join(root, entry))) ? compiled : source;
+  const fingerprint = fingerprintFiles(catalogDependencyFiles(root, selected, read), read);
+  return fingerprint ? `sha256:${fingerprint.slice(0, 24)}` : null;
+}
+
+function uiResourceRevision(root: string, read: RuntimeFileReader): string | null {
+  const compiled = [
+    "dist/server/chatgpt-consent-widget.js",
+    "dist/server/chatgpt-widget-capability-lab.js",
+    "dist/server/e2e-screenshot-widget.js",
+    "dist/server/chatgpt-vision-image-widget.js",
+  ];
+  const source = [
+    "src/server/chatgpt-consent-widget.ts",
+    "src/server/chatgpt-widget-capability-lab.ts",
+    "src/server/e2e-screenshot-widget.ts",
+    "src/server/chatgpt-vision-image-widget.ts",
+  ];
+  const selected = compiled.every((entry) => existsSync(path.join(root, entry))) ? compiled : source;
+  const fingerprint = fingerprintFiles(catalogDependencyFiles(root, selected, read), read);
+  return fingerprint ? `sha256:${fingerprint.slice(0, 24)}` : null;
+}
+export function legacyUiResourceRevisionForRoot(root: string): string | null {
+  const compiled = [
+    "dist/server/chatgpt-consent-widget.js",
+    "dist/server/chatgpt-widget-capability-lab.js",
+    "dist/server/e2e-screenshot-widget.js",
+    "dist/server/chatgpt-vision-image-widget.js",
+  ];
+  const source = [
+    "src/server/chatgpt-consent-widget.ts",
+    "src/server/chatgpt-widget-capability-lab.ts",
+    "src/server/e2e-screenshot-widget.ts",
+    "src/server/chatgpt-vision-image-widget.ts",
   ];
   const selected = compiled.every((entry) => existsSync(path.join(root, entry))) ? compiled : source;
   const fingerprint = fingerprintRuntimeFiles(root, selected);
   return fingerprint ? `sha256:${fingerprint.slice(0, 24)}` : null;
 }
 
-function uiResourceRevision(root: string): string | null {
-  const compiled = [
-    "dist/server/chatgpt-consent-widget.js",
-    "dist/server/chatgpt-widget-capability-lab.js",
-    "dist/server/e2e-screenshot-widget.js",
-  ];
-  const source = [
-    "src/server/chatgpt-consent-widget.ts",
-    "src/server/chatgpt-widget-capability-lab.ts",
-    "src/server/e2e-screenshot-widget.ts",
-  ];
-  const selected = compiled.every((entry) => existsSync(path.join(root, entry))) ? compiled : source;
-  const fingerprint = fingerprintRuntimeFiles(root, selected);
-  return fingerprint ? `sha256:${fingerprint.slice(0, 24)}` : null;
-}
+
 
 function packageVersion(root: string): string {
   try {
@@ -324,15 +391,15 @@ function readSealedRuntimeBuildIdentity(root: string, observed: {
   }
 }
 
-function freshRuntimeManifestForRoot(runtimeRoot: string, timestamp: string | null): RuntimeManifest {
+function freshRuntimeManifestForRoot(runtimeRoot: string, timestamp: string | null, read = runtimeFileReader(runtimeRoot)): RuntimeManifest {
   const packageVersionValue = packageVersion(runtimeRoot);
   const sourceRevisionValue = sourceRevision(runtimeRoot);
-  const sourceFingerprintValue = sourceFingerprint(runtimeRoot);
-  const buildFingerprintValue = buildFingerprint(runtimeRoot);
-  const cliSha256Value = cliSha256(runtimeRoot);
-  const toolSchemaRevisionValue = toolSchemaRevision(runtimeRoot);
-  const hostCatalogRevisionValue = hostCatalogRevision(runtimeRoot);
-  const uiResourceRevisionValue = uiResourceRevision(runtimeRoot);
+  const sourceFingerprintValue = sourceFingerprint(runtimeRoot, read);
+  const buildFingerprintValue = buildFingerprint(runtimeRoot, read);
+  const cliSha256Value = cliSha256(read);
+  const toolSchemaRevisionValue = toolSchemaRevision(runtimeRoot, read);
+  const hostCatalogRevisionValue = hostCatalogRevision(runtimeRoot, read);
+  const uiResourceRevisionValue = uiResourceRevision(runtimeRoot, read);
   const nodeVersion = process.version;
   const runtimeFingerprint = buildFingerprintValue;
   return {
@@ -416,12 +483,13 @@ export function getRuntimeManifest(): RuntimeManifest {
 
 export function getRuntimeManifestForRoot(runtimeRootValue: string): RuntimeManifest {
   const runtimeRoot = path.resolve(runtimeRootValue);
+  const read = runtimeFileReader(runtimeRoot);
   const packageVersionValue = packageVersion(runtimeRoot);
-  const buildFingerprintValue = buildFingerprint(runtimeRoot);
-  const cliSha256Value = cliSha256(runtimeRoot);
-  const toolSchemaRevisionValue = toolSchemaRevision(runtimeRoot);
-  const hostCatalogRevisionValue = hostCatalogRevision(runtimeRoot);
-  const uiResourceRevisionValue = uiResourceRevision(runtimeRoot);
+  const buildFingerprintValue = buildFingerprint(runtimeRoot, read);
+  const cliSha256Value = cliSha256(read);
+  const toolSchemaRevisionValue = toolSchemaRevision(runtimeRoot, read);
+  const hostCatalogRevisionValue = hostCatalogRevision(runtimeRoot, read);
+  const uiResourceRevisionValue = uiResourceRevision(runtimeRoot, read);
   const sealed = readSealedRuntimeBuildIdentity(runtimeRoot, {
     packageVersion: packageVersionValue,
     buildFingerprint: buildFingerprintValue,
@@ -437,7 +505,7 @@ export function getRuntimeManifestForRoot(runtimeRootValue: string): RuntimeMani
         uiResourceRevision: sealed.uiResourceRevision ?? uiResourceRevisionValue,
         runtimeRoot,
       }
-    : freshRuntimeManifestForRoot(runtimeRoot, configuredBuildTimestamp());
+    : freshRuntimeManifestForRoot(runtimeRoot, configuredBuildTimestamp(), read);
   return manifest;
 }
 

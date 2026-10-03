@@ -51,6 +51,11 @@ const ProjectLaneRecordSchema = z.object({
   expiresAt: z.number().int().nonnegative(),
   createdAt: z.number().int().nonnegative(),
   lastUsedAt: z.number().int().nonnegative(),
+  continuationState: z.enum(["active", "terminal-pending-resume"]).optional(),
+  continuationApprovalRequestId: z.string().regex(/^op_[0-9a-f-]{36}$/u).optional(),
+  continuationOperationId: z.string().regex(/^bg_[0-9a-f-]{36}$/u).optional(),
+  continuationStartedAt: z.number().int().nonnegative().optional(),
+  continuationTerminalAt: z.number().int().nonnegative().optional(),
 });
 
 export type ProjectLaneRecord = z.infer<typeof ProjectLaneRecordSchema>;
@@ -85,6 +90,15 @@ const SessionSchema = z.object({
       expiresAt: z.number().int().nonnegative(),
     })
     .nullable(),
+  hostManagement: z
+    .object({
+      grantId: z.string().regex(/^hmg_[0-9a-f-]{36}$/i),
+      level: z.enum(["tools", "admin"]),
+      issuedAt: z.number().int().nonnegative(),
+      expiresAt: z.number().int().nonnegative(),
+    })
+    .nullable()
+    .optional(),
   lanes: z.array(ProjectLaneRecordSchema).max(MAX_PROJECT_LANES).optional(),
   releasedLanes: z.array(ReleasedProjectLaneRecordSchema).max(16).optional(),
 });

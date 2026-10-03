@@ -16,6 +16,7 @@ on:
       - "windows/Build-And-Verify-Portable.cmd"
       - "windows/Build-And-Verify-Portable.ps1"
       - "windows/Build-Portable.ps1"
+      - "windows/Finalize-Signed-Portable.ps1"
       - "windows/ChatGPTToCodexLauncher.cs"
       - "windows/ChatGPTToCodexTray.ps1"
       - "windows/Configure-Activity-Remote.ps1"
@@ -29,6 +30,7 @@ on:
       - "windows/Verify-OAuth-Approval-Wiring.ps1"
       - "windows/Verify-Portable-First-Install-UI.ps1"
       - "windows/Verify-Portable.ps1"
+      - "windows/Verify-Release-Candidate.ps1"
       - "windows/Verify-Tailscale-Path.ps1"
       - "windows/Verify-Unified-Dashboard-UI.ps1"
       - "windows/Start-ChatGPTToCodexTray.cmd"
@@ -50,6 +52,7 @@ on:
       - "windows/Build-And-Verify-Portable.cmd"
       - "windows/Build-And-Verify-Portable.ps1"
       - "windows/Build-Portable.ps1"
+      - "windows/Finalize-Signed-Portable.ps1"
       - "windows/ChatGPTToCodexLauncher.cs"
       - "windows/ChatGPTToCodexTray.ps1"
       - "windows/Configure-Activity-Remote.ps1"
@@ -63,6 +66,7 @@ on:
       - "windows/Verify-OAuth-Approval-Wiring.ps1"
       - "windows/Verify-Portable-First-Install-UI.ps1"
       - "windows/Verify-Portable.ps1"
+      - "windows/Verify-Release-Candidate.ps1"
       - "windows/Verify-Tailscale-Path.ps1"
       - "windows/Verify-Unified-Dashboard-UI.ps1"
       - "windows/Start-ChatGPTToCodexTray.cmd"
@@ -136,6 +140,7 @@ jobs:
             "windows/Archive-Portable.ps1",
             "windows/Build-And-Verify-Portable.ps1",
             "windows/Build-Portable.ps1",
+            "windows/Finalize-Signed-Portable.ps1",
             "windows/ChatGPTToCodexTray.ps1",
             "windows/Configure-Activity-Remote.ps1",
             "windows/Generate-BrandIcon.ps1",
@@ -146,6 +151,7 @@ jobs:
             "windows/Verify-OAuth-Approval-Wiring.ps1",
             "windows/Verify-Portable-First-Install-UI.ps1",
             "windows/Verify-Portable.ps1",
+            "windows/Verify-Release-Candidate.ps1",
             "windows/Verify-Tailscale-Path.ps1",
             "windows/Verify-Unified-Dashboard-UI.ps1"
           )
@@ -175,6 +181,7 @@ jobs:
             "windows/Archive-Portable.ps1",
             "windows/Build-And-Verify-Portable.ps1",
             "windows/Build-Portable.ps1",
+            "windows/Finalize-Signed-Portable.ps1",
             "windows/ChatGPTToCodexTray.ps1",
             "windows/Configure-Activity-Remote.ps1",
             "windows/Generate-BrandIcon.ps1",
@@ -185,6 +192,7 @@ jobs:
             "windows/Verify-OAuth-Approval-Wiring.ps1",
             "windows/Verify-Portable-First-Install-UI.ps1",
             "windows/Verify-Portable.ps1",
+            "windows/Verify-Release-Candidate.ps1",
             "windows/Verify-Tailscale-Path.ps1",
             "windows/Verify-Unified-Dashboard-UI.ps1"
           )
@@ -238,6 +246,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           npm run build:windows-portable
           npm run verify:windows-portable
+          npm run verify:windows-release-candidate
           $arch = (node -p "process.arch").Trim()
           if ($arch -ne "${{ matrix.arch }}") {
             throw "Portable architecture mismatch. Expected ${{ matrix.arch }}, got $arch."
@@ -276,9 +285,16 @@ jobs:
           }
           $zip = Join-Path $env:GITHUB_WORKSPACE "build\windows-portable\chatgpt2codex-windows-$arch.zip"
           if (-not (Test-Path -LiteralPath $zip)) { throw "Portable zip was not produced." }
+          $checksum = "$zip.sha256"
+          if (-not (Test-Path -LiteralPath $checksum)) { throw "Portable SHA-256 sidecar was not produced." }
           $zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          $checksumContent = (Get-Content -Raw -LiteralPath $checksum).Trim()
+          $expectedChecksumLine = "$zipHash  chatgpt2codex-windows-$arch.zip"
+          if ($checksumContent -ne $expectedChecksumLine) {
+            throw "Portable SHA-256 sidecar does not match the ZIP."
+          }
           Write-Host "portable-zip-sha256=$zipHash"
-          "$zipHash  chatgpt2codex-windows-$arch.zip" | Set-Content -LiteralPath "$zip.sha256" -Encoding ASCII
+          Write-Host "portable-checksum=$checksum"
 
       - name: Verify portable first-install isolation
         shell: powershell

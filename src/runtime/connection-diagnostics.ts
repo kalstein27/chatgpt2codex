@@ -19,6 +19,7 @@ export interface ConnectionDiagnosticSafeInputs {
   leasePreset?: "read-only" | "tests-only" | "full-write" | "image-only" | "control";
   requestedPreset?: "read-only" | "tests-only" | "full-write" | "image-only" | "control";
   requiredCapability?: "read" | "verify" | "write" | "image" | "remote" | "control";
+  requiredHostManagementLevel?: "tools" | "admin";
   projectSelectPurpose?: "legacy-admin" | "control";
   confirmSwitch?: boolean;
   captureScreenshot?: boolean;
@@ -28,6 +29,7 @@ export interface ConnectionDiagnosticSafeInputs {
   destructive?: boolean;
   projectId?: string;
   commandId?: string;
+  workLaneProvided?: boolean;
 }
 
 export type ConnectionDiagnosticPhase =
@@ -66,6 +68,12 @@ export interface ConnectionDiagnosticInput {
   requestCount?: number;
   reusedRequestCount?: number;
   activeSessionCount?: number;
+  dispatchToResponseMs?: number;
+  workerDurationMs?: number;
+  inlineFastPath?: boolean;
+  handoffReason?: string;
+  coalescedReplay?: boolean;
+  restartInterrupted?: boolean;
   operationId?: string;
   phase?: ConnectionDiagnosticPhase;
   actionStarted?: boolean;
@@ -99,6 +107,7 @@ export interface ConnectionDiagnosticSummary {
   recentEvents: ConnectionDiagnosticEvent[];
   recentCommandEvents: ConnectionDiagnosticEvent[];
   clientCancellationRecovery?: ClientCancellationRecovery;
+  turnLossRecovery?: TurnLossRecoveryEvidence;
 }
 
 export interface ClientCancellationRecovery {
@@ -119,6 +128,20 @@ export interface ClientCancellationRecovery {
     | "inspect-completed-result-before-retry"
     | "inspect-failure-before-retry"
     | "inspect-connection-audit-before-retry";
+}
+
+export interface TurnLossRecoveryEvidence {
+  observedAt: string;
+  projectId?: string;
+  leasePreset?: "read-only" | "tests-only" | "full-write" | "image-only" | "control";
+  triggerTool?: string;
+  idleMs?: number;
+  previousToolCompletedAt?: string;
+  postToolSilenceMs?: number;
+  previousToolSucceeded: boolean;
+  transportErrorObserved: boolean;
+  unreleasedPrivilegedLaneObserved: true;
+  automaticRetrySafe: false;
 }
 
 export interface ConnectionAuditOptions {
@@ -151,6 +174,7 @@ export interface ConnectionAuditSummary {
   }>;
   slowRequests: ConnectionDiagnosticEvent[];
   recentFailures: ConnectionDiagnosticEvent[];
+  turnLossRecoveries: TurnLossRecoveryEvidence[];
   lifecycle: ConnectionLifecycleSummary;
 }
 
@@ -279,6 +303,16 @@ function safeEvent(input: ConnectionDiagnosticInput): ConnectionDiagnosticEvent 
     ...(Number.isFinite(input.activeSessionCount)
       ? { activeSessionCount: Math.max(0, Math.round(input.activeSessionCount ?? 0)) }
       : {}),
+    ...(Number.isFinite(input.dispatchToResponseMs)
+      ? { dispatchToResponseMs: Math.max(0, Math.round(input.dispatchToResponseMs ?? 0)) }
+      : {}),
+    ...(Number.isFinite(input.workerDurationMs)
+      ? { workerDurationMs: Math.max(0, Math.round(input.workerDurationMs ?? 0)) }
+      : {}),
+    ...(typeof input.inlineFastPath === "boolean" ? { inlineFastPath: input.inlineFastPath } : {}),
+    ...(bounded(input.handoffReason) ? { handoffReason: bounded(input.handoffReason) } : {}),
+    ...(typeof input.coalescedReplay === "boolean" ? { coalescedReplay: input.coalescedReplay } : {}),
+    ...(typeof input.restartInterrupted === "boolean" ? { restartInterrupted: input.restartInterrupted } : {}),
     ...(bounded(input.operationId) ? { operationId: bounded(input.operationId) } : {}),
     ...(input.phase && SAFE_DIAGNOSTIC_PHASES.has(input.phase) ? { phase: input.phase } : {}),
     ...(typeof input.actionStarted === "boolean" ? { actionStarted: input.actionStarted } : {}),
@@ -376,6 +410,47 @@ function clientCancellationRecovery(
     automaticRetrySafe: false,
     recommendedAction,
   };
+}
+
+function turnLossRecoveries(
+  events: ConnectionDiagnosticEvent[],
+  limit = 20,
+): TurnLossRecoveryEvidence[] {
+  const recoveries: TurnLossRecoveryEvidence[] = [];
+  for (let index = 0; index < events.length; index += 1) {
+    const cleanup = events[index]!;
+    if (cleanup.event !== "project.lane.turn-loss-cleaned") continue;
+    let previousToolCall: ConnectionDiagnosticEvent | undefined;
+    for (let priorIndex = index - 1; priorIndex >= 0; priorIndex -= 1) {
+      const candidate = events[priorIndex]!;
+      if (candidate.event === "tool.call") {
+        previousToolCall = candidate;
+        break;
+      }
+    }
+    const previousAt = previousToolCall ? Date.parse(previousToolCall.at) : Number.NEGATIVE_INFINITY;
+    const cleanupAt = Date.parse(cleanup.at);
+    const transportErrorObserved = events.some((event) => {
+      const at = Date.parse(event.at);
+      return event.event === "mcp.transport_error" && at >= previousAt && at <= cleanupAt;
+    });
+    recoveries.push({
+      observedAt: cleanup.at,
+      ...(cleanup.safeInputs?.projectId ? { projectId: cleanup.safeInputs.projectId } : {}),
+      ...(cleanup.safeInputs?.leasePreset ? { leasePreset: cleanup.safeInputs.leasePreset } : {}),
+      ...(cleanup.tool ? { triggerTool: cleanup.tool } : {}),
+      ...(Number.isFinite(cleanup.durationMs) ? { idleMs: Math.max(0, cleanup.durationMs ?? 0) } : {}),
+      previousToolSucceeded: previousToolCall?.outcome === "success",
+      ...(previousToolCall ? { previousToolCompletedAt: previousToolCall.at } : {}),
+      ...(Number.isFinite(previousAt) && Number.isFinite(cleanupAt)
+        ? { postToolSilenceMs: Math.max(0, cleanupAt - previousAt) }
+        : {}),
+      transportErrorObserved,
+      unreleasedPrivilegedLaneObserved: true,
+      automaticRetrySafe: false,
+    });
+  }
+  return recoveries.slice(-Math.max(1, limit));
 }
 
 function lifecycleSummary(events: ConnectionDiagnosticEvent[]): ConnectionLifecycleSummary {
@@ -533,6 +608,7 @@ export class FileConnectionDiagnostics implements ConnectionDiagnosticsSink {
     }
     const lifecycle = lifecycleSummary(events);
     const cancellationRecovery = clientCancellationRecovery(events);
+    const turnLossRecovery = turnLossRecoveries(events, 1).at(-1);
     return {
       logPath: this.logPath,
       lastEventAt: events.at(-1)?.at,
@@ -548,6 +624,7 @@ export class FileConnectionDiagnostics implements ConnectionDiagnosticsSink {
       recentEvents,
       recentCommandEvents: recentCommandEvents(events),
       ...(cancellationRecovery ? { clientCancellationRecovery: cancellationRecovery } : {}),
+      ...(turnLossRecovery ? { turnLossRecovery } : {}),
     };
   }
 
@@ -623,6 +700,7 @@ export class FileConnectionDiagnostics implements ConnectionDiagnosticsSink {
         .sort((a, b) => (b.durationMs ?? 0) - (a.durationMs ?? 0) || b.at.localeCompare(a.at))
         .slice(0, maxSlowRequests),
       recentFailures: events.filter((event) => event.outcome === "failure").slice(-maxRecentFailures),
+      turnLossRecoveries: turnLossRecoveries(events),
       lifecycle: lifecycleSummary(events),
     };
   }

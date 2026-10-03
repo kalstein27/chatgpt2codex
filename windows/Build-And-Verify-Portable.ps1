@@ -78,6 +78,7 @@ try {
     $nodeArch = (& $node.Source -p "process.arch").Trim()
     $expectedStage = Join-Path $outputBase ("chatgpt2codex-windows-" + $nodeArch)
     $expectedZip = $expectedStage + ".zip"
+    $expectedChecksum = $expectedZip + ".sha256"
     if (-not (Test-Path -LiteralPath (Join-Path $expectedStage "portable-manifest.json"))) {
         throw "Portable build reported success but the isolated staging manifest is missing: $expectedStage"
     }
@@ -86,6 +87,9 @@ try {
     }
     if ((Get-Item -LiteralPath $expectedZip).Length -le 0) {
         throw "Portable build reported success but the isolated ZIP is empty: $expectedZip"
+    }
+    if (-not (Test-Path -LiteralPath $expectedChecksum)) {
+        throw "Portable build reported success but the SHA-256 sidecar is missing: $expectedChecksum"
     }
 
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "Verify-OAuth-Approval-Wiring.ps1")

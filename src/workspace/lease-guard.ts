@@ -2,13 +2,13 @@ import { DomainError, ErrorCode, type Lease, type LeasePreset, type ToolContext 
 import { requireLease } from "./project-select.js";
 import { requireProjectLane } from "../state/project-lanes.js";
 import { requireProjectPrivilege } from "../state/project-privilege-locks.js";
+import { isChatGpt2CodexSourceProject, requireHostManagement } from "../state/host-management.js";
 import type { SessionDocument } from "../state/store.js";
 
 /**
  * Capability ceiling checked against the active project lease's preset.
- * Shared by src/server/tools.ts (file/command/git tools) and
- * src/control/tools.ts (desktop-control tools) so both enforce the same
- * preset -> capability table from a single source of truth.
+ * Project leases authorize project-confined work only. Host-wide administration
+ * is intentionally kept in the separate host-management grant model.
  */
 export type LeaseCapability = "read" | "verify" | "write" | "image" | "remote" | "control";
 
@@ -18,7 +18,7 @@ export interface ProjectLeaseRequirementOptions {
   allowRemoteSerial?: boolean;
 }
 
-/** Smallest lease preset that grants each capability without widening access. */
+/** Smallest lease preset that grants each project capability without widening access. */
 export const RECOMMENDED_PRESET_BY_CAPABILITY: Readonly<Record<LeaseCapability, LeasePreset>> = {
   read: "read-only",
   verify: "tests-only",
@@ -48,6 +48,17 @@ function requireLeaseCapability(lease: Lease, capability: LeaseCapability): Leas
   return lease;
 }
 
+async function requireSelfHostAdmin(
+  ctx: ToolContext,
+  project: ToolContext["registry"][number] | undefined,
+  capability: LeaseCapability,
+): Promise<void> {
+  if (!project || capability === "read" || capability === "control") return;
+  if (await isChatGpt2CodexSourceProject(project)) {
+    await requireHostManagement(ctx, "admin");
+  }
+}
+
 /**
  * Require an unexpired lease for `projectId` that permits `capability`.
  * Throws LEASE_REQUIRED (no/mismatched lease), LEASE_EXPIRED (matching lease
@@ -63,9 +74,7 @@ export async function requireProjectLease(
 ): Promise<Lease> {
   const session = await ctx.store.getSession(ctx.sessionScope);
   const remoteIsolation = ctx.remote === true && ctx.config.multiProjectLanesEnabled === true;
-  const project = workLaneId !== undefined || remoteIsolation
-    ? ctx.registry.find((entry) => entry.projectId === projectId)
-    : undefined;
+  const project = ctx.registry.find((entry) => entry.projectId === projectId);
   if ((workLaneId !== undefined || remoteIsolation) && !project) {
     throw new DomainError(ErrorCode.PROJECT_NOT_FOUND, `Unknown projectId: ${projectId}`);
   }
@@ -80,8 +89,10 @@ export async function requireProjectLease(
       project: project!,
       workLaneId,
       ownerScope: ctx.sessionScope ?? "local-default",
+      allowContinuationActive: capability === "read",
     });
     const authorized = requireLeaseCapability(laneLease, capability);
+    await requireSelfHostAdmin(ctx, project, capability);
     if (remoteIsolation) {
       await requireProjectPrivilege({
         stateDir: ctx.stateDir,
@@ -114,6 +125,7 @@ export async function requireProjectLease(
   }
   const lease = requireLease(session, projectId);
   const authorized = requireLeaseCapability(lease, capability);
+  await requireSelfHostAdmin(ctx, project, capability);
   if (remoteIsolation) {
     await requireProjectPrivilege({
       stateDir: ctx.stateDir,

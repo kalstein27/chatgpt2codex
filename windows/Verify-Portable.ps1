@@ -110,6 +110,13 @@ if (-not (Test-Path -LiteralPath $zip)) { throw "Portable ZIP is missing: $zip" 
 $zipInfo = Get-Item -LiteralPath $zip
 if ($zipInfo.Length -le 0) { throw "Portable ZIP is empty: $zip" }
 $zipHash = Get-C2ctSha256Hex $zip
+$checksumPath = $zip + ".sha256"
+if (-not (Test-Path -LiteralPath $checksumPath)) { throw "Portable SHA-256 sidecar is missing: $checksumPath" }
+$checksumContent = (Get-Content -Raw -LiteralPath $checksumPath).Trim()
+$expectedChecksumLine = $zipHash + "  " + [System.IO.Path]::GetFileName($zip)
+if ($checksumContent -ne $expectedChecksumLine) {
+    throw "Portable SHA-256 sidecar does not match the ZIP: $checksumPath"
+}
 
 Write-Host "windows-portable-verification=PASS"
 Write-Host "portable-root=$bundle"
@@ -122,3 +129,4 @@ Write-Host "portable-npm-cli-sha256=$npmCliHash"
 Write-Host "portable-brand-icon=true"
 Write-Host "portable-plugin-icon-sha256=$pluginIconHash"
 Write-Host "portable-zip-sha256=$zipHash"
+Write-Host "portable-checksum=$checksumPath"

@@ -42,7 +42,12 @@ export async function resolveScheduledCodexExecutable(deps: ExecutableResolverDe
     return verifyExecutable(override, fsDeps);
   }
   const candidates: string[] = [];
-  if ((deps.platform ?? process.platform) === "darwin") candidates.push("/Applications/ChatGPT.app/Contents/Resources/codex");
+  if ((deps.platform ?? process.platform) === "darwin") {
+    candidates.push(
+      "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+      "/Applications/ChatGPT.app/Contents/Resources/codex",
+    );
+  }
   for (const entry of (env.PATH ?? "").split(path.delimiter).filter(Boolean)) {
     if (isAbsoluteSafe(entry)) candidates.push(path.join(entry, (deps.platform ?? process.platform) === "win32" ? "codex.exe" : "codex"));
   }

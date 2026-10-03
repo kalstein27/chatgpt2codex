@@ -1,9 +1,10 @@
+import { runtimeGenerationMatches, runtimeSchemaRefreshRequired } from "./runtime-schema-identity.js";
 import { randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { getRuntimeManifest, type RuntimeManifest } from "./runtime-manifest.js";
 import { getLatestAppliedSchemaChangingRuntimeApplyReceipt, type RuntimeApplyReceipt } from "./runtime-apply.js";
-import { readHostCatalogRebind, type HostCatalogRebindReceipt } from "./host-catalog-rebind.js";
+import { hostCatalogRebindMarkerToolName, matchesHostCatalogRebindReceipt, readHostCatalogRebind, type HostCatalogRebindReceipt } from "./host-catalog-rebind.js";
 
 const DIR_MODE = 0o700;
 const FILE_MODE = 0o600;
@@ -30,6 +31,8 @@ export interface ToolSchemaRecoveryPlan {
     | "no-applied-schema-change"
     | "latest-schema-change-is-not-current-runtime"
     | "runtime-schema-changed-awaiting-tools-list"
+    | "post-apply-host-catalog-refresh-failed"
+    | "post-apply-refresh-scan-awaiting-tool-mention"
     | "post-apply-tools-list-observed"
     | "post-apply-host-catalog-rebind-observed";
   toolSchemaChanged: boolean;
@@ -49,6 +52,7 @@ export interface ToolSchemaRecoveryPlan {
     forceRefresh: true;
     requiresFreshChatVerification: false;
     connectorReregistrationRequired: false;
+    expectedMarkerTool: string | null;
   };
   instruction: string;
 }
@@ -163,30 +167,13 @@ function manifestCatalogRevision(manifest: RuntimeManifest): string | null {
 }
 
 function appliedSchemaChange(receipt: RuntimeApplyReceipt | null): boolean {
-  const catalogChanged = receipt
-    ? manifestCatalogRevision(receipt.previousManifest) !== manifestCatalogRevision(receipt.targetManifest)
-    : false;
-  const uiResourceChanged = Boolean(
-    receipt
-    && typeof receipt.previousManifest.uiResourceRevision === "string"
-    && typeof receipt.targetManifest.uiResourceRevision === "string"
-    && receipt.previousManifest.uiResourceRevision !== receipt.targetManifest.uiResourceRevision,
-  );
-  return Boolean(
-    receipt
+  return Boolean(receipt
     && (receipt.state === "APPLIED" || receipt.state === "ALREADY_APPLIED")
-    && (catalogChanged || uiResourceChanged),
-  );
+    && runtimeSchemaRefreshRequired(receipt.previousManifest, receipt.targetManifest));
 }
 
 function applyTargetsCurrentRuntime(receipt: RuntimeApplyReceipt, runtimeManifest: RuntimeManifest): boolean {
-  const targetCatalogRevision = manifestCatalogRevision(receipt.targetManifest);
-  const runtimeCatalogRevision = manifestCatalogRevision(runtimeManifest);
-  if (targetCatalogRevision && runtimeCatalogRevision && targetCatalogRevision !== runtimeCatalogRevision) return false;
-  if (receipt.targetManifest.runtimeFingerprint && runtimeManifest.runtimeFingerprint) {
-    return receipt.targetManifest.runtimeFingerprint === runtimeManifest.runtimeFingerprint;
-  }
-  return true;
+  return runtimeGenerationMatches(receipt.targetManifest, runtimeManifest);
 }
 
 export function toolSchemaRecoveryPlan(input: {
@@ -201,24 +188,14 @@ export function toolSchemaRecoveryPlan(input: {
     lastRuntimeApply && applyTargetsCurrentRuntime(lastRuntimeApply, runtimeManifest),
   );
   const applyAt = lastRuntimeApply ? Date.parse(lastRuntimeApply.updatedAt) : Number.NaN;
-  const rebindObservedAt = hostCatalogRebind ? Date.parse(hostCatalogRebind.observedAt) : Number.NaN;
-  const refreshCompletedAt = lastRuntimeApply?.hostCatalogRefreshCompletedAt
-    ? Date.parse(lastRuntimeApply.hostCatalogRefreshCompletedAt)
-    : Number.NaN;
+  const expectedHostCatalogMarkerTool = hostCatalogRebindMarkerToolName(runtimeManifest.hostCatalogRevision);
   const hostCatalogRebindVerified = hostCatalogRebind && applyTargetsCurrent
-    ? Boolean(
-      lastRuntimeApply
-      && lastRuntimeApply.hostCatalogRefreshAttempted === true
-      && lastRuntimeApply.hostCatalogRefreshRequested === true
-      && lastRuntimeApply.hostCatalogScanCompleted === true
-      && Number.isFinite(applyAt)
-      && Number.isFinite(refreshCompletedAt)
-      && Number.isFinite(rebindObservedAt)
-      && refreshCompletedAt >= applyAt
-      && rebindObservedAt >= refreshCompletedAt
-      && hostCatalogRebind.runtimeHostCatalogRevision === runtimeManifest.hostCatalogRevision
-      && hostCatalogRebind.runtimeFingerprint === runtimeManifest.runtimeFingerprint,
-    )
+    ? matchesHostCatalogRebindReceipt(hostCatalogRebind, {
+      hostCatalogRevision: runtimeManifest.hostCatalogRevision,
+      runtimeFingerprint: runtimeManifest.runtimeFingerprint,
+      markerToolName: expectedHostCatalogMarkerTool,
+      observedAtOrAfter: applyAt,
+    })
     : null;
   const base = {
     toolSchemaChanged,
@@ -236,6 +213,7 @@ export function toolSchemaRecoveryPlan(input: {
       forceRefresh: true as const,
       requiresFreshChatVerification: false as const,
       connectorReregistrationRequired: false as const,
+      expectedMarkerTool: expectedHostCatalogMarkerTool,
     },
   };
 
@@ -268,7 +246,51 @@ export function toolSchemaRecoveryPlan(input: {
       reason: "post-apply-host-catalog-rebind-observed",
       toolListRefreshObserved: false,
       preferredExecution: "named-tool",
-      instruction: "The bounded post-apply host catalog refresh completed and a direct named catalog marker was then invoked against the same runtime fingerprint and host-catalog revision. Treat the current chat named-tool mount as rebound even if a separate tools/list observation has not been recorded. Keep c2ct_invoke only as a backend fallback if a later named call is rejected. Widget/approval presenters must continue to use their dedicated direct named surface.",
+      instruction: "The host catalog refresh/scan workflow completed and a direct named catalog marker was then invoked against the same runtime fingerprint and host-catalog revision. Treat the current chat named-tool mount as rebound even if a separate tools/list observation has not been recorded. Keep c2ct_invoke only as a backend fallback if a later named call is rejected. Widget/approval presenters must continue to use their dedicated direct named surface.",
+    };
+  }
+
+  const postApplyRefreshScanAwaitingToolMention = Boolean(
+    applyTargetsCurrent
+    && lastRuntimeApply?.hostCatalogRefreshAttempted === true
+    && lastRuntimeApply.hostCatalogRefreshRequested === true
+    && lastRuntimeApply.hostCatalogScanCompleted === true
+    && lastRuntimeApply.hostCatalogRefreshStatus === "refresh-requested"
+    && expectedHostCatalogMarkerTool !== null,
+  );
+  if (postApplyRefreshScanAwaitingToolMention) {
+    return {
+      ...base,
+      mode: "stable-dispatcher-preferred",
+      reason: "post-apply-refresh-scan-awaiting-tool-mention",
+      toolListRefreshObserved: false,
+      preferredExecution: "c2ct_invoke",
+      instruction: "The manual refresh plus scan workflow completed for the current runtime generation, but the current chat has not yet recorded direct named mount proof. Do not refresh again. Ask the user to send a native @C2CT tool mention in this same chat; assistant-authored @C2CT text and Widget Shell buttons are not equivalent to that host re-entry. On the next user turn invoke hostCatalogRefresh.expectedMarkerTool directly by its named surface. Only that exact direct marker success proves current-chat host rebind. Until then, backend-safe operations may continue through tool_schema_get + c2ct_invoke without connector re-registration.",
+    };
+  }
+
+  const manualHostCatalogRefreshRequired = Boolean(
+    applyTargetsCurrent
+    && lastRuntimeApply
+    && (
+      lastRuntimeApply.hostCatalogRefreshStatus === "manual-action-required"
+      || (
+        lastRuntimeApply.hostCatalogRefreshAttempted === true
+        && (
+          lastRuntimeApply.hostCatalogRefreshStatus === "unavailable"
+          || lastRuntimeApply.hostCatalogRefreshStatus === "failed"
+        )
+      )
+    ),
+  );
+  if (manualHostCatalogRefreshRequired) {
+    return {
+      ...base,
+      mode: "stable-dispatcher-preferred",
+      reason: "post-apply-host-catalog-refresh-failed",
+      toolListRefreshObserved: false,
+      preferredExecution: "c2ct_invoke",
+      instruction: "The host-catalog refresh/scan state for this runtime generation is incomplete. Runtime apply does not refresh the host catalog automatically. Continue backend-safe work through tool_schema_get + c2ct_invoke. Use the ChatGPT Settings C2CT force-refresh path manually, then run scan-tools explicitly. A scan is not convergence proof unless its currentChatRebindProbeTool equals the expected live generation marker and that exact direct named marker is callable in this chat.",
     };
   }
 
@@ -307,7 +329,7 @@ export function toolSchemaRecoveryPlan(input: {
     reason: "runtime-schema-changed-awaiting-tools-list",
     toolListRefreshObserved: false,
     preferredExecution: "c2ct_invoke",
-    instruction: "The runtime schema changed and no current post-apply tools/list fetch has been observed. Refresh the host connector runtime snapshot with app/installed(forceRefresh=true), then re-query the direct named mount in the current chat. A successful catalog refresh can update the current chat; use a fresh chat only as fallback when the current host mount remains stale. Refresh plugin/package inventory separately only when plugin metadata itself changed. Until host convergence, route backend-safe public operations through stable c2ct_invoke. Widget/approval presenter exception: never use c2ct_invoke to render or validate ChatGPT widget UI, approval cards, outputTemplate/resource mounts, or host confirmation UI; those require the dedicated direct named presenter/tool surface. If c2ct_invoke refuses a target because that named tool requires host confirmation, do not bypass the boundary. Do not re-register the bare /mcp connector.",
+    instruction: "The runtime schema changed and no current post-apply tools/list fetch has been observed. Runtime apply does not refresh the host catalog automatically. Use the ChatGPT Settings C2CT force-refresh path manually, then run scan-tools explicitly and re-query the direct named mount in the current chat. Require the scanned currentChatRebindProbeTool to equal the expected live generation marker. If the marker mismatches, stop scan loops and refresh manually again only when the user chooses to. Backend-safe operations may continue through c2ct_invoke. Widget/approval presenter exception: never use c2ct_invoke to render or validate ChatGPT widget UI, approval cards, outputTemplate/resource mounts, or host confirmation UI; those require the dedicated direct named presenter/tool surface. If c2ct_invoke refuses a target because that named tool requires host confirmation, do not bypass the boundary. Do not re-register the bare /mcp connector.",
   };
 }
 

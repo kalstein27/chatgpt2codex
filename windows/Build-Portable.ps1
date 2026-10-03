@@ -104,6 +104,7 @@ if (Test-RunningNodeInsidePath $stage) {
 
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $stage
 Remove-Item -Force -ErrorAction SilentlyContinue $zip
+Remove-Item -Force -ErrorAction SilentlyContinue ($zip + ".sha256")
 New-Item -ItemType Directory -Force -Path $stage, (Join-Path $stage "runtime"), (Join-Path $stage "assets") | Out-Null
 
 Copy-WithRetry "dist" (Join-Path $stage "dist") -Recurse -Label "dist"

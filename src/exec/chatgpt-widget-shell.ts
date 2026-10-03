@@ -1,8 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { DomainError, ErrorCode } from "../types.js";
+import {
+  classifyTerminalState,
+  normalizeCardState,
+  type ChatGptCardLifecycleState,
+} from "./chatgpt-card-lifecycle.js";
 
 const DEFAULT_TTL_MS = 30 * 60_000;
 const MAX_CARDS = 128;
+const AUTO_CONTINUE_DELAY_MS = 15_000;
 export const CHATGPT_WIDGET_SHELL_COMPAT_PREFIX = "__c2ct_widget_shell_choice_v1__|";
 
 export interface ChatGptWidgetChoiceOption {
@@ -19,6 +25,7 @@ export interface ChatGptWidgetChoiceCard {
   options: ChatGptWidgetChoiceOption[];
   compact: boolean;
   availableAt: number | null;
+  autoContinueAt: number | null;
   createdAt: number;
   expiresAt: number;
   status: "pending" | "resolved";
@@ -30,6 +37,29 @@ export interface ChatGptWidgetChoiceResult {
   choiceId: string;
   choiceLabel: string;
   resolvedAt: number;
+}
+
+const WIDGET_CHOICE_TERMINAL_STATUSES = { resolved: "completed" } as const;
+
+export function chatGptWidgetChoiceCardLifecycle(
+  card: Pick<ChatGptWidgetChoiceCard, "cardId" | "status" | "expiresAt">,
+  input: { presented?: boolean; resolving?: boolean; pollStatus?: boolean; now?: number } = {},
+): ChatGptCardLifecycleState {
+  const now = input.now ?? Date.now();
+  const expired = card.status === "pending" && card.expiresAt < now;
+  const terminalReason = expired
+    ? "expired"
+    : classifyTerminalState(card.status, WIDGET_CHOICE_TERMINAL_STATUSES);
+  const phase = input.resolving ? "resolving" : input.presented ? "waiting-user" : "presentable";
+  return normalizeCardState({
+    identityKey: `widget-choice:${card.cardId}`,
+    phase,
+    terminalReason,
+    expiresAt: card.expiresAt,
+    statusSource: "server-authoritative",
+    presentationRequired: phase === "presentable",
+    pollMode: phase === "resolving" && input.pollStatus === true ? "bounded-status-only" : "none",
+  });
 }
 
 export function decodeChatGptWidgetChoiceTransport(payload: string): { cardId: string; choiceId: string } | undefined {
@@ -70,6 +100,7 @@ function publicCard(card: StoredCard): ChatGptWidgetChoiceCard {
     options: card.options.map((option) => ({ ...option })),
     compact: card.compact,
     availableAt: card.availableAt,
+    autoContinueAt: card.autoContinueAt,
     createdAt: card.createdAt,
     expiresAt: card.expiresAt,
     status: card.status,
@@ -127,9 +158,13 @@ export function createChatGptWidgetChoiceCard(input: {
   }
   validateOptions(input.options);
   if (input.compact === true && input.options.length !== 1) throw invalid("Compact choice cards require exactly one option");
+  const autoContinueAt = input.compact === true && input.options.length === 1 && input.options[0]?.id === "continue"
+    ? now + unlockAfterMs + AUTO_CONTINUE_DELAY_MS
+    : null;
   prune(now);
 
   const cardId = `wcc_${randomUUID()}`;
+  const availableAt = unlockAfterMs > 0 ? now + unlockAfterMs : null;
   const card: StoredCard = {
     kind: "choice",
     cardId,
@@ -137,7 +172,8 @@ export function createChatGptWidgetChoiceCard(input: {
     prompt: input.prompt,
     options: input.options.map((option) => ({ ...option })),
     compact: input.compact === true,
-    availableAt: unlockAfterMs > 0 ? now + unlockAfterMs : null,
+    availableAt,
+    autoContinueAt,
     createdAt: now,
     expiresAt: now + ttlMs,
     status: "pending",
@@ -215,7 +251,9 @@ export function getChatGptWidgetChoiceResult(input: {
   const card = cards.get(cardId);
   if (!card) throw invalid("Choice result was not found or expired");
   if (card.sessionScope !== input.sessionScope) throw forbidden("Choice result belongs to another ChatGPT session");
-  if (!card.result) return { status: "pending", cardId: card.cardId };
+  const lifecycle = chatGptWidgetChoiceCardLifecycle(card, { now });
+  if (lifecycle.phase !== "terminal") return { status: "pending", cardId: card.cardId };
+  if (!card.result) throw invalid("Choice result was not found or expired");
   if (input.receiptId && card.result.receiptId !== input.receiptId) throw invalid("Choice result identifiers do not match");
   return { status: "resolved", ...card.result };
 }
