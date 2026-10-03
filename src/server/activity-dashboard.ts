@@ -4,7 +4,7 @@ import path from "node:path";
 import { redact } from "../policy/secrets.js";
 import type { RuntimeActivityTracker, RuntimeConversationSummary } from "../runtime/activity.js";
 import type { ActivityMcpHealth } from "./activity-mcp-health.js";
-import { CHATGPT_OPERATION_APPROVAL_USER_PROMPTS, CHATGPT_STANDARD_CONSENT_USER_PROMPTS } from "./chatgpt-card-prompts.js";
+import { CHATGPT_CONSENT_META_KEY, CHATGPT_CONSENT_WIDGET_HTML } from "./chatgpt-consent-widget.js";
 
 const MAX_DASHBOARD_OPERATIONS = 12;
 const MAX_WIDGET_LOAD_ACTIVITY = 24;
@@ -28,6 +28,15 @@ export const ACTIVITY_DASHBOARD_CONTRACT_VERSION = 1;
 const ACTIVITY_DASHBOARD_MAX_OVERRIDE_BYTES = 512 * 1024;
 const ACTIVITY_DASHBOARD_CONTRACT_MARKER = `<meta name="c2ct-activity-dashboard-contract" content="${ACTIVITY_DASHBOARD_CONTRACT_VERSION}">`;
 const FAILURE_BURST_WINDOW_MS = 2 * 60 * 1000;
+const GALLERY_C2CT_APP_ICON_SVG = [
+  '<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">',
+  '<defs><linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#087E78"/><stop offset=".55" stop-color="#119B93"/><stop offset="1" stop-color="#20B6AD"/></linearGradient><linearGradient id="shield" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FF9C14"/><stop offset="1" stop-color="#FF7A00"/></linearGradient></defs>',
+  '<rect x="28" y="28" width="968" height="968" rx="210" fill="url(#bg)"/>',
+  '<g fill="none" stroke="#fff" stroke-width="64" stroke-linecap="round" stroke-linejoin="round"><path d="M514 171 C321 171 176 308 176 491 C176 594 225 684 306 744 L286 842 L405 777 C440 786 476 791 514 791 C705 791 852 655 852 476 C852 299 706 171 514 171 Z"/><path d="M426 388 L334 480 L426 572"/><path d="M602 388 L694 480 L602 572"/><path d="M552 349 L476 611"/></g>',
+  '<g><path d="M720 596 C789 620 850 618 905 596 L919 610 V738 C919 833 858 895 812 919 C766 895 705 833 705 738 V610 Z" fill="url(#shield)" stroke="#FFD13A" stroke-width="26" stroke-linejoin="round"/><path d="M755 758 L799 802 L873 718" fill="none" stroke="#fff" stroke-width="42" stroke-linecap="round" stroke-linejoin="round"/></g>',
+  '</svg>',
+].join("");
+const GALLERY_C2CT_APP_ICON_DATA_URI = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(GALLERY_C2CT_APP_ICON_SVG)}`;
 
 export interface ActivityDashboardApproval {
   id: string;
@@ -549,6 +558,148 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     .gallery-choice-list { display: grid; gap: 7px; margin-top: 9px; }
     .gallery-choice { text-align: left; padding: 8px 10px; }
     .gallery-choice small { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.4; font-weight: 500; }
+    .gallery-live-card { padding: 12px; overflow: hidden; }
+    .gallery-live-label { margin: 0 2px 10px; color: var(--muted); font-size: 11px; font-weight: 760; }
+    .gallery-host-controls { display: flex; justify-content: flex-end; margin: -2px 0 10px; }
+    .gallery-host-debug-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10.5px; font-weight: 650; user-select: none; }
+    .gallery-host-debug-toggle input { width: 14px; height: 14px; margin: 0; accent-color: var(--blue); }
+    .gallery-chatgpt-host {
+      box-sizing: border-box;
+      width: 100%;
+      margin: 0 auto;
+      padding: clamp(12px, 2.1vw, 20px);
+      border-radius: 0;
+      background: transparent;
+      color: #555;
+    }
+    .gallery-live-card[data-preview-platform="ios"] {
+      width: 100%;
+      max-width: 440px;
+      justify-self: center;
+      padding: 0;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
+      overflow: visible;
+    }
+    .gallery-live-card[data-preview-platform="ios"] > .gallery-live-label,
+    .gallery-live-card[data-preview-platform="ios"] > .gallery-flow { display: none; }
+    .gallery-comparison-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 12px; align-items: start; }
+    .gallery-comparison-card { position: relative; padding-top: 36px !important; }
+    .gallery-comparison-card > .gallery-live-label { display: none; }
+    .gallery-comparison-card::before {
+      content: attr(data-ab-label);
+      position: absolute;
+      top: 7px;
+      left: 10px;
+      min-height: 22px;
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 8px;
+      background: var(--panel2);
+      color: var(--text);
+      font-size: 11px;
+      font-weight: 760;
+      line-height: 1.2;
+    }
+    .gallery-comparison-card[data-preview-variant="improved"]::before {
+      color: var(--blue);
+      border-color: color-mix(in srgb, var(--blue) 42%, var(--line));
+    }
+    .gallery-auto-ios-spacer { min-height: 1px; }
+    .gallery-comparison-note { margin: 8px 0 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
+    .gallery-ios-reference-image {
+      display: block;
+      width: 100%;
+      height: auto;
+      margin: 0 0 12px;
+      padding: 0;
+      border: 0;
+      border-radius: 0;
+    }
+    .gallery-chatgpt-host[data-platform="ios"] {
+      max-width: 440px;
+      padding: 0 16px;
+      border-radius: 0;
+      background: #fff;
+      color: #555;
+    }
+    .gallery-chatgpt-host[data-platform="desktop"] { max-width: 820px; }
+    .gallery-chatgpt-app-row {
+      display: flex;
+      align-items: center;
+      gap: clamp(9px, 1.4vw, 12px);
+      margin: 0 0 clamp(14px, 2.3vw, 22px);
+      padding-left: 1px;
+    }
+    .gallery-chatgpt-app-icon {
+      display: block;
+      width: clamp(28px, 4.4vw, 40px);
+      height: clamp(28px, 4.4vw, 40px);
+      border-radius: clamp(8px, 1.2vw, 11px);
+      object-fit: cover;
+      flex: 0 0 auto;
+    }
+    .gallery-chatgpt-app-name {
+      font-size: clamp(17px, 2.6vw, 24px);
+      font-weight: 700;
+      letter-spacing: -.015em;
+      line-height: 1.2;
+    }
+    .gallery-chatgpt-host[data-platform="ios"] .gallery-chatgpt-app-row {
+      gap: 8px;
+      margin: 0 0 12px;
+      padding: 0;
+    }
+    .gallery-chatgpt-host[data-platform="ios"] .gallery-chatgpt-app-icon {
+      width: 20px;
+      height: 20px;
+      border-radius: 6px;
+    }
+    .gallery-chatgpt-host[data-platform="ios"] .gallery-chatgpt-app-name {
+      color: #555;
+      font-size: 16px;
+      font-weight: 650;
+    }
+    .gallery-chatgpt-widget-viewport {
+      box-sizing: border-box;
+      width: 100%;
+      padding: clamp(10px, 1.7vw, 16px);
+      border: 1px solid rgba(255,255,255,.18);
+      border-radius: clamp(18px, 2.7vw, 25px);
+      background: rgba(255,255,255,.025);
+      overflow: hidden;
+    }
+    .gallery-chatgpt-host[data-platform="ios"] .gallery-chatgpt-widget-viewport {
+      width: auto;
+      margin: 0 4px;
+      padding: 0;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+    }
+    .gallery-live-widget-frame { display: block; width: 100%; min-height: 88px; border: 0; background: transparent; overflow: hidden; }
+    #gallery-view.gallery-show-bounds .gallery-chatgpt-host { outline: none; }
+    #gallery-view.gallery-show-bounds .gallery-chatgpt-widget-viewport { outline: 1px dashed rgba(255,185,92,.82); outline-offset: -4px; }
+    #gallery-view.gallery-show-bounds .gallery-live-widget-frame { outline: 1px dashed rgba(107,224,157,.84); outline-offset: -2px; }
+    @media (max-width: 720px) {
+      .gallery-ios-reference-image {
+        width: 100vw;
+        max-width: none;
+        margin-left: calc(50% - 50vw);
+        margin-right: calc(50% - 50vw);
+      }
+      .gallery-chatgpt-host { padding: 12px; border-radius: 16px; }
+      .gallery-chatgpt-app-row { margin-bottom: 14px; }
+      .gallery-chatgpt-widget-viewport { padding: 10px; border-radius: 18px; }
+      .gallery-chatgpt-host[data-platform="ios"] { padding: 0 16px; border-radius: 0; }
+      .gallery-chatgpt-host[data-platform="ios"] .gallery-chatgpt-app-row { margin-bottom: 12px; }
+      .gallery-chatgpt-host[data-platform="ios"] .gallery-chatgpt-widget-viewport { padding: 0; border-radius: 0; }
+      .gallery-auto-ios-spacer { display: none; }
+    }
     .gallery-flow { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
     .gallery-flow-title, .gallery-button-guide-title { color: var(--muted); font-size: 10.5px; font-weight: 760; letter-spacing: .01em; }
     .gallery-flow-steps { display: flex; flex-wrap: wrap; gap: 5px 4px; align-items: center; margin-top: 7px; }
@@ -663,6 +814,9 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     .activity-preview-line[role="button"]:focus-visible { box-shadow: 0 0 0 1px color-mix(in srgb, var(--blue) 65%, transparent); }
     .activity-preview-line.failed, .activity-entry.failed .activity-line { color: var(--red); }
     .activity-preview-line.failed .activity-time, .activity-entry.failed .activity-time { color: color-mix(in srgb, var(--red) 72%, var(--muted)); }
+    .activity-preview-line.permission-required, .activity-entry.permission-required .activity-line { color: var(--orange); }
+    .activity-preview-line.permission-required .activity-time, .activity-entry.permission-required .activity-time { color: color-mix(in srgb, var(--orange) 74%, var(--muted)); }
+    .activity-preview-line.stopped, .activity-entry.stopped .activity-line { color: var(--muted); }
     .activity-preview-line.failed.historical, .activity-entry.failed.historical .activity-line { color: var(--muted); opacity: .76; }
     .activity-preview-line.failed.historical .activity-time, .activity-entry.failed.historical .activity-time { color: var(--muted); }
     .activity-time { flex: 0 0 40px; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 9.5px; }
@@ -715,6 +869,31 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       #cards { grid-template-columns: 1fr; }
       .gallery-grid { grid-template-columns: 1fr; }
       .gallery-card { border-radius: 16px; padding: 16px; }
+      /*
+       * iPhone reference measurement:
+       *   screenshot width = 1320px
+       *   real ChatGPT card = x 60..1259 = 1200px = 90.9090909vw
+       * The shared widget document adds 4px body padding on each side, so the
+       * preview viewport is reference-card width + 8px. The visible .card
+       * therefore lands at the same measured 400pt width on a 440pt viewport.
+       */
+      .gallery-card.gallery-live-card { overflow: visible; }
+      .gallery-card.gallery-live-card .gallery-chatgpt-widget-viewport {
+        width: calc(90.9090909vw + 8px);
+        max-width: none;
+        margin-left: 50%;
+        margin-right: 0;
+        padding: 0;
+        border: 0;
+        border-radius: 0;
+        background: transparent;
+        overflow: visible;
+        transform: translateX(-50%);
+      }
+      .gallery-card.gallery-live-card[data-preview-variant="improved"] .gallery-chatgpt-widget-viewport {
+        width: 90.9090909vw;
+      }
+      .gallery-comparison-grid { grid-template-columns: 1fr; }
       .gallery-title-row { align-items: flex-start; margin-bottom: 11px; }
       .gallery-title { font-size: 18px; }
       .gallery-state { padding: 5px 10px; font-size: 13px; line-height: 1.35; }
@@ -883,123 +1062,39 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     </div>
   </section>
   <section id="gallery-view" class="view-panel" hidden>
-    <div class="gallery-note"><b>미리보기 전용</b> · 현재 ChatGPT 카드 상태머신과 같은 사용자 흐름을 한곳에 모았습니다. 이 화면의 클릭은 실제 승인이나 작업을 실행하지 않으며, 승인 카드의 프롬프트는 실제 전송 경로와 같은 공용 문자열 소스를 사용합니다.</div>
+    <div class="gallery-note"><b>미리보기 전용</b> · ChatGPT 카드는 실제 <code>CHATGPT_CONSENT_WIDGET_HTML</code> 렌더러를 그대로 사용하고, 그 바깥에 ChatGPT가 제공하는 앱 행·외곽선·호스트 여백만 미리보기용으로 재현합니다. Activity 카드는 실제 <code>makeCard()</code>로 샘플 데이터만 렌더합니다. 미리보기에서는 클릭·승인·자동진행·상태조회가 비활성화됩니다.</div>
+    <div class="gallery-host-controls"><label class="gallery-host-debug-toggle"><input id="gallery-debug-bounds" type="checkbox">영역선 보기</label></div>
     <section class="gallery-section">
-      <div class="section-head"><h2>인라인 승인 카드</h2><span>현재 승인 · 자동 재개 흐름</span></div>
-      <div class="gallery-grid">
-        <article class="gallery-card" data-gallery-flow="보호 작업 요청 생성|서버에 pending 승인 저장|카드 즉시 표시|허용 1회|서버 authoritative allow 확정|exact 작업 continuation 시작|현재 채팅 자동 재개 1회|작업 상태 자동 확인">
-          <div class="gallery-title-row"><div class="gallery-title">확인</div><span class="gallery-state orange">승인 대기</span></div>
-          <div class="gallery-preview">프로젝트 chatgpt2codex · 보호 작업 “command_run” 1회 수행</div>
-          <div class="gallery-time">생성: 2026. 09. 27. 12:40:12 · 만료: 2026. 09. 27. 12:45:12</div>
-          <div class="gallery-impact">영향: 승인된 정확한 요청만 1회 실행</div>
-          <details class="gallery-details"><summary>상세 명령 및 파라미터</summary><div class="gallery-detail-command">tool: command_run\nprojectId: chatgpt2codex\ncommandId: npm:test\nwritesWorkspace: false</div></details>
-          <div class="gallery-actions"><button class="deny" data-preview-label="거절" data-preview-prompt-key="deny" data-preview-effect="서버에 denied 결정을 저장하고 보호 작업은 실행하지 않습니다.">거절</button><button class="allow" data-preview-label="허용" data-preview-prompt-key="allow" data-preview-effect="정확히 이 one-shot 승인을 저장하고 연결된 작업을 시작합니다. 승인 확정 뒤 현재 채팅도 자동으로 한 번 재개되므로 완료 결과 확인 버튼을 다시 누르지 않습니다.">허용</button></div>
-        </article>
-        <article class="gallery-card" data-gallery-flow="일반 consent 요청|pending 카드 표시|사용자 범위 선택|이번만 또는 프로젝트 범위 저장|후속 대화 자동 전달">
-          <div class="gallery-title-row"><div class="gallery-title">확인</div><span class="gallery-state orange">권한 선택</span></div>
-          <div class="gallery-preview">이 작업을 이번 한 번만 허용하거나 현재 프로젝트 범위에서 허용합니다.</div>
-          <div class="gallery-impact">영향: 선택한 범위의 일반 consent만 저장 · operation approval과 별도</div>
-          <div class="gallery-actions"><button class="deny" data-preview-label="거절" data-preview-prompt-set="standard" data-preview-prompt-key="deny" data-preview-effect="일반 consent 요청을 거절하고 후속 대화에 거절 의도를 전달합니다.">거절</button><button class="allow" data-preview-label="이번만 허용" data-preview-prompt-set="standard" data-preview-prompt-key="allow" data-preview-effect="이번 요청만 허용하고 후속 대화를 자동 전달합니다.">이번만 허용</button><button class="allow" data-preview-label="이 프로젝트에서 허용" data-preview-prompt-set="standard" data-preview-prompt-key="allowProject" data-preview-effect="현재 프로젝트 범위 consent를 저장하고 후속 대화를 자동 전달합니다.">이 프로젝트에서 허용</button></div>
-        </article>
-        <article class="gallery-card critical" data-gallery-flow="고위험 작업 preflight|exact 요청 봉인|Critical Approval 표시|허용 1회|봉인된 worker 시작|현재 채팅 자동 재개|health / rollback 확인|필요 시 수동 Settings 새로고침 handoff">
-          <div class="gallery-title-row"><div class="gallery-title">⚠️ 고위험 승인</div><span class="gallery-state red">승인 대기</span></div>
-          <div class="gallery-critical-badge">Mac 시스템 변경</div>
-          <div class="gallery-warning">Mac C2CT runtime 실제 교체 · 성공 후 schema 변경 시 Settings에서 C2CT를 수동 새로고침</div>
-          <div class="gallery-critical-meta"><div class="gallery-critical-row"><span class="gallery-critical-key">대상</span><span class="gallery-critical-value">현재 fingerprint → sealed candidate</span></div><div class="gallery-meta">롤백: 새 runtime health check 실패 시 기존 runtime 자동 롤백</div><div class="gallery-meta">적용 후: 정상 적용 후 자동 catalog refresh 없음 · Settings 수동 새로고침 후 scan-tools 별도 실행</div></div>
-          <div class="gallery-preview">현재 runtime을 새 immutable runtime으로 교체합니다.</div>
-          <div class="gallery-time">승인은 exact request와 현재 세션에만 결합</div>
-          <div class="gallery-impact">영향: 앱/runtime/process 실제 변경 가능</div>
-          <details class="gallery-details"><summary>상세 명령 및 파라미터</summary><div class="gallery-detail-command">tool: runtime_apply_local\nprojectId: chatgpt2codex\npreserveConnector: true\nrollbackOnHealthFailure: true</div></details>
-          <details class="gallery-details"><summary>기술 원문</summary><div class="gallery-detail-command">CRITICAL: replace the live C2CT runtime; preserve supervisor/connector/tunnel; never replay an approved mutation</div></details>
-          <div class="gallery-actions"><button class="deny" data-preview-label="거절" data-preview-prompt-key="deny" data-preview-effect="고위험 작업을 시작하지 않고 요청을 거절 상태로 종료합니다.">거절</button><button class="allow" data-preview-label="위험을 이해하고 승인" data-preview-prompt-key="allow" data-preview-effect="봉인된 exact 작업만 시작합니다. 승인 후 mutation을 다시 호출하지 않고 status-only로 이어가며 현재 채팅은 자동 재개합니다.">위험을 이해하고 승인</button></div>
-        </article>
-        <article class="gallery-card critical" data-gallery-flow="검증된 app build 확인|exact app 교체 요청 봉인|Critical Approval 표시|허용 1회|/Applications 교체|app/supervisor/runtime 재기동|health 확인 또는 rollback|현재 채팅 자동 재개">
-          <div class="gallery-title-row"><div class="gallery-title">⚠️ 고위험 승인</div><span class="gallery-state red">승인 대기</span></div>
-          <div class="gallery-critical-badge">Mac 앱 교체</div>
-          <div class="gallery-warning">/Applications 앱 실제 교체 · app/supervisor/runtime 재기동 가능 · 연결 일시 중단 가능</div>
-          <div class="gallery-critical-meta"><div class="gallery-critical-row"><span class="gallery-critical-key">대상</span><span class="gallery-critical-value">현재 executable → 검증된 새 executable</span></div><div class="gallery-meta">롤백: 설치/health verification 실패 시 기존 앱·실행 상태 롤백</div></div>
-          <div class="gallery-preview">검증된 ChatGPT To Codex 앱을 /Applications에 설치합니다.</div>
-          <div class="gallery-impact">영향: 앱 파일 교체와 연결 일시 중단 가능</div>
-          <div class="gallery-actions"><button class="deny" data-preview-label="거절" data-preview-prompt-key="deny" data-preview-effect="앱을 교체하지 않고 exact 요청을 종료합니다.">거절</button><button class="allow" data-preview-label="위험을 이해하고 승인" data-preview-prompt-key="allow" data-preview-effect="승인에 묶인 exact app worker만 시작합니다. mutation을 재호출하지 않고 status-only로 이어가며 현재 채팅은 자동 재개합니다.">위험을 이해하고 승인</button></div>
-        </article>
-        <article class="gallery-card success" data-gallery-flow="허용 클릭|서버 allow 확정|one-shot worker 시작|현재 채팅 자동 재개 dispatch|operation 상태 자동 관찰">
-          <div class="gallery-title-row"><div class="gallery-title">확인</div><span class="gallery-state green">승인 완료</span></div>
-          <div class="gallery-preview">승인 완료 · 작업 실행 중</div>
-          <div class="gallery-impact">영향: 승인된 정확한 작업 1회만 실행</div>
-          <div class="gallery-status-message">현재 채팅 자동 재개 중 · 별도의 “완료 결과 확인” 버튼을 다시 누르지 않음</div>
-        </article>
-        <article class="gallery-card success" data-gallery-flow="승인 완료|작업 terminal 관찰|outputRef 보존|현재 채팅 자동 재개 latch 확인|카드 terminal 상태 유지">
-          <div class="gallery-title-row"><div class="gallery-title">확인</div><span class="gallery-state green">처리 완료</span></div>
-          <div class="gallery-preview">작업 완료 · 결과 확인 가능</div>
-          <div class="gallery-status-message">현재 채팅 자동 재개됨 · 동일 승인으로 mutation 재실행 불가</div>
-        </article>
-        <article class="gallery-card denied" data-gallery-flow="승인 카드 표시|거절 클릭|서버에 denied 저장|원래 작업 중단|terminal 상태 유지">
-          <div class="gallery-title-row"><div class="gallery-title">확인</div><span class="gallery-state red">거절 완료</span></div>
-          <div class="gallery-preview">요청이 거절되어 보호 작업은 실행되지 않습니다.</div>
-          <div class="gallery-status-message">기존 one-shot token 재사용 금지 · 다시 필요하면 새 요청 생성</div>
-        </article>
-        <article class="gallery-card" data-gallery-flow="사용자 결정 수신|decision 요청 1회|서버 authoritative 검증 중|중복 클릭 차단|응답 또는 receipt reconciliation">
-          <div class="gallery-title-row"><div class="gallery-title">확인</div><span class="gallery-state blue">처리 중</span></div>
-          <div class="gallery-preview">승인 결정을 서버에 저장하고 연결된 작업을 준비하는 중입니다.</div>
-          <div class="gallery-impact">영향: authoritative allow 전에는 실행 권한으로 간주하지 않음</div>
-          <div class="gallery-actions"><button disabled>거절</button><button disabled>허용</button></div>
-        </article>
-        <article class="gallery-card muted" data-gallery-flow="pending 카드 표시|서버 expiry 확인|버튼 비활성|새 요청 필요">
-          <div class="gallery-title-row"><div class="gallery-title">확인</div><span class="gallery-state gray">만료</span></div>
-          <div class="gallery-preview">승인 유효 시간이 지나 카드가 비활성화되었습니다.</div>
-          <div class="gallery-status-message">만료된 token 재사용 금지 · 새 승인 요청 필요</div>
-        </article>
-        <article class="gallery-card" data-gallery-flow="decision 응답 유실 또는 status 오류|서버 receipt 상태만 재조회|mutation 자동 재전송 금지|읽기 전용 복구">
-          <div class="gallery-title-row"><div class="gallery-title">확인</div><span class="gallery-state orange">확인 불가</span></div>
-          <div class="gallery-preview">서버 승인 기록을 확인할 수 없습니다.</div>
-          <div class="gallery-status-message">승인 재전송 없이 상태만 다시 확인할 수 있습니다.</div>
-          <div class="gallery-actions"><button class="gallery-choice" data-preview-label="상태만 다시 확인" data-preview-effect="persisted approval/receipt를 읽기 전용으로 확인합니다. 기존 mutation은 재실행하지 않습니다.">상태만 다시 확인</button></div>
-        </article>
-        <article class="gallery-card denied" data-gallery-flow="authoritative allow 확정|채팅 자동 재개 전송 실패|승인 성공 상태 유지|mutation 재실행 금지|사용자가 채팅에서 상태 확인 가능">
-          <div class="gallery-title-row"><div class="gallery-title">확인</div><span class="gallery-state red">대화 재개 실패</span></div>
-          <div class="gallery-preview">승인된 작업은 그대로 유지되지만 현재 채팅 자동 재개 전송에 실패했습니다.</div>
-          <div class="gallery-status-message">승인된 작업은 재실행하지 않음 · 필요하면 채팅에서 status-only 확인</div>
-        </article>
+      <div class="section-head"><h2>인라인 승인 카드 A/B</h2><span>원본 코드 vs 미리보기 전용 개선안</span></div>
+      <div class="gallery-comparison-grid">
+        <article class="gallery-card gallery-live-card gallery-comparison-card" data-live-widget-preview="approval-standard" data-preview-name="일반 작업 승인 · 기존" data-preview-variant="baseline" data-ab-label="일반 작업 승인 · 기존" data-gallery-flow="보호 작업 요청|pending 승인|사용자 결정|exact 작업 1회"></article>
+        <article class="gallery-card gallery-live-card gallery-comparison-card" data-live-widget-preview="approval-standard" data-preview-name="일반 작업 승인 · 개선안" data-preview-variant="improved" data-ab-label="일반 작업 승인 · 개선안" data-gallery-flow="보호 작업 요청|pending 승인|사용자 결정|exact 작업 1회"></article>
+        <article class="gallery-card gallery-live-card gallery-comparison-card" data-live-widget-preview="approval-project" data-preview-name="프로젝트 명령 승인 · 기존" data-preview-variant="baseline" data-ab-label="프로젝트 명령 승인 · 기존" data-gallery-flow="명령 승인 요청|이번만 또는 프로젝트 허용|exact 명령 실행"></article>
+        <article class="gallery-card gallery-live-card gallery-comparison-card" data-live-widget-preview="approval-project" data-preview-name="프로젝트 명령 승인 · 개선안" data-preview-variant="improved" data-ab-label="프로젝트 명령 승인 · 개선안" data-gallery-flow="명령 승인 요청|이번만 또는 프로젝트 허용|exact 명령 실행"></article>
+        <article class="gallery-card gallery-live-card gallery-comparison-card" data-live-widget-preview="preapply" data-preview-name="Runtime 교체 사전준비 · 기존" data-preview-variant="baseline" data-ab-label="Runtime 사전준비 · 기존" data-gallery-flow="새 카드 자산 적용|실제 위젯 로드 확인|Critical 승인 준비"></article>
+        <article class="gallery-card gallery-live-card gallery-comparison-card" data-live-widget-preview="preapply" data-preview-name="Runtime 교체 사전준비 · 개선안" data-preview-variant="improved" data-ab-label="Runtime 사전준비 · 개선안" data-gallery-flow="새 카드 자산 적용|실제 위젯 로드 확인|Critical 승인 준비"></article>
+        <article class="gallery-card gallery-live-card gallery-comparison-card" data-live-widget-preview="critical-runtime" data-preview-name="Runtime 교체 승인 · 기존" data-preview-variant="baseline" data-ab-label="Runtime 교체 승인 · 기존" data-gallery-flow="고위험 preflight|Critical 승인|봉인된 runtime 교체"></article>
+        <article class="gallery-card gallery-live-card gallery-comparison-card" data-live-widget-preview="critical-runtime" data-preview-name="Runtime 교체 승인 · 개선안" data-preview-variant="improved" data-ab-label="Runtime 교체 승인 · 개선안" data-gallery-flow="고위험 preflight|Critical 승인|봉인된 runtime 교체"></article>
+        <article class="gallery-card gallery-live-card gallery-comparison-card" data-live-widget-preview="critical-app" data-preview-name="Mac 앱 교체 승인 · 기존" data-preview-variant="baseline" data-ab-label="Mac 앱 교체 승인 · 기존" data-gallery-flow="앱 검증|Critical 승인|검증된 앱 교체"></article>
+        <article class="gallery-card gallery-live-card gallery-comparison-card" data-live-widget-preview="critical-app" data-preview-name="Mac 앱 교체 승인 · 개선안" data-preview-variant="improved" data-ab-label="Mac 앱 교체 승인 · 개선안" data-gallery-flow="앱 검증|Critical 승인|검증된 앱 교체"></article>
       </div>
     </section>
     <section class="gallery-section">
-      <div class="section-head"><h2>선택 · 진행 카드</h2><span>Widget Shell / handoff</span></div>
-      <div class="gallery-grid">
-        <article class="gallery-card" data-gallery-flow="선택 카드 payload 생성|Widget Shell 표시|사용자 옵션 선택|로컬 선택 상태 저장|선택 intent를 후속 대화 입력으로 전달">
-          <div class="gallery-title-row"><div class="gallery-title">다음 작업 선택</div><span class="gallery-state blue">선택 대기</span></div>
-          <div class="gallery-preview">여러 안전한 경로 중 하나를 선택하는 일반 Widget Shell 카드입니다.</div>
-          <div class="gallery-choice-list">
-            <button class="gallery-choice" data-preview-label="상태만 확인" data-preview-effect="선택 intent가 다음 사용자 입력으로 전달되고 읽기 전용 상태 확인을 이어갑니다.">상태만 확인<small>읽기 전용으로 현재 상태를 다시 확인합니다.</small></button>
-            <button class="gallery-choice" data-preview-label="검증 진행" data-preview-effect="선택 intent가 다음 사용자 입력으로 전달되고 테스트·빌드 검증을 이어갑니다.">검증 진행<small>테스트와 빌드를 실행해 변경을 검증합니다.</small></button>
-            <button class="gallery-choice" data-preview-label="나중에 하기" data-preview-effect="추가 작업 없이 선택 카드 흐름만 종료합니다.">나중에 하기<small>아무 변경 없이 카드를 닫습니다.</small></button>
-          </div>
-        </article>
-        <article class="gallery-card" data-gallery-flow="compact continuation 카드 표시|15초 countdown|사용자가 먼저 누르면 즉시 진행|취소하면 자동 진행 중단|timer 만료 시 후속 대화 1회 전달">
-          <div class="gallery-title-row"><div class="gallery-title">계속 진행</div><span class="gallery-state blue">자동 진행 대기</span></div>
-          <div class="gallery-preview">15초 후 자동으로 계속합니다.</div>
-          <div class="gallery-choice-list"><button class="gallery-choice" data-preview-label="계속 진행하기" data-preview-effect="후속 대화를 즉시 1회 전달하고 자동 timer를 종료합니다.">계속 진행하기</button><button class="gallery-choice" data-preview-label="자동 진행 취소" data-preview-effect="자동 진행 timer만 취소하고 보호 작업 승인에는 영향을 주지 않습니다.">자동 진행 취소</button></div>
-        </article>
-        <article class="gallery-card" data-gallery-flow="runtime 적용 완료|Settings에서 C2CT 수동 새로고침|사용자가 완료 클릭|scan-tools 정확히 1회|필요 시 generation 재진입 안내">
-          <div class="gallery-title-row"><div class="gallery-title">C2CT 새로고침</div><span class="gallery-state orange">사용자 확인 대기</span></div>
-          <div class="gallery-preview">Settings에서 C2CT를 새로고침한 뒤 확인해 주세요.</div>
-          <div class="gallery-choice-list"><button class="gallery-choice" data-preview-label="완료" data-preview-effect="Settings 새로고침이 이미 끝났다는 확인입니다. catalog-refresh를 다시 하지 않고 scan-tools를 정확히 1회 실행합니다.">완료</button></div>
-        </article>
-        <article class="gallery-card" data-gallery-flow="scan-tools에서 새 generation marker 확인|재진입 카드 표시|@C2CT 탭해 복사|ChatGPT 입력창에서 native 도구 mention 선택 후 전송|exact marker 직접 호출">
-          <div class="gallery-title-row"><div class="gallery-title">C2CT 다시 연결</div><span class="gallery-state blue">재진입 필요</span></div>
-          <div class="gallery-preview">현재 채팅이 새 도구 generation을 직접 마운트했는지 확인합니다.</div>
-          <div class="gallery-choice-list"><button class="gallery-choice" data-preview-label="@C2CT" data-preview-effect="토큰을 복사합니다. Widget의 합성 follow-up이 아니라 ChatGPT 입력창에서 native @C2CT 도구 mention을 선택해 직접 전송해야 합니다.">@C2CT<small>탭해서 복사 후 입력창에서 도구 선택, 전송</small></button></div>
-        </article>
+      <div class="section-head"><h2>선택 · 진행 카드 A/B</h2><span>자동 진행은 현재안 고정</span></div>
+      <div class="gallery-comparison-grid">
+        <article class="gallery-card gallery-live-card gallery-comparison-card" data-live-widget-preview="choice" data-preview-name="일반 선택 카드 · 기존" data-preview-variant="baseline" data-ab-label="일반 선택 · 기존" data-gallery-flow="선택 payload|Widget Shell 표시|사용자 선택"></article>
+        <article class="gallery-card gallery-live-card gallery-comparison-card" data-live-widget-preview="choice" data-preview-name="일반 선택 카드 · 개선안" data-preview-variant="improved" data-ab-label="일반 선택 · 개선안" data-gallery-flow="선택 payload|Widget Shell 표시|사용자 선택"></article>
+        <article id="gallery-preview-auto-ios" class="gallery-card gallery-live-card" data-live-widget-preview="auto-ios" data-preview-name="자동 진행 · iPhone" data-gallery-flow="compact 카드|15초 countdown|취소 또는 자동 진행"></article>
+        <div class="gallery-auto-ios-spacer" aria-hidden="true"></div>
+        <article class="gallery-card gallery-live-card gallery-comparison-card" data-live-widget-preview="manual-refresh" data-preview-name="C2CT 새로고침 · 기존" data-preview-variant="baseline" data-ab-label="C2CT 새로고침 · 기존" data-gallery-flow="Settings 수동 새로고침|완료 입력|scan-tools 1회"></article>
+        <article class="gallery-card gallery-live-card gallery-comparison-card" data-live-widget-preview="manual-refresh" data-preview-name="C2CT 새로고침 · 개선안" data-preview-variant="improved" data-ab-label="C2CT 새로고침 · 개선안" data-gallery-flow="Settings 수동 새로고침|완료 입력|scan-tools 1회"></article>
+        <article class="gallery-card gallery-live-card gallery-comparison-card" data-live-widget-preview="reentry" data-preview-name="C2CT 다시 연결 · 기존" data-preview-variant="baseline" data-ab-label="C2CT 다시 연결 · 기존" data-gallery-flow="generation marker 확인|@C2CT native 재진입"></article>
+        <article class="gallery-card gallery-live-card gallery-comparison-card" data-live-widget-preview="reentry" data-preview-name="C2CT 다시 연결 · 개선안" data-preview-variant="improved" data-ab-label="C2CT 다시 연결 · 개선안" data-gallery-flow="generation marker 확인|@C2CT native 재진입"></article>
       </div>
     </section>
     <section class="gallery-section">
-      <div class="section-head"><h2>Activity 작업 카드</h2><span>대표 상태</span></div>
-      <div class="gallery-grid gallery-activity">
-        <article class="card status-blue" data-gallery-flow="activity event 기록|dashboard poll 수신|프로젝트/상태 정규화|작업 중 카드 렌더"><div class="card-primary"><span class="project-badge">chatgpt2codex</span><div class="title">승인 UX 수정</div><span class="start-time">12:42</span><span class="status blue">작업 중</span></div></article>
-        <article class="card status-orange" data-gallery-flow="보호 작업 approval 대기|activity event 갱신|dashboard poll 수신|승인 대기 카드 렌더"><div class="card-primary"><span class="project-badge">chatgpt2codex</span><div class="title">런타임 교체</div><span class="start-time">12:44</span><span class="status orange">승인 대기</span></div></article>
-        <article class="card status-green" data-gallery-flow="검증 작업 시작|완료 event 기록|dashboard poll 수신|완료 카드 렌더"><div class="card-primary"><span class="project-badge">chatgpt2codex</span><div class="title">전체 테스트</div><span class="start-time">12:46</span><span class="status green">완료</span></div></article>
-        <article class="card status-red" data-gallery-flow="도구 실행 시작|실패 event 기록|dashboard poll 수신|실패 카드 렌더"><div class="card-primary"><span class="project-badge">chatgpt2codex</span><div class="title">도구 호출</div><span class="start-time">12:47</span><span class="status red">실패</span></div></article>
-        <article class="card status-gray" data-gallery-flow="과거 terminal event 보존|현재 세션과 분리|dashboard history 분류|이전 실패 카드 렌더"><div class="card-primary"><span class="project-badge">chatgpt2codex</span><div class="title provisional">이전 실패 기록</div><span class="start-time">11:12</span><span class="status gray">이전 실패</span></div></article>
-      </div>
+      <div class="section-head"><h2>Activity 작업 카드</h2><span>실제 makeCard() 렌더러</span></div>
+      <div id="gallery-activity-live" class="gallery-grid gallery-activity"></div>
     </section>
   </section>
 </main>
@@ -1081,10 +1176,338 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   var restartPending = false;
   var restartRequestedAt = 0;
   var restartSawDisconnect = false;
-  var operationApprovalUserPrompts = ${JSON.stringify(CHATGPT_OPERATION_APPROVAL_USER_PROMPTS)};
-  var standardConsentUserPrompts = ${JSON.stringify(CHATGPT_STANDARD_CONSENT_USER_PROMPTS)};
+  var liveCardWidgetHtml = ${JSON.stringify(CHATGPT_CONSENT_WIDGET_HTML).replace(/</gu, "\\u003c")};
+  var consentMetaKey = ${JSON.stringify(CHATGPT_CONSENT_META_KEY)};
+  var galleryPreviewFrameSeq = 0;
   cardsViewButton.hidden = !devCardsEnabled;
   settingsViewButton.hidden = !settingsEnabled;
+
+  function galleryApprovalOutput(overrides) {
+    var now = Date.now();
+    return Object.assign({
+      requestId: "op_00000000-0000-4000-8000-000000000001",
+      projectId: "chatgpt2codex",
+      status: "pending",
+      approvalKind: "operation",
+      approvalChannel: "chatgpt-widget",
+      approvalSeverity: "standard",
+      decisionTool: "chatgpt_operation_approval_decide",
+      statusTool: "chatgpt_operation_approval_status",
+      interactionProofRequired: true,
+      operationTool: "command_run",
+      preview: "프로젝트 chatgpt2codex · 보호 작업 “command_run” 1회 수행",
+      summary: "프로젝트 chatgpt2codex · 보호 작업 “command_run” 1회 수행",
+      impact: "승인된 정확한 요청만 1회 실행",
+      details: "tool: command_run\nprojectId: chatgpt2codex\ncommandId: npm:test\nwritesWorkspace: false",
+      projectScopeAllowed: false,
+      createdAt: now - 30000,
+      expiresAt: now + 300000,
+      serverNow: now
+    }, overrides || {});
+  }
+  function galleryApprovalMeta() {
+    var meta = {};
+    meta[consentMetaKey] = { token: "preview-token" };
+    return meta;
+  }
+  function galleryWidgetScenario(name) {
+    var now = Date.now();
+    if (name === "approval-standard") {
+      return { output: galleryApprovalOutput(), meta: galleryApprovalMeta(), widgetState: {}, platform: "desktop" };
+    }
+    if (name === "approval-project") {
+      return {
+        output: galleryApprovalOutput({
+          requestId: "op_00000000-0000-4000-8000-000000000002",
+          summary: "프로젝트 chatgpt2codex · 새 명령 프로필을 이번만 허용하거나 이 프로젝트에서 허용",
+          preview: "프로젝트 chatgpt2codex · 새 명령 프로필을 이번만 허용하거나 이 프로젝트에서 허용",
+          impact: "승인된 exact executable + argv 프로필만 해당 범위에서 허용",
+          projectScopeAllowed: true
+        }),
+        meta: galleryApprovalMeta(),
+        widgetState: {},
+        platform: "desktop"
+      };
+    }
+    if (name === "preapply") {
+      return {
+        output: { presentationKind: "widget-preapply-load-only", status: "pending" },
+        meta: {},
+        widgetState: {},
+        platform: "desktop"
+      };
+    }
+    if (name === "critical-runtime") {
+      return {
+        output: galleryApprovalOutput({
+          requestId: "op_00000000-0000-4000-8000-000000000003",
+          approvalSeverity: "critical",
+          operationTool: "runtime_apply_local",
+          summary: "현재 runtime을 새 immutable runtime으로 교체합니다.",
+          preview: "현재 runtime을 새 immutable runtime으로 교체합니다.",
+          impact: "앱/runtime/process 실제 변경 가능",
+          details: "tool: runtime_apply_local\nprojectId: chatgpt2codex\npreserveConnector: true\nrollbackOnHealthFailure: true",
+          criticalBadge: "Mac 시스템 변경",
+          criticalWarning: "Mac C2CT runtime 실제 교체 · 성공 후 schema 변경 시 Settings에서 C2CT를 수동 새로고침",
+          criticalIdentityBefore: "현재 fingerprint",
+          criticalIdentityAfter: "sealed candidate",
+          criticalRollback: "새 runtime health check 실패 시 기존 runtime 자동 롤백",
+          criticalPostApply: "Settings 수동 새로고침 후 scan-tools 별도 실행"
+        }),
+        meta: galleryApprovalMeta(),
+        widgetState: {},
+        platform: "desktop"
+      };
+    }
+    if (name === "critical-app") {
+      return {
+        output: galleryApprovalOutput({
+          requestId: "op_00000000-0000-4000-8000-000000000004",
+          approvalSeverity: "critical",
+          operationTool: "macos_app_apply_local",
+          summary: "검증된 ChatGPT To Codex 앱을 /Applications에 설치합니다.",
+          preview: "검증된 ChatGPT To Codex 앱을 /Applications에 설치합니다.",
+          impact: "앱 파일 교체와 연결 일시 중단 가능",
+          details: "tool: macos_app_apply_local\nprojectId: chatgpt2codex",
+          criticalBadge: "Mac 앱 교체",
+          criticalWarning: "/Applications 앱 실제 교체 · app/supervisor/runtime 재기동 가능 · 연결 일시 중단 가능",
+          criticalIdentityBefore: "현재 executable",
+          criticalIdentityAfter: "검증된 새 executable",
+          criticalRollback: "설치/health verification 실패 시 기존 앱·실행 상태 롤백"
+        }),
+        meta: galleryApprovalMeta(),
+        widgetState: {},
+        platform: "desktop"
+      };
+    }
+    if (name === "choice") {
+      return {
+        output: {
+          presentationKind: "widget-shell-choice",
+          shellVersion: 1,
+          card: {
+            kind: "choice",
+            cardId: "wcc_preview_choice",
+            title: "다음 작업 선택",
+            prompt: "여러 안전한 경로 중 하나를 선택하세요.",
+            options: [
+              { id: "status", label: "상태만 확인", description: "읽기 전용으로 현재 상태를 다시 확인합니다." },
+              { id: "verify", label: "검증 진행", description: "테스트와 빌드를 실행해 변경을 검증합니다." },
+              { id: "later", label: "나중에 하기", description: "아무 변경 없이 카드를 닫습니다." }
+            ],
+            compact: false,
+            availableAt: null,
+            createdAt: now,
+            expiresAt: now + 1800000,
+            status: "pending"
+          }
+        },
+        meta: {},
+        widgetState: {},
+        platform: "desktop"
+      };
+    }
+    if (name === "auto-ios") {
+      return {
+        output: {
+          presentationKind: "widget-shell-choice",
+          shellVersion: 1,
+          card: {
+            kind: "choice",
+            cardId: "wcc_preview_auto_ios",
+            title: "계속 진행",
+            prompt: "자동 진행 카드 UI 확인",
+            options: [{ id: "continue", label: "계속 진행하기" }],
+            compact: true,
+            availableAt: null,
+            autoContinueAt: now + 14000,
+            createdAt: now,
+            expiresAt: now + 1800000,
+            status: "pending"
+          }
+        },
+        meta: {},
+        widgetState: {},
+        platform: "ios"
+      };
+    }
+    if (name === "manual-refresh") {
+      return {
+        output: {
+          presentationKind: "widget-shell-choice",
+          shellVersion: 1,
+          card: {
+            kind: "choice",
+            cardId: "wcc_preview_refresh",
+            title: "C2CT 새로고침",
+            prompt: "Settings에서 C2CT를 새로고침한 뒤 확인해 주세요.",
+            options: [{ id: "refreshed", label: "완료" }],
+            compact: true,
+            availableAt: null,
+            createdAt: now,
+            expiresAt: now + 1800000,
+            status: "pending"
+          }
+        },
+        meta: {},
+        widgetState: {},
+        platform: "desktop"
+      };
+    }
+    if (name === "reentry") {
+      return {
+        output: {
+          presentationKind: "catalog-host-reentry",
+          hostToolMentionRequired: true,
+          hostToolMention: "@C2CT",
+          expectedMarkerTool: "chatgpt_catalog_refresh_marker_preview",
+          syntheticFollowUpAllowed: false,
+          sideEffects: "none"
+        },
+        meta: {},
+        widgetState: {},
+        platform: "desktop"
+      };
+    }
+    return null;
+  }
+  function galleryImprovedCardPreviewCss() {
+    return "<style id=\"c2ct-gallery-improved-v1\">"
+      + "body{padding:0!important;}"
+      + ".card{border-radius:14px!important;padding:12px 13px 13px!important;}"
+      + ".title-row{margin-bottom:7px!important;}"
+      + ".title{font-size:15.5px!important;line-height:1.32!important;}"
+      + ".approval-time{margin-top:5px!important;}"
+      + ".impact{margin-top:7px!important;padding:7px 9px!important;}"
+      + ".approval-details{margin-top:7px!important;padding-left:9px!important;padding-right:9px!important;}"
+      + ".approval-details summary{min-height:42px!important;padding:8px 0!important;}"
+      + ".actions{gap:8px!important;margin-top:10px!important;}"
+      + "button{min-height:44px!important;}"
+      + ".critical-badge{margin-bottom:6px!important;padding:4px 8px!important;}"
+      + ".critical-warning{margin-bottom:8px!important;padding:9px 10px!important;}"
+      + ".critical-meta{margin:7px 0 8px!important;padding:8px 9px!important;}"
+      + ".card.preapply-minimal{padding:9px 11px!important;}"
+      + ".card.preapply-minimal .title-row{margin-bottom:0!important;}"
+      + ".shell-options{gap:7px!important;margin-top:9px!important;}"
+      + ".shell-option{min-height:46px!important;padding:8px 10px!important;}"
+      + ".card.reentry-compact{padding:10px 11px 11px!important;}"
+      + ".reentry-token{margin-top:8px!important;padding:9px 11px!important;}"
+      + ".card.shell-compact.shell-auto{--shell-auto-pad-y:12px!important;border-radius:18px!important;padding:12px 14px 10px!important;}"
+      + ".card.shell-compact.shell-auto .shell-options{gap:10px!important;}"
+      + ".card.shell-compact.shell-auto .shell-option{min-height:52px!important;padding:11px 14px!important;border-radius:13px!important;}"
+      + ".card.shell-compact.shell-auto .shell-option-title{font-size:16px!important;line-height:1.35!important;}"
+      + "</style>";
+  }
+  function galleryWidgetDocument(name, previewId, variant, forcedTheme) {
+    var scenario = galleryWidgetScenario(name);
+    if (!scenario) return "";
+    var previewTheme = forcedTheme === "light" || forcedTheme === "dark" ? forcedTheme : "";
+    var themeExpression = previewTheme
+      ? JSON.stringify(previewTheme)
+      : "(window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light')";
+    var bootstrap = "<script>(function(){"
+      + "window.__C2CT_CARD_PREVIEW__=true;"
+      + "window.__C2CT_CARD_PREVIEW_PLATFORM__=" + JSON.stringify(scenario.platform || "desktop") + ";"
+      + "var state=" + JSON.stringify(scenario.widgetState || {}) + ";"
+      + "window.openai={"
+      + "theme:" + themeExpression + ","
+      + "toolOutput:" + JSON.stringify(scenario.output || {}) + ","
+      + "toolResponseMetadata:" + JSON.stringify(scenario.meta || {}) + ","
+      + "widgetState:state,"
+      + "setWidgetState:function(next){state=next||{};this.widgetState=state;},"
+      + "notifyIntrinsicHeight:function(height){window.parent.postMessage({type:'c2ct-card-preview-height',previewId:" + JSON.stringify(previewId) + ",height:height},'*');}"
+      + "};"
+      + "})();<\/script><style>body{pointer-events:none!important;overflow:hidden!important}</style>";
+    var html = liveCardWidgetHtml;
+    if (variant === "improved") html = html.replace("</head>", galleryImprovedCardPreviewCss() + "</head>");
+    return html.replace("<body>", "<body>" + bootstrap);
+  }
+  function renderGalleryLiveWidgets() {
+    document.querySelectorAll("[data-live-widget-preview]").forEach(function (host) {
+      if (host.getAttribute("data-live-mounted") === "1") return;
+      host.setAttribute("data-live-mounted", "1");
+      var name = host.getAttribute("data-live-widget-preview") || "";
+      var variant = host.getAttribute("data-preview-variant") || "baseline";
+      var forcedTheme = host.getAttribute("data-preview-theme") || "";
+      var scenario = galleryWidgetScenario(name);
+      var label = document.createElement("div");
+      label.className = "gallery-live-label";
+      label.textContent = host.getAttribute("data-preview-name") || name;
+      var chatHost = document.createElement("div");
+      chatHost.className = "gallery-chatgpt-host";
+      chatHost.dataset.platform = scenario && scenario.platform === "ios" ? "ios" : "desktop";
+      host.dataset.previewPlatform = chatHost.dataset.platform;
+      host.dataset.previewVariant = variant;
+      var appRow = document.createElement("div");
+      appRow.className = "gallery-chatgpt-app-row";
+      var appIcon = document.createElement("img");
+      appIcon.className = "gallery-chatgpt-app-icon";
+      appIcon.src = ${JSON.stringify(GALLERY_C2CT_APP_ICON_DATA_URI)};
+      appIcon.alt = "";
+      var appName = document.createElement("div");
+      appName.className = "gallery-chatgpt-app-name";
+      appName.textContent = "C2CT";
+      appRow.append(appIcon, appName);
+      var viewport = document.createElement("div");
+      viewport.className = "gallery-chatgpt-widget-viewport";
+      var frame = document.createElement("iframe");
+      var previewId = "gallery-preview-" + (++galleryPreviewFrameSeq);
+      frame.className = "gallery-live-widget-frame";
+      frame.title = label.textContent + " 실제 UI 미리보기";
+      frame.setAttribute("sandbox", "allow-scripts");
+      frame.setAttribute("scrolling", "no");
+      frame.dataset.previewId = previewId;
+      frame.srcdoc = galleryWidgetDocument(name, previewId, variant, forcedTheme);
+      viewport.appendChild(frame);
+      chatHost.append(appRow, viewport);
+      if (name === "auto-ios" && host.getAttribute("data-reference-image") !== "0") {
+        var referenceImage = document.createElement("img");
+        referenceImage.className = "gallery-ios-reference-image";
+        referenceImage.src = "data:image/webp;base64,"
+          + "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";
+        referenceImage.alt = "";
+        host.append(label, referenceImage, chatHost);
+      } else {
+        host.append(label, chatHost);
+      }
+    });
+  }
+  window.addEventListener("message", function (event) {
+    var data = event.data;
+    if (!data || data.type !== "c2ct-card-preview-height") return;
+    document.querySelectorAll(".gallery-live-widget-frame").forEach(function (frame) {
+      if (frame.contentWindow !== event.source) return;
+      var height = Math.max(88, Math.min(760, Number(data.height) || 88));
+      frame.style.height = height + "px";
+    });
+  });
+  function renderGalleryActivityCards() {
+    var host = document.getElementById("gallery-activity-live");
+    if (!host || host.getAttribute("data-live-mounted") === "1") return;
+    host.setAttribute("data-live-mounted", "1");
+    var now = Date.now();
+    var samples = [
+      { id: "preview-active", title: "승인 UX 수정", titleSource: "host", state: "running", firstSeenAt: now - 120000, lastActiveAt: now - 3000, boundProjectId: "chatgpt2codex", operations: [], workGroups: [] },
+      { id: "preview-approval", title: "런타임 교체", titleSource: "host", state: "waiting-approval", firstSeenAt: now - 90000, lastActiveAt: now - 2000, boundProjectId: "chatgpt2codex", operations: [], workGroups: [] },
+      { id: "preview-done", title: "전체 테스트", titleSource: "host", state: "completed", firstSeenAt: now - 240000, lastActiveAt: now - 120000, boundProjectId: "chatgpt2codex", operations: [], workGroups: [] },
+      { id: "preview-permission", title: "도구 호출", titleSource: "host", state: "failed", firstSeenAt: now - 60000, lastActiveAt: now - 5000, boundProjectId: "chatgpt2codex", operations: [{ operationId: "preview-permission-op", tool: "project_lane_open", projectId: "chatgpt2codex", state: "failed", startedAt: now - 6000, finishedAt: now - 5000, errorCode: "LEASE_REQUIRED" }], workGroups: [] },
+      { id: "preview-failed", title: "도구 호출", titleSource: "host", state: "failed", firstSeenAt: now - 300000, lastActiveAt: now - 120000, boundProjectId: "chatgpt2codex", operations: [{ operationId: "preview-failed-op", tool: "command_run", projectId: "chatgpt2codex", state: "failed", startedAt: now - 125000, finishedAt: now - 120000, errorCode: "INTERNAL_ERROR" }], workGroups: [] }
+    ];
+    var fragment = document.createDocumentFragment();
+    samples.forEach(function (chat) { fragment.appendChild(makeCard(chat, now)); });
+    host.replaceChildren(fragment);
+  }
+  var galleryDebugBounds = document.getElementById("gallery-debug-bounds");
+  if (galleryDebugBounds) {
+    galleryDebugBounds.checked = initialParams.get("bounds") === "1";
+    galleryView.classList.toggle("gallery-show-bounds", galleryDebugBounds.checked);
+    galleryDebugBounds.addEventListener("change", function () {
+      galleryView.classList.toggle("gallery-show-bounds", galleryDebugBounds.checked);
+    });
+  }
 
   function renderGalleryPreviewGuides() {
     document.querySelectorAll("[data-gallery-flow]").forEach(function (card) {
@@ -1115,64 +1538,8 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
         });
       flow.append(flowTitle, flowSteps);
       card.appendChild(flow);
-
-      var buttons = Array.from(card.querySelectorAll("[data-preview-effect]"));
-      if (!buttons.length) return;
-
-      var guide = document.createElement("div");
-      guide.className = "gallery-button-guide";
-      var guideTitle = document.createElement("div");
-      guideTitle.className = "gallery-button-guide-title";
-      guideTitle.textContent = "버튼을 누르면";
-      guide.appendChild(guideTitle);
-      buttons.forEach(function (button) {
-        var row = document.createElement("div");
-        row.className = "gallery-button-guide-row";
-        var label = document.createElement("div");
-        label.className = "gallery-button-guide-label";
-        label.textContent = button.getAttribute("data-preview-label") || button.textContent.trim();
-        var promptKey = button.getAttribute("data-preview-prompt-key");
-        var promptSet = button.getAttribute("data-preview-prompt-set") === "standard" ? standardConsentUserPrompts : operationApprovalUserPrompts;
-        var promptText = promptKey && promptSet[promptKey]
-          ? promptSet[promptKey]
-          : (button.getAttribute("data-preview-prompt") || label.textContent);
-        var body = document.createElement("div");
-        body.className = "gallery-button-guide-body";
-        var effect = document.createElement("div");
-        effect.className = "gallery-button-guide-effect";
-        effect.textContent = button.getAttribute("data-preview-effect") || "";
-        var prompt = document.createElement("div");
-        prompt.className = "gallery-button-guide-prompt";
-        prompt.textContent = "실제 입력 프롬프트 · " + promptText;
-        body.append(effect, prompt);
-        row.append(label, body);
-        guide.appendChild(row);
-      });
-      card.appendChild(guide);
-
-      var result = document.createElement("div");
-      result.className = "gallery-sim-result";
-      result.setAttribute("role", "status");
-      result.setAttribute("aria-live", "polite");
-      card.appendChild(result);
-      buttons.forEach(function (button) {
-        if (button.disabled) return;
-        button.addEventListener("click", function (event) {
-          event.preventDefault();
-          event.stopPropagation();
-          var label = button.getAttribute("data-preview-label") || button.textContent.trim();
-          var promptKey = button.getAttribute("data-preview-prompt-key");
-          var promptSet = button.getAttribute("data-preview-prompt-set") === "standard" ? standardConsentUserPrompts : operationApprovalUserPrompts;
-          var promptText = promptKey && promptSet[promptKey]
-            ? promptSet[promptKey]
-            : (button.getAttribute("data-preview-prompt") || label);
-          result.textContent = "미리보기 결과 · " + label + "\n실제 입력 프롬프트 · " + promptText + "\n" + (button.getAttribute("data-preview-effect") || "");
-          result.classList.add("visible");
-        });
-      });
     });
   }
-  renderGalleryPreviewGuides();
 
   function setDashboardView(nextView, updateLocation) {
     selectedView = normalizedView(nextView);
@@ -1697,8 +2064,24 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   var RECENT_COMPLETION_ACTIVE_MS = 60000;
   var RECENT_FAILURE_EMPHASIS_MS = 5 * 60 * 1000;
   var FAILURE_BURST_WINDOW_MS = 2 * 60 * 1000;
+  var PERMISSION_REQUIRED_CODES = new Set([
+    "LEASE_REQUIRED", "LEASE_EXPIRED", "HOST_MANAGEMENT_REQUIRED", "HOST_MANAGEMENT_EXPIRED",
+    "COMMAND_NOT_ALLOWED", "PERMISSION_DENIED", "CONTROL_DISABLED", "SCAN_DENIED"
+  ]);
+  function isPermissionRequiredFailure(entry) {
+    return Boolean(entry && entry.state === "failed" && PERMISSION_REQUIRED_CODES.has(String(entry.errorCode || "")));
+  }
+  function approvalStopLabel(entry) {
+    if (!entry || entry.state !== "failed") return "";
+    if (entry.errorCode === "APPROVAL_DENIED") return "승인 거절";
+    if (entry.errorCode === "APPROVAL_EXPIRED") return "승인 만료";
+    return "";
+  }
+  function isHardFailure(entry) {
+    return Boolean(entry && entry.state === "failed" && !isPermissionRequiredFailure(entry) && !approvalStopLabel(entry));
+  }
   function isHistoricalFailure(entry, now) {
-    if (!entry || entry.state !== "failed") return false;
+    if (!isHardFailure(entry)) return false;
     var terminalAt = Number.isFinite(entry.finishedAt) ? entry.finishedAt : entry.startedAt;
     return Number.isFinite(terminalAt) && Math.max(0, now - terminalAt) > RECENT_FAILURE_EMPHASIS_MS;
   }
@@ -1720,6 +2103,9 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       return { key: "stale", text: "장시간 정체", color: "orange", priority: 4 };
     }
     if (state === "failed") {
+      if (current && isPermissionRequiredFailure(current)) return { key: "permission", text: "권한 필요", color: "orange", priority: 3 };
+      var stoppedLabel = approvalStopLabel(current);
+      if (stoppedLabel) return { key: "stopped", text: stoppedLabel, color: "gray", priority: 4 };
       if (terminalAgeMs < RECENT_COMPLETION_ACTIVE_MS) return { key: "warning", text: "주의", color: "orange", priority: 3 };
       return { key: "failed", text: "실패", color: "red", priority: 5 };
     }
@@ -1794,6 +2180,9 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       base = detail ? action + " · " + detail : action;
     }
     if (op.state !== "failed") return base;
+    if (isPermissionRequiredFailure(op)) return "권한 필요 · " + base;
+    var stoppedLabel = approvalStopLabel(op);
+    if (stoppedLabel) return stoppedLabel + " · " + base;
     var failureLabel = isHistoricalFailure(op, now) ? "이전 실패" : "실패";
     if (Number(op.repeatCount || 1) > 1) failureLabel += " " + op.repeatCount + "회";
     return failureLabel + " · " + base;
@@ -1847,12 +2236,14 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   }
   function makeActivityPreviewLine(chat, entry, now, openDetail) {
     var historicalFailure = isHistoricalFailure(entry, now);
+    var permissionRequired = isPermissionRequiredFailure(entry);
+    var stopped = Boolean(approvalStopLabel(entry));
     var text = activitySummary(chat, entry, now);
-    var line = el("span", "activity-preview-line" + (entry.state === "failed" ? " failed" : "") + (historicalFailure ? " historical" : ""));
+    var line = el("span", "activity-preview-line" + (permissionRequired ? " permission-required" : stopped ? " stopped" : entry.state === "failed" ? " failed" : "") + (historicalFailure ? " historical" : ""));
     line.setAttribute("role", "button");
     line.tabIndex = 0;
     line.setAttribute("aria-label", "상세 보기 · " + text);
-    line.title = historicalFailure ? "이전 실패 기록 · 눌러서 상세 보기" : "눌러서 상세 보기";
+    line.title = permissionRequired ? "권한 필요 기록 · 눌러서 상세 보기" : stopped ? "승인 종료 기록 · 눌러서 상세 보기" : historicalFailure ? "이전 실패 기록 · 눌러서 상세 보기" : "눌러서 상세 보기";
     line.appendChild(el("span", "activity-time", fmtStartClock(entry.startedAt)));
     var content = el("span", "activity-text", text);
     content.title = text;
@@ -1872,9 +2263,11 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
   }
   function makeActivityEntry(chat, entry, now) {
     var historicalFailure = isHistoricalFailure(entry, now);
+    var permissionRequired = isPermissionRequiredFailure(entry);
+    var stoppedLabel = approvalStopLabel(entry);
     var text = activitySummary(chat, entry, now);
     var detailKey = activityDetailKey(chat, entry);
-    var wrapper = el("div", "activity-entry" + (entry.state === "failed" ? " failed" : "") + (historicalFailure ? " historical" : "") + (expandedOperationDetails.has(detailKey) ? " detail-open" : ""));
+    var wrapper = el("div", "activity-entry" + (permissionRequired ? " permission-required" : stoppedLabel ? " stopped" : entry.state === "failed" ? " failed" : "") + (historicalFailure ? " historical" : "") + (expandedOperationDetails.has(detailKey) ? " detail-open" : ""));
     var line = el("div", "activity-line");
     line.setAttribute("role", "button");
     line.tabIndex = 0;
@@ -1894,8 +2287,10 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
     if (Number.isFinite(entry.elapsedMs)) meta.push("소요 " + fmtDuration(entry.elapsedMs));
     if (entry.state) meta.push("상태 " + entry.state);
     if (entry.phase) meta.push("단계 " + entry.phase);
-    if (entry.errorCode) meta.push("오류 " + entry.errorCode);
+    if (entry.errorCode) meta.push((permissionRequired || stoppedLabel ? "사유 " : "오류 ") + entry.errorCode);
     if (Number(entry.repeatCount || 1) > 1) meta.push("연속 반복 " + entry.repeatCount + "회");
+    if (permissionRequired) meta.push("구분 권한 필요");
+    if (stoppedLabel) meta.push("구분 " + stoppedLabel);
     if (historicalFailure) meta.push("구분 이전 실패");
     detail.appendChild(el("div", "activity-detail-meta", meta.join(" · ")));
     if (Array.isArray(entry.repeatOccurrences) && entry.repeatOccurrences.length > 1) {
@@ -2393,6 +2788,9 @@ const ACTIVITY_DASHBOARD_TEMPLATE = String.raw`<!doctype html>
       setMutableControlsAvailable(false);
     }
   }
+  renderGalleryLiveWidgets();
+  renderGalleryPreviewGuides();
+  renderGalleryActivityCards();
   refresh();
   setInterval(refresh, 1000);
 })();

@@ -1,4 +1,5 @@
 import { Script } from "node:vm";
+import ts from "typescript";
 import {
   CHATGPT_CONSENT_WIDGET_DIRECT_URI,
   CHATGPT_CONSENT_WIDGET_HTML,
@@ -35,6 +36,68 @@ const LITERAL_DOM_ID_REFERENCE_PATTERNS = [
   /\bdocument\.getElementById\(\s*["']([^"']+)["']\s*\)/gu,
   /\bdocument\.querySelector(?:All)?\(\s*["']#([A-Za-z][A-Za-z0-9_.:-]*)["']\s*\)/gu,
 ] as const;
+
+const UNRESOLVED_IDENTIFIER_DIAGNOSTIC_CODES = new Set([2304, 2552]);
+const BINDING_COMPILER_OPTIONS: ts.CompilerOptions = {
+  allowJs: true,
+  checkJs: true,
+  noEmit: true,
+  noImplicitAny: false,
+  skipLibCheck: true,
+  target: ts.ScriptTarget.ES2022,
+  module: ts.ModuleKind.None,
+  lib: ["lib.es2022.d.ts", "lib.dom.d.ts"],
+};
+const BINDING_BASE_HOST = ts.createCompilerHost(BINDING_COMPILER_OPTIONS, true);
+const BINDING_LIB_SOURCE_CACHE = new Map<string, ts.SourceFile | undefined>();
+const VALIDATED_INLINE_SCRIPT_BINDINGS = new Set<string>();
+
+function bindingLibrarySourceFile(
+  name: string,
+  languageVersion: ts.ScriptTarget | ts.CreateSourceFileOptions,
+  onError?: (message: string) => void,
+  shouldCreateNewSourceFile?: boolean,
+): ts.SourceFile | undefined {
+  if (!BINDING_LIB_SOURCE_CACHE.has(name)) {
+    BINDING_LIB_SOURCE_CACHE.set(
+      name,
+      BINDING_BASE_HOST.getSourceFile(name, languageVersion, onError, shouldCreateNewSourceFile),
+    );
+  }
+  return BINDING_LIB_SOURCE_CACHE.get(name);
+}
+
+export function validateInlineScriptBindings(target: ChatGptWidgetValidationTarget): void {
+  const scripts = extractInlineWidgetScripts(target.html);
+  scripts.forEach((script, index) => {
+    if (VALIDATED_INLINE_SCRIPT_BINDINGS.has(script)) return;
+    const fileName = `/__c2ct_widget_${target.name}_${index + 1}.js`;
+    const sourceFile = ts.createSourceFile(fileName, script, ts.ScriptTarget.ES2022, true, ts.ScriptKind.JS);
+    const host: ts.CompilerHost = {
+      ...BINDING_BASE_HOST,
+      fileExists: (name) => name === fileName || BINDING_BASE_HOST.fileExists(name),
+      readFile: (name) => name === fileName ? script : BINDING_BASE_HOST.readFile(name),
+      getSourceFile: (name, languageVersion, onError, shouldCreateNewSourceFile) =>
+        name === fileName
+          ? sourceFile
+          : bindingLibrarySourceFile(name, languageVersion, onError, shouldCreateNewSourceFile),
+    };
+    const program = ts.createProgram([fileName], BINDING_COMPILER_OPTIONS, host);
+    const unresolved = program.getSemanticDiagnostics(sourceFile).filter((diagnostic) =>
+      UNRESOLVED_IDENTIFIER_DIAGNOSTIC_CODES.has(diagnostic.code)
+    );
+    if (unresolved.length > 0) {
+      const diagnostic = unresolved[0]!;
+      const position = diagnostic.file && diagnostic.start !== undefined
+        ? diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start)
+        : null;
+      const location = position ? `:${position.line + 1}:${position.character + 1}` : "";
+      const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, " ");
+      throw new Error(`ChatGPT widget ${target.name} has an unresolved inline JavaScript binding${location}: ${message}`);
+    }
+    VALIDATED_INLINE_SCRIPT_BINDINGS.add(script);
+  });
+}
 
 export const SHIPPED_CHATGPT_WIDGETS: readonly ChatGptWidgetValidationTarget[] = [
   { name: "legacy-consent-loader", html: CHATGPT_CONSENT_WIDGET_LOADER_HTML, resourceUri: CHATGPT_CONSENT_WIDGET_LEGACY_URI },
@@ -79,6 +142,9 @@ export function validateWidgetResourceUri(target: ChatGptWidgetValidationTarget)
 
 export function validateChatGptWidgetHtml(target: ChatGptWidgetValidationTarget): number {
   const html = target.html.trim();
+  if (html.includes("[REDACTED]")) {
+    throw new Error(`ChatGPT widget ${target.name} contains a literal redaction placeholder`);
+  }
   if (!/^<!doctype html>/iu.test(html)) {
     throw new Error(`ChatGPT widget ${target.name} is missing an HTML doctype`);
   }
@@ -100,11 +166,18 @@ export function validateChatGptWidgetHtml(target: ChatGptWidgetValidationTarget)
       throw new Error(`ChatGPT widget ${target.name} has invalid inline JavaScript: ${message}`);
     }
   });
+  validateInlineScriptBindings(target);
   validateLiteralDomIdReferences(target);
   return scripts.length;
 }
 
 export function validateShippedChatGptWidgets(): ChatGptWidgetValidationSummary {
+  if (
+    CHATGPT_OPERATION_APPROVAL_WIDGET_HTML === CHATGPT_CONSENT_WIDGET_LOADER_HTML
+    || CHATGPT_OPERATION_APPROVAL_WIDGET_HTML.includes("chatgpt_widget_asset_get")
+  ) {
+    throw new Error("ChatGPT operation approval must remain a self-contained widget without loader asset fetches");
+  }
   let scriptCount = 0;
   for (const target of SHIPPED_CHATGPT_WIDGETS) {
     scriptCount += validateChatGptWidgetHtml(target);

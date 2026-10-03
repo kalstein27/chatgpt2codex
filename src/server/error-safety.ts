@@ -39,7 +39,7 @@ const PUBLIC_DOMAIN_MESSAGES: Partial<Record<ErrorCode, string>> = {
   [ErrorCode.PENDING_WORK_IN_ACTIVE]: "Another operation is already active.",
   [ErrorCode.ACTIVE_OPERATION_IN_PROGRESS]: "Another operation is still running.",
   [ErrorCode.RUNTIME_UPDATE_IN_PROGRESS]: "A runtime or app update is in progress. Retry after the drain completes.",
-  [ErrorCode.ACTIVE_PROJECT_LEASE_HELD]: "Another project still holds an active privileged lease.",
+  [ErrorCode.ACTIVE_PROJECT_LEASE_HELD]: "An active privileged lease already holds the requested or overlapping project root.",
   [ErrorCode.RECOVERY_NOT_FOREIGN_WORK_LANE]: "The requested state is not a recoverable foreign work lane.",
   [ErrorCode.SERIAL_ADMIN_LEASE_HELD]: "A serial or control lease currently holds the project root.",
   [ErrorCode.CURRENT_SESSION_LANE_USE_NORMAL_RELEASE]: "The current session owns this work lane.",

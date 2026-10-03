@@ -29,6 +29,7 @@ export interface ConnectionDiagnosticSafeInputs {
   destructive?: boolean;
   projectId?: string;
   commandId?: string;
+  workLaneProvided?: boolean;
 }
 
 export type ConnectionDiagnosticPhase =

@@ -4,7 +4,7 @@ import {
   CHATGPT_STANDARD_CONSENT_USER_PROMPTS,
 } from "./chatgpt-card-prompts.js";
 
-export const CHATGPT_OPERATION_APPROVAL_WIDGET_VERSION = 29;
+export const CHATGPT_OPERATION_APPROVAL_WIDGET_VERSION = 30;
 export const CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL =
   `chatgpt_operation_approval_presenter_v${CHATGPT_OPERATION_APPROVAL_WIDGET_VERSION}`;
 export const CHATGPT_OPERATION_APPROVAL_WIDGET_URI =
@@ -346,13 +346,24 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
   .shell-option-title { display: block; font-size: 13px; font-weight: 650; line-height: 1.35; }
   .shell-option-description { display: block; margin-top: 3px; font-size: 11px; line-height: 1.35; opacity: .65; }
   .card.shell-compact { border-color: transparent; padding: 2px 0; }
-  .card.shell-compact .title-row, .card.shell-compact #shell-prompt, .card.shell-compact #shell-status { display: none; }
-  .card.shell-compact .shell-options { margin-top: 0; }
+  .card.shell-compact #shell-status { display: none; }
+  .card.shell-compact .shell-options { margin-top: 9px; }
   .card.shell-compact .shell-option { min-height: 46px; text-align: center; }
-  .card.shell-compact.shell-auto { border-color: rgba(128,128,128,.22); padding: 10px 11px 11px; }
-  .card.shell-compact.shell-auto #shell-status { display: block; margin: 0 0 9px; text-align: center; }
+  .card.shell-compact.shell-auto {
+    --shell-auto-pad-y: clamp(14px, 2vw, 22px);
+    border-color: rgba(128,128,128,.22);
+    border-radius: clamp(15px, 1.8vw, 19px);
+    padding: var(--shell-auto-pad-y) clamp(14px, 2vw, 20px) calc(var(--shell-auto-pad-y) - 4px);
+  }
+  .card.shell-compact.shell-auto .shell-options { gap: clamp(10px, 1.35vw, 14px); }
+  .card.shell-compact.shell-auto .shell-option { min-height: clamp(54px, 7vw, 72px); padding: clamp(12px, 1.75vw, 18px) clamp(14px, 2vw, 20px); border-radius: clamp(11px, 1.4vw, 14px); }
+  .card.shell-compact.shell-auto .shell-option-title { font-size: clamp(15px, 2vw, 20px); font-weight: 700; line-height: 1.4; }
+  .card.shell-compact.shell-auto #shell-status { display: none; }
   .card.shell-compact.shell-auto .shell-options.shell-auto-pair { grid-template-columns: minmax(0, 1fr); }
-  .card.shell-compact.shell-auto .shell-cancel { color: inherit; opacity: .72; }
+  .card.shell-compact.shell-auto .shell-cancel { color: inherit; opacity: .76; }
+  @media (min-width: 600px) {
+    .card.shell-compact.shell-auto { padding-left: clamp(18px, 2.3vw, 26px); padding-right: clamp(18px, 2.3vw, 26px); }
+  }
   .shell-debug { margin-top: 7px; font-size: 10px; line-height: 1.4; opacity: .56; text-align: center; overflow-wrap: anywhere; }
   .card.reentry-compact { padding: 12px 13px 13px; }
   .card.reentry-compact .title-row { display: none; }
@@ -452,6 +463,9 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
   var shellUnlockCardId = null;
   var shellAutoContinueTimer = null;
   var shellAutoContinueCardId = null;
+  var shellAutoContinuePaintArmCardId = null;
+  var shellAutoContinuePaintArmGeneration = 0;
+  var shellAutoContinuePaintStartedAtByCard = Object.create(null);
   var shellAutoContinueVisibilityObserver = null;
   var shellAutoContinueVisibilityCardId = null;
   var shellAutoContinueRenderCardId = null;
@@ -484,6 +498,7 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
   var localApprovalInteraction = null;
   var localFollowUpDiagnostic = null;
   var approvalAttemptSequence = 0;
+  var previewMode = window.__C2CT_CARD_PREVIEW__ === true;
   function api() { return window.openai || {}; }
   function output() { return latestToolOutput || api().toolOutput || {}; }
   function responseMeta() { return latestToolMeta || api().toolResponseMetadata || {}; }
@@ -768,6 +783,10 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
   }
   function scheduleIntrinsicHeight() {
     if (heightFrame) cancelAnimationFrame(heightFrame);
+    if (document.hidden === true) {
+      reportIntrinsicHeight();
+      return;
+    }
     heightFrame = requestAnimationFrame(reportIntrinsicHeight);
   }
   function secret() {
@@ -1251,7 +1270,7 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
         return;
       }
       var pollAfterMs = Number(result.pollAfterMs);
-      [REDACTED](target, Number.isFinite(pollAfterMs) && pollAfterMs > 0 ? Math.max(250, pollAfterMs) : 1000);
+      scheduleApprovedOperationObservation(target, Number.isFinite(pollAfterMs) && pollAfterMs > 0 ? Math.max(250, pollAfterMs) : 1000);
     } catch (_) {
       if (target !== entry) return;
       target.operationObserveFailures = (target.operationObserveFailures || 0) + 1;
@@ -1357,6 +1376,8 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
       card.options[0] && card.options[0].id === "continue" && typeof card.autoContinueAt === "number");
   }
   function isIosLikeShellClient() {
+    if (previewMode && window.__C2CT_CARD_PREVIEW_PLATFORM__ === "ios") return true;
+    if (previewMode && window.__C2CT_CARD_PREVIEW_PLATFORM__ === "desktop") return false;
     var nav = typeof navigator === "object" && navigator ? navigator : null;
     if (!nav) return false;
     var ua = typeof nav.userAgent === "string" ? nav.userAgent : "";
@@ -1438,7 +1459,56 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
     void persistShellAutoContinueRenderStart(card.cardId, startedAt);
     return startedAt;
   }
+  function usesIosActionablePaintGate(card) {
+    return isAutoContinuationCard(card) && isIosLikeShellClient();
+  }
+  function clearShellAutoContinuePaintState(cardId) {
+    shellAutoContinuePaintArmGeneration += 1;
+    if (!cardId || shellAutoContinuePaintArmCardId === cardId) shellAutoContinuePaintArmCardId = null;
+    if (cardId) delete shellAutoContinuePaintStartedAtByCard[cardId];
+    else shellAutoContinuePaintStartedAtByCard = Object.create(null);
+  }
+  function shellContinueIsActionable(card) {
+    if (!card || document.hidden === true) return false;
+    var shell = document.getElementById("shell");
+    var button = document.getElementById("shell-continue-button");
+    if (!shell || shell.hidden === true || !button || button.disabled === true) return false;
+    return true;
+  }
+  function armShellAutoContinueAfterActionablePaint(card) {
+    if (!usesIosActionablePaintGate(card) || card.status === "resolved" || restoredShellSubmission(card.cardId)) return;
+    var autoState = restoredShellAutoContinue(card.cardId);
+    if (autoState && (autoState.status === "sent" || autoState.status === "cancelled" || autoState.status === "attempting" || autoState.status === "ready")) return;
+    if (Number.isFinite(shellAutoContinuePaintStartedAtByCard[card.cardId])) return;
+    if (shellAutoContinuePaintArmCardId === card.cardId) return;
+    shellAutoContinuePaintArmGeneration += 1;
+    var generation = shellAutoContinuePaintArmGeneration;
+    shellAutoContinuePaintArmCardId = card.cardId;
+    if (typeof requestAnimationFrame !== "function") {
+      shellAutoContinuePaintArmCardId = null;
+      return;
+    }
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () {
+        if (generation !== shellAutoContinuePaintArmGeneration || shellAutoContinuePaintArmCardId !== card.cardId) return;
+        shellAutoContinuePaintArmCardId = null;
+        var currentOut = output();
+        var currentCard = currentOut && currentOut.card && currentOut.card.kind === "choice" ? currentOut.card : null;
+        if (!currentCard || currentCard.cardId !== card.cardId || !shellContinueIsActionable(currentCard)) return;
+        if (restoredShellSubmission(currentCard.cardId) || currentCard.status === "resolved") return;
+        shellAutoContinuePaintStartedAtByCard[currentCard.cardId] = Date.now();
+        markShellAutoContinueRendered(currentCard);
+        refreshShellAutoContinueStatus(currentCard);
+        scheduleShellAutoContinue(currentCard);
+      });
+    });
+  }
   function shellAutoContinueDeadline(card) {
+    if (usesIosActionablePaintGate(card)) {
+      if (document.hidden === true) return null;
+      var paintStartedAt = shellAutoContinuePaintStartedAtByCard[card.cardId];
+      return Number.isFinite(paintStartedAt) ? paintStartedAt + shellAutoContinueDelayMs(card) : null;
+    }
     if (isSimpleAutoContinueCard(card) || (isAutoContinuationCard(card) && isIosLikeShellClient())) {
       if (isVisibilityPauseAutoContinueCard(card) && (document.hidden === true || shellVisibilityPauseStoppedCardId === card.cardId)) return null;
       if (isPhase3IntersectionCard(card) && shellPhase3IntersectionStoppedCardId === card.cardId) return null;
@@ -1696,6 +1766,7 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
     return telemetry;
   }
   function maybeRefreshPersistedStatus() {
+    if (previewMode) return;
     if (!entry || presentationKind === "widget-capability-lab" || presentationKind === "widget-shell-choice" || presentationKind === "widget-preapply-load-only") return;
     if (entry.status !== "checking" && entry.status !== "pending" && entry.status !== "error" && entry.status !== "working") return;
     if (statusRefreshedRequestId === entry.requestId || statusRefreshInFlight) return;
@@ -1779,13 +1850,13 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
         else void clearApprovalInteraction(requestId);
         render();
         if (requestId.indexOf("op_") === 0 && (mapped === "allowed" || mapped === "consumed")) {
+          autoResumeApprovedOperationOnce(entry, entry.allowFollowUpPrompt || ${JSON.stringify(CHATGPT_OPERATION_APPROVAL_USER_PROMPTS.allow)});
           if (usesCommandTerminalObserver(entry)) {
             entry.operationObservationStartedAt = entry.operationObservationStartedAt || Date.now();
-            [REDACTED](entry, 0);
-          } else {
-            autoResumeApprovedOperationOnce(entry, entry.allowFollowUpPrompt || ${JSON.stringify(CHATGPT_OPERATION_APPROVAL_USER_PROMPTS.allow)});
+            scheduleApprovedOperationObservation(entry, 0);
           }
         }
+        render();
         render();
       } catch (error) {
         if (entry === target && target.attempt === attempt && presentationKind !== "widget-preapply-load-only") {
@@ -1987,6 +2058,7 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
       prompt.textContent = "선택 카드 없음";
       clearShellUnlockTimer();
       clearShellAutoContinueTimer();
+      clearShellAutoContinuePaintState();
       clearShellAutoContinueVisibilityObserver();
       return;
     }
@@ -1998,12 +2070,14 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
     var locked = remainingMs > 0;
     var compact = card.compact === true && Array.isArray(card.options) && card.options.length === 1;
     var autoContinuation = isAutoContinuationCard(card);
+    var iosPaintGatedAuto = usesIosActionablePaintGate(card);
     var baselineAuto = isBaselineAutoContinueCard(card);
     var visibilityPauseAuto = isVisibilityPauseAutoContinueCard(card);
     var intersectionPauseAuto = isPhase3IntersectionCard(card);
     var simpleAuto = baselineAuto || visibilityPauseAuto || (autoContinuation && isIosLikeShellClient());
-    if (simpleAuto && !submittedForCard && !resolved && shellVisibilityPauseStoppedCardId !== card.cardId) markShellAutoContinueRendered(card);
+    if (simpleAuto && !iosPaintGatedAuto && !submittedForCard && !resolved && shellVisibilityPauseStoppedCardId !== card.cardId) markShellAutoContinueRendered(card);
     var autoState = autoContinuation ? restoredShellAutoContinue(card.cardId) : null;
+    var autoCancelLatched = autoContinuation && cancelShellAutoContinue.pendingCardId === card.cardId;
     var showAutoCancel = Boolean(autoContinuation && !submittedForCard && !resolved &&
       (!autoState || (autoState.status !== "sent" && autoState.status !== "attempting")));
     var autoDeadline = autoContinuation ? shellAutoContinueDeadline(card) : null;
@@ -2015,10 +2089,15 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
     (Array.isArray(card.options) ? card.options : []).forEach(function (option) {
       var button = document.createElement("button");
       button.className = "shell-option";
+      if (option.id === "continue") button.id = "shell-continue-button";
       button.disabled = shellBusy || submittedForCard || resolved || locked;
       var title = document.createElement("span");
       title.className = "shell-option-title";
+      if (option.id === "continue") title.id = "shell-continue-title";
       title.textContent = simpleAuto ? (option.label || option.id || "선택") : (autoContinuation && option.id === "continue" ? "지금 계속" : (option.label || option.id || "선택"));
+      if (simpleAuto && option.id === "continue" && !autoCancelLatched && !autoState) {
+        title.textContent = (option.label || "계속 진행하기") + " · " + Math.max(0, Math.ceil(autoRemainingMs / 1000)) + "초";
+      }
       if (locked && compact) title.textContent += " · " + formatShellDelay(remainingMs) + " 후";
       if (restored && restored.choiceId === option.id) title.textContent += " ✓";
       button.appendChild(title);
@@ -2034,19 +2113,25 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
     if (showAutoCancel) {
       var cancel = document.createElement("button");
       cancel.className = "shell-option shell-cancel";
-      cancel.disabled = shellBusy || (autoState && autoState.status === "cancelled");
+      cancel.disabled = shellBusy || autoCancelLatched || (autoState && autoState.status === "cancelled");
       var cancelTitle = document.createElement("span");
       cancelTitle.className = "shell-option-title";
-      cancelTitle.textContent = autoState && autoState.status === "cancelled" ? "자동 진행 취소됨" : "자동 진행 취소";
+      cancelTitle.textContent = autoCancelLatched || (autoState && autoState.status === "cancelled") ? "자동 진행 취소됨" : "자동 진행 취소";
       cancel.appendChild(cancelTitle);
-      cancel.addEventListener("click", function () {
-        if (cancel.disabled) return;
+      var cancelRequested = false;
+      var requestAutoCancel = function (event) {
+        if (cancel.disabled || cancelRequested) return;
+        cancelRequested = true;
+        cancelShellAutoContinue.pendingCardId = card.cardId;
         cancel.disabled = true;
         cancelTitle.textContent = "자동 진행 취소됨";
-        status.textContent = "자동 진행 취소됨 · 필요하면 지금 계속을 눌러 주세요.";
+        var continueTitle = document.getElementById("shell-continue-title");
+        if (continueTitle) continueTitle.textContent = (card.options && card.options[0] && card.options[0].label) || "계속 진행하기";
         clearShellAutoContinueTimer();
         void cancelShellAutoContinue(card);
-      });
+      };
+      cancel.addEventListener("pointerdown", requestAutoCancel);
+      cancel.addEventListener("click", requestAutoCancel);
       options.appendChild(cancel);
     }
     if (restored) {
@@ -2057,7 +2142,7 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
       status.textContent = "다른 채팅 이동 감지 · 자동 진행 중지됨.";
     } else if (intersectionPauseAuto && shellPhase3IntersectionStoppedCardId === card.cardId && !shellBusy) {
       status.textContent = "카드 비가시 감지 · 자동 진행 중지됨.";
-    } else if (autoContinuation && autoState && autoState.status === "cancelled") {
+    } else if (autoCancelLatched || (autoContinuation && autoState && autoState.status === "cancelled")) {
       status.textContent = "자동 진행 취소됨 · 필요하면 지금 계속을 눌러 주세요.";
     } else if (autoContinuation && autoState && autoState.status === "ready") {
       status.textContent = "자동 진행이 차단됨 · 지금 계속을 눌러 주세요.";
@@ -2090,6 +2175,11 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
     }
     scheduleShellUnlock(card);
     scheduleShellAutoContinue(card);
+    if (iosPaintGatedAuto && !submittedForCard && !resolved && !autoState) {
+      armShellAutoContinueAfterActionablePaint(card);
+    } else if (iosPaintGatedAuto && (submittedForCard || resolved || autoState)) {
+      clearShellAutoContinuePaintState(card.cardId);
+    }
   }
   function formatShellDelay(ms) {
     var totalSeconds = Math.max(1, Math.ceil(ms / 1000));
@@ -2100,27 +2190,28 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
   }
   function refreshShellAutoContinueStatus(card) {
     if (!isAutoContinuationCard(card)) return;
-    var status = document.getElementById("shell-status");
-    if (!status) return;
+    var continueTitle = document.getElementById("shell-continue-title");
+    if (!continueTitle) return;
+    var baseLabel = (card.options && card.options[0] && card.options[0].label) || "계속 진행하기";
     var autoState = restoredShellAutoContinue(card.cardId);
     if (autoState && autoState.status === "cancelled") {
-      status.textContent = "자동 진행 취소됨 · 필요하면 지금 계속을 눌러 주세요.";
+      continueTitle.textContent = baseLabel;
       return;
     }
     if (autoState && autoState.status === "ready") {
-      status.textContent = "자동 진행이 차단됨 · 지금 계속을 눌러 주세요.";
+      continueTitle.textContent = baseLabel;
       return;
     }
     if (autoState && autoState.status === "attempting") {
-      status.textContent = "자동 진행 요청 중";
+      continueTitle.textContent = "계속 진행 중…";
       return;
     }
     var deadline = shellAutoContinueDeadline(card);
     if (deadline === null) {
-      status.textContent = "실제 채팅 진입 신호가 확인되면 15초 카운트다운을 시작합니다.";
+      continueTitle.textContent = baseLabel;
       return;
     }
-    status.textContent = Math.max(0, Math.ceil((deadline - Date.now()) / 1000)) + "초 후 자동으로 계속합니다.";
+    continueTitle.textContent = baseLabel + " · " + Math.max(0, Math.ceil((deadline - Date.now()) / 1000)) + "초";
   }
   function clearShellUnlockTimer() {
     if (shellUnlockTimer !== null) clearInterval(shellUnlockTimer);
@@ -2220,6 +2311,11 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
       clearShellAutoContinueTimer();
       return;
     }
+    if (usesIosActionablePaintGate(card) && (document.hidden === true || !Number.isFinite(shellAutoContinuePaintStartedAtByCard[card.cardId]))) {
+      if (document.hidden === true) clearShellAutoContinuePaintState(card.cardId);
+      clearShellAutoContinueTimer();
+      return;
+    }
     var deadline = shellAutoContinueDeadline(card);
     if (deadline === null) {
       markShellAutoContinueRendered(card);
@@ -2244,6 +2340,12 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
         clearShellAutoContinueTimer();
         return;
       }
+      if (usesIosActionablePaintGate(currentCard) && document.hidden === true) {
+        clearShellAutoContinuePaintState(currentCard.cardId);
+        clearShellAutoContinueTimer();
+        renderShellChoice(currentOut);
+        return;
+      }
       if (isVisibilityPauseAutoContinueCard(currentCard) && document.hidden === true) {
         shellVisibilityPauseStoppedCardId = currentCard.cardId;
         clearShellAutoContinueTimer();
@@ -2266,6 +2368,10 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
     }, 1000);
   }
   function scheduleShellAutoContinue(card) {
+    if (previewMode) {
+      clearShellAutoContinueTimer();
+      return;
+    }
     if (isSimpleAutoContinueCard(card) || (isAutoContinuationCard(card) && isIosLikeShellClient())) {
       scheduleBaselineAutoContinue(card);
       return;
@@ -3023,12 +3129,12 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
       }
       render();
       if (operationApproval && isAllowDecision) {
+        autoResumeApprovedOperationOnce(entry, userFollowUpPrompt);
         if (usesCommandTerminalObserver(entry)) {
           entry.operationObservationStartedAt = entry.operationObservationStartedAt || Date.now();
           void observeApprovedOperation(entry, decisionResult);
-        } else {
-          autoResumeApprovedOperationOnce(entry, userFollowUpPrompt);
         }
+        return;
         return;
       }
       if (!operationApproval) {
@@ -3043,12 +3149,12 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
     } catch (_) {
       if (entry.attempt !== attempt || entry.reconciled || presentationKind === "widget-preapply-load-only") return;
       if (entry.status === "allowed" || entry.status === "consumed") {
+        autoResumeApprovedOperationOnce(entry, userFollowUpPrompt);
         if (usesCommandTerminalObserver(entry)) {
           entry.message = "승인 완료 · 작업 상태 확인 중";
-          [REDACTED](entry, 0);
-        } else {
-          autoResumeApprovedOperationOnce(entry, userFollowUpPrompt);
+          scheduleApprovedOperationObservation(entry, 0);
         }
+        render();
         render();
         return;
       }
@@ -3088,6 +3194,11 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
   if (document && typeof document.addEventListener === "function") {
     document.addEventListener("visibilitychange", function () {
       var signal = document.hidden ? "visibility-hidden" : "visibility-visible";
+      if (document.hidden === true) {
+        var visibilityOut = output();
+        var visibilityCard = visibilityOut && visibilityOut.card && visibilityOut.card.kind === "choice" ? visibilityOut.card : null;
+        if (visibilityCard && usesIosActionablePaintGate(visibilityCard)) clearShellAutoContinuePaintState(visibilityCard.cardId);
+      }
       recordShellVisibilityDiagnostic(signal);
       noteShellAutoForegroundSignal(signal);
       render();
@@ -3115,7 +3226,7 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
   });
   // Warm the MCP Apps bridge before the user can press an approval button so
   // ui/message normally stays inside the original transient user interaction.
-  void ensureMcpAppsReady().catch(function () {});
+  if (!previewMode) void ensureMcpAppsReady().catch(function () {});
   render();
   recordShellVisibilityDiagnostic("mount");
   // iOS can hydrate window.openai globals after the iframe's first script turn
@@ -3175,9 +3286,9 @@ export const CHATGPT_CONSENT_WIDGET_URI =
 export const CHATGPT_CONSENT_WIDGET_LAB_URI =
   `ui://widget/c2ct-consent-lab-${CHATGPT_CONSENT_WIDGET_RESOURCE_KEY}.html`;
 
-// Operation approvals keep a versioned immutable loader as the host cache
-// boundary. Pending cards fetch the active verified card asset, while presenter
-// payloads that are already terminal or clearly expired render directly in the
-// loader and skip asset/bridge work. Preapply deliberately bypasses that fast
-// path because its purpose is to prove that the active asset can load.
-export const CHATGPT_OPERATION_APPROVAL_WIDGET_HTML = CHATGPT_CONSENT_WIDGET_LOADER_HTML;
+// Operation approvals use one immutable self-contained document as the host
+// cache boundary. This deliberately avoids the loader -> private asset_get
+// round-trip on the critical approval path, because some iOS hosts can defer
+// iframe/tool-bridge startup long after the presenter itself has returned.
+// Shared Widget Shell/consent cards keep the hot-applied loader path above.
+export const CHATGPT_OPERATION_APPROVAL_WIDGET_HTML = CHATGPT_CONSENT_WIDGET_HTML;

@@ -280,14 +280,29 @@ export async function openProjectLane(
       maximum: MAX_PROJECT_LANES,
     });
   }
-  if (
-    input.preset !== "read-only" &&
-    lanes.some((lane) => lane.projectRootDigest === rootDigest && lane.preset !== "read-only")
-  ) {
+  const conflictingLane = input.preset !== "read-only"
+    ? lanes.find((lane) => lane.projectRootDigest === rootDigest && lane.preset !== "read-only")
+    : undefined;
+  if (conflictingLane) {
+    const ownerRelation = conflictingLane.ownerScopeDigest === ownerScopeDigest(input.ownerScope)
+      ? "current"
+      : "foreign";
     throw new DomainError(
       ErrorCode.ACTIVE_PROJECT_LEASE_HELD,
       "The requested project already has an active privileged work lane",
-      { projectId: input.project.projectId },
+      {
+        projectId: input.project.projectId,
+        conflictingProjectId: conflictingLane.projectId,
+        conflictKind: "project-lane",
+        blockingProjectId: conflictingLane.projectId,
+        rootRelation: "same-root",
+        blockingPreset: conflictingLane.preset,
+        blockingKind: "lane",
+        ownerRelation,
+        recommendedAction: ownerRelation === "current"
+          ? "release-current-blocking-lease"
+          : "wait-for-blocking-owner-release",
+      },
     );
   }
   if (
@@ -302,8 +317,15 @@ export async function openProjectLane(
       "The requested project already has an active privileged serial lease",
       {
         projectId: input.project.projectId,
+        conflictingProjectId: serialLease.projectId,
         conflictingPreset: serialLease.preset,
         conflictKind: "serial-lease",
+        blockingProjectId: serialLease.projectId,
+        rootRelation: "same-root",
+        blockingPreset: serialLease.preset,
+        blockingKind: "serial",
+        ownerRelation: "current",
+        recommendedAction: "release-current-blocking-lease",
       },
     );
   }

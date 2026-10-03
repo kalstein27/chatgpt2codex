@@ -299,6 +299,7 @@ import {
   stageChatGptWidgetPreapplyRenderCandidate,
 } from "../runtime/chatgpt-widget-preapply.js";
 import { recordChatGptWidgetPreapplyAssetLoad } from "../runtime/chatgpt-widget-preapply.js";
+import { verifyChatGptWidgetPreapplyCandidate } from "../runtime/chatgpt-widget-preapply.js";
 import { readToolSchemaRecoveryState } from "../runtime/tool-schema-revalidation.js";
 import { hostCatalogRebindMarkerToolName, matchesHostCatalogRebindReceipt, readHostCatalogRebind, recordHostCatalogRebind } from "../runtime/host-catalog-rebind.js";
 import {
@@ -2195,12 +2196,74 @@ function backgroundRequestDigest(
     .digest("hex");
 }
 
+type DurableReplayMode = "exact" | "fresh";
+
+const MANAGED_MCP_FRESH_READ_ACTIONS = new Set([
+  "get",
+  "list",
+  "read",
+  "query",
+  "find",
+  "search",
+  "preview",
+  "inspect",
+  "check",
+  "status",
+  "lookup",
+  "fetch",
+]);
+
+const MANAGED_MCP_MUTATION_ACTIONS = new Set([
+  "create",
+  "update",
+  "delete",
+  "apply",
+  "claim",
+  "release",
+  "set",
+  "clear",
+  "add",
+  "attach",
+  "detach",
+  "relink",
+  "remove",
+  "request",
+  "install",
+  "start",
+  "stop",
+  "restart",
+  "write",
+  "patch",
+  "move",
+  "rename",
+  "reorder",
+  "send",
+]);
+
+function managedMcpCallReplayMode(toolName: string): DurableReplayMode {
+  const tokens = toolName.toLowerCase().split(/[^a-z0-9]+/u).filter(Boolean);
+  // Never let an otherwise read-looking compound name weaken replay protection
+  // for an explicit mutation verb such as get_and_delete. `refresh` is handled
+  // below as a leading action because it can also be a noun in names such as
+  // get_code_map_refresh_status.
+  if (tokens.some((token) => MANAGED_MCP_MUTATION_ACTIONS.has(token))) return "exact";
+  for (const token of tokens) {
+    if (MANAGED_MCP_FRESH_READ_ACTIONS.has(token)) return "fresh";
+    if (token === "refresh") return "exact";
+  }
+  // Upstream names/descriptions/annotations are third-party content. Unknown
+  // semantics therefore keep the existing exact response-loss replay contract.
+  return "exact";
+}
+
 function durableRequestIdentity(
   ctx: ToolContext,
   extra: unknown,
   tool: string,
   operationFingerprint: string,
+  replayMode: DurableReplayMode = "exact",
 ): string {
+  if (replayMode === "fresh") return `${tool}:fresh:${randomUUID()}:${operationFingerprint}`;
   const requestId = extra && typeof extra === "object" && !Array.isArray(extra)
     ? (extra as { requestId?: unknown }).requestId
     : undefined;
@@ -2238,6 +2301,7 @@ async function runDurableHostTool<T extends object>(
   options: {
     kind: string;
     fingerprintInput: unknown;
+    replayMode?: DurableReplayMode;
     execute: (updatePhase: (phase: string) => Promise<void>) => Promise<T>;
     successMessage: (result: T) => string;
   },
@@ -2251,7 +2315,7 @@ async function runDurableHostTool<T extends object>(
   const response = await durableOperationManager(ctx.stateDir).startWithFastPath({
     binding: { ownerScope: backgroundOwnerScope(ctx), scope: "host" },
     kind: options.kind,
-    requestIdentity: durableRequestIdentity(ctx, extra, options.kind, operationFingerprint),
+    requestIdentity: durableRequestIdentity(ctx, extra, options.kind, operationFingerprint, options.replayMode),
     operationFingerprint,
     execute: async (_signal, updatePhase) => options.execute(updatePhase),
   });
@@ -2962,7 +3026,7 @@ export function defaultChatGptApprovalPrompts(tool: string): {
 } {
   if (tool === "command_request") {
     return {
-      allowFollowUpPrompt: "C2CT command_request 승인을 허용했어. command_request를 재호출하지 마. 승인 카드가 exact operation을 terminal까지 자동 관찰한 뒤 현재 채팅을 1회 재개해. 정상 terminal continuation에서는 operation_status를 다시 호출하지 말고 outputRef가 있으면 output_read만 읽어 이어가. observer 실패, reconnect/response loss, diagnostics, approval recovery, UNKNOWN일 때만 approvalRequestId로 operation_status fallback을 사용해.",
+      allowFollowUpPrompt: "C2CT command_request 승인을 허용했어. command_request를 재호출하지 마. 현재 채팅을 바로 이어서 승인된 exact operation을 approvalRequestId로 status-only 확인해 terminal까지 진행하고, outputRef가 있으면 같은 approvalRequestId binding으로 output_read를 읽어. mutation을 재실행하지 마.",
       denyFollowUpPrompt: "C2CT command_request 승인을 거절했어. 이 exact operation은 실행하지 말고 종료해줘.",
     };
   }
@@ -3317,7 +3381,16 @@ function activityProgressMessage(
   return `${activityHint} · ${stage}`;
 }
 
-function connectionSafeInputsFrom(input: unknown): ConnectionDiagnosticSafeInputs {
+const WORK_LANE_DIAGNOSTIC_TOOLS = new Set([
+  "file_apply_patch",
+  "file_edit_lines",
+  "file_create",
+  "command_run",
+  "command_request",
+  "e2e_run_command",
+]);
+
+function connectionSafeInputsFrom(input: unknown, toolName?: string): ConnectionDiagnosticSafeInputs {
   if (!input || typeof input !== "object" || Array.isArray(input)) return {};
   const record = input as Record<string, unknown>;
   const intent = record.intent && typeof record.intent === "object" && !Array.isArray(record.intent)
@@ -3342,6 +3415,9 @@ function connectionSafeInputsFrom(input: unknown): ConnectionDiagnosticSafeInput
     ...(typeof intent?.writesWorkspace === "boolean" ? { writesWorkspace: intent.writesWorkspace } : {}),
     ...(typeof intent?.needsNetwork === "boolean" ? { needsNetwork: intent.needsNetwork } : {}),
     ...(typeof intent?.destructive === "boolean" ? { destructive: intent.destructive } : {}),
+    ...(toolName && WORK_LANE_DIAGNOSTIC_TOOLS.has(toolName)
+      ? { workLaneProvided: typeof record.workLaneId === "string" && record.workLaneId.length > 0 }
+      : {}),
   };
 }
 
@@ -3472,10 +3548,11 @@ function diagnosticPhaseFromToolProgress(phase: ToolProgressPhase): ConnectionDi
 
 async function connectionSafeInputsForCall(
   ctx: ToolContext,
+  toolName: string,
   input: unknown,
   requiredCapability: LeaseCapability | undefined,
 ): Promise<ConnectionDiagnosticSafeInputs | undefined> {
-  const safeInputs = connectionSafeInputsFrom(input);
+  const safeInputs = connectionSafeInputsFrom(input, toolName);
   if (requiredCapability) safeInputs.requiredCapability = requiredCapability;
   const session = await loadSession(ctx).catch(() => undefined);
   if (session?.lease) safeInputs.leasePreset = session.lease.preset;
@@ -3703,7 +3780,7 @@ async function withErrorMapping<T extends Record<string, unknown>>(
   ensureDashboardTitle(ctx, toolName, input);
   const callStartedAt = Date.now();
   await cleanupIdleSameSessionLanesAtIngress(ctx, toolName, input, callStartedAt);
-  const progressSafeInputs = connectionSafeInputsFrom(input);
+  const progressSafeInputs = connectionSafeInputsFrom(input, toolName);
   const activityHint = activityHintFromInput(toolName, input);
   const operationId = ctx.activity?.tracker.startOperation(
     ctx.activity.session,
@@ -3768,7 +3845,7 @@ async function withErrorMapping<T extends Record<string, unknown>>(
     ctx.activity?.tracker.finishOperation(ctx.activity.session, operationId, {
       errorCode: result.isError ? "TOOL_RESULT_ERROR" : undefined,
     });
-    const safeInputs = await connectionSafeInputsForCall(ctx, input, progressConfig?.requiredCapability);
+    const safeInputs = await connectionSafeInputsForCall(ctx, toolName, input, progressConfig?.requiredCapability);
     await ctx.diagnostics
       ?.record({
         event: "tool.call",
@@ -3794,7 +3871,7 @@ async function withErrorMapping<T extends Record<string, unknown>>(
     ctx.activity?.tracker.finishOperation(ctx.activity.session, operationId, {
       errorCode: String(mapped.structuredContent.code),
     });
-    const safeInputs = await connectionSafeInputsForCall(ctx, input, progressConfig?.requiredCapability);
+    const safeInputs = await connectionSafeInputsForCall(ctx, toolName, input, progressConfig?.requiredCapability);
     const diagnostic = await ctx.diagnostics
       ?.record({
         event: "tool.call",
@@ -4554,16 +4631,26 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       _meta: chatGptToolMeta("Applying C2CT widget asset...", "C2CT widget asset applied"),
       inputSchema: {
         projectId: z.string(),
-        workLaneId: WORK_LANE_ID_SCHEMA,
+        workLaneId: ctx.remote && ctx.config.multiProjectLanesEnabled === true
+          ? WORK_LANE_ID_SCHEMA
+          : WORK_LANE_ID_SCHEMA.optional(),
       },
     },
     async (input) => withErrorMapping(ctx, "chatgpt_widget_asset_apply", input, async () => {
       await requireProjectLease(ctx, input.projectId, "write", input.workLaneId);
       const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+      const verifiedCandidate = await verifyChatGptWidgetPreapplyCandidate(entry.root);
+      if (!verifiedCandidate) {
+        throw new DomainError(ErrorCode.PERMISSION_DENIED, "Widget hot-apply requires an exact verified widget:preapply candidate", {
+          reason: "widget_preapply_receipt_missing_or_stale",
+          recommendedAction: "npm run widget:preapply",
+        });
+      }
       const meta = await applyCandidateChatGptWidgetAsset({
         projectRoot: entry.root,
         stateDir: ctx.stateDir,
         supportedProtocolVersion: CHATGPT_WIDGET_ASSET_PROTOCOL_VERSION,
+        expectedRevision: verifiedCandidate.widgetAssetRevision,
       });
       const preapplyStage = await stageChatGptWidgetPreapplyRenderCandidate({
         stateDir: ctx.stateDir,
@@ -6110,6 +6197,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                     "To enter an explicit serial-admin workflow from a normal work lane: first finish and verify tracked work, release your exact current work lane with reason=done, then acquire project_select with purpose=legacy-admin and reason=maintenance. Perform the serial-only operation, release that serial lease with reason=done when finished, and reacquire a normal work lane with reason=work only if more coding is needed.",
                     "Runtime/app lifecycle tools may remain serial-admin-bound even when they look read-only. If a live named schema has no workLaneId and returns LEASE_REQUIRED while your normal work lane is healthy, do not treat that as lane failure or steal another lease. Enter serial admin only if that lifecycle operation is actually needed, following the exact release -> project_select purpose=legacy-admin -> operation -> project_release boundary.",
                     "Never switch, release, renew, or replace another chat's serial lease or sibling work lane to prepare your own task.",
+                    "connection_status.privilegedProjectBlockers is a registry-wide active privileged-lock inventory, not a filtered verdict that every listed project blocks the current target. Treat an entry as a real conflict only when the failing lane/lease result reports the relevant same-root or ancestor/descendant relation.",
                     "If project_lane_open is blocked, use project_lane_recover for diagnosis and cleanup. A same-session lost-handle or stale session/root-lock mismatch is de-escalated without local approval and never touches a foreign owner. A genuinely foreign abandoned lane still requires explicit local approval, refuses while the project has active foreground/background work, retires only the exact foreign root-lock generation, and then requires a fresh project_lane_open.",
                   ]
                 : [
@@ -6267,6 +6355,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                   "Schema/catalog divergence rule: if the ChatGPT host catalog and live tool_schema_get result disagree, do not infer live runtime capability from the host catalog alone. Read docs/C2CT-LIVE-SCHEMA-HOST-CATALOG-RECOVERY.ko.md, compare host-mounted catalog, live runtime registry, and manifest/revalidation state separately, and never use c2ct_invoke to render a presenter.",
                   "Current-chat host rebind recovery: the canonical post-runtime-apply path is runtime apply -> manual ChatGPT Settings C2CT refresh -> user presses 완료 -> scan-tools exactly once -> terminal/output recovery -> direct chatgpt_catalog_reentry_presenter_v1 -> native @C2CT generation-marker proof. Once the user confirms the manual Settings refresh is complete, never call chatgpt_catalog_refresh and never run npm catalog-refresh; go directly to scan-tools once. If scan-tools is approval-gated, present its approval card immediately; the card observes that exact operation to terminal, so the normal terminal continuation must not add a model operation_status call or replay command_run. Use approvalRequestId operation_status only for active fallback, observer failure, reconnect/response loss, diagnostics, approval recovery, or UNKNOWN, and read outputRef with the same binding when needed so lane transitions cannot orphan the result. After scan succeeds and currentChatRebindProbeTool equals the expected live marker, do not refresh or scan again: immediately render the @C2CT copy/re-entry card. Ask the user to send a native @C2CT tool mention in this same chat, then directly invoke the exact expected generation marker. Only that direct marker success proves current-chat host rebind. A successful scan with a different marker is stale-host evidence: stop scan loops and use the Settings manual refresh path again only if the user chooses to. Do not re-register the bare /mcp connector.",
                   "Widget/presenter UI exception: never use c2ct_invoke to render or validate ChatGPT widget UI, approval cards, outputTemplate/resource mounts, or host confirmation UI. Generic dispatch can prove backend execution only; it does not reproduce the direct named tool's host-mounted static metadata. Always call the dedicated named presenter/tool directly for UI render or approval-surface E2E.",
+                  "Operation-approval first-paint rule: the versioned Critical operation approval widget must remain self-contained. Never replace CHATGPT_OPERATION_APPROVAL_WIDGET_HTML with the shared loader or make its first paint depend on chatgpt_widget_asset_get. Some iOS hosts can defer iframe/tool-bridge startup after presenter success, so a second private asset fetch can leave the approval card blank. Shared ordinary consent/Widget Shell may use the loader path. For approval-card updates, require the shipped-widget self-contained validation gate plus direct named presenter, resources/read, and visible-card acceptance before runtime apply.",
                   ...(canRunLocalShell ? ["local_shell_run for local-only Codex-style commands inside the selected project"] : []),
                   ...e2eWorkflow,
                   "repo_status/repo_diff_summary, then git_commit and git_push when explicitly requested",
@@ -7801,6 +7890,13 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             }
           : null;
         const privilegedProjectBlockers = await inspectPrivilegedProjectBlockers(ctx);
+        const privilegedProjectBlockersSemantics = {
+          scope: "registered-project-lock-inventory",
+          filteredForCurrentProject: false,
+          conflictVerdict: false,
+          guidance:
+            "Inventory only. A listed lock is not proof that it blocks the requested project; use the actual ACTIVE_PROJECT_LEASE_HELD conflict details/root relation.",
+        };
         const runtimeIdentityWarnings = [
           ...(runtimeManifest.sourceRevision ? [] : ["sourceRevision-unavailable"]),
           ...(runtimeManifest.sourceFingerprint ? [] : ["sourceFingerprint-unavailable"]),
@@ -7881,6 +7977,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               pendingRgApprovalCount,
               activeOperations: [...activeOperations, ...activeBackgroundOperations],
               privilegedProjectBlockers,
+              privilegedProjectBlockersSemantics,
               authorizationPlan: projectAuthorizationPlan(ctx.config.multiProjectLanesEnabled === true),
               ...(recoveryClassification ? { recoveryClassification } : {}),
               ...(turnAbandonmentAssessment ? { turnAbandonmentAssessment } : {}),
@@ -8064,6 +8161,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             rgVersion,
             activeOperations: [...activeOperations, ...activeBackgroundOperations],
             privilegedProjectBlockers,
+            privilegedProjectBlockersSemantics,
             authorizationPlan: projectAuthorizationPlan(ctx.config.multiProjectLanesEnabled === true),
             ...(recoveryClassification ? { recoveryClassification } : {}),
             ...(turnAbandonmentAssessment ? { turnAbandonmentAssessment } : {}),
@@ -10725,7 +10823,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Call tool on managed MCP",
       description:
-        "Call one tool on an installed managed MCP server through ChatGPT2Codex's stable proxy. Remote calls persist a durable host-scoped operation before upstream work starts: fast calls may finish inline, while slower calls return a rop_* operationId for operation_status polling and operation_result retrieval. Exact stable-request replays converge on the original operation and must never blindly re-run upstream work. Upstream MCP tools are third-party code and can have their own local/network side effects; use only servers the owner explicitly trusted.",
+        "Call one tool on an installed managed MCP server through ChatGPT2Codex's stable proxy. Remote calls persist a durable host-scoped operation before upstream work starts: fast calls may finish inline, while slower calls return a rop_* operationId for operation_status polling and operation_result retrieval. Unambiguous read/status-style upstream tool names use a fresh durable request identity for each logical call so time-varying state is not served from an old terminal receipt; mutation-like or unknown names retain exact response-loss replay/idempotency. This freshness routing never lowers authorization and does not trust upstream descriptions or readOnlyHint metadata. Upstream MCP tools are third-party code and can have their own local/network side effects; use only servers the owner explicitly trusted.",
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
       _meta: chatGptToolMeta("Calling managed MCP tool...", "Managed MCP tool call complete"),
       inputSchema: {
@@ -10740,6 +10838,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       runDurableHostTool(ctx, extra, {
         kind: "managed_mcp_call",
         fingerprintInput: { serverId: input.serverId, toolName: input.toolName, arguments: input.arguments ?? {} },
+        replayMode: managedMcpCallReplayMode(input.toolName),
         execute: async (updatePhase) => {
           await updatePhase("upstream-call");
           const result = await callManagedMcpTool(ctx.stateDir, input.serverId, input.toolName, input.arguments ?? {});
@@ -11196,7 +11295,9 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       _meta: chatGptToolMeta("Applying file patch...", "File patch applied"),
       inputSchema: {
         projectId: z.string(),
-        workLaneId: WORK_LANE_ID_SCHEMA.optional(),
+        workLaneId: ctx.remote && ctx.config.multiProjectLanesEnabled === true
+          ? WORK_LANE_ID_SCHEMA
+          : WORK_LANE_ID_SCHEMA.optional(),
         patch: z.string(),
         preconditionHashes: z.record(z.string(), z.string()).optional(),
         requestId: z.string().regex(MUTATION_REQUEST_ID_PATTERN).optional(),
@@ -11281,7 +11382,9 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       _meta: chatGptToolMeta("Editing file lines...", "File lines edited"),
       inputSchema: {
         projectId: z.string(),
-        workLaneId: WORK_LANE_ID_SCHEMA.optional(),
+        workLaneId: ctx.remote && ctx.config.multiProjectLanesEnabled === true
+          ? WORK_LANE_ID_SCHEMA
+          : WORK_LANE_ID_SCHEMA.optional(),
         requestId: z.string().regex(MUTATION_REQUEST_ID_PATTERN).optional(),
         edits: z
           .array(
@@ -11376,7 +11479,9 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       _meta: chatGptToolMeta("Creating project file...", "Project file created"),
       inputSchema: {
         projectId: z.string(),
-        workLaneId: WORK_LANE_ID_SCHEMA.optional(),
+        workLaneId: ctx.remote && ctx.config.multiProjectLanesEnabled === true
+          ? WORK_LANE_ID_SCHEMA
+          : WORK_LANE_ID_SCHEMA.optional(),
         path: z.string(),
         content: z.string(),
         overwrite: z.boolean().optional(),
@@ -12051,7 +12156,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             return chatGptOperationApprovalPending(ctx, {
               requestId,
               tool: "command_request",
-              allowFollowUpPrompt: "C2CT command_request를 이번만 허용했어. command_request를 재호출하지 마. 승인 카드가 exact operation을 terminal까지 자동 관찰한 뒤 현재 채팅을 1회 재개해. 정상 terminal continuation에서는 operation_status를 다시 호출하지 말고 outputRef가 있으면 output_read만 읽은 뒤 원래 작업을 계속해줘. observer 실패, reconnect/response loss, diagnostics, approval recovery, UNKNOWN일 때만 approvalRequestId로 operation_status fallback을 사용해. 사용자에게 추가 고고를 요구하지 마.",
+              allowFollowUpPrompt: "C2CT command_request를 이번만 허용했어. command_request를 재호출하지 마. 현재 채팅을 바로 이어서 승인된 exact operation을 approvalRequestId로 status-only 확인해 terminal까지 진행하고, outputRef가 있으면 같은 approvalRequestId binding으로 output_read를 읽은 뒤 원래 작업을 계속해줘. mutation을 재실행하거나 사용자에게 추가 고고를 요구하지 마.",
               denyFollowUpPrompt: "C2CT command_request를 거절했어. 이 exact operation은 실행하지 말고 종료해줘.",
               extra: {
                 projectId: entry.projectId,
@@ -12130,12 +12235,14 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Run project command",
       description:
-        "Run an allowlisted discovered command (never arbitrary shell). Remote ChatGPT/MCP always persists a background operation, even if synchronous is requested. Stable non-approved requests may wait only for a bounded inline terminal window and return terminal with operationStatusCallsRequired=0; longer work falls back to adaptive operation_status polling. Exact response-loss replays converge on the original operation. Protected remote approvals persist approval-wait immediately; Allow resumes that exact captured operation server-side once, so callers must not replay command_run. Native/local callers may still use bounded synchronous execution.",
+        "Run an allowlisted discovered command (never arbitrary shell). In remote multi-project mode, carry the exact workLaneId for verify/network/write/destructive commands; omission is valid only for commands classified read-only. Remote ChatGPT/MCP always persists a background operation, even if synchronous is requested. Stable non-approved requests may wait only for a bounded inline terminal window and return terminal with operationStatusCallsRequired=0; longer work falls back to adaptive operation_status polling. Exact response-loss replays converge on the original operation. Protected remote approvals persist approval-wait immediately; Allow resumes that exact captured operation server-side once, so callers must not replay command_run. Native/local callers may still use bounded synchronous execution.",
       annotations: COMMAND_RUN_ANNOTATIONS,
       _meta: chatGptToolMeta("Running project command...", "Project command finished"),
       inputSchema: {
         projectId: z.string(),
-        workLaneId: WORK_LANE_ID_SCHEMA.optional(),
+        workLaneId: WORK_LANE_ID_SCHEMA.optional().describe(
+          "Required for remote multi-project verify/network/write/destructive commands; optional only when the resolved command is read-only.",
+        ),
         commandId: z.string(),
         args: z.array(z.string()).optional(),
         executionMode: z.enum(["synchronous", "background"]).optional(),
@@ -12455,7 +12562,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               return chatGptOperationApprovalPending(ctx, {
                 requestId,
                 tool: "command_run",
-                allowFollowUpPrompt: "C2CT command_run 승인을 허용했어. command_run은 재호출하지 마. 승인 카드가 exact operation을 terminal까지 자동 관찰한 뒤 현재 채팅을 1회 재개해. 정상 terminal continuation에서는 operation_status를 다시 호출하지 말고 outputRef가 있으면 output_read만 읽은 뒤 원래 작업을 계속해줘. observer 실패, reconnect/response loss, diagnostics, approval recovery, UNKNOWN일 때만 approvalRequestId로 operation_status fallback을 사용해. 사용자에게 추가 고고를 요구하지 마.",
+                allowFollowUpPrompt: "C2CT command_run 승인을 허용했어. command_run은 재호출하지 마. 현재 채팅을 바로 이어서 승인된 exact operation을 approvalRequestId로 status-only 확인해 terminal까지 진행하고, outputRef가 있으면 같은 approvalRequestId binding으로 output_read를 읽은 뒤 원래 작업을 계속해줘. mutation을 재실행하거나 사용자에게 추가 고고를 요구하지 마.",
                 denyFollowUpPrompt: "C2CT command_run 승인을 거절했어. 이 작업은 실행하지 말고 거절 상태로 종료해줘.",
                 extra: {
                   commandId: input.commandId,
@@ -13541,7 +13648,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
               return chatGptOperationApprovalPending(ctx, {
                 requestId,
                 tool: "e2e_run_command",
-                allowFollowUpPrompt: `C2CT e2e_run_command 승인을 허용했어. e2e_run_command는 재호출하지 마. 승인 카드가 exact command operation을 terminal까지 자동 관찰한 뒤 현재 채팅을 1회 재개해. 정상 terminal continuation에서는 operation_status를 다시 호출하지 말고 command 결과를 이어가.${input.captureScreenshot === true ? " 요청된 screenshot은 command terminal 뒤 독립 post-processing 결과를 사용하고, screenshot 실패를 command 실패로 바꾸거나 screenshot 성공을 command 성공으로 바꾸지 마." : ""} observer 실패, reconnect/response loss, diagnostics, approval recovery, UNKNOWN일 때만 approvalRequestId로 operation_status fallback을 사용해.`,
+                allowFollowUpPrompt: `C2CT e2e_run_command 승인을 허용했어. e2e_run_command는 재호출하지 마. 현재 채팅을 바로 이어서 승인된 exact command operation을 approvalRequestId로 status-only 확인해 terminal까지 진행하고 command 결과를 이어가.${input.captureScreenshot === true ? " 요청된 screenshot은 command terminal 뒤 독립 post-processing 결과를 사용하고, screenshot 실패를 command 실패로 바꾸거나 screenshot 성공을 command 성공으로 바꾸지 마." : ""} mutation을 재실행하지 마.`,
                 denyFollowUpPrompt: "C2CT e2e_run_command 승인을 거절했어. 이 명령은 실행하지 말고 거절 상태로 종료해줘.",
                 extra: { risk: operationRisk, projectId: input.projectId, captureScreenshot: input.captureScreenshot === true },
               });

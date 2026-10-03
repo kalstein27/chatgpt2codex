@@ -234,6 +234,19 @@ async function validatedBuildReceipt(runtimeRoot: string, manifest: RuntimeManif
     : null;
 }
 
+export async function verifyChatGptWidgetPreapplyCandidate(projectRoot: string): Promise<{
+  candidateFingerprint: string;
+  widgetAssetRevision: string;
+} | null> {
+  const manifest = getRuntimeManifestForRoot(projectRoot);
+  const receipt = await validatedBuildReceipt(projectRoot, manifest);
+  if (!receipt) return null;
+  return {
+    candidateFingerprint: receipt.candidateFingerprint,
+    widgetAssetRevision: receipt.widgetAssetRevision,
+  };
+}
+
 export async function stageChatGptWidgetPreapplyRenderCandidate(input: {
   stateDir: string;
   projectId: string;
