@@ -30,6 +30,10 @@ export interface ConnectionDiagnosticSafeInputs {
   projectId?: string;
   commandId?: string;
   workLaneProvided?: boolean;
+  batchSize?: number;
+  resultCount?: number;
+  truncated?: boolean;
+  concurrencyLimit?: number;
 }
 
 export type ConnectionDiagnosticPhase =
@@ -70,6 +74,8 @@ export interface ConnectionDiagnosticInput {
   activeSessionCount?: number;
   dispatchToResponseMs?: number;
   workerDurationMs?: number;
+  pollAfterMs?: number;
+  completionToObservationMs?: number;
   inlineFastPath?: boolean;
   handoffReason?: string;
   coalescedReplay?: boolean;
@@ -175,6 +181,33 @@ export interface ConnectionAuditSummary {
   slowRequests: ConnectionDiagnosticEvent[];
   recentFailures: ConnectionDiagnosticEvent[];
   turnLossRecoveries: TurnLossRecoveryEvidence[];
+  efficiency: {
+    operationStatusCalls: number;
+    operationStatusFailures: number;
+    singleReadCalls: number;
+    batchReadCalls: number;
+    codeSearchBatchCalls: number;
+    fileReadBatchCalls: number;
+    measurementScope: "server-tool-events-only";
+  };
+  operationPolling: {
+    operationCount: number;
+    pollCount: number;
+    comparablePollCount: number;
+    unchangedPollCount: number;
+    unchangedPollRatio: number;
+    terminalObservationCount: number;
+    averageCompletionToObservationMs?: number;
+    p95CompletionToObservationMs?: number;
+    topPolledOperations: Array<{
+      operationId: string;
+      pollCount: number;
+      unchangedPollCount: number;
+      terminalObserved: boolean;
+      completionToObservationMs?: number;
+    }>;
+    measurementScope: "server-operation-status-events-only";
+  };
   lifecycle: ConnectionLifecycleSummary;
 }
 
@@ -260,6 +293,16 @@ function safeDiagnosticInputs(
   if (projectId) safe.projectId = projectId;
   const commandId = bounded(input.commandId);
   if (commandId) safe.commandId = commandId;
+  if (Number.isInteger(input.batchSize) && (input.batchSize ?? -1) >= 0 && (input.batchSize ?? 0) <= 64) {
+    safe.batchSize = input.batchSize;
+  }
+  if (Number.isInteger(input.resultCount) && (input.resultCount ?? -1) >= 0 && (input.resultCount ?? 0) <= 100_000) {
+    safe.resultCount = input.resultCount;
+  }
+  if (typeof input.truncated === "boolean") safe.truncated = input.truncated;
+  if (Number.isInteger(input.concurrencyLimit) && (input.concurrencyLimit ?? 0) >= 1 && (input.concurrencyLimit ?? 0) <= 16) {
+    safe.concurrencyLimit = input.concurrencyLimit;
+  }
   return Object.keys(safe).length > 0 ? safe : undefined;
 }
 
@@ -308,6 +351,12 @@ function safeEvent(input: ConnectionDiagnosticInput): ConnectionDiagnosticEvent 
       : {}),
     ...(Number.isFinite(input.workerDurationMs)
       ? { workerDurationMs: Math.max(0, Math.round(input.workerDurationMs ?? 0)) }
+      : {}),
+    ...(Number.isFinite(input.pollAfterMs)
+      ? { pollAfterMs: Math.max(0, Math.round(input.pollAfterMs ?? 0)) }
+      : {}),
+    ...(Number.isFinite(input.completionToObservationMs)
+      ? { completionToObservationMs: Math.max(0, Math.round(input.completionToObservationMs ?? 0)) }
       : {}),
     ...(typeof input.inlineFastPath === "boolean" ? { inlineFastPath: input.inlineFastPath } : {}),
     ...(bounded(input.handoffReason) ? { handoffReason: bounded(input.handoffReason) } : {}),
@@ -665,6 +714,60 @@ export class FileConnectionDiagnostics implements ConnectionDiagnosticsSink {
       }
     }
 
+    const countFor = (tool: string): { calls: number; failures: number } =>
+      toolCounts.get(tool) ?? { calls: 0, failures: 0 };
+    const operationStatus = countFor("operation_status");
+    const codeSearch = countFor("code_search");
+    const codeSearchBatch = countFor("code_search_batch");
+    const fileReadSlice = countFor("file_read_slice");
+    const fileReadBatch = countFor("file_read_batch");
+    const operationPolls = events.filter((event) =>
+      event.event === "operation.status.observed" &&
+      typeof event.operationId === "string" &&
+      typeof event.requestKind === "string"
+    );
+    const pollByOperation = new Map<string, {
+      pollCount: number;
+      unchangedPollCount: number;
+      terminalObserved: boolean;
+      completionToObservationMs?: number;
+      lastState?: string;
+    }>();
+    let comparablePollCount = 0;
+    let unchangedPollCount = 0;
+    let terminalObservationCount = 0;
+    for (const event of operationPolls) {
+      const operationId = event.operationId!;
+      const state = event.requestKind!;
+      const current = pollByOperation.get(operationId) ?? {
+        pollCount: 0,
+        unchangedPollCount: 0,
+        terminalObserved: false,
+      };
+      current.pollCount += 1;
+      if (current.lastState !== undefined) {
+        comparablePollCount += 1;
+        if (current.lastState === state) {
+          current.unchangedPollCount += 1;
+          unchangedPollCount += 1;
+        }
+      }
+      current.lastState = state;
+      if (event.phase === "completed") {
+        if (!current.terminalObserved) terminalObservationCount += 1;
+        current.terminalObserved = true;
+        if (Number.isFinite(event.completionToObservationMs)) {
+          const lag = Math.max(0, Math.round(event.completionToObservationMs ?? 0));
+          current.completionToObservationMs = current.completionToObservationMs === undefined
+            ? lag
+            : Math.min(current.completionToObservationMs, lag);
+        }
+      }
+      pollByOperation.set(operationId, current);
+    }
+    const completionLags = [...pollByOperation.values()]
+      .flatMap((value) => value.completionToObservationMs === undefined ? [] : [value.completionToObservationMs]);
+
     return {
       logPath: this.logPath,
       archiveDir: this.archiveDir,
@@ -701,6 +804,47 @@ export class FileConnectionDiagnostics implements ConnectionDiagnosticsSink {
         .slice(0, maxSlowRequests),
       recentFailures: events.filter((event) => event.outcome === "failure").slice(-maxRecentFailures),
       turnLossRecoveries: turnLossRecoveries(events),
+      efficiency: {
+        operationStatusCalls: operationStatus.calls,
+        operationStatusFailures: operationStatus.failures,
+        singleReadCalls: codeSearch.calls + fileReadSlice.calls,
+        batchReadCalls: codeSearchBatch.calls + fileReadBatch.calls,
+        codeSearchBatchCalls: codeSearchBatch.calls,
+        fileReadBatchCalls: fileReadBatch.calls,
+        measurementScope: "server-tool-events-only",
+      },
+      operationPolling: {
+        operationCount: pollByOperation.size,
+        pollCount: operationPolls.length,
+        comparablePollCount,
+        unchangedPollCount,
+        unchangedPollRatio: comparablePollCount === 0
+          ? 0
+          : Math.round((unchangedPollCount / comparablePollCount) * 10_000) / 10_000,
+        terminalObservationCount,
+        ...(completionLags.length > 0
+          ? {
+              averageCompletionToObservationMs: roundedAverage(
+                completionLags.reduce((sum, value) => sum + value, 0),
+                completionLags.length,
+              ),
+              p95CompletionToObservationMs: percentile(completionLags, 0.95),
+            }
+          : {}),
+        topPolledOperations: [...pollByOperation.entries()]
+          .map(([operationId, value]) => ({
+            operationId,
+            pollCount: value.pollCount,
+            unchangedPollCount: value.unchangedPollCount,
+            terminalObserved: value.terminalObserved,
+            ...(value.completionToObservationMs !== undefined
+              ? { completionToObservationMs: value.completionToObservationMs }
+              : {}),
+          }))
+          .sort((left, right) => right.pollCount - left.pollCount || left.operationId.localeCompare(right.operationId))
+          .slice(0, 20),
+        measurementScope: "server-operation-status-events-only",
+      },
       lifecycle: lifecycleSummary(events),
     };
   }

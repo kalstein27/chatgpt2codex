@@ -186,6 +186,7 @@ import {
   CHATGPT_CONSENT_WIDGET_HTML,
   CHATGPT_CONSENT_WIDGET_LOADER_HTML,
   CHATGPT_CONSENT_WIDGET_PREVIOUS_LOADER_URI,
+  CHATGPT_CONSENT_WIDGET_LEGACY_LOADER_URI,
   CHATGPT_CONSENT_WIDGET_DIRECT_URI,
   CHATGPT_CONSENT_WIDGET_LAB_LEGACY_URI,
   CHATGPT_CONSENT_WIDGET_LAB_URI,
@@ -2264,19 +2265,37 @@ function durableRequestIdentity(
   replayMode: DurableReplayMode = "exact",
 ): string {
   if (replayMode === "fresh") return `${tool}:fresh:${randomUUID()}:${operationFingerprint}`;
-  const requestId = extra && typeof extra === "object" && !Array.isArray(extra)
-    ? (extra as { requestId?: unknown }).requestId
+  const extraRecord = extra && typeof extra === "object" && !Array.isArray(extra)
+    ? extra as { requestId?: unknown; _meta?: unknown }
     : undefined;
+  const requestId = extraRecord?.requestId;
   if (
     ctx.remote === true
     && ctx.sessionScope
     && !isRemoteTransientSessionScope(ctx.sessionScope)
-    && (typeof requestId === "string" || typeof requestId === "number")
   ) {
+    const meta = extraRecord?._meta && typeof extraRecord._meta === "object" && !Array.isArray(extraRecord._meta)
+      ? extraRecord._meta as { progressToken?: unknown }
+      : undefined;
+    const progressToken = meta?.progressToken;
+    if (
+      (typeof progressToken === "string" && progressToken.length > 0)
+      || (typeof progressToken === "number" && Number.isFinite(progressToken))
+    ) {
+      const progressIdentity = createHash("sha256")
+        .update(`${typeof progressToken}:${String(progressToken)}`)
+        .digest("hex");
+      return `${tool}:progress:${progressIdentity}:${operationFingerprint}`;
+    }
+    if (typeof requestId !== "string" && typeof requestId !== "number") {
+      return `${tool}:ephemeral:${randomUUID()}`;
+    }
     // Some MCP hosts reuse their JSON-RPC request id across distinct tool calls.
-    // Bind the transport-provided id to the operation fingerprint so exact
-    // response-loss replays still coalesce while a later call with different
-    // input cannot collide with an earlier durable operation.
+    // Prefer the per-request MCP progress token above when the host supplies it:
+    // that distinguishes distinct logical calls even when the outer JSON-RPC id
+    // is reused, while an exact response-loss retry keeps the same token and
+    // coalesces onto the original durable receipt. Older clients without a
+    // progress token keep the conservative request-id replay behavior.
     return `${tool}:${typeof requestId}:${String(requestId)}:${operationFingerprint}`;
   }
   if (ctx.actionInvocation?.operationId) {
@@ -2302,6 +2321,7 @@ async function runDurableHostTool<T extends object>(
     kind: string;
     fingerprintInput: unknown;
     replayMode?: DurableReplayMode;
+    requestIdentity?: string;
     execute: (updatePhase: (phase: string) => Promise<void>) => Promise<T>;
     successMessage: (result: T) => string;
   },
@@ -2315,7 +2335,8 @@ async function runDurableHostTool<T extends object>(
   const response = await durableOperationManager(ctx.stateDir).startWithFastPath({
     binding: { ownerScope: backgroundOwnerScope(ctx), scope: "host" },
     kind: options.kind,
-    requestIdentity: durableRequestIdentity(ctx, extra, options.kind, operationFingerprint, options.replayMode),
+    requestIdentity: options.requestIdentity
+      ?? durableRequestIdentity(ctx, extra, options.kind, operationFingerprint, options.replayMode),
     operationFingerprint,
     execute: async (_signal, updatePhase) => options.execute(updatePhase),
   });
@@ -2764,6 +2785,33 @@ interface ToolListRequestLike {
   params?: Record<string, unknown>;
 }
 
+const C2CT_EXECUTION_POLICY = Object.freeze({
+  revision: 1,
+  independentReads: "bounded-batch-or-parallel",
+  readBatchTools: ["code_search_batch", "file_read_batch"],
+  sequencingBoundaries: [
+    "data-dependency",
+    "conflicting-access",
+    "approval-or-capability-transition",
+    "snapshot-consistency-requirement",
+    "response-loss-recovery",
+  ],
+  snapshotRule:
+    "Batched or parallel reads are best-effort unless a tool explicitly guarantees a snapshot. Use per-result observation metadata when consistency matters.",
+  verificationRule:
+    "Wait for dependent mutations and background operations to reach terminal state before fan-out verification reads.",
+  mutationParallelism: "disabled-until-conflict-contract-verified",
+  mutationParallelismEnforcement:
+    "agent-planning-policy-only; this does not install a server-wide mutation mutex",
+  mutationRule:
+    "Serialize mutations unless an owner-reviewed conflict contract explicitly proves disjoint write/shared-state scopes and regression coverage.",
+});
+
+const CODE_SEARCH_BATCH_MAX_QUERIES = 6;
+const CODE_SEARCH_BATCH_CONCURRENCY = 4;
+const CODE_SEARCH_BATCH_DEFAULT_RESULTS_PER_QUERY = 40;
+const CODE_SEARCH_BATCH_DEFAULT_TOTAL_MATCHES = 180;
+
 // Local stdio MCP clients such as Codex/Claude already have first-class local
 // filesystem, search, shell, test, Git, and computer-use tools. Advertising a
 // second overlapping C2CT toolchain makes those clients route ordinary local
@@ -2790,6 +2838,7 @@ const NATIVE_FIRST_HIDDEN_TOOL_NAMES: ReadonlySet<string> = new Set([
   "git_diff_summary",
   "show_changes",
   "code_search",
+  "code_search_batch",
   "rg_search",
   "file_read_slice",
   "file_read_batch",
@@ -3396,6 +3445,11 @@ function connectionSafeInputsFrom(input: unknown, toolName?: string): Connection
   const intent = record.intent && typeof record.intent === "object" && !Array.isArray(record.intent)
     ? record.intent as Record<string, unknown>
     : undefined;
+  const batchSize = toolName === "code_search_batch" && Array.isArray(record.queries)
+    ? record.queries.length
+    : toolName === "file_read_batch" && Array.isArray(record.slices)
+      ? record.slices.length
+      : undefined;
   return {
     ...(typeof record.projectId === "string" ? { projectId: redact(record.projectId).slice(0, 120) } : {}),
     ...(typeof record.commandId === "string" ? { commandId: redact(record.commandId).slice(0, 240) } : {}),
@@ -3415,6 +3469,7 @@ function connectionSafeInputsFrom(input: unknown, toolName?: string): Connection
     ...(typeof intent?.writesWorkspace === "boolean" ? { writesWorkspace: intent.writesWorkspace } : {}),
     ...(typeof intent?.needsNetwork === "boolean" ? { needsNetwork: intent.needsNetwork } : {}),
     ...(typeof intent?.destructive === "boolean" ? { destructive: intent.destructive } : {}),
+    ...(typeof batchSize === "number" ? { batchSize } : {}),
     ...(toolName && WORK_LANE_DIAGNOSTIC_TOOLS.has(toolName)
       ? { workLaneProvided: typeof record.workLaneId === "string" && record.workLaneId.length > 0 }
       : {}),
@@ -3492,6 +3547,7 @@ function activityHintFromInput(toolName: string, input: unknown): string | undef
     command_request: "정확한 외부 명령 검증",
     local_shell_run: "로컬 명령 실행",
     code_search: "관련 코드 검색",
+    code_search_batch: "관련 코드 여러 검색",
     rg_search: "프로젝트 전체 검색",
     file_read_slice: "파일 내용 확인",
     file_read_batch: "관련 파일 여러 개 확인",
@@ -4559,6 +4615,10 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
   );
   registerConsentWidgetResource(
     "c2ct-consent-widget-loader-v10-compat",
+    CHATGPT_CONSENT_WIDGET_LEGACY_LOADER_URI,
+  );
+  registerConsentWidgetResource(
+    "c2ct-consent-widget-previous-loader",
     CHATGPT_CONSENT_WIDGET_PREVIOUS_LOADER_URI,
   );
   registerConsentWidgetResource(
@@ -6177,6 +6237,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                 scopeRule:
                   "Host-scoped durable operations are project-lane independent; project-scoped operations preserve the original project/root/lane ownership boundary.",
               },
+              executionPolicy: C2CT_EXECUTION_POLICY,
               instructionDiscovery: [
                 "Stage 1 normal fast path is lease-neutral: when projectId is known, call agent_bootstrap(projectId=...) once to combine runtime/schema, project rules/status, and repo state. Use connection_status -> agent_guide as the detailed reconnect/error recovery path.",
                 "If an expected project under an authorized workspace/project root is missing, call workspace_refresh_index before concluding that it is unavailable, then query workspace_list_projects/workspace_get_project again. Use the default shallow scan first and bounded depth only for genuinely nested project folders.",
@@ -6286,7 +6347,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                     : [],
                   serialAdmin: ["project_select", "project_renew_lease", "project_release"],
                   approvals: ["mobile_approval_status", "mobile_approval_setup"],
-                  inspect: ["connection_audit", "repo_status", "repo_diff_summary", "code_search", "file_read_slice", "file_read_batch"],
+                  inspect: ["connection_audit", "repo_status", "repo_diff_summary", "code_search", "code_search_batch", "file_read_slice", "file_read_batch"],
                   modify: ["file_edit_lines", "file_apply_patch", "file_create", ...(canRunLocalShell ? ["local_shell_run"] : [])],
                   fixedLocalFile: ["verified_local_file_apply"],
                   verify: verificationTools,
@@ -6412,7 +6473,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
                 multiProjectLanesEnabled
                   ? "Only when source/test work begins, open the smallest suitable project work lane and treat the successful project_lane_open response as the authoritative exact workLaneId; do not add an immediate project_lane_status round-trip unless lane freshness becomes uncertain after a turn, approval, reconnect, response loss, lease failure, or returned recovery instruction. Keep project_select for legacy/admin serial work and desktop control only."
                   : "Only when source/test work begins, acquire the narrowest required serial project_select lease.",
-                "Use code_search first, then narrow file_read_slice calls; when several exact slices are already known, prefer file_read_batch to reduce host invocations. Avoid broad context-pack calls in ChatGPT because OpenAI safety may block them before they reach chatgpt2codex.",
+                "Use code_search first when the search scope is still unknown. When several search inputs are already fixed and independent, prefer bounded code_search_batch; when several exact slices are already known, prefer file_read_batch. Do not batch across data dependencies, conflicting access, approval/capability transitions, snapshot-consistency requirements, or response-loss recovery. Avoid broad context-pack calls in ChatGPT because OpenAI safety may block them before they reach chatgpt2codex.",
                 "Apply redaction-safe changes with file_edit_lines when displayed context contains [REDACTED]; otherwise use file_apply_patch or file_create. Never hand the user a script to paste when the action bridge is reachable.",
                 "Use verified_local_file_apply for predeclared integrity-verified fixed local artifact installs; its dedicated schema intentionally has no command, argv, raw source path, or raw destination path fields.",
                 `Remote long-operation rule: a long-capable tool gets only the common ${REMOTE_FAST_PATH_BUDGET_MS}ms fast path. If it is still active, return its persisted receipt, honor pollAfterMs on the exact status API, and continue the original objective after terminal. Never use foreground sleep/readiness waits to keep the request open and never blind-replay after cancellation, response loss, reconnect, timeout, or UNKNOWN. Generic host work uses rop_* with operation_status/operation_result; dedicated bg_*/prep_*/runtime/app receipts keep their own status contract.`,
@@ -8675,8 +8736,11 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
             remainingTurns,
             continueRequired: remainingTurns > 0,
             nextActions,
+            executionPolicy: C2CT_EXECUTION_POLICY,
             loopRules: [
               "Do one small inspect/edit/verify batch per action round.",
+              "Batch or parallelize only already-fixed independent reads, with bounded fan-out and response size. Stop fan-out when a result changes the next input or when snapshot consistency is required.",
+              "Keep mutations sequential until an owner-reviewed conflict contract and regression suite explicitly prove a safe parallel write scope.",
               "Keep each tool call short; avoid silent long thinking turns.",
               doneRule,
               "This is local ChatGPT-driven tooling, not OpenAI Codex quota.",
@@ -10486,6 +10550,240 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
   );
 
   registerTool(
+    "code_search_batch",
+    {
+      title: "Search independent code queries in one batch",
+      description:
+        "Run up to 6 already-fixed, independent project code searches in one logical operation with a fixed per-call concurrency limit of 4. Remote calls use the standard durable ~1s fast path: return inline when fast, otherwise return a rop_* receipt for operation_status/operation_result. Use only when no query depends on another query's result and no single-snapshot consistency is required. Per-query failures are isolated, secret paths/snippets keep code_search redaction rules, total matches are bounded, and maxTotalBytes bounds the final code_search_batch structuredContent JSON including its envelope. This is read-only batching, not a mutation scheduler; concurrency 4 is per batch call, not a process-wide semaphore.",
+      annotations: READ_ONLY_ANNOTATIONS,
+      _meta: chatGptToolMeta("Searching code batch...", "Code search batch complete"),
+      inputSchema: {
+        projectId: z.string(),
+        workLaneId: WORK_LANE_ID_SCHEMA.optional(),
+        queries: z.array(z.object({
+          id: z.string().regex(/^[A-Za-z0-9._:-]{1,40}$/u).optional(),
+          query: z.string().min(1).max(4096),
+          mode: z.enum(["text", "symbol", "semantic"]).optional(),
+          maxResults: z.number().int().positive().max(100).optional(),
+        })).min(1).max(CODE_SEARCH_BATCH_MAX_QUERIES),
+        maxTotalMatches: z.number().int().positive().max(400).optional(),
+        maxTotalBytes: z.number().int().min(8 * 1024).max(512 * 1024).optional(),
+      },
+    },
+    async (input, extra) => {
+      return withErrorMapping(ctx, "code_search_batch", input, async () => {
+        if (input.workLaneId) {
+          await requireProjectLease(ctx, input.projectId, "read", input.workLaneId);
+        }
+        const entry = await resolveOrThrow(ctx, { projectId: input.projectId });
+        const maxTotalMatches = input.maxTotalMatches ?? CODE_SEARCH_BATCH_DEFAULT_TOTAL_MATCHES;
+        const maxTotalBytes = input.maxTotalBytes ?? (ctx.remote === true ? 96 * 1024 : 192 * 1024);
+        return runDurableProjectTool(ctx, extra, {
+          kind: "code_search_batch",
+          projectId: entry.projectId,
+          projectRoot: entry.root,
+          workLaneId: input.workLaneId,
+          fingerprintInput: {
+            queries: input.queries,
+            maxTotalMatches,
+            maxTotalBytes,
+          },
+          execute: async (updatePhase) => {
+            await updatePhase("code-search-batch");
+            const batchStartedAt = new Date().toISOString();
+            const batchStartedMs = Date.now();
+            const concurrencyLimit = Math.min(CODE_SEARCH_BATCH_CONCURRENCY, input.queries.length);
+            const rawResults: Array<Record<string, unknown> | undefined> = new Array(input.queries.length);
+            let nextIndex = 0;
+
+            const worker = async (): Promise<void> => {
+              while (true) {
+                const index = nextIndex;
+                nextIndex += 1;
+                if (index >= input.queries.length) return;
+                const request = input.queries[index]!;
+                const observedAt = new Date().toISOString();
+                const startedMs = Date.now();
+                try {
+                  const requestedMaxResults = request.maxResults ?? CODE_SEARCH_BATCH_DEFAULT_RESULTS_PER_QUERY;
+                  const result = await codeSearch(entry.root, request.query, request.mode, requestedMaxResults + 1);
+                  const queryTruncated = result.matches.length > requestedMaxResults;
+                  const matches = result.matches
+                    .filter((match) => !isSecretReadPath(path.join(entry.root, match.path)))
+                    .map((match) => ({ ...match, snippet: redact(match.snippet) }))
+                    .slice(0, requestedMaxResults);
+                  rawResults[index] = {
+                    index,
+                    ...(request.id ? { id: request.id } : {}),
+                    ok: true,
+                    status: "success",
+                    observedAt,
+                    completedAt: new Date().toISOString(),
+                    durationMs: Math.max(0, Date.now() - startedMs),
+                    backend: result.backend,
+                    matches,
+                    truncated: queryTruncated,
+                  };
+                } catch (error) {
+                  const mapped = mapError(error, ctx.remote === true).structuredContent as Record<string, unknown>;
+                  rawResults[index] = {
+                    index,
+                    ...(request.id ? { id: request.id } : {}),
+                    ok: false,
+                    status: "failed",
+                    observedAt,
+                    completedAt: new Date().toISOString(),
+                    durationMs: Math.max(0, Date.now() - startedMs),
+                    errorCode: String(mapped.code ?? "SEARCH_FAILED"),
+                    error: String(mapped.error ?? "Code search failed"),
+                  };
+                }
+              }
+            };
+
+            await Promise.all(Array.from({ length: concurrencyLimit }, () => worker()));
+
+            const skippedResult = (index: number, error: string): Record<string, unknown> => ({
+              index,
+              ...(input.queries[index]?.id ? { id: input.queries[index]!.id } : {}),
+              ok: false,
+              status: "skipped",
+              errorCode: "BATCH_RESPONSE_LIMIT",
+              error,
+              truncated: true,
+            });
+            const executionFailureCount = rawResults.filter((raw) => raw?.ok !== true).length;
+            let remainingMatches = maxTotalMatches;
+            const results: Array<Record<string, unknown>> = rawResults.map((raw, index) => {
+              const item = raw ?? {
+                index,
+                ok: false,
+                status: "failed",
+                errorCode: "SEARCH_FAILED",
+                error: "Search worker did not return a result.",
+              };
+              if (item.ok !== true) return item;
+              const originalMatches = Array.isArray(item.matches) ? item.matches : [];
+              const matches = originalMatches.slice(0, Math.max(0, remainingMatches));
+              remainingMatches -= matches.length;
+              return {
+                ...item,
+                matches,
+                truncated: item.truncated === true || matches.length < originalMatches.length,
+              };
+            });
+
+            const completedAt = new Date().toISOString();
+            const durationMs = Math.max(0, Date.now() - batchStartedMs);
+            const makeStructured = (): Record<string, unknown> => {
+              const successCount = results.filter((item) => item.ok === true).length;
+              const failureCount = results.filter((item) => item.status === "failed").length;
+              const skippedCount = results.filter((item) => item.status === "skipped").length;
+              const returnedMatchCount = results.reduce(
+                (sum, item) => sum + (Array.isArray(item.matches) ? item.matches.length : 0),
+                0,
+              );
+              const truncated = results.some((item) => item.truncated === true || item.status === "skipped");
+              const base = {
+                results,
+                batchStartedAt,
+                completedAt,
+                durationMs,
+                concurrencyLimit,
+                requestedCount: input.queries.length,
+                successCount,
+                failureCount,
+                executionFailureCount,
+                skippedCount,
+                omittedResultCount: Math.max(0, input.queries.length - results.length),
+                returnedMatchCount,
+                maxTotalMatches,
+                maxTotalBytes,
+                byteBudgetScope: "wire-structuredContent",
+                truncated,
+                consistency: {
+                  mode: "best-effort-non-snapshot",
+                  observedAtPerResult: true,
+                  mutationParallelism: "disabled-policy-only",
+                },
+              };
+              let bytesUsed = 0;
+              let measured = { ...base, bytesUsed };
+              for (let pass = 0; pass < 6; pass += 1) {
+                const nextBytes = Buffer.byteLength(
+                  JSON.stringify(addToolCallProof(measured, "code_search_batch", true)),
+                  "utf8",
+                );
+                if (nextBytes === bytesUsed) break;
+                bytesUsed = nextBytes;
+                measured = { ...base, bytesUsed };
+              }
+              return measured;
+            };
+
+            let structured = makeStructured();
+            while ((structured.bytesUsed as number) > maxTotalBytes) {
+              let shrunk = false;
+              for (let index = results.length - 1; index >= 0; index -= 1) {
+                const item = results[index]!;
+                const matches = Array.isArray(item.matches) ? item.matches : [];
+                if (item.ok === true && matches.length > 0) {
+                  results[index] = matches.length === 1
+                    ? skippedResult(index, "All matches omitted because maxTotalBytes was reached.")
+                    : { ...item, matches: matches.slice(0, -1), truncated: true };
+                  shrunk = true;
+                  break;
+                }
+              }
+              if (!shrunk) {
+                for (let index = results.length - 1; index >= 0; index -= 1) {
+                  if (results[index]?.status !== "skipped") {
+                    results[index] = skippedResult(index, "Result omitted because maxTotalBytes was reached.");
+                    shrunk = true;
+                    break;
+                  }
+                }
+              }
+              if (!shrunk) {
+                throw new DomainError(
+                  ErrorCode.INVALID_ARGUMENT,
+                  "maxTotalBytes is too small for the minimum code_search_batch response envelope",
+                  { maxTotalBytes, requestedCount: input.queries.length },
+                );
+              }
+              structured = makeStructured();
+            }
+
+            void ctx.diagnostics?.record({
+              event: "read.batch.completed",
+              outcome:
+                executionFailureCount > 0 ||
+                (structured.skippedCount as number) > 0 ||
+                (structured.omittedResultCount as number) > 0
+                  ? "info"
+                  : "success",
+              phase: "completed",
+              tool: "code_search_batch",
+              durationMs,
+              safeInputs: {
+                projectId: input.projectId,
+                batchSize: input.queries.length,
+                resultCount: structured.returnedMatchCount as number,
+                truncated: structured.truncated as boolean,
+                concurrencyLimit,
+              },
+            }).catch(() => undefined);
+
+            return structured;
+          },
+          successMessage: (result) =>
+            `Completed ${input.queries.length} independent code search(es): ${String(result.successCount)} returned success, ${String(result.failureCount)} returned failure, ${String(result.skippedCount)} skipped, ${String(result.returnedMatchCount)} match(es) returned.`,
+        });
+      });
+    },
+  );
+
+  registerTool(
     "rg_install_managed",
     {
       title: "Install pinned managed ripgrep",
@@ -10823,7 +11121,7 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     {
       title: "Call tool on managed MCP",
       description:
-        "Call one tool on an installed managed MCP server through ChatGPT2Codex's stable proxy. Remote calls persist a durable host-scoped operation before upstream work starts: fast calls may finish inline, while slower calls return a rop_* operationId for operation_status polling and operation_result retrieval. Unambiguous read/status-style upstream tool names use a fresh durable request identity for each logical call so time-varying state is not served from an old terminal receipt; mutation-like or unknown names retain exact response-loss replay/idempotency. This freshness routing never lowers authorization and does not trust upstream descriptions or readOnlyHint metadata. Upstream MCP tools are third-party code and can have their own local/network side effects; use only servers the owner explicitly trusted.",
+        "Call one tool on an installed managed MCP server through ChatGPT2Codex's stable proxy. Remote calls persist a durable host-scoped operation before upstream work starts: fast calls may finish inline, while slower calls return a rop_* operationId for operation_status polling and operation_result retrieval. Unambiguous read/status-style upstream tool names use a fresh durable request identity for each logical call so time-varying state is not served from an old terminal receipt. Mutation-like or unknown upstream names require a caller-owned requestId on remote ChatGPT: use a new requestId for each intentional logical action, and reuse the exact same requestId only when recovering that same call after response loss. This prevents host JSON-RPC id reuse from replaying an older terminal mutation while preserving exact idempotency for retries. This routing never lowers authorization and does not trust upstream descriptions or readOnlyHint metadata. Upstream MCP tools are third-party code and can have their own local/network side effects; use only servers the owner explicitly trusted.",
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
       _meta: chatGptToolMeta("Calling managed MCP tool...", "Managed MCP tool call complete"),
       inputSchema: {
@@ -10832,13 +11130,24 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         serverId: z.string().min(1).max(120),
         toolName: z.string().min(1).max(200),
         arguments: z.record(z.unknown()).optional(),
+        requestId: z.string().regex(MUTATION_REQUEST_ID_PATTERN).optional().describe("Required for remote mutation-like or unknown calls. New logical action = new requestId; response-loss recovery of the same action = reuse the same requestId."),
       },
     },
-    async (input, extra) => withErrorMapping<Record<string, unknown>>(ctx, "managed_mcp_call", input, async () =>
-      runDurableHostTool(ctx, extra, {
+    async (input, extra) => withErrorMapping<Record<string, unknown>>(ctx, "managed_mcp_call", input, async () => {
+      const replayMode = managedMcpCallReplayMode(input.toolName);
+      if (ctx.remote === true && replayMode === "exact" && !input.requestId) {
+        throw new DomainError(
+          ErrorCode.INVALID_ARGUMENT,
+          "Remote mutation-like or unknown managed_mcp_call requires requestId; use a new requestId for each intentional logical action and reuse it only for response-loss recovery",
+        );
+      }
+      return runDurableHostTool(ctx, extra, {
         kind: "managed_mcp_call",
         fingerprintInput: { serverId: input.serverId, toolName: input.toolName, arguments: input.arguments ?? {} },
-        replayMode: managedMcpCallReplayMode(input.toolName),
+        replayMode,
+        ...(replayMode === "exact" && input.requestId
+          ? { requestIdentity: `managed_mcp_call:logical:${input.requestId}` }
+          : {}),
         execute: async (updatePhase) => {
           await updatePhase("upstream-call");
           const result = await callManagedMcpTool(ctx.stateDir, input.serverId, input.toolName, input.arguments ?? {});
@@ -10851,7 +11160,8 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
           return result;
         },
         successMessage: () => `Called ${input.toolName} on managed MCP ${input.serverId}.`,
-      })),
+      });
+    }),
   );
 
   registerTool(
@@ -12809,6 +13119,41 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
     },
   );
 
+  const operationCompletionObservationLagMs = (finishedAt: unknown): number | undefined => {
+    const finishedMs = typeof finishedAt === "number"
+      ? finishedAt
+      : typeof finishedAt === "string"
+        ? Date.parse(finishedAt)
+        : Number.NaN;
+    if (!Number.isFinite(finishedMs)) return undefined;
+    return Math.max(0, Date.now() - finishedMs);
+  };
+
+  const recordOperationStatusObservation = (input: {
+    operationId: string;
+    state: string;
+    active: boolean;
+    finishedAt?: unknown;
+    pollAfterMs?: number;
+    projectId?: string;
+  }): void => {
+    void ctx.diagnostics?.record({
+      event: "operation.status.observed",
+      outcome: "info",
+      tool: "operation_status",
+      operationId: input.operationId,
+      requestKind: input.state,
+      phase: input.active ? "running" : "completed",
+      ...(Number.isFinite(input.pollAfterMs) ? { pollAfterMs: input.pollAfterMs } : {}),
+      ...(!input.active
+        ? {
+            completionToObservationMs: operationCompletionObservationLagMs(input.finishedAt),
+          }
+        : {}),
+      ...(input.projectId ? { safeInputs: { projectId: input.projectId } } : {}),
+    }).catch(() => undefined);
+  };
+
   registerTool(
     "operation_status",
     {
@@ -12837,6 +13182,14 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
         });
         const durable = await manager.status({ ...lookupBinding, operationId: input.operationId });
         const operationActive = ["queued", "running", "finalizing"].includes(durable.state);
+        recordOperationStatusObservation({
+          operationId: durable.operationId,
+          state: durable.state,
+          active: operationActive,
+          finishedAt: durable.finishedAt,
+          pollAfterMs: operationActive ? durable.pollAfterMs : undefined,
+          projectId: durable.projectId,
+        });
         if (!operationActive) {
           void ctx.diagnostics?.record({
             event: "durable.operation.terminal",
@@ -12914,6 +13267,14 @@ export function registerTools(server: unknown, ctx: ToolContext): void {
       }
       const operationActive = ["approval-wait", "queued", "spawning", "running", "cleanup"].includes(snapshot.state);
       const pollAfterMs = operationActive ? recommendedOperationPollAfterMs(snapshot) : undefined;
+      recordOperationStatusObservation({
+        operationId: snapshot.operationId,
+        state: snapshot.state,
+        active: operationActive,
+        finishedAt: snapshot.finishedAt,
+        pollAfterMs,
+        projectId: entry.projectId,
+      });
       return makeResult(
         {
           ...snapshot,

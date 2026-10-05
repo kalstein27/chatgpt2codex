@@ -4,7 +4,10 @@ import {
   CHATGPT_STANDARD_CONSENT_USER_PROMPTS,
 } from "./chatgpt-card-prompts.js";
 
-export const CHATGPT_OPERATION_APPROVAL_WIDGET_VERSION = 30;
+// Shared card HTML is embedded in both the loader fallback and the immutable
+// approval document. Keep their host resource identities in sync when that
+// bundled document changes; its content hash remains the asset revision.
+export const CHATGPT_OPERATION_APPROVAL_WIDGET_VERSION = 31;
 export const CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL =
   `chatgpt_operation_approval_presenter_v${CHATGPT_OPERATION_APPROVAL_WIDGET_VERSION}`;
 export const CHATGPT_OPERATION_APPROVAL_WIDGET_URI =
@@ -12,7 +15,7 @@ export const CHATGPT_OPERATION_APPROVAL_WIDGET_URI =
 export const CHATGPT_OPERATION_APPROVAL_WIDGET_RESOURCE_NAME =
   `c2ct-operation-approval-widget-v${CHATGPT_OPERATION_APPROVAL_WIDGET_VERSION}`;
 
-export const CHATGPT_WIDGET_PREAPPLY_PRESENTER_VERSION = 1;
+export const CHATGPT_WIDGET_PREAPPLY_PRESENTER_VERSION = 2;
 export const CHATGPT_WIDGET_PREAPPLY_PRESENTER_TOOL =
   `chatgpt_widget_preapply_presenter_v${CHATGPT_WIDGET_PREAPPLY_PRESENTER_VERSION}`;
 export const CHATGPT_WIDGET_PREAPPLY_WIDGET_URI =
@@ -20,11 +23,12 @@ export const CHATGPT_WIDGET_PREAPPLY_WIDGET_URI =
 export const CHATGPT_WIDGET_PREAPPLY_WIDGET_RESOURCE_NAME =
   `c2ct-widget-preapply-v${CHATGPT_WIDGET_PREAPPLY_PRESENTER_VERSION}`;
 export const CHATGPT_CONSENT_WIDGET_LAB_VERSION = 9;
-export const CHATGPT_CONSENT_WIDGET_LOADER_VERSION = 13;
+export const CHATGPT_CONSENT_WIDGET_LOADER_VERSION = 15;
 // Keep previous loader-mounted addresses available as stale-host compatibility
 // aliases. The current shared Widget Shell/consent presenter also uses a
 // versioned loader so hot-applied card HTML is fetched at mount.
-export const CHATGPT_CONSENT_WIDGET_PREVIOUS_LOADER_URI = "ui://widget/c2ct-consent-loader-v12.html";
+export const CHATGPT_CONSENT_WIDGET_PREVIOUS_LOADER_URI = "ui://widget/c2ct-consent-loader-v14.html";
+export const CHATGPT_CONSENT_WIDGET_LEGACY_LOADER_URI = "ui://widget/c2ct-consent-loader-v13.html";
 export const CHATGPT_CONSENT_WIDGET_LEGACY_URI = "ui://widget/c2ct-consent-v8.html";
 export const CHATGPT_CONSENT_WIDGET_LAB_LEGACY_URI =
   `ui://widget/c2ct-consent-v${CHATGPT_CONSENT_WIDGET_LAB_VERSION}.html`;
@@ -79,6 +83,7 @@ const CHATGPT_CONSENT_WIDGET_LOADER_TEMPLATE = `<!doctype html>
   var bundledFallbackBase64 = "__C2CT_BUNDLED_FALLBACK_BASE64__";
   var bundledFallbackRevision = "__C2CT_BUNDLED_FALLBACK_REVISION__";
   var assetLoadStarted = false;
+  var expectedActiveRevision = "";
   function structured(result) {
     if (!result || typeof result !== "object") return {};
     if (result.structuredContent && typeof result.structuredContent === "object") return result.structuredContent;
@@ -245,6 +250,7 @@ const CHATGPT_CONSENT_WIDGET_LOADER_TEMPLATE = `<!doctype html>
     var bootstrapOut = presenterBootstrap && presenterBootstrap.toolOutput;
     var bootstrapKind = bootstrapOut && typeof bootstrapOut.presentationKind === "string" ? bootstrapOut.presentationKind : "";
     var activeRevision = bootstrapOut && typeof bootstrapOut.widgetAssetRevision === "string" ? bootstrapOut.widgetAssetRevision : "";
+    expectedActiveRevision = activeRevision;
     if (bootstrapKind !== "widget-preapply-load-only" && bootstrapKind !== "widget-capability-lab" && activeRevision && activeRevision === bundledFallbackRevision) {
       var bundledHtml = bundledFallbackHtml();
       if (bundledHtml) {
@@ -257,12 +263,12 @@ const CHATGPT_CONSENT_WIDGET_LOADER_TEMPLATE = `<!doctype html>
     if (preferNative) {
       var nativeAttempt = { dispatched: false, cancelled: false };
       try {
-        result = await withTimeout(loadThroughNative(a, nativeAttempt), 1200);
+        result = await withTimeout(loadThroughNative(a, nativeAttempt), 5000);
       } catch (error) {
         if (nativeAttempt.dispatched) throw error;
         nativeAttempt.cancelled = true;
         var nativeFallbackMcpAttempt = { dispatched: false, cancelled: false };
-        result = await withTimeout(loadThroughMcpApps(nativeFallbackMcpAttempt), 1600).catch(function (mcpError) {
+        result = await withTimeout(loadThroughMcpApps(nativeFallbackMcpAttempt), 5000).catch(function (mcpError) {
           nativeFallbackMcpAttempt.cancelled = true;
           throw mcpError;
         });
@@ -270,27 +276,32 @@ const CHATGPT_CONSENT_WIDGET_LOADER_TEMPLATE = `<!doctype html>
     } else {
       var mcpAttempt = { dispatched: false, cancelled: false };
       try {
-        result = await withTimeout(loadThroughMcpApps(mcpAttempt), 1200);
+        result = await withTimeout(loadThroughMcpApps(mcpAttempt), 5000);
       } catch (error) {
         if (mcpAttempt.dispatched || typeof a.callTool !== "function") throw error;
         mcpAttempt.cancelled = true;
         var mcpFallbackNativeAttempt = { dispatched: false, cancelled: false };
-        result = await withTimeout(loadThroughNative(a, mcpFallbackNativeAttempt), 1600);
+        result = await withTimeout(loadThroughNative(a, mcpFallbackNativeAttempt), 5000);
       }
     }
     var out = structured(result);
     installCardHtml(out.html);
   }
   void load().catch(function () {
-    var fallbackHtml = bundledFallbackHtml();
-    if (fallbackHtml) {
-      try {
-        installCardHtml(fallbackHtml);
-        return;
-      } catch (_) {}
+    var bundledMatchesExpected = !expectedActiveRevision || expectedActiveRevision === bundledFallbackRevision;
+    if (bundledMatchesExpected) {
+      var fallbackHtml = bundledFallbackHtml();
+      if (fallbackHtml) {
+        try {
+          installCardHtml(fallbackHtml);
+          return;
+        } catch (_) {}
+      }
     }
     var status = document.getElementById("status");
-    if (status) status.textContent = "카드 로딩 실패 · presenter/runtime 확인 필요";
+    if (status) status.textContent = expectedActiveRevision
+      ? "새 카드 자산 로딩 실패 · 이전 UI fallback 차단됨"
+      : "카드 로딩 실패 · presenter/runtime 확인 필요";
   });
 })();
 </script>
@@ -347,8 +358,19 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
   .shell-option-description { display: block; margin-top: 3px; font-size: 11px; line-height: 1.35; opacity: .65; }
   .card.shell-compact { border-color: transparent; padding: 2px 0; }
   .card.shell-compact #shell-status { display: none; }
-  .card.shell-compact .shell-options { margin-top: 9px; }
-  .card.shell-compact .shell-option { min-height: 46px; text-align: center; }
+  .card.shell-compact .shell-options { margin: 8px 0 0; }
+  .card.shell-compact .shell-option {
+    min-height: 44px;
+    padding: 10px 12px;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+    text-align: center;
+  }
+  .card.shell-compact .shell-option-title { font-size: clamp(20px, 2.2vw, 22px); font-weight: 740; line-height: 1.22; }
+  .card.shell-compact .shell-option:active:not(:disabled) { opacity: .68; }
+  .card.shell-compact .shell-option.shell-resolved:disabled { opacity: 1; }
   .card.shell-compact.shell-auto {
     --shell-auto-pad-y: clamp(14px, 2vw, 22px);
     border-color: rgba(128,128,128,.22);
@@ -356,8 +378,8 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
     padding: var(--shell-auto-pad-y) clamp(14px, 2vw, 20px) calc(var(--shell-auto-pad-y) - 4px);
   }
   .card.shell-compact.shell-auto .shell-options { gap: clamp(10px, 1.35vw, 14px); }
-  .card.shell-compact.shell-auto .shell-option { min-height: clamp(54px, 7vw, 72px); padding: clamp(12px, 1.75vw, 18px) clamp(14px, 2vw, 20px); border-radius: clamp(11px, 1.4vw, 14px); }
-  .card.shell-compact.shell-auto .shell-option-title { font-size: clamp(15px, 2vw, 20px); font-weight: 700; line-height: 1.4; }
+  .card.shell-compact.shell-auto .shell-option { min-height: 44px; padding: 10px 12px; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+  .card.shell-compact.shell-auto .shell-option-title { font-size: clamp(20px, 2.2vw, 22px); font-weight: 740; line-height: 1.22; }
   .card.shell-compact.shell-auto #shell-status { display: none; }
   .card.shell-compact.shell-auto .shell-options.shell-auto-pair { grid-template-columns: minmax(0, 1fr); }
   .card.shell-compact.shell-auto .shell-cancel { color: inherit; opacity: .76; }
@@ -2089,19 +2111,24 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
     (Array.isArray(card.options) ? card.options : []).forEach(function (option) {
       var button = document.createElement("button");
       button.className = "shell-option";
+      if (compact && resolved) button.classList.add("shell-resolved");
       if (option.id === "continue") button.id = "shell-continue-button";
       button.disabled = shellBusy || submittedForCard || resolved || locked;
       var title = document.createElement("span");
       title.className = "shell-option-title";
       if (option.id === "continue") title.id = "shell-continue-title";
-      title.textContent = simpleAuto ? (option.label || option.id || "선택") : (autoContinuation && option.id === "continue" ? "지금 계속" : (option.label || option.id || "선택"));
-      if (simpleAuto && option.id === "continue" && !autoCancelLatched && !autoState) {
-        title.textContent = (option.label || "계속 진행하기") + " · " + Math.max(0, Math.ceil(autoRemainingMs / 1000)) + "초";
+      if (compact && resolved) {
+        title.textContent = "완료 ✓";
+      } else {
+        title.textContent = simpleAuto ? (option.label || option.id || "선택") : (autoContinuation && option.id === "continue" ? "지금 계속" : (option.label || option.id || "선택"));
+        if (simpleAuto && option.id === "continue" && !autoCancelLatched && !autoState) {
+          title.textContent = (option.label || "계속 진행하기") + " · " + Math.max(0, Math.ceil(autoRemainingMs / 1000)) + "초";
+        }
+        if (locked && compact) title.textContent += " · " + formatShellDelay(remainingMs) + " 후";
+        if (restored && restored.choiceId === option.id) title.textContent += " ✓";
       }
-      if (locked && compact) title.textContent += " · " + formatShellDelay(remainingMs) + " 후";
-      if (restored && restored.choiceId === option.id) title.textContent += " ✓";
       button.appendChild(title);
-      if (option.description) {
+      if (option.description && !(compact && resolved)) {
         var description = document.createElement("span");
         description.className = "shell-option-description";
         description.textContent = option.description;
@@ -2526,14 +2553,23 @@ export const CHATGPT_CONSENT_WIDGET_HTML = `<!doctype html>
     // remounts and is intentionally never cleared for this card.
     void persistShellSubmission(card, choiceId);
     var selectedOption = (Array.isArray(card.options) ? card.options : []).find(function (option) { return option.id === choiceId; });
-    var compactContinuation = card.compact === true && Array.isArray(card.options) && card.options.length === 1 && choiceId === "continue";
+    var compactSingleChoice = card.compact === true && Array.isArray(card.options) && card.options.length === 1;
+    var compactContinuation = compactSingleChoice && choiceId === "continue";
     var userFollowUpPrompt = compactContinuation
       ? shellContinuationInput(card, selectedOption)
       : ((selectedOption && selectedOption.label) || "선택 완료");
     var followUpPromise = beginFollowUpTurn(card.cardId, userFollowUpPrompt);
     try {
       await persistShellChoice(card, choiceId);
-      if (clickedButton) clickedButton.querySelector(".shell-option-title").textContent += " ✓";
+      if (clickedButton) {
+        var clickedTitle = clickedButton.querySelector(".shell-option-title");
+        if (clickedTitle) clickedTitle.textContent = compactSingleChoice ? "완료 ✓" : clickedTitle.textContent + " ✓";
+        if (compactSingleChoice) {
+          clickedButton.classList.add("shell-resolved");
+          var clickedDescription = clickedButton.querySelector(".shell-option-description");
+          if (clickedDescription) clickedDescription.remove();
+        }
+      }
     } catch (_) {
       shellBusy = false;
       document.getElementById("shell-status").textContent = "❌ 선택 상태 저장 실패 · 버튼 잠금 유지 · 새 카드 필요";

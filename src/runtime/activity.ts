@@ -333,6 +333,7 @@ function defaultToolActivity(tool: string, phaseId: RuntimeActivityPhaseId): str
     repo_status: "Git 저장소 상태 확인 중",
     git_status: "Git 상태 확인 중",
     code_search: "관련 코드 검색 중",
+    code_search_batch: "관련 코드 여러 검색 중",
     rg_search: "프로젝트 전체 검색 중",
     file_read_slice: "파일 내용 확인 중",
     file_read_batch: "관련 파일 여러 개 확인 중",

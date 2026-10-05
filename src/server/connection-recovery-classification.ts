@@ -77,7 +77,7 @@ const CONNECTION_RECOVERY_RECHECK_MS = 5_000;
 
 const READ_ONLY_RECOVERY_TOOLS = new Set([
   "agent_bootstrap", "agent_guide", "connection_audit", "connection_status", "project_rules", "project_status",
-  "repo_status", "git_status", "code_search", "file_read_slice", "file_read_batch", "command_list",
+  "repo_status", "git_status", "code_search", "code_search_batch", "file_read_slice", "file_read_batch", "command_list",
   "operation_status", "output_read", "mutation_status", "runtime_apply_status", "macos_app_apply_status",
   "chatgpt_catalog_refresh_status", "tool_schema_get", "managed_mcp_list", "managed_mcp_status", "managed_mcp_logs",
   "managed_mcp_tools", "managed_mcp_resources", "managed_mcp_read_resource", "host_management_status", "project_lane_status",

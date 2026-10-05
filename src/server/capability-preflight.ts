@@ -47,6 +47,7 @@ const RULES: Readonly<Record<string, ToolPreflightRule>> = {
   host_management_release: {},
 
   code_search: { projectCapability: "read" },
+  code_search_batch: { projectCapability: "read" },
   file_read_slice: { projectCapability: "read" },
   file_read_batch: { projectCapability: "read" },
   command_list: { projectCapability: "read" },

@@ -60,6 +60,7 @@ export const MCP_CORE_TOOL_NAMES = [
   "macos_app_apply_status",
   "runtime_snapshot_status",
   "code_search",
+  "code_search_batch",
   "file_read_slice",
   "file_read_batch",
   "file_edit_lines",
