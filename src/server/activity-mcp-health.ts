@@ -7,7 +7,24 @@ import type { ExternalWatchdogStatus } from "../runtime/external-watchdog-status
 const RECENT_HEALTH_WINDOW_MS = 5 * 60 * 1000;
 const MAX_HEALTH_EVENTS = 16;
 
+const RECOVERABLE_FAILURE_CODES = new Set([
+  "INVALID_ARGUMENT",
+  "LEASE_REQUIRED",
+  "LEASE_EXPIRED",
+  "ACTIVE_PROJECT_LEASE_HELD",
+  "PROJECT_NOT_FOUND",
+  "PROJECT_NOT_SELECTED",
+  "AMBIGUOUS_PROJECT",
+  "WORKSPACE_NOT_READY",
+  "APPROVAL_REQUIRED",
+  "CONFIRMATION_PENDING",
+  "PENDING_WORK_IN_ACTIVE",
+  "ACTIVE_OPERATION_IN_PROGRESS",
+  "RUNTIME_UPDATE_IN_PROGRESS",
+]);
+
 export type ActivityMcpHealthState = "healthy" | "degraded" | "unhealthy";
+export type ActivityMcpFailureClass = "recoverable" | "transport" | "runtime" | "operation";
 
 export interface ActivityMcpHealthEvent {
   at: string;
@@ -17,6 +34,7 @@ export interface ActivityMcpHealthEvent {
   tool?: string;
   phase?: string;
   diagnosticId?: string;
+  classification?: ActivityMcpFailureClass;
 }
 
 export interface ActivityMcpHealth {
@@ -25,6 +43,7 @@ export interface ActivityMcpHealth {
   reason: string;
   generatedAt: number;
   recentFailureCount: number;
+  recentRecoverableFailureCount: number;
   recentTransportFailureCount: number;
   lastSuccessAt?: string;
   lastFailureAt?: string;
@@ -32,6 +51,7 @@ export interface ActivityMcpHealth {
   watchdogProbeFresh: boolean | null;
   watchdogConsecutiveFailures: number;
   watchdogProbeAgeMs: number | null;
+  watchdogIncident: ExternalWatchdogStatus["incident"];
   events: ActivityMcpHealthEvent[];
 }
 
@@ -48,6 +68,14 @@ function isTransportFailure(event: ConnectionDiagnosticEvent): boolean {
     || event.phase === "transport";
 }
 
+function failureClassification(event: ConnectionDiagnosticEvent): ActivityMcpFailureClass | undefined {
+  if (event.outcome !== "failure") return undefined;
+  if (event.errorCode && RECOVERABLE_FAILURE_CODES.has(event.errorCode)) return "recoverable";
+  if (isTransportFailure(event)) return "transport";
+  if (event.event.startsWith("runtime.")) return "runtime";
+  return "operation";
+}
+
 function isHealthTimelineEvent(event: ConnectionDiagnosticEvent): boolean {
   return event.outcome === "failure"
     || event.event === "mcp.transport_error"
@@ -58,6 +86,7 @@ function isHealthTimelineEvent(event: ConnectionDiagnosticEvent): boolean {
 }
 
 function toHealthEvent(event: ConnectionDiagnosticEvent): ActivityMcpHealthEvent {
+  const classification = failureClassification(event);
   return {
     at: event.at,
     event: event.event,
@@ -66,6 +95,7 @@ function toHealthEvent(event: ConnectionDiagnosticEvent): ActivityMcpHealthEvent
     ...(event.tool ? { tool: event.tool } : {}),
     ...(event.phase ? { phase: event.phase } : {}),
     ...(event.diagnosticId ? { diagnosticId: event.diagnosticId } : {}),
+    ...(classification ? { classification } : {}),
   };
 }
 
@@ -76,7 +106,9 @@ export function activityMcpHealth(
 ): ActivityMcpHealth {
   const cutoff = now - RECENT_HEALTH_WINDOW_MS;
   const recentEvents = (diagnostics?.recentEvents ?? []).filter((event) => eventTime(event) >= cutoff);
-  const recentFailures = recentEvents.filter((event) => event.outcome === "failure");
+  const observedFailures = recentEvents.filter((event) => event.outcome === "failure");
+  const recentRecoverableFailures = observedFailures.filter((event) => failureClassification(event) === "recoverable");
+  const recentFailures = observedFailures.filter((event) => failureClassification(event) !== "recoverable");
   const recentTransportFailures = recentFailures.filter(isTransportFailure);
   const watchdogStatus = watchdog?.available ? watchdog.status : "unavailable";
   const watchdogFresh = watchdog?.available ? watchdog.probeFresh : null;
@@ -107,12 +139,30 @@ export function activityMcpHealth(
         : "watchdog 상태 확인 필요";
   }
 
+  if (watchdog?.incident) {
+    if (watchdog.incident.active) {
+      reason = `외부 연결 장애 · ${watchdog.incident.latestFailureLayer}`;
+    } else if (state === "healthy") {
+      reason = `최근 외부 연결 장애 복구됨 · ${watchdog.incident.latestFailureLayer}`;
+    }
+  }
+
   const events = (diagnostics?.recentEvents ?? [])
     .filter(isHealthTimelineEvent)
     .slice(-MAX_HEALTH_EVENTS)
     .map(toHealthEvent);
 
-  if (watchdog?.recentFailure && Date.parse(watchdog.recentFailure.at) >= now - 30 * 60 * 1000) {
+  if (watchdog?.incident && Date.parse(watchdog.incident.startedAt) >= now - 30 * 60 * 1000) {
+    for (const stage of watchdog.incident.stages) {
+      events.push({
+        at: stage.at,
+        event: `external.watchdog.${stage.layer}`,
+        outcome: stage.layer === "healthy" ? "success" : "failure",
+        ...(stage.layer === "healthy" ? {} : { errorCode: stage.layer }),
+        diagnosticId: watchdog.incident.incidentId,
+      });
+    }
+  } else if (watchdog?.recentFailure && Date.parse(watchdog.recentFailure.at) >= now - 30 * 60 * 1000) {
     events.push({
       at: watchdog.recentFailure.at,
       event: "external.watchdog",
@@ -129,6 +179,7 @@ export function activityMcpHealth(
     reason,
     generatedAt: now,
     recentFailureCount: recentFailures.length,
+    recentRecoverableFailureCount: recentRecoverableFailures.length,
     recentTransportFailureCount: recentTransportFailures.length,
     ...(diagnostics?.lastSuccessAt ? { lastSuccessAt: diagnostics.lastSuccessAt } : {}),
     ...(diagnostics?.lastFailureAt ? { lastFailureAt: diagnostics.lastFailureAt } : {}),
@@ -136,6 +187,7 @@ export function activityMcpHealth(
     watchdogProbeFresh: watchdogFresh ?? null,
     watchdogConsecutiveFailures: watchdogFailures,
     watchdogProbeAgeMs: watchdog?.probeAgeMs ?? null,
+    watchdogIncident: watchdog?.incident ?? null,
     events: events.slice(-MAX_HEALTH_EVENTS),
   };
 }

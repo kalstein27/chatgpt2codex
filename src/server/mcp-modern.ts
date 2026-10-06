@@ -36,14 +36,16 @@ export interface ModernMcpDispatchResult {
   response?: Record<string, unknown>;
 }
 
-const IMMUTABLE_APPROVAL_WIDGET_RESOURCE_TTL_MS = 24 * 60 * 60 * 1000;
+const IMMUTABLE_WIDGET_RESOURCE_TTL_MS = 24 * 60 * 60 * 1000;
 const IMMUTABLE_APPROVAL_WIDGET_RESOURCE_RE = /^ui:\/\/widget\/c2ct-operation-approval-v\d+\.html$/;
+const IMMUTABLE_SHARED_WIDGET_RESOURCE_RE = /^ui:\/\/widget\/c2ct-consent(?:-lab)?-[a-f0-9]{24}\.html$/;
 
-function isImmutableApprovalWidgetRead(result: Record<string, unknown>): boolean {
+function isImmutableWidgetRead(result: Record<string, unknown>): boolean {
   const contents = Array.isArray(result.contents) ? result.contents : [];
   if (contents.length !== 1 || !isRecord(contents[0])) return false;
   return typeof contents[0].uri === "string"
-    && IMMUTABLE_APPROVAL_WIDGET_RESOURCE_RE.test(contents[0].uri);
+    && (IMMUTABLE_APPROVAL_WIDGET_RESOURCE_RE.test(contents[0].uri)
+      || IMMUTABLE_SHARED_WIDGET_RESOURCE_RE.test(contents[0].uri));
 }
 
 type LegacyRequestHandler = (
@@ -99,12 +101,12 @@ function decorateModernResult(
     decorated.cacheScope = "private";
   }
   if (method === "resources/read") {
-    // Versioned operation-approval resources are immutable by identity. Cache
-    // those privately so repeated approval cards do not pay a host resource
-    // refetch/revalidation round trip; all mutable/shared widget resources keep
-    // the conservative zero-TTL policy.
-    decorated.ttlMs = isImmutableApprovalWidgetRead(result)
-      ? IMMUTABLE_APPROVAL_WIDGET_RESOURCE_TTL_MS
+    // Versioned approvals and content-addressed shared resources are immutable
+    // by identity. Cache them privately so same-revision cards can reuse static
+    // bytes. Legacy loader aliases remain zero-TTL because they intentionally
+    // resolve the active widget asset at mount time.
+    decorated.ttlMs = isImmutableWidgetRead(result)
+      ? IMMUTABLE_WIDGET_RESOURCE_TTL_MS
       : 0;
     decorated.cacheScope = "private";
   }
@@ -238,6 +240,9 @@ export async function dispatchModernMcpRequest(
   try {
     const result = await invokeLegacyHandler(ctx, method, params, {
       _meta: modernRequestMeta(body) ?? {},
+      ...(typeof request.id === "string" || typeof request.id === "number"
+        ? { requestId: request.id }
+        : {}),
     });
     if (method === "tools/list") {
       const currentRevision = typeof result.schemaRevision === "string" ? result.schemaRevision : undefined;

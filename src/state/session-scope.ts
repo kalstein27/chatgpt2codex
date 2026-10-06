@@ -41,6 +41,10 @@ export function remoteConversationSessionScope(meta: unknown): string | undefine
   return hashedSessionScope("remote-chat", value);
 }
 
+export function isRemoteConversationSessionScope(scope: string | undefined): boolean {
+  return typeof scope === "string" && scope.startsWith("remote-chat:");
+}
+
 /** Stable only for one stateful MCP transport. Transport rotation intentionally
  * loses project capability rather than falling back to a shared owner scope. */
 export function remoteTransportSessionScope(seed: string): string {
@@ -51,4 +55,8 @@ export function remoteTransportSessionScope(seed: string): string {
  * identity. It is intentionally not reusable by a later request. */
 export function remoteTransientSessionScope(): string {
   return hashedSessionScope("remote-transient", randomUUID());
+}
+
+export function isRemoteTransientSessionScope(scope: string | undefined): boolean {
+  return typeof scope === "string" && scope.startsWith("remote-transient:");
 }

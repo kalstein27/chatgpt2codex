@@ -35,6 +35,8 @@ OPERATOR_STOP_FILE="$STATE_DIR/operator-stop"
 RUNTIME_APPLY_MAINTENANCE_FILE="$STATE_DIR/runtime-apply-maintenance"
 CFLOG="$(mktemp -t chatgpt2codex-cf.XXXX.log)"
 SRVLOG="$(mktemp -t chatgpt2codex-server.XXXX.log)"
+ROUTERLOG="$(mktemp -t chatgpt2codex-router.XXXX.log)"
+RUNTIME_ROUTER_DISPATCH_LOG="$STATE_DIR/logs/runtime-router-dispatch.jsonl"
 LAST_RUNTIME_FAILURE_LOG="$STATE_DIR/logs/last-runtime-failure.log"
 SUPERVISOR_LIFECYCLE_LOG="$STATE_DIR/logs/supervisor-lifecycle.log"
 DOCTOR_SCRIPT="$ROOT/macos-dependency-doctor.sh"
@@ -43,6 +45,10 @@ if [[ ! -f "$DOCTOR_SCRIPT" && -f "$ROOT/scripts/macos-dependency-doctor.sh" ]];
 fi
 LAUNCHER_SUBSHELL_LEVEL="${BASH_SUBSHELL:-0}"
 CLEANED_UP=0
+ROUTER_PID=""
+SERVER_PORT=""
+SERVER_GENERATION_ID=""
+RETIRED_SERVER_PIDS=()
 HEALTH_CHECK_INTERVAL_TICKS=5
 HEALTH_FAILURE_THRESHOLD=3
 HUNG_RECOVERY_COOLDOWN_SEC=30
@@ -62,17 +68,22 @@ append_supervisor_lifecycle() {
 
 cleanup() {
   local reason="${1:-EXIT}"
+  local retired_pid
   # Command substitutions run in Bash subshells and inherit EXIT traps on some
   # macOS Bash versions. Only the top-level launcher may own/stop these PIDs.
   [[ "${BASH_SUBSHELL:-0}" == "$LAUNCHER_SUBSHELL_LEVEL" ]] || return 0
   [[ "$CLEANED_UP" == "0" ]] || return 0
   CLEANED_UP=1
-  append_supervisor_lifecycle "stop reason=$reason child=${SRV_PID:-none}"
+  append_supervisor_lifecycle "stop reason=$reason child=${SRV_PID:-none} router=${ROUTER_PID:-none}"
   echo
-  echo "[chatgpt2codex] stopping server/tunnel..."
+  echo "[chatgpt2codex] stopping router/server/tunnel..."
+  [[ -n "${ROUTER_PID:-}" ]] && kill "$ROUTER_PID" 2>/dev/null || true
   [[ -n "${SRV_PID:-}" ]] && kill "$SRV_PID" 2>/dev/null || true
+  for retired_pid in "${RETIRED_SERVER_PIDS[@]}"; do
+    [[ -n "$retired_pid" ]] && kill "$retired_pid" 2>/dev/null || true
+  done
   [[ -n "${CF_PID:-}" ]] && kill "$CF_PID" 2>/dev/null || true
-  rm -f "$CFLOG" "$SRVLOG"
+  rm -f "$CFLOG" "$SRVLOG" "$ROUTERLOG"
 }
 trap 'cleanup EXIT' EXIT
 trap 'cleanup INT; exit 130' INT
@@ -103,6 +114,27 @@ sleep_1s() {
   # disappear while /Applications/ChatGPT To Codex.app is being swapped.
   /bin/sleep 1
 }
+
+allocate_runtime_port() {
+  node -e '
+    const net = require("node:net");
+    const server = net.createServer();
+    server.unref();
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      const port = address && typeof address === "object" ? address.port : 0;
+      server.close(() => {
+        if (!Number.isSafeInteger(port) || port < 1) process.exit(1);
+        process.stdout.write(String(port));
+      });
+    });
+  '
+}
+
+new_runtime_generation_id() {
+  node -e 'process.stdout.write(`runtime-${require("node:crypto").randomUUID()}`)'
+}
+
 
 operator_stop_requested() {
   [[ -f "$OPERATOR_STOP_FILE" ]]
@@ -191,12 +223,17 @@ resolve_server_node() {
 
 start_server_process() {
   local requested_root="${1:-}"
+  local requested_port="${2:-}"
+  local requested_generation="${3:-}"
+  local server_args=()
   if [[ -n "$requested_root" ]]; then
     SERVER_RUNTIME_ROOT="$requested_root"
   else
     SERVER_RUNTIME_ROOT="$(resolve_server_runtime_root)"
   fi
   SERVER_NODE="$(resolve_server_node "$SERVER_RUNTIME_ROOT")"
+  SERVER_PORT="${requested_port:-$(allocate_runtime_port)}"
+  SERVER_GENERATION_ID="${requested_generation:-$(new_runtime_generation_id)}"
   if [[ ! -f "$SERVER_RUNTIME_ROOT/dist/cli.js" ]]; then
     echo "[chatgpt2codex] runtime is missing dist/cli.js: $SERVER_RUNTIME_ROOT" >&2
     return 1
@@ -204,18 +241,70 @@ start_server_process() {
   SERVER_RUNTIME_VERSION="$("$SERVER_NODE" -e \
     'try { process.stdout.write(require(process.argv[1]).version || "unknown") } catch { process.stdout.write("unknown") }' \
     "$SERVER_RUNTIME_ROOT/package.json" 2>/dev/null || printf 'unknown')"
-  printf '\n[chatgpt2codex] starting runtime from %s\n' "$SERVER_RUNTIME_ROOT" >>"$SRVLOG"
+  server_args=(serve --http --port "$SERVER_PORT" --public-url "$PUBLIC_URL" --workspace "$WORKSPACE")
+  if [[ -n "$IDLE_SHUTDOWN_MINUTES" ]]; then
+    server_args+=(--idle-shutdown-minutes "$IDLE_SHUTDOWN_MINUTES")
+  fi
+  printf '\n[chatgpt2codex] starting runtime generation %s from %s on private port %s\n' "$SERVER_GENERATION_ID" "$SERVER_RUNTIME_ROOT" "$SERVER_PORT" >>"$SRVLOG"
   CHATGPT2CODEX_RUNTIME_ROOT="$SERVER_RUNTIME_ROOT" \
+    CHATGPT2CODEX_RUNTIME_GENERATION_ID="$SERVER_GENERATION_ID" \
+    CHATGPT2CODEX_RUNTIME_UPSTREAM_PORT="$SERVER_PORT" \
     CHATGPT2CODEX_SUPERVISOR_PID="$$" \
     CHATGPT2CODEX_CLOUDFLARED_PID="${CF_PID:-}" \
     CHATGPT2CODEX_TUNNEL_MODE="$TUNNEL_MODE" \
     CHATGPT2CODEX_PUBLIC_ORIGIN="$PUBLIC_URL" \
     CHATGPT2CODEX_PORT="$PORT" \
     CHATGPT2CODEX_RUNTIME_VERSION="$SERVER_RUNTIME_VERSION" \
-    "$SERVER_NODE" "$SERVER_RUNTIME_ROOT/dist/cli.js" "${SERVER_ARGS[@]}" \
+    "$SERVER_NODE" "$SERVER_RUNTIME_ROOT/dist/cli.js" "${server_args[@]}" \
     ${ACTIVE_PROJECT_ARGS[@]+"${ACTIVE_PROJECT_ARGS[@]}"} >>"$SRVLOG" 2>&1 &
   SRV_PID=$!
-  echo "[chatgpt2codex] runtime process started (supervisor=$$, server=$SRV_PID, version=$SERVER_RUNTIME_VERSION)."
+  echo "[chatgpt2codex] runtime process started (supervisor=$$, server=$SRV_PID, generation=$SERVER_GENERATION_ID, private-port=$SERVER_PORT, version=$SERVER_RUNTIME_VERSION)."
+}
+
+runtime_router_control() {
+  local router_node
+  router_node="$(resolve_server_node "$ROOT")"
+  "$router_node" "$ROOT/dist/runtime/runtime-router-control.js" "$@"
+}
+
+initialize_runtime_router() {
+  runtime_router_control init --state-dir "$STATE_DIR" \
+    --generation-id "$SERVER_GENERATION_ID" --runtime-root "$SERVER_RUNTIME_ROOT" \
+    --pid "$SRV_PID" --port "$SERVER_PORT" >>"$ROUTERLOG" 2>&1
+}
+
+switch_runtime_router_to_current() {
+  if ! runtime_router_control stage --state-dir "$STATE_DIR" \
+      --generation-id "$SERVER_GENERATION_ID" --runtime-root "$SERVER_RUNTIME_ROOT" \
+      --pid "$SRV_PID" --port "$SERVER_PORT" >>"$ROUTERLOG" 2>&1; then
+    return 1
+  fi
+  if ! curl -fsS --max-time 2 "http://127.0.0.1:$SERVER_PORT/healthz" >/dev/null 2>&1; then
+    runtime_router_control clear-candidate --state-dir "$STATE_DIR" \
+      --generation-id "$SERVER_GENERATION_ID" >>"$ROUTERLOG" 2>&1 || true
+    return 1
+  fi
+  if runtime_router_control activate --state-dir "$STATE_DIR" \
+      --generation-id "$SERVER_GENERATION_ID" >>"$ROUTERLOG" 2>&1; then
+    return 0
+  fi
+  runtime_router_control clear-candidate --state-dir "$STATE_DIR" \
+    --generation-id "$SERVER_GENERATION_ID" >>"$ROUTERLOG" 2>&1 || true
+  return 1
+}
+
+start_runtime_router() {
+  local router_node
+  router_node="$(resolve_server_node "$ROOT")"
+  if [[ ! -f "$ROOT/dist/runtime/runtime-router-worker.js" || ! -f "$ROOT/dist/runtime/runtime-router-control.js" ]]; then
+    echo "[chatgpt2codex] runtime router assets are missing from $ROOT/dist/runtime." >&2
+    return 1
+  fi
+  "$router_node" "$ROOT/dist/runtime/runtime-router-worker.js" \
+    --state-dir "$STATE_DIR" --host 127.0.0.1 --port "$PORT" \
+    --dispatch-log "$RUNTIME_ROUTER_DISPATCH_LOG" >>"$ROUTERLOG" 2>&1 &
+  ROUTER_PID=$!
+  echo "[chatgpt2codex] runtime router started (router=$ROUTER_PID, public-local-port=$PORT)."
 }
 
 restore_runtime_pointer() {
@@ -230,32 +319,43 @@ restore_runtime_pointer() {
 
 reload_server_runtime() {
   local previous_root="$SERVER_RUNTIME_ROOT"
+  local previous_pid="${SRV_PID:-}"
+  local previous_port="$SERVER_PORT"
+  local previous_generation="$SERVER_GENERATION_ID"
+  local previous_node="$SERVER_NODE"
+  local previous_version="$SERVER_RUNTIME_VERSION"
+  local target_root
+  target_root="$(resolve_server_runtime_root)"
   rm -f "$RUNTIME_RELOAD_FILE"
-  append_supervisor_lifecycle "reload-begin child=${SRV_PID:-none}"
-  echo "[chatgpt2codex] applying runtime update while preserving the connector URL..."
-  echo "[chatgpt2codex] stopping runtime process $SRV_PID (supervisor=$$)."
-  stop_managed_server_process
+  append_supervisor_lifecycle "reload-begin child=${previous_pid:-none} generation=${previous_generation:-none}"
+  echo "[chatgpt2codex] preparing runtime generation $target_root while the active generation remains routed."
 
-  if start_server_process &&
-     wait_http_ok "http://127.0.0.1:$PORT/healthz" 20 "updated local server"; then
-    reset_hung_recovery_state
-    append_supervisor_lifecycle "reload-complete child=${SRV_PID:-none}"
-    echo "[chatgpt2codex] runtime updated; connector URL is unchanged."
-    return 0
+  # Phase C keeps the old generation alive until the candidate is healthy and
+  # the router state has been atomically switched. Drain/retirement is a later phase.
+  SRV_PID=""
+  if start_server_process "$target_root" &&
+     wait_http_ok "http://127.0.0.1:$SERVER_PORT/healthz" 20 "candidate runtime"; then
+    if switch_runtime_router_to_current; then
+      [[ -n "$previous_pid" ]] && RETIRED_SERVER_PIDS+=("$previous_pid")
+      reset_hung_recovery_state
+      append_supervisor_lifecycle "reload-complete old=${previous_pid:-none} child=${SRV_PID:-none} generation=$SERVER_GENERATION_ID"
+      echo "[chatgpt2codex] runtime routing switched atomically to generation $SERVER_GENERATION_ID; previous generation remains retired for later drain."
+      return 0
+    fi
+    echo "[chatgpt2codex] candidate was healthy but the atomic router switch failed; keeping the previous generation active." >&2
+  else
+    echo "[chatgpt2codex] candidate runtime failed readiness; keeping the previous generation active." >&2
   fi
 
-  echo "[chatgpt2codex] updated runtime failed health check; rolling back." >&2
-  append_supervisor_lifecycle "reload-target-health-failed child=${SRV_PID:-none}"
+  append_supervisor_lifecycle "reload-candidate-rejected child=${SRV_PID:-none}"
   [[ -n "${SRV_PID:-}" ]] && stop_managed_server_process || true
   restore_runtime_pointer "$previous_root"
-  start_server_process
-  if wait_http_ok "http://127.0.0.1:$PORT/healthz" 20 "rolled-back local server"; then
-    reset_hung_recovery_state
-    append_supervisor_lifecycle "reload-rollback-complete child=${SRV_PID:-none}"
-    echo "[chatgpt2codex] previous runtime restored; connector URL is unchanged." >&2
-    return 1
-  fi
-  echo "[chatgpt2codex] rollback runtime also failed. Log: $SRVLOG" >&2
+  SRV_PID="$previous_pid"
+  SERVER_RUNTIME_ROOT="$previous_root"
+  SERVER_PORT="$previous_port"
+  SERVER_GENERATION_ID="$previous_generation"
+  SERVER_NODE="$previous_node"
+  SERVER_RUNTIME_VERSION="$previous_version"
   return 1
 }
 
@@ -277,6 +377,23 @@ local_runtime_healthy() {
   curl -fsS --max-time 2 "http://127.0.0.1:$PORT/healthz" 2>/dev/null |
     grep -Eq '"ok"[[:space:]]*:[[:space:]]*true'
 }
+
+monitor_runtime_router() {
+  if [[ -n "${ROUTER_PID:-}" ]] && kill -0 "$ROUTER_PID" 2>/dev/null; then
+    return 0
+  fi
+  [[ -n "${ROUTER_PID:-}" ]] && wait "$ROUTER_PID" 2>/dev/null || true
+  ROUTER_PID=""
+  append_supervisor_lifecycle "router-restart-begin"
+  if start_runtime_router && wait_http_ok "http://127.0.0.1:$PORT/healthz" 20 "recovered runtime router"; then
+    append_supervisor_lifecycle "router-restart-complete router=$ROUTER_PID"
+    return 0
+  fi
+  echo "[chatgpt2codex] stable runtime router could not be recovered. Router log:" >&2
+  cat "$ROUTERLOG" >&2
+  return 1
+}
+
 
 reclaim_healthy_runtime_for_handoff() {
   local health runtime_pid supervisor_pid runtime_parent supervisor_command target_pid i
@@ -395,13 +512,11 @@ recover_hung_managed_runtime() {
   [[ -n "$previous_root" ]] || return 1
   hung_recovery_budget_allows || return 1
 
-  echo "[chatgpt2codex] managed runtime recovery attempt $HUNG_RECOVERY_ATTEMPTS/$HUNG_RECOVERY_MAX_ATTEMPTS: $reason; preserving supervisor=$$, tunnel mode=$TUNNEL_MODE."
+  echo "[chatgpt2codex] managed runtime recovery attempt $HUNG_RECOVERY_ATTEMPTS/$HUNG_RECOVERY_MAX_ATTEMPTS: $reason; preserving supervisor=$$, router=${ROUTER_PID:-none}, tunnel mode=$TUNNEL_MODE."
   stop_managed_server_process
 
-  # A previous runtime may have died while holding a short-lived local state
-  # lock. Retry long enough to cross the 30s stale-lock fallback rather than
-  # declaring the managed runtime unrecoverable after one immediate restart.
-  # The sequence is fixed and bounded: immediate, +5s, +10s, +20s.
+  # A failed active runtime can leave a short-lived local state lock. Retry a
+  # bounded sequence, then atomically repoint the still-running public router.
   for retry_delay in 0 5 10 20; do
     attempt=$((attempt + 1))
     if [[ "$retry_delay" -gt 0 ]]; then
@@ -414,10 +529,11 @@ recover_hung_managed_runtime() {
     fi
 
     if start_server_process "$previous_root" &&
-       wait_http_ok "http://127.0.0.1:$PORT/healthz" 20 "recovered managed runtime"; then
+       wait_http_ok "http://127.0.0.1:$SERVER_PORT/healthz" 20 "recovered managed runtime" &&
+       switch_runtime_router_to_current; then
       HEALTH_TICK=0
       CONSECUTIVE_HEALTH_FAILURES=0
-      echo "[chatgpt2codex] managed runtime recovered; supervisor and connector/tunnel were preserved."
+      echo "[chatgpt2codex] managed runtime recovered and the stable router now targets generation $SERVER_GENERATION_ID."
       return 0
     fi
 
@@ -425,7 +541,7 @@ recover_hung_managed_runtime() {
     [[ -n "${SRV_PID:-}" ]] && stop_managed_server_process || true
   done
 
-  echo "[chatgpt2codex] managed runtime recovery exhausted the bounded retry sequence; preserving the supervisor/tunnel for explicit inspection." >&2
+  echo "[chatgpt2codex] managed runtime recovery exhausted the bounded retry sequence; preserving the supervisor/router/tunnel for explicit inspection." >&2
   HUNG_RECOVERY_DISABLED=1
   return 1
 }
@@ -781,20 +897,22 @@ else
   echo "[chatgpt2codex] 1/2 loopback-only mode; no public tunnel."
 fi
 
-echo "[chatgpt2codex] 2/3 starting local HTTP/OAuth MCP server..."
+echo "[chatgpt2codex] 2/3 starting private runtime + stable generation router..."
 ACTIVE_PROJECT_ARGS=()
 if [[ -n "${CHATGPT2CODEX_ACTIVE_PROJECT_ROOT:-}" ]]; then
   ACTIVE_PROJECT_ARGS+=(--active-project-root "$CHATGPT2CODEX_ACTIVE_PROJECT_ROOT")
   ACTIVE_PROJECT_ARGS+=(--active-project-preset "${CHATGPT2CODEX_ACTIVE_PROJECT_PRESET:-full-write}")
 fi
-SERVER_ARGS=(serve --http --port "$PORT" --public-url "$PUBLIC_URL" --workspace "$WORKSPACE")
-if [[ -n "$IDLE_SHUTDOWN_MINUTES" ]]; then
-  SERVER_ARGS+=(--idle-shutdown-minutes "$IDLE_SHUTDOWN_MINUTES")
-fi
 start_server_process
-if ! wait_http_ok "http://127.0.0.1:$PORT/healthz" 20 "local server"; then
+if ! wait_http_ok "http://127.0.0.1:$SERVER_PORT/healthz" 20 "private active runtime"; then
   echo "[chatgpt2codex] server log: $SRVLOG" >&2
   cat "$SRVLOG" >&2
+  exit 1
+fi
+if ! initialize_runtime_router || ! start_runtime_router ||
+   ! wait_http_ok "http://127.0.0.1:$PORT/healthz" 20 "stable runtime router"; then
+  echo "[chatgpt2codex] runtime router failed to become ready. Router log:" >&2
+  cat "$ROUTERLOG" >&2
   exit 1
 fi
 HEALTH_INSTANCE_ID="$(curl -fsS --max-time 3 "http://127.0.0.1:$PORT/healthz" 2>/dev/null | node -e '
@@ -872,6 +990,10 @@ while true; do
     reload_server_runtime || true
   elif [[ -f "$RUNTIME_RELOAD_FILE" ]]; then
     reload_server_runtime || true
+  fi
+  if ! monitor_runtime_router; then
+    sleep_1s
+    continue
   fi
   monitor_managed_runtime_health
   if [[ -z "${SRV_PID:-}" ]]; then

@@ -5,6 +5,7 @@ import { DomainError, ErrorCode } from "../types.js";
 
 export const CHATGPT_WIDGET_ASSET_SCHEMA_VERSION = 1;
 export const CHATGPT_WIDGET_ASSET_MAX_BYTES = 512 * 1024;
+const REDACTION_PLACEHOLDER = "[" + "REDACTED" + "]";
 export const CHATGPT_WIDGET_BUILD_HTML_RELATIVE_PATH = path.join(
   "dist",
   "server",
@@ -43,6 +44,13 @@ function assertWidgetHtml(html: string): void {
   }
   if (html.includes("\0")) {
     throw new DomainError(ErrorCode.NULLBYTE_REJECTED, "ChatGPT widget asset contains a null byte");
+  }
+  if (html.includes(REDACTION_PLACEHOLDER)) {
+    throw new DomainError(
+      ErrorCode.PATCH_CONTEXT_REDACTED,
+      "ChatGPT widget asset contains a literal redaction placeholder",
+      { reason: "literal_redaction_placeholder" },
+    );
   }
   if (!/^<!doctype html>/iu.test(html.trimStart()) || !html.includes('id="approval"') || !html.includes("<script>")) {
     throw new DomainError(ErrorCode.INVALID_ARGUMENT, "ChatGPT widget asset does not match the expected approval-card document shape");
@@ -142,8 +150,16 @@ export async function applyCandidateChatGptWidgetAsset(options: {
   projectRoot: string;
   stateDir: string;
   supportedProtocolVersion: number;
+  expectedRevision?: string;
 }): Promise<ChatGptWidgetAssetMeta> {
   const candidate = await readCandidateAsset(options.projectRoot);
+  if (options.expectedRevision && candidate.meta.revision !== options.expectedRevision) {
+    throw new DomainError(ErrorCode.HASH_MISMATCH, "Built ChatGPT widget asset is not the verified preapply candidate", {
+      expectedRevision: options.expectedRevision,
+      observedRevision: candidate.meta.revision,
+      reason: "preapply_candidate_revision_mismatch",
+    });
+  }
   if (candidate.meta.protocolVersion !== options.supportedProtocolVersion) {
     throw new DomainError(ErrorCode.PERMISSION_DENIED, "Widget asset protocol differs from the live runtime; apply the matching runtime before hot-applying this UI", {
       candidateProtocolVersion: candidate.meta.protocolVersion,

@@ -1,5 +1,8 @@
 import type { McpRequestClassification } from "./mcp-request-classification.js";
-import { CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL } from "./chatgpt-consent-widget.js";
+import {
+  CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL,
+  CHATGPT_WIDGET_PREAPPLY_PRESENTER_TOOL,
+} from "./chatgpt-consent-widget.js";
 
 export const MCP_MODERN_PROTOCOL_VERSION = "2026-07-28";
 export const MCP_PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion";
@@ -12,7 +15,7 @@ export const MCP_SERVER_INFO_META_KEY = "io.modelcontextprotocol/serverInfo";
 export const MCP_SCHEMA_CACHE_TTL_MS = 0;
 export const MCP_DISCOVERY_TTL_MS = MCP_SCHEMA_CACHE_TTL_MS;
 export const MCP_TOOL_LIST_TTL_MS = MCP_SCHEMA_CACHE_TTL_MS;
-export const MCP_SCHEMA_CONTRACT_VERSION = 4;
+export const MCP_SCHEMA_CONTRACT_VERSION = 5;
 export const MCP_SCHEMA_REVISION_META_KEY = "io.ezbuilder.chatgpt2codex/schemaRevision";
 export const MCP_SCHEMA_EXPIRED_META_KEY = "io.ezbuilder.chatgpt2codex/schemaExpired";
 export const MCP_SCHEMA_REVALIDATE_META_KEY = "io.ezbuilder.chatgpt2codex/schemaMustRevalidate";
@@ -28,9 +31,15 @@ export const MCP_TOOL_CAPABILITIES = {
 
 export const MCP_CORE_TOOL_NAMES = [
   "c2ct_invoke",
-  "chatgpt_catalog_refresh",
+  CHATGPT_WIDGET_PREAPPLY_PRESENTER_TOOL,
   CHATGPT_OPERATION_APPROVAL_PRESENTER_TOOL,
+  "chatgpt_manual_refresh_presenter_v1",
+  "chatgpt_catalog_reentry_presenter_v1",
+  "agent_bootstrap",
   "connection_status",
+  "host_management_status",
+  "host_management_acquire",
+  "host_management_release",
   "chatgpt_continuation_resume",
   "connection_audit",
   "session_context_update",
@@ -46,10 +55,12 @@ export const MCP_CORE_TOOL_NAMES = [
   "project_status",
   "project_rules",
   "operation_status",
+  "operation_result",
   "runtime_apply_status",
   "macos_app_apply_status",
   "runtime_snapshot_status",
   "code_search",
+  "code_search_batch",
   "file_read_slice",
   "file_read_batch",
   "file_edit_lines",

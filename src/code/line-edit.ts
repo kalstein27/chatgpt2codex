@@ -13,6 +13,12 @@ import {
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
 const MAX_EDIT_BYTES = 10 * 1024 * 1024;
 const SHA256_RE = /^[a-f0-9]{64}$/i;
+const REDACTION_PLACEHOLDER = "[" + "REDACTED" + "]";
+
+function placeholderCount(text: string): number {
+  if (!text.includes(REDACTION_PLACEHOLDER)) return 0;
+  return text.split(REDACTION_PLACEHOLDER).length - 1;
+}
 
 export interface LineEdit {
   path: string;
@@ -184,6 +190,24 @@ export async function editFileLines(
         lineCount: logicalLines.length,
         reason: "invalid_line_range",
       });
+    }
+
+    const removedPlaceholderCount = logicalLines
+      .slice(insertionIndex, insertionIndex + edit.deleteCount)
+      .reduce((count, line) => count + placeholderCount(line), 0);
+    const insertedPlaceholderCount = edit.lines
+      .reduce((count, line) => count + placeholderCount(line), 0);
+    if (insertedPlaceholderCount > removedPlaceholderCount) {
+      throw new DomainError(
+        ErrorCode.PATCH_CONTEXT_REDACTED,
+        `Line edit would introduce a redaction placeholder into ${edit.path}`,
+        {
+          path: edit.path,
+          startLine: edit.startLine,
+          reason: "redaction_placeholder_introduction",
+          recommendedTool: "file_read_slice",
+        },
+      );
     }
 
     const nextLines = [...logicalLines];

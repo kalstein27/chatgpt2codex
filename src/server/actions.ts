@@ -167,6 +167,15 @@ const ACTION_ROUTES: ActionRoute[] = [
     schema: "ConnectionAuditInput",
   },
   {
+    path: "/actions/agent-bootstrap",
+    tool: "agent_bootstrap",
+    operationId: "agent_bootstrap",
+    summary: "Bootstrap C2CT fast path",
+    description:
+      "Lease-neutral compact bootstrap that combines runtime/schema state with optional project rules and repository status. Pass known revisions to receive a bounded delta on repeated calls.",
+    schema: "AgentBootstrapInput",
+  },
+  {
     path: "/actions/workspace-list-projects",
     tool: "workspace_list_projects",
     operationId: "workspace_list_projects",
@@ -272,7 +281,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "command_run",
     summary: "Run allowlisted project command",
     description:
-      "Run an allowlisted project command through chatgpt2codex. Remote execution is always handed off to a persisted background operation, even if synchronous is requested, so one Action/MCP request never waits for subprocess completion. Protected approvals return promptly; after approval replay the exact same input, then poll operation_status until terminal.",
+      "Run an allowlisted project command through chatgpt2codex. Remote execution always persists a background operation. Stable non-approved requests may finish inside a bounded inline terminal window with no operation_status call; longer work falls back to adaptive polling, and exact response-loss replays converge on the original operation. Protected approvals persist approval-wait immediately; Allow resumes that exact captured operation server-side once, so callers must not replay command_run.",
     schema: "CommandRunInput",
   },
   {
@@ -316,7 +325,7 @@ const ACTION_ROUTES: ActionRoute[] = [
     operationId: "e2e_run_command",
     summary: "Run a guarded E2E command",
     description:
-      "Run a guarded project E2E/test command. Remote execution is always persisted as a background operation; poll operation_status until terminal. If visual proof is requested, capture it afterward with the screenshot action instead of holding this request open for both the long command and screenshot.",
+      "Run a guarded project E2E/test command. Remote execution always persists a background operation. Stable non-approved requests may finish inside a bounded inline terminal window with no operation_status call; longer work falls back to adaptive operation_status polling. Optional screenshot capture is post-processing after command terminal and reports its own status independently from the command result; active long-running fallback defers that screenshot until terminal.",
     schema: "E2eRunCommandInput",
   },
   {
@@ -438,7 +447,7 @@ const ACTION_ROUTES: ActionRoute[] = [
 ];
 
 const OPENAPI_ACTION_TOOL_NAMES = new Set([
-  "agent_guide",
+  "agent_bootstrap",
   "goal_intake",
   "goal_loop",
   "project_lane_open",
@@ -817,7 +826,7 @@ export function openApiSpec(publicOrigin: string): Record<string, unknown> {
       title: "chatgpt2codex Custom GPT Actions",
       version: "0.1.6",
       description:
-        "OpenAPI bridge for Custom GPTs. This does not call OpenAI Codex or spend Codex quota; ChatGPT drives local coding actions through chatgpt2codex. Bootstrap lease-neutrally with connection_status -> agent_guide before acquiring project capability; this works even when zero projects are registered. The live agent_guide is the canonical C2CT contract. When multi-project lanes are enabled, normal coding uses the dedicated project_lane_open/status/renew/release/recover actions and carries the exact workLaneId through lane-aware dedicated actions. project_select remains a legacy/admin serial path, not a normal coding fallback. Platform-compatible tools omitted from the compact dedicated surface remain reachable through call_tool with their runtime schema validation and approval gates intact. Hard gate: do not claim local project inspection, edits, tests, commits, or image saves unless a current-turn ActionToolResponse includes ok=true and toolCall.namespace=ChatGPT_To_Codex. If the active ChatGPT app was Image Generation/ImageGen, image_gen, python_user_visible, or a text-only answer, no chatgpt2codex local work happened; reselect/reconnect ChatGPT To Codex or refresh this Action schema. For /goal or broad implementation prompts, call goal_intake or goal_loop immediately before long reasoning. This compact schema stays at or below 30 operations including action_health and call_tool. It avoids broad context-pack actions that ChatGPT safety may block; inspect with code_search followed by narrow file_read_slice calls instead. " +
+        "OpenAPI bridge for Custom GPTs. This does not call OpenAI Codex or spend Codex quota; ChatGPT drives local coding actions through chatgpt2codex. Prefer the dedicated lease-neutral agent_bootstrap action for normal bootstrap, passing projectId when known; it combines runtime/schema, project rules/status, and repo state in one bounded response. Detailed connection_status and agent_guide remain available through call_tool for reconnect/error recovery, and agent_guide remains the canonical detailed C2CT contract. Host-management lifecycle tools (host_management_status/acquire/release) remain intentionally available through call_tool so they reuse the exact registered MCP schema, conversation-scoped grant checks, and runtime approval metadata without expanding the compact dedicated surface past 30 operations. When multi-project lanes are enabled, normal coding uses the dedicated project_lane_open/status/renew/release/recover actions and carries the exact workLaneId through lane-aware dedicated actions. project_select remains a legacy/admin serial path, not a normal coding fallback. Platform-compatible tools omitted from the compact dedicated surface remain reachable through call_tool with their runtime schema validation and approval gates intact. Hard gate: do not claim local project inspection, edits, tests, commits, or image saves unless a current-turn ActionToolResponse includes ok=true and toolCall.namespace=ChatGPT_To_Codex. If the active ChatGPT app was Image Generation/ImageGen, image_gen, python_user_visible, or a text-only answer, no chatgpt2codex local work happened; reselect/reconnect ChatGPT To Codex or refresh this Action schema. For /goal or broad implementation prompts, call goal_intake or goal_loop immediately before long reasoning. This compact schema stays at or below 30 operations including action_health and call_tool. It avoids broad context-pack actions that ChatGPT safety may block; inspect with code_search followed by narrow file_read_slice calls instead. " +
         (isNativeE2eSupported()
           ? "On macOS it directly exposes e2e_test_and_show_screenshot; lower-level E2E operations remain available through call_tool. "
           : `Native E2E screenshot actions are omitted on ${process.platform}; use command_run for verification. `) +
@@ -847,7 +856,7 @@ export function openApiSpec(publicOrigin: string): Record<string, unknown> {
             toolName: {
               type: "string",
               description:
-                "Registered chatgpt2codex MCP tool name, e.g. file_apply_patch, file_create, command_run, repo_status, git_commit, git_push.",
+                "Registered chatgpt2codex MCP tool name, e.g. host_management_status, host_management_acquire, host_management_release, file_apply_patch, file_create, command_run, repo_status, git_commit, git_push.",
             },
             input: {
               type: "object",
@@ -942,6 +951,21 @@ export function openApiSpec(publicOrigin: string): Record<string, unknown> {
           properties: {
             projectId: { type: "string" },
             path: { type: "string" },
+          },
+        },
+        AgentBootstrapInput: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            projectId: { type: "string", minLength: 1, maxLength: 120 },
+            knownBootstrapRevision: { type: "string", pattern: "^sha256:[a-f0-9]{24}$" },
+            knownRulesRevision: { type: "string", pattern: "^sha256:[a-f0-9]{24}$" },
+            knownRepoRevision: { type: "string", pattern: "^sha256:[a-f0-9]{24}$" },
+            plannedTools: {
+              type: "array",
+              maxItems: 16,
+              items: { type: "string", minLength: 1, maxLength: 128 },
+            },
           },
         },
         ProjectOnlyInput: {

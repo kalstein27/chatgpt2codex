@@ -9,7 +9,7 @@ $SettingsDir = Join-Path $env:APPDATA $AppName
 $LogDir = Join-Path $env:LOCALAPPDATA $AppName
 $SettingsPath = Join-Path $SettingsDir "settings.json"
 $LogPath = Join-Path $LogDir "chatgpt2codex.log"
-$RepoUrlDefault = if ($env:CHATGPT2CODEX_UPDATE_REPO_URL) { $env:CHATGPT2CODEX_UPDATE_REPO_URL } else { "https://github.com/ezBuilder/chatgpt2codex" }
+$RepoUrlDefault = if ($env:CHATGPT2CODEX_UPDATE_REPO_URL) { $env:CHATGPT2CODEX_UPDATE_REPO_URL } else { "https://github.com/kalstein27/chatgpt2codex" }
 $StartupShortcutPath = Join-Path ([Environment]::GetFolderPath("Startup")) "ChatGPT To Codex.lnk"
 New-Item -ItemType Directory -Force -Path $SettingsDir, $LogDir | Out-Null
 

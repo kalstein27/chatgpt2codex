@@ -214,7 +214,7 @@ export class ScheduledLunaWorker {
     try {
       receipt.state = "RUNNING"; receipt.startedAt = this.clock.now(); await this.persist(receipt);
       if (control.cancelRequested) { receipt.state = "CANCELLED"; receipt.finishedAt = this.clock.now(); await this.persist(receipt); return; }
-      const argv = ["exec", "--model", "gpt-5.6-luna", "--ephemeral", "--sandbox", "workspace-write", "--approve-for-me", "--cd", root, "--output-schema", schemaPath, "--output-last-message", resultPath, "--json"] as const;
+      const argv = ["exec", "--model", "gpt-5.6-luna", "--ephemeral", "--approve-for-me", "--cd", root, "--output-schema", schemaPath, "--output-last-message", resultPath, "--json"] as const;
       const child = this.spawn(this.executablePath, argv, { cwd: root, env: minimalEnv(this.environment) }); control.process = child; receipt.subprocessStarted = true; if (child.pid !== undefined) receipt.pid = child.pid; await this.persist(receipt);
       child.stdin.write(boundedWorkerPrompt(prompt)); child.stdin.end();
       const timeout = new Promise<never>((_, reject) => { control.timer = this.clock.setTimeout(() => reject(new Error("TIMEOUT")), timeoutMs); });
